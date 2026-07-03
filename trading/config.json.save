@@ -1,0 +1,44 @@
+{
+  "_comment": "欧易单交易所配置。状态文件存项目根目录。凭据也可用环境变量 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE 覆盖；DINGTALK_WEBHOOK 覆盖钉钉。",
+
+  "okx": {
+    "label": "欧易"    "apiKey": "你的欧易APIKey（也可用环境变量 OKX_API_KEY 覆盖）",
+    "secret": "你的欧易Secret（也可用环境变量 OKX_API_SECRET 覆盖）",
+    "password": "你的欧易API passphrase（也可用环境变量 OKX_API_PASSPHRASE 覆盖）",
+    "margin_mode": "cross",
+    "leverage": 5,
+    "leverage_overrides": { "BTCUSDT": 10 },
+    "sandbox": false
+  },
+
+  "strategy": {
+    "channel_period": 28,
+    "ma_short_period": 6,
+    "ma_long_period": 28,
+    "ma_stop_period": 28,
+    "default_risk_per_trade": 0.01
+  },
+
+  "trading": {
+    "symbols": [
+      { "name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "turtle" },
+      { "name": "ETHUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "ma_cross" }
+    ]
+  },
+
+  "equity_tick_retention_days": 30,
+
+  "scheduler": {
+    "check_hour": 8,
+    "check_minute": 0,
+    "summary_hour": 8,
+    "summary_minute": 0,
+    "weekly_hour": 8,
+    "weekly_minute": 1,
+    "stop_loss_scan_interval_minutes": 5
+  },
+
+  "dingtalk": {
+    "webhook_url": "你的钉钉机器人 webhook（也可用环境变量 DINGTALK_WEBHOOK 覆盖）"
+  }
+}

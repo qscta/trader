@@ -1,0 +1,930 @@
+from flask import Flask, jsonify, request, send_from_directory, session
+from functools import wraps
+import json
+import logging
+import re
+import threading
+import os
+import secrets
+from datetime import datetime
+from trade_state import TradeStatePersistenceError, enrich_closed_trade_with_fees
+
+# 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）
+_SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
+MAX_RISK_PER_TRADE = 0.5  # 单笔风险上限 50%：防止把 1 当 1% 输（API 直调时）这类数量级笔误
+
+
+def _validate_symbol_input(name, risk_per_trade=None, strategy=None):
+    """返回错误信息字符串；None 表示通过。"""
+    if not name or not _SYMBOL_RE.match(name):
+        return f'交易对名不合法: {name!r}（须为大写字母/数字且以 USDT 结尾，如 BTCUSDT）'
+    if risk_per_trade is not None:
+        try:
+            r = float(risk_per_trade)
+        except (TypeError, ValueError):
+            return f'风险度不是有效数字: {risk_per_trade!r}'
+        if not (0 < r <= MAX_RISK_PER_TRADE):
+            return f'风险度超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}'
+    if strategy is not None and strategy not in ('turtle', 'ma_cross'):
+        return f'未知策略: {strategy!r}（只支持 turtle / ma_cross）'
+    return None
+
+app = Flask(__name__, static_folder='static', static_url_path='/static')
+app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
+try:
+    app.json.ensure_ascii = False     # Flask >= 2.2（JSON_AS_ASCII 已废弃）
+except AttributeError:
+    pass
+app.secret_key = os.environ.get('FLASK_SECRET_KEY')
+if not app.secret_key:
+    raise RuntimeError('未配置 FLASK_SECRET_KEY，拒绝启动')
+
+LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
+
+# 全局单交易所系统（由 wsgi / __main__ 注入）
+trading_system = None
+
+logger = logging.getLogger(__name__)
+
+# 手动检查防重入标记
+_manual_check_running = False
+_manual_check_guard = threading.Lock()
+
+API_TOKEN = os.environ.get('TRADING_API_TOKEN')
+
+
+def require_auth(f):
+    """API认证装饰器：支持Session或Token认证。"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if session.get('authenticated'):
+            return f(*args, **kwargs)
+        token = request.headers.get('X-API-Token')
+        if API_TOKEN and token and secrets.compare_digest(token, API_TOKEN):
+            return f(*args, **kwargs)
+        return jsonify({'error': '认证失败，请登录或提供有效的API Token'}), 401
+    return decorated
+
+
+# ============ 钉钉推送 ============
+
+def send_dingtalk(msg):
+    """业务操作通知，统一走 DingTalkNotifier 发送：
+    - notifier 会校验响应 errcode——钉钉被关键词拦截时返回 HTTP 200 + errcode!=0，
+      此前直接 post 只看状态码，被拒收也会记成推送成功；
+    - 标题固定带「交易系统」满足机器人关键词安全校验（手动平仓/参数更新/资金同步
+      等消息原文本不含关键词，text 直发会被静默拒收）。
+    """
+    try:
+        notifier = getattr(trading_system, 'notifier', None) if trading_system else None
+        if not notifier:
+            logger.warning(f"钉钉推送跳过: 系统尚未就绪: {msg[:40]}")
+            return
+        # 钉钉 markdown 中单个换行不生效，转成空行分隔以保持原有多行排版
+        notifier.send_message('[交易系统] 操作通知', msg.replace('\n', '\n\n'))
+    except Exception as e:
+        logger.error(f"钉钉推送失败: {e}")
+
+
+# ============ 系统获取 ============
+
+def _require_system():
+    """返回 (trading_system, error_response)。欧易单交易所版，无需 exchange 参数。"""
+    if trading_system is None:
+        return None, (jsonify({'error': '系统尚未就绪'}), 503)
+    return trading_system, None
+
+
+def _persist_config():
+    """把整份 config 写回磁盘。"""
+    if trading_system and hasattr(trading_system, 'persist_config'):
+        return trading_system.persist_config()
+    return False
+
+
+def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_message):
+    """配置提交：持久化整份 config；写盘失败把 config[section][sub]（sub 为 None 则整段）
+    回滚为 backup，并返回 500 错误响应；成功则 reload 策略并返回 None。
+    必须在 system._config_lock 内调用（写路由的统一收口，替代五处重复样板）。"""
+    if not _persist_config():
+        if sub_key is None:
+            system.config[section_key] = backup
+        else:
+            system.config[section_key][sub_key] = backup
+        return jsonify({'error': fail_message}), 500
+    system.reload_strategies()
+    return None
+
+
+# ============ 全局路由 ============
+
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    if not LOGIN_PASSWORD:
+        return jsonify({'success': False, 'message': '服务器未配置登录密码，请使用API Token'}), 503
+    data = request.get_json() or {}
+    if data.get('password', '') == LOGIN_PASSWORD:
+        session['authenticated'] = True
+        return jsonify({'success': True, 'message': '登录成功'})
+    return jsonify({'success': False, 'message': '密码错误'}), 401
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify({'success': True, 'message': '已登出'})
+
+
+@app.route('/api/check_auth', methods=['GET'])
+def check_auth():
+    if session.get('authenticated'):
+        return jsonify({'authenticated': True})
+    return jsonify({'authenticated': False}), 401
+
+
+# 单所版已移除多所聚合接口（/api/exchanges、/api/overview、/api/overview_ohlc）
+
+
+@app.route('/api/logs', methods=['GET'])
+@require_auth
+def get_logs():
+    try:
+        lines = max(1, min(request.args.get('lines', 50, type=int), 1000))
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            all_lines = f.readlines()
+        filtered = [l for l in all_lines if not (' "' in l and 'HTTP/1.1' in l) and 'code 400, message Bad request' not in l]
+        result = filtered[-lines:]
+        result.reverse()
+        return jsonify({'logs': result})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============ 业务路由（单所版，无 exchange 参数） ============
+
+@app.route('/api/status', methods=['GET'])
+@require_auth
+def get_status():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        open_positions = system.trade_state.get_all_open_positions()
+        last_symbol_update = None
+        try:
+            mtime = os.path.getmtime(trading_system.config_file)
+            last_symbol_update = datetime.fromtimestamp(mtime).isoformat()
+        except Exception as e:
+            logger.warning(f"忽略异常: {e}")
+        manual_symbols = [s['name'] for s in system.config['trading']['symbols'] if s.get('enabled', True)]
+        try:
+            stop_residues = list(system.trade_state.get_stop_residues().keys())
+        except Exception:
+            stop_residues = []
+        stop_anomalies = dict(getattr(system, '_stop_anomalies', {}) or {})
+        return jsonify({
+            'status': 'running',
+            'exchange': system.exchange_id,
+            'label': system.label,
+            'open_positions_count': len(open_positions),
+            'open_positions': open_positions,
+            'enabled_symbols': manual_symbols,
+            'manual_pool_count': len(manual_symbols),
+            'stop_residues': stop_residues,
+            'stop_anomalies': stop_anomalies,
+            'last_symbol_update': last_symbol_update
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/symbols', methods=['GET'])
+@require_auth
+def get_symbols():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+        open_position_symbols = set(system.trade_state.get_all_open_positions().keys())
+        for symbol in symbols:
+            symbol['has_open_position'] = symbol.get('name') in open_position_symbols
+        return jsonify(symbols)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/symbols', methods=['POST'])
+@require_auth
+def add_symbol():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        data = request.get_json(silent=True)
+        if not data or 'name' not in data:
+            return jsonify({'error': '缺少必要参数'}), 400
+
+        new_symbol = {
+            'name': data['name'].upper(),
+            'enabled': data.get('enabled', True),
+            'risk_per_trade': data.get('risk_per_trade', 0.01),
+            'strategy': data.get('strategy', 'turtle')
+        }
+        invalid = _validate_symbol_input(new_symbol['name'], new_symbol['risk_per_trade'], new_symbol['strategy'])
+        if invalid:
+            return jsonify({'error': invalid}), 400
+        for s in system.config['trading']['symbols']:
+            if s['name'] == new_symbol['name']:
+                return jsonify({'error': '交易对已存在'}), 400
+
+        # 验证交易对在交易所是否真实存在
+        try:
+            ccxt_symbol = system.exchange_api.to_ccxt_symbol(new_symbol['name'])
+            test_ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=5)
+            if not test_ohlcv or len(test_ohlcv) == 0:
+                return jsonify({'error': f"交易所不存在永续合约 {new_symbol['name']}，请检查名称是否正确"}), 400
+        except Exception:
+            return jsonify({'error': f"交易所验证失败: {new_symbol['name']} 不是有效的永续合约交易对"}), 400
+
+        with trading_system._config_lock:
+            if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
+                return jsonify({'error': '交易对已存在'}), 400
+            backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+            system.config['trading']['symbols'].append(new_symbol)
+            err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，交易对未添加')
+            if err_resp:
+                return err_resp
+
+        # 海龟策略：回溯历史，中轨后尚未突破则激活可开仓状态
+        if new_symbol['strategy'] == 'turtle':
+            try:
+                symbol_name = new_symbol['name']
+                ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
+                ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=365)
+                if ohlcv:
+                    df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+                    df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
+                    strategy = system.get_strategy_for_symbol({'strategy': 'turtle'})[0]
+                    armed = strategy.is_first_breakout_armed(df)
+                    if armed:
+                        system.trade_state.set_signal_state(symbol_name, True)
+                        logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为可开仓状态")
+                    else:
+                        logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为未激活状态")
+            except Exception as e:
+                logger.warning(f"初始化 {new_symbol['name']} 状态失败: {e}")
+
+        strategy_text = '海龟通道' if new_symbol['strategy'] == 'turtle' else '双均线EMA'
+        send_dingtalk(f'[{system.label}] 新增交易对: {new_symbol["name"]}, 策略: {strategy_text}, '
+                      f'风险度: {new_symbol["risk_per_trade"]*100:.1f}%, 状态: {"启用" if new_symbol["enabled"] else "禁用"}')
+        return jsonify({'status': 'success', 'message': f'交易对 {new_symbol["name"]} 已添加', 'symbol': new_symbol})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/symbols/<symbol>', methods=['PUT'])
+@require_auth
+def update_symbol(symbol):
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({'error': '缺少参数'}), 400
+        invalid = _validate_symbol_input(
+            symbol.upper(),
+            data.get('risk_per_trade') if 'risk_per_trade' in data else None,
+            data.get('strategy') if 'strategy' in data else None,
+        )
+        if invalid:
+            return jsonify({'error': invalid}), 400
+        # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
+        if 'strategy' in data and system.trade_state.get_open_position(symbol.upper()):
+            return jsonify({'error': f'{symbol.upper()} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
+                                     '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
+        with trading_system._config_lock:
+            backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+            for s in system.config['trading']['symbols']:
+                if s['name'] == symbol.upper():
+                    if 'enabled' in data:
+                        s['enabled'] = bool(data['enabled'])
+                    if 'risk_per_trade' in data:
+                        s['risk_per_trade'] = float(data['risk_per_trade'])
+                    if 'strategy' in data:
+                        s['strategy'] = data['strategy']
+
+                    err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
+                    if err_resp:
+                        return err_resp
+
+                    changes = []
+                    if 'enabled' in data:
+                        changes.append(f'状态: {"启用" if data["enabled"] else "禁用"}')
+                    if 'risk_per_trade' in data:
+                        changes.append(f'风险度: {data["risk_per_trade"]*100:.1f}%')
+                    if 'strategy' in data:
+                        strategy_text = '海龟通道' if data['strategy'] == 'turtle' else '双均线EMA'
+                        changes.append(f'策略: {strategy_text}')
+                    send_dingtalk(f'[{system.label}] 更新交易对: {symbol}, {", ".join(changes)}')
+                    return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已更新'})
+        return jsonify({'error': '交易对不存在'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/symbols/<symbol>', methods=['DELETE'])
+@require_auth
+def delete_symbol(symbol):
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        symbol_u = symbol.upper()
+        with trading_system._config_lock:
+            # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，必须先把策略固化进持仓，
+            # 否则删除后 check_and_execute 会按默认 turtle 托管，双均线仓位会被错误管理。
+            held = system.trade_state.get_open_position(symbol_u)
+            if held and not held.get('strategy'):
+                cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_u), None)
+                cfg_strategy = (cfg or {}).get('strategy')
+                if cfg_strategy:
+                    system.trade_state.set_position_strategy(symbol_u, cfg_strategy)
+                else:
+                    return jsonify({'error': '该持仓缺少策略信息，无法保证删除后继续按原策略托管，已阻止删除。'
+                                             '请先在品种配置中明确该交易对的策略后再删除。'}), 400
+            backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+            system.config['trading']['symbols'] = [
+                s for s in system.config['trading']['symbols'] if s['name'] != symbol_u
+            ]
+            err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，删除已回滚')
+            if err_resp:
+                return err_resp
+        send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/positions', methods=['GET'])
+@require_auth
+def get_positions():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        positions = json.loads(json.dumps(system.trade_state.get_all_open_positions()))
+        try:
+            for symbol, pos in positions.items():
+                try:
+                    ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
+                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
+                    current_price = ticker['last']
+                    pos['current_price'] = current_price
+                    entry = pos['entry_price']
+                    size = pos['position_size']
+                    if pos['side'] == 'long':
+                        pnl = (current_price - entry) * size
+                        pnl_pct = (current_price - entry) / entry * 100
+                    else:
+                        pnl = (entry - current_price) * size
+                        pnl_pct = (entry - current_price) / entry * 100
+                    pos['unrealized_pnl'] = round(pnl, 2)
+                    pos['unrealized_pnl_pct'] = round(pnl_pct, 2)
+                except Exception:
+                    pos['current_price'] = None
+                    pos['unrealized_pnl'] = None
+                    pos['unrealized_pnl_pct'] = None
+                try:
+                    open_time = pos.get('open_time')
+                    if open_time:
+                        if isinstance(open_time, str):
+                            try:
+                                open_dt = datetime.fromisoformat(open_time.replace('Z', '+00:00')).replace(tzinfo=None)
+                            except Exception:
+                                open_dt = datetime.strptime(open_time[:19], '%Y-%m-%dT%H:%M:%S')
+                        else:
+                            open_dt = datetime.fromtimestamp(open_time / 1000)
+                        pos['holding_days'] = (datetime.now() - open_dt).days
+                    else:
+                        pos['holding_days'] = None
+                except Exception:
+                    pos['holding_days'] = None
+        except Exception as e:
+            logger.warning(f"忽略异常: {e}")
+        return jsonify(positions)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trades', methods=['GET'])
+@require_auth
+def get_trades():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
+        return jsonify(trades)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trades_summary', methods=['GET'])
+@require_auth
+def get_trades_summary():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
+        if not trades:
+            return jsonify({'total': 0})
+        total = len(trades)
+        wins = [t for t in trades if t.get('pnl', 0) > 0]
+        losses = [t for t in trades if t.get('pnl', 0) <= 0]
+        win_count = len(wins)
+        loss_count = len(losses)
+        win_rate = win_count / total * 100 if total > 0 else 0
+        total_pnl = sum(t.get('pnl', 0) for t in trades)
+        avg_win = sum(t.get('pnl', 0) for t in wins) / win_count if win_count > 0 else 0
+        avg_loss = sum(t.get('pnl', 0) for t in losses) / loss_count if loss_count > 0 else 0
+        loss_sum = sum(t.get('pnl', 0) for t in losses)
+        win_sum = sum(t.get('pnl', 0) for t in wins)
+        profit_factor = abs(win_sum / loss_sum) if loss_sum != 0 else None
+        avg_pnl_pct = sum(t.get('pnl_percent', 0) for t in trades) / total
+        max_win = max((t.get('pnl', 0) for t in trades), default=0)
+        max_loss = min((t.get('pnl', 0) for t in trades), default=0)
+        return jsonify({
+            'total': total, 'win_count': win_count, 'loss_count': loss_count,
+            'win_rate': round(win_rate, 1), 'total_pnl': round(total_pnl, 2),
+            'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2),
+            'profit_factor': round(profit_factor, 2) if profit_factor else None,
+            'avg_pnl_pct': round(avg_pnl_pct, 2),
+            'max_win': round(max_win, 2), 'max_loss': round(max_loss, 2)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/config', methods=['GET'])
+@require_auth
+def get_config():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        return jsonify({
+            'strategy': system.config.get('strategy', {}),
+            'trading': system.config.get('trading', {}),
+            'scheduler': trading_system.config.get('scheduler', {})
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/account_stats', methods=['GET'])
+@require_auth
+def get_account_stats():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        return jsonify(system.equity_tracker.build_account_stats(persist=False))
+    except Exception as e:
+        logger.error(f"获取账户统计异常: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/equity_sync', methods=['POST'])
+@require_auth
+def equity_sync():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        result = system.equity_tracker.equity_sync()
+        send_dingtalk(f'[{system.label}] 资金变动同步\n'
+                      f'原基准: {result["old_initial"]:.2f} USDT\n'
+                      f'新基准: {result["new_initial"]:.2f} USDT\n'
+                      f'求索指数锚点: {result["qiusuo_index"]:.2f}\n'
+                      f'除数: {result["old_divisor"]:.6f} -> {result["new_divisor"]:.6f}\n'
+                      f'时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        return jsonify({'status': 'success',
+                        'message': f'权益基准已同步为 {result["new_initial"]:.2f} USDT',
+                        **result})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logger.error(f"权益同步异常: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/equity_history', methods=['GET'])
+@require_auth
+def get_equity_history():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        snapshots = system.equity_tracker.load_daily_equity()
+        eq_hist = system.equity_tracker.load_equity_history()
+        return jsonify({'daily_snapshots': snapshots, 'initial_equity': eq_hist.get('initial_equity', 0)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/qiusuo_index_ohlc', methods=['GET'])
+@app.route('/api/equity_ohlc', methods=['GET'])
+@require_auth
+def get_qiusuo_index_ohlc():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        days = int(request.args.get('days', system.equity_tracker.EQUITY_OHLC_DEFAULT_DAYS))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'days 参数无效'}), 400
+    if days > 0:
+        days = max(7, days)   # 去掉 730 上限，允许更长区间
+    # days <= 0 表示「全部」，由 EquityTracker 返回完整历史
+    try:
+        return jsonify(system.equity_tracker.build_qiusuo_index_ohlc(days=days))
+    except Exception as e:
+        logger.error(f"获取求索指数OHLC失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/strategy_params', methods=['GET'])
+@require_auth
+def get_strategy_params():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        return jsonify(system.config.get('strategy', {}))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/strategy_params', methods=['PUT'])
+@require_auth
+def update_strategy_params():
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({'error': '缺少参数'}), 400
+        # 范围硬校验：非法值 400，不写配置、不 reload（周期正整数；短期必须小于长期；风险度限幅）
+        try:
+            parsed = {}
+            for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
+                if key in data:
+                    v = int(data[key])
+                    if not (2 <= v <= 500):
+                        return jsonify({'error': f'{key} 超出允许范围 [2, 500]: {v}'}), 400
+                    parsed[key] = v
+            if 'default_risk_per_trade' in data:
+                r = float(data['default_risk_per_trade'])
+                if not (0 < r <= MAX_RISK_PER_TRADE):
+                    return jsonify({'error': f'默认风险度超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}'}), 400
+                parsed['default_risk_per_trade'] = r
+        except (TypeError, ValueError) as e:
+            return jsonify({'error': f'参数不是有效数字: {e}'}), 400
+        cur = system.config.get('strategy', {})
+        eff_short = parsed.get('ma_short_period', cur.get('ma_short_period', 7))
+        eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
+        if eff_short >= eff_long:
+            return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
+
+        changed = []
+        with trading_system._config_lock:
+            backup = json.loads(json.dumps(system.config.get('strategy', {})))
+            sp = system.config.setdefault('strategy', {})
+
+            label_map = {'channel_period': '海龟通道周期', 'ma_short_period': 'EMA短期周期',
+                         'ma_long_period': 'EMA长期周期', 'ma_stop_period': 'EMA止损周期'}
+            for key, v in parsed.items():
+                sp[key] = v
+                if key == 'default_risk_per_trade':
+                    changed.append(f"默认风险度: {v*100:.1f}%")
+                else:
+                    changed.append(f"{label_map[key]}: {v}")
+
+            err_resp = _commit_config_or_rollback(system, 'strategy', None, backup, '配置写入失败，策略参数更新已回滚')
+            if err_resp:
+                return err_resp
+            send_dingtalk(f'[{system.label}] 策略参数更新: {", ".join(changed)}')
+            return jsonify({'status': 'success', 'message': '策略参数已更新', 'params': system.config['strategy']})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/instant_open', methods=['POST'])
+@require_auth
+def instant_open():
+    """即时开仓 - 根据交易对策略类型使用对应信号检测。"""
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        # 与 08:00 日检 / 盘中巡检互斥，防止并发下单（拿不到锁直接拒绝，不排队）
+        if not system._trade_lock.acquire(blocking=False):
+            return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
+        try:
+            data = request.get_json(silent=True)
+            if not data or 'name' not in data:
+                return jsonify({'error': '缺少交易对名称'}), 400
+
+            symbol_name = data['name'].upper()
+            risk_per_trade = data.get('risk_per_trade', 0.01)
+            strategy_type = data.get('strategy', 'turtle')
+            invalid = _validate_symbol_input(symbol_name, risk_per_trade, strategy_type)
+            if invalid:
+                return jsonify({'error': invalid}), 400
+
+            if system.trade_state.get_open_position(symbol_name):
+                return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
+
+            ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
+            ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=120)
+            if not ohlcv:
+                return jsonify({'error': f'{symbol_name} 获取K线数据失败'}), 500
+
+            df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+            df = system.exchange_api.filter_closed_candles(df, '1d')
+            if len(df) < 30:
+                return jsonify({'error': f'{symbol_name} K线数据不足'}), 400
+
+            try:
+                ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
+                current_price = float(ticker['last'])
+            except Exception as e:
+                current_price = float(df['close'].iloc[-1])
+                logger.warning(f"{symbol_name} 获取实时市价失败({e})，回退收盘价: {current_price}")
+
+            signal_side = None
+            stop_loss_price = None
+            signal_info = {}
+
+            if strategy_type == 'ma_cross':
+                signal = system.ma_cross_strategy.check_current_state(df)
+                if not signal:
+                    return jsonify({'error': f'{symbol_name} K线数据不足，无法计算EMA信号'}), 400
+                signal_side = signal.get('action')
+                if signal_side not in ('long', 'short'):
+                    return jsonify({'error': f'{symbol_name} 当前EMA无明确方向（短期EMA≈长期EMA）',
+                                    'info': {'ema_short': round(signal.get('ema_short', 0), 2),
+                                             'ema_long': round(signal.get('ema_long', 0), 2),
+                                             'current_price': current_price}}), 400
+                stop_loss_price = signal['lower_stop'] if signal_side == 'long' else signal['upper_stop']
+                signal_info = {'ema_short': round(signal.get('ema_short', 0), 2),
+                               'ema_long': round(signal.get('ema_long', 0), 2),
+                               'upper_stop': round(signal.get('upper_stop', 0), 2),
+                               'lower_stop': round(signal.get('lower_stop', 0), 2),
+                               'strategy': 'ma_cross'}
+            else:
+                signal = system.turtle_strategy.check_current_state(df)
+                if not signal:
+                    return jsonify({'error': f'{symbol_name} K线数据不足，无法计算信号'}), 400
+                signal_side = signal.get('action')
+                if signal_side not in ('long', 'short'):
+                    return jsonify({'error': f'{symbol_name} 当前无海龟通道突破信号',
+                                    'info': {'upper': signal.get('upper_line'), 'lower': signal.get('lower_line'),
+                                             'mid': signal.get('mid_line'), 'current_price': current_price}}), 400
+                stop_loss_price = signal['lower_line'] if signal_side == 'long' else signal['upper_line']
+                signal_info = {'upper': signal.get('upper_line'), 'lower': signal.get('lower_line'),
+                               'mid': signal.get('mid_line'), 'strategy': 'turtle'}
+
+            symbol_config = {'name': symbol_name, 'enabled': True,
+                             'risk_per_trade': risk_per_trade, 'strategy': strategy_type}
+            # buffer_notification=False：本路由下方自发专属钉钉，不进日检汇总缓冲
+            system._execute_open(symbol_name, signal_side, current_price, stop_loss_price, symbol_config,
+                                 buffer_notification=False)
+
+            new_position = system.trade_state.get_open_position(symbol_name)
+            if not new_position:
+                return jsonify({'error': f'{symbol_name} 开仓执行失败，请查看日志'}), 500
+
+            with trading_system._config_lock:
+                exists = any(s['name'] == symbol_name for s in system.config['trading']['symbols'])
+                if not exists:
+                    backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+                    system.config['trading']['symbols'].append(symbol_config)
+                    err_resp = _commit_config_or_rollback(
+                        system, 'trading', 'symbols', backup_symbols,
+                        f'{symbol_name} 已开仓，但写入交易对配置失败，请检查磁盘和配置文件')
+                    if err_resp:
+                        return err_resp
+
+            direction_text = '做多' if signal_side == 'long' else '做空'
+            strategy_text = '海龟通道' if strategy_type == 'turtle' else '双均线EMA'
+            send_dingtalk(f'[{system.label}-即时开仓] {symbol_name} {direction_text} ({strategy_text})\n'
+                          f'入场价: {new_position["entry_price"]}\n'
+                          f'数量: {new_position["position_size"]}\n'
+                          f'止损价: {new_position["stop_loss_price"]}\n'
+                          f'风险度: {risk_per_trade*100:.1f}%\n已自动加入标准交易对管理')
+            return jsonify({'status': 'success', 'message': f'{symbol_name} 即时开仓成功，已加入标准交易对',
+                            'trade': {'symbol': symbol_name, 'side': signal_side,
+                                      'entry_price': new_position['entry_price'],
+                                      'position_size': new_position['position_size'],
+                                      'stop_loss_price': new_position['stop_loss_price'],
+                                      'stop_order_id': new_position.get('stop_order_id'),
+                                      'risk_per_trade': risk_per_trade, 'strategy': strategy_type,
+                                      'signal_info': signal_info}})
+        finally:
+            system._trade_lock.release()
+    except Exception as e:
+        logger.error(f"即时开仓异常: {e}")
+        return jsonify({'error': f'即时开仓异常: {str(e)}'}), 500
+
+
+@app.route('/api/close_position', methods=['POST'])
+@require_auth
+def close_position():
+    """手动平仓指定交易对。"""
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        # 与 08:00 日检 / 盘中巡检互斥，防止并发下单（拿不到锁直接拒绝，不排队）
+        if not system._trade_lock.acquire(blocking=False):
+            return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
+        try:
+            data = request.get_json(silent=True)
+            if not data or 'name' not in data:
+                return jsonify({'error': '缺少交易对名称'}), 400
+
+            symbol_name = data['name'].upper()
+            position = system.trade_state.get_open_position(symbol_name)
+            if not position:
+                return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400
+
+            ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
+            close_order = system.exchange_api.close_position(ccxt_symbol, position['side'], position['position_size'])
+            if not close_order:
+                return jsonify({'error': f'{symbol_name} 平仓失败'}), 500
+
+            actual_price = close_order.get('average', None)
+            if actual_price and isinstance(actual_price, str):
+                actual_price = float(actual_price)
+            if not actual_price:
+                try:
+                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
+                    actual_price = ticker['last'] if ticker else position['entry_price']
+                except Exception:
+                    actual_price = position['entry_price']
+
+            if not system._cancel_stop_order_confirmed(symbol_name, ccxt_symbol, position.get('stop_order_id')):
+                logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
+
+            try:
+                closed_position = system.trade_state.close_position(symbol_name, actual_price)
+            except TradeStatePersistenceError as e:
+                system.trade_state.force_runtime_close_position(symbol_name, actual_price)
+                getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
+                logger.critical(f"[{system.label}] {symbol_name} 手动平仓后本地状态保存失败: {e}")
+                system.notifier.notify_error(
+                    f"[{system.label}] {symbol_name} 手动平仓已在交易所执行，但本地状态保存失败，请立即核对")
+                return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
+            # 仓位已结束：清除该品种的止损异常警示
+            getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
+
+            direction_text = '做多' if position['side'] == 'long' else '做空'
+            send_dingtalk(f'[{system.label}-手动平仓] {symbol_name} {direction_text}\n'
+                          f'出场价: {actual_price}\n'
+                          f'盈亏: {closed_position.get("pnl", 0):.2f} USDT\n'
+                          f'盈亏率: {closed_position.get("pnl_percent", 0):.2f}%')
+            return jsonify({'status': 'success', 'message': f'{symbol_name} 平仓成功', 'trade': closed_position})
+        finally:
+            system._trade_lock.release()
+    except Exception as e:
+        logger.error(f"手动平仓异常: {e}")
+        return jsonify({'error': f'手动平仓异常: {str(e)}'}), 500
+
+
+@app.route('/api/channel_data', methods=['GET'])
+@require_auth
+def get_channel_data():
+    """获取某个持仓的K线和通道数据。"""
+    system, err = _require_system()
+    if err:
+        return err
+    try:
+        symbol = request.args.get('symbol', '')
+        if not symbol:
+            return jsonify({'error': '缺少symbol参数'}), 400
+
+        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
+        ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=60)
+        df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+
+        period = system.config.get('strategy', {}).get('channel_period', 28)  # 兜底与 TurtleStrategy 默认一致
+        closes = df['close'].values
+        upper_list, lower_list = [], []
+        for i in range(len(closes)):
+            if i < period:
+                upper_list.append(None)
+                lower_list.append(None)
+            else:
+                upper_list.append(max(closes[i-period:i]))
+                lower_list.append(min(closes[i-period:i]))
+        df['upper'] = upper_list
+        df['lower'] = lower_list
+        df['middle'] = df.apply(lambda r: (r['upper']+r['lower'])/2 if r['upper'] is not None else None, axis=1)
+        df = df.dropna(subset=['upper', 'lower'])
+        df = df.dropna()
+
+        positions = system.trade_state.get_all_open_positions()
+        pos = positions.get(symbol, {})
+        dates = df['timestamp'].dt.strftime('%m-%d').tolist()
+        result = {
+            'dates': dates, 'closes': df['close'].tolist(),
+            'upper': df['upper'].tolist(), 'lower': df['lower'].tolist(), 'middle': df['middle'].tolist(),
+            'entry_price': pos.get('entry_price'), 'stop_loss': pos.get('stop_loss_price'),
+            'current_price': df['close'].iloc[-1] if len(df) > 0 else None,
+            'side': pos.get('side', ''), 'unrealized_pnl': None, 'unrealized_pnl_pct': None
+        }
+        if result['entry_price'] and result['current_price']:
+            ep = result['entry_price']
+            cp = result['current_price']
+            size = pos.get('position_size', 0)
+            if pos.get('side') == 'long':
+                result['unrealized_pnl'] = (cp - ep) * size
+                result['unrealized_pnl_pct'] = (cp - ep) / ep * 100
+            else:
+                result['unrealized_pnl'] = (ep - cp) * size
+                result['unrealized_pnl_pct'] = (ep - cp) / ep * 100
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"获取通道数据失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _set_manual_check_running(value):
+    global _manual_check_running
+    with _manual_check_guard:
+        if value and _manual_check_running:
+            return False  # 已在执行，拒绝重入
+        _manual_check_running = value
+        return True
+
+
+@app.route('/api/manual_check', methods=['POST'])
+@require_auth
+def manual_check():
+    """手动触发交易信号检查（后台线程执行，防重入）。"""
+    system, err = _require_system()
+    if err:
+        return err
+    # 要求 JSON body（空 {} 即可）：其余写接口因解析 JSON 天然免疫跨站表单，
+    # 本接口原本无参数，补上同等门槛（防 CSRF 触发手动检查）
+    if request.get_json(silent=True) is None:
+        return jsonify({'error': '请求须携带 JSON body（空对象 {} 即可），'
+                                 '例如: curl -X POST -H "Content-Type: application/json" -d "{}"'}), 400
+    if not _set_manual_check_running(True):
+        return jsonify({'status': 'busy', 'message': '已有手动检查在执行中，请稍后再试'}), 409
+    try:
+        logger.info(f"[{system.label}] 手动触发交易检查")
+
+        def run_check():
+            try:
+                system.check_and_execute_trades(manual_run=True)
+                logger.info(f"[{system.label}] 手动触发的交易检查执行完毕")
+            except Exception as e:
+                logger.error(f"[{system.label}] 手动触发的交易检查失败: {e}")
+            finally:
+                _set_manual_check_running(False)
+
+        threading.Thread(target=run_check, daemon=True).start()
+        return jsonify({'status': 'running', 'message': '交易检查已触发，正在后台执行...'})
+    except Exception as e:
+        _set_manual_check_running(False)
+        logger.error(f"手动触发失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+def _bootstrap():
+    """创建欧易单交易所系统（供 __main__ / wsgi 调用）。"""
+    global trading_system
+    if trading_system is not None:
+        return trading_system
+    from main import TradingSystem
+    trading_system = TradingSystem()
+    return trading_system
+
+
+if __name__ == '__main__':
+    _bootstrap()
+    threading.Thread(target=trading_system.start, daemon=True).start()
+    logger.info("HTTP API 服务器启动在 0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

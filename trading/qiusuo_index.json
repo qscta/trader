@@ -1,0 +1,30 @@
+{
+  "base_index": 1853.0,
+  "current_divisor": 3.0197347864872723,
+  "anchor_equity": 62154.492045406194,
+  "anchor_index": 20582.76518969,
+  "anchor_time": "2026-06-22T15:58:54",
+  "history": [
+    {
+      "effective_from": "2026-06-12T20:05:57",
+      "divisor": 2.6974023025364273,
+      "anchor_equity": 4998.2864666,
+      "anchor_index": 1853.0,
+      "reason": "initial"
+    },
+    {
+      "effective_from": "2026-06-18T13:48:20",
+      "divisor": 3.0196596313767836,
+      "anchor_equity": 5592.317888152743,
+      "anchor_index": 1851.96961606,
+      "reason": "equity_sync"
+    },
+    {
+      "effective_from": "2026-06-22T15:58:54",
+      "divisor": 3.0197347864872723,
+      "anchor_equity": 62154.492045406194,
+      "anchor_index": 20582.76518969,
+      "reason": "equity_sync"
+    }
+  ]
+}

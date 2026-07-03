@@ -1,0 +1,45 @@
+{
+  "_comment": "欧易单交易所配置。状态文件存项目根目录。凭据也可用环境变量 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE 覆盖；DINGTALK_WEBHOOK 覆盖钉钉。",
+  "okx": {
+    "label": "欧易",
+    "apiKey": "d6ab8cde-c863-48ec-8bff-f2939620a734",
+    "secret": "96BBCEDE3C7A1B93315B636CC2E7C5A6",
+    "password": "Yl.21582586",
+    "margin_mode": "cross",
+    "leverage": 5,
+    "leverage_overrides": {
+      "BTCUSDT": 10
+    },
+    "sandbox": true
+  },
+  "strategy": {
+    "channel_period": 28,
+    "ma_short_period": 7,
+    "ma_long_period": 28,
+    "ma_stop_period": 28,
+    "default_risk_per_trade": 0.01
+  },
+  "trading": {
+    "symbols": [
+      {
+        "name": "BTCUSDT",
+        "enabled": true,
+        "risk_per_trade": 0.01,
+        "strategy": "turtle"
+      }
+    ]
+  },
+  "equity_tick_retention_days": 30,
+  "scheduler": {
+    "check_hour": 8,
+    "check_minute": 0,
+    "summary_hour": 8,
+    "summary_minute": 0,
+    "weekly_hour": 8,
+    "weekly_minute": 1,
+    "stop_loss_scan_interval_minutes": 5
+  },
+  "dingtalk": {
+    "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=42173f6b7f2db1102de7b41951867b864b3859a93522e753dd8ada8dc5e52739"
+  }
+}

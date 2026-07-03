@@ -1,0 +1,290 @@
+"""OKX 适配层交易安全单测（桩 ccxt/pandas，本机可运行）。
+
+覆盖 Codex 第四轮审查的三条红线：
+1. contractSize 不可得必须 fail closed（抛异常拒绝换算/交易，不许默认 1.0）。
+2. 撤算法止损必须可验证：OrderNotFound 不等于已撤干净，以「算法单列表查无此 id」为准。
+3. 止损创建超时确认必须 方向+触发价+张数 全匹配，不能只按方向误认残留旧单。
+"""
+import sys
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+# 桩 ccxt / pandas 后导入 okx_api，导入完立即恢复（同 _test_stubs 思路）
+_CCXT_EXC = ('OrderNotFound', 'RequestTimeout', 'NetworkError', 'ExchangeNotAvailable',
+             'DDoSProtection', 'RateLimitExceeded', 'InsufficientFunds', 'InvalidOrder',
+             'BadRequest', 'AuthenticationError', 'PermissionDenied', 'BadSymbol', 'NotSupported')
+_saved = {}
+for _name in ('ccxt', 'pandas'):
+    _saved[_name] = sys.modules.get(_name)
+_ccxt = types.ModuleType('ccxt')
+for _e in _CCXT_EXC:
+    setattr(_ccxt, _e, type(_e, (Exception,), {}))
+_ccxt.okx = Mock()
+sys.modules['ccxt'] = _ccxt
+sys.modules['pandas'] = types.ModuleType('pandas')
+sys.modules.pop('exchange_base', None)
+sys.modules.pop('okx_api', None)
+import okx_api
+from okx_api import OkxApi, ContractSizeUnavailable
+for _name, _orig in _saved.items():
+    if _orig is None:
+        sys.modules.pop(_name, None)
+    else:
+        sys.modules[_name] = _orig
+sys.modules.pop('exchange_base', None)
+sys.modules.pop('okx_api', None)
+
+OrderNotFound = _ccxt.OrderNotFound
+RequestTimeout = _ccxt.RequestTimeout
+
+
+def _bare_api():
+    """不经 __init__ 构造最小 OkxApi（不连交易所）。"""
+    api = object.__new__(OkxApi)
+    api.exchange = Mock()
+    api._contract_size_cache = {}
+    api._amount_precision_cache = {}
+    api.CANCEL_VERIFY_RECHECK_DELAY = 0  # 测试不等待复查间隔
+    return api
+
+
+class ContractSizeFailClosedTest(unittest.TestCase):
+    def test_missing_contract_size_raises(self):
+        """市场数据缺 contractSize：必须抛异常，不允许默认 1.0。"""
+        api = _bare_api()
+        api.exchange.market.return_value = {'contractSize': None}
+        with self.assertRaises(ContractSizeUnavailable):
+            api._get_contract_size('BTC/USDT:USDT')
+
+    def test_market_query_failure_raises(self):
+        api = _bare_api()
+        api.exchange.market.side_effect = RuntimeError('网络错误')
+        with self.assertRaises(ContractSizeUnavailable):
+            api._get_contract_size('BTC/USDT:USDT')
+
+    def test_coin_to_contracts_propagates(self):
+        """换算入口同样拒绝交易（异常向上传播给调用方放弃本次开/平/止损）。"""
+        api = _bare_api()
+        api.exchange.market.side_effect = RuntimeError('网络错误')
+        with self.assertRaises(ContractSizeUnavailable):
+            api._coin_to_contracts('BTC/USDT:USDT', 0.5)
+
+    def test_valid_contract_size_cached(self):
+        api = _bare_api()
+        api.exchange.market.return_value = {'contractSize': 0.01}
+        self.assertEqual(api._get_contract_size('BTC/USDT:USDT'), 0.01)
+        self.assertEqual(api._contract_size_cache['BTC/USDT:USDT'], 0.01)
+
+
+class CancelAlgoVerifiedTest(unittest.TestCase):
+    def test_order_not_found_but_still_listed_is_failure(self):
+        """关键回归：cancel 报 OrderNotFound（参数不匹配）但算法单列表仍有该 id → 必须判失败。"""
+        api = _bare_api()
+        api.exchange.cancel_order.side_effect = OrderNotFound('不存在')
+        api.exchange.fetch_open_orders.return_value = [{'id': 'stop-1', 'side': 'sell'}]
+        self.assertFalse(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+    def test_cancelled_and_absent_is_success(self):
+        api = _bare_api()
+        api.exchange.cancel_order.return_value = {'id': 'stop-1'}
+        api.exchange.fetch_open_orders.return_value = []
+        self.assertTrue(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+    def test_cancel_failed_but_absent_is_success(self):
+        """撤销调用失败但列表确认目标不存在（已触发/已撤）→ 成功。"""
+        api = _bare_api()
+        api.exchange.cancel_order.side_effect = OrderNotFound('不存在')
+        api.exchange.fetch_open_orders.return_value = [{'id': 'other', 'side': 'sell'}]
+        self.assertTrue(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+    def test_unverifiable_is_failure(self):
+        """撤销与确认查询都失败：不可确认 ≠ 已撤干净 → 失败。"""
+        api = _bare_api()
+        api.exchange.cancel_order.side_effect = RuntimeError('超时')
+        api.exchange.fetch_open_orders.side_effect = RuntimeError('超时')
+        self.assertFalse(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+
+class TimeoutConfirmCoinUnitsTest(unittest.TestCase):
+    """下单超时后经持仓查询确认的返回单，amount 必须换算回币数——张数不外泄的分层契约。"""
+
+    def _api(self):
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._leverage_done = {'BTC/USDT:USDT'}
+        api.exchange.amount_to_precision.return_value = '10'  # 0.1 币 / 0.01 面值 = 10 张
+        return api
+
+    def test_open_timeout_confirm_returns_coins(self):
+        api = self._api()
+        api.exchange.create_order.side_effect = RequestTimeout('超时')
+        api.exchange.fetch_positions.side_effect = [
+            [],                                                # 开仓前：无仓
+            [{'contracts': 10, 'symbol': 'BTC/USDT:USDT'}],    # 超时后确认：已成交 10 张
+        ]
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.open_position('BTC/USDT:USDT', 'long', 0.1)
+        self.assertEqual(order['id'], 'timeout_confirmed')
+        self.assertAlmostEqual(order['amount'], 0.1)  # 10 张 × 0.01 = 0.1 币
+
+    def test_close_timeout_confirm_returns_coins(self):
+        api = self._api()
+        api.exchange.create_order.side_effect = RequestTimeout('超时')
+        api.exchange.fetch_positions.side_effect = [
+            [{'contracts': 10, 'symbol': 'BTC/USDT:USDT'}],    # 平仓前：持仓 10 张
+            [],                                                # 超时后确认：已平
+        ]
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.close_position('BTC/USDT:USDT', 'long', 0.1)
+        self.assertEqual(order['id'], 'timeout_confirmed')
+        self.assertAlmostEqual(order['amount'], 0.1)
+
+
+class CancelVerifyRecheckTest(unittest.TestCase):
+    """验证复查：交易所列表可能滞后于撤单生效，首查仍在须复查一次再裁决。"""
+
+    def test_laggy_list_recheck_confirms_success(self):
+        """撤单已生效但首次复核列表仍显示该单：复查确认消失 → 成功，不误报残留。"""
+        api = _bare_api()
+        api.exchange.cancel_order.return_value = {'id': 'stop-1'}
+        listed = [{'id': 'stop-1', 'side': 'sell'}]
+        # _fetch_algo_orders 每轮按三种参数组合各查一次：首轮仍在列表，复查轮已消失
+        api.exchange.fetch_open_orders.side_effect = [listed, listed, listed, [], [], []]
+        self.assertTrue(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+    def test_still_listed_after_recheck_is_failure(self):
+        """复查后仍在列表：确实没撤掉 → 失败（残留标记生效）。"""
+        api = _bare_api()
+        api.exchange.cancel_order.return_value = {'id': 'stop-1'}
+        api.exchange.fetch_open_orders.return_value = [{'id': 'stop-1', 'side': 'sell'}]
+        self.assertFalse(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
+
+
+class FetchAlgoMergeTest(unittest.TestCase):
+    def test_merges_results_across_param_variants(self):
+        """某组合成功但返回空、另一组合才查到算法单：必须合并三种组合的结果。"""
+        api = _bare_api()
+        api.exchange.fetch_open_orders.side_effect = [
+            [],                                  # ordType=conditional：成功但空
+            [{'id': 'stop-1', 'side': 'sell'}],  # trigger=True：查到
+            RuntimeError('不支持'),               # stop=True：失败
+        ]
+        orders = api._fetch_algo_orders('BTC/USDT:USDT')
+        self.assertEqual([o['id'] for o in orders], ['stop-1'])
+
+    def test_dedupes_by_order_id(self):
+        api = _bare_api()
+        same = {'id': 'stop-1', 'side': 'sell'}
+        api.exchange.fetch_open_orders.return_value = [same]
+        self.assertEqual(len(api._fetch_algo_orders('BTC/USDT:USDT')), 1)
+
+    def test_all_variants_failed_raises(self):
+        api = _bare_api()
+        api.exchange.fetch_open_orders.side_effect = RuntimeError('全挂')
+        with self.assertRaises(RuntimeError):
+            api._fetch_algo_orders('BTC/USDT:USDT')
+
+
+class CancelOrderFallbackReverifyTest(unittest.TestCase):
+    def test_normal_cancel_success_but_algo_still_listed_is_failure(self):
+        """普通撤单 fallback 返回成功，但算法单列表仍有该 id：必须返回 False。"""
+        api = _bare_api()
+
+        def cancel(order_id, symbol, params=None):
+            if params is not None:
+                raise RuntimeError('算法单撤销失败')
+            return {'id': order_id}  # 普通撤单"成功"
+
+        api.exchange.cancel_order.side_effect = cancel
+        api.exchange.fetch_open_orders.return_value = [{'id': 'stop-1', 'side': 'sell'}]
+
+        self.assertFalse(api.cancel_order('BTC/USDT:USDT', 'stop-1'))
+
+    def test_normal_cancel_success_and_absent_is_success(self):
+        """算法单路径确认失败（单仍在列表）→ 普通撤单成功 → 复验已消失 → True。"""
+        api = _bare_api()
+
+        def cancel(order_id, symbol, params=None):
+            if params is not None:
+                raise RuntimeError('算法单撤销失败')
+            return {'id': order_id}
+
+        api.exchange.cancel_order.side_effect = cancel
+        listed = [{'id': 'stop-1', 'side': 'sell'}]
+        # _fetch_algo_orders 每轮按三种参数组合各查一次：前一轮仍在列表，普通撤单后一轮已消失
+        api.exchange.fetch_open_orders.side_effect = [listed, listed, listed, [], [], []]
+
+        self.assertTrue(api.cancel_order('BTC/USDT:USDT', 'stop-1'))
+
+
+class FindStopOrderStateTest(unittest.TestCase):
+    """止损存在性三态判定：intact 必须方向+触发价+张数严格一致；id 在但内容不符返回 mismatch。"""
+
+    def _api(self):
+        api = _bare_api()
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api.exchange.amount_to_precision.return_value = '10'  # 0.1 币 / 0.01 面值 = 10 张
+        return api
+
+    def test_strict_match_is_intact(self):
+        api = self._api()
+        api.exchange.fetch_open_orders.return_value = [
+            {'id': 'stop-1', 'side': 'sell', 'amount': 10.0, 'stopLossPrice': 55000.0, 'info': {}}]
+        self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'intact')
+
+    def test_same_price_wrong_size_not_intact(self):
+        """Codex 场景：同方向同触发价但张数只有一半（人工改挂）→ 不算 intact。"""
+        api = self._api()
+        api.exchange.fetch_open_orders.return_value = [
+            {'id': 'other', 'side': 'sell', 'amount': 5.0, 'stopLossPrice': 55000.0, 'info': {}}]
+        self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'missing')
+
+    def test_id_present_but_content_differs_is_mismatch(self):
+        api = self._api()
+        api.exchange.fetch_open_orders.return_value = [
+            {'id': 'stop-1', 'side': 'sell', 'amount': 5.0, 'stopLossPrice': 50000.0, 'info': {}}]
+        self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'mismatch')
+
+    def test_empty_list_is_missing(self):
+        api = self._api()
+        api.exchange.fetch_open_orders.return_value = []
+        self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'missing')
+
+    def test_contract_size_failure_propagates(self):
+        """面值不可得：fail-closed 异常向上传播，调用方按 fail-safe 跳过本轮。"""
+        api = _bare_api()
+        api.exchange.market.side_effect = RuntimeError('网络错误')
+        with self.assertRaises(ContractSizeUnavailable):
+            api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0)
+
+
+class StopOrderMatchTest(unittest.TestCase):
+    GOOD = {'side': 'sell', 'amount': 25.0, 'stopLossPrice': 98.5, 'info': {}}
+
+    def test_full_match(self):
+        self.assertTrue(OkxApi._algo_order_matches(self.GOOD, 'sell', 98.5, 25.0))
+
+    def test_wrong_trigger_price_is_old_order(self):
+        """触发价不同（残留旧止损）→ 不匹配，防止误认。"""
+        old = dict(self.GOOD, stopLossPrice=95.0)
+        self.assertFalse(OkxApi._algo_order_matches(old, 'sell', 98.5, 25.0))
+
+    def test_wrong_contracts_rejected(self):
+        self.assertFalse(OkxApi._algo_order_matches(dict(self.GOOD, amount=10.0), 'sell', 98.5, 25.0))
+
+    def test_wrong_side_rejected(self):
+        self.assertFalse(OkxApi._algo_order_matches(dict(self.GOOD, side='buy'), 'sell', 98.5, 25.0))
+
+    def test_unreadable_fields_rejected(self):
+        """字段读不到一律视为不匹配（宁可重试创建，不误认）。"""
+        self.assertFalse(OkxApi._algo_order_matches({'side': 'sell', 'info': {}}, 'sell', 98.5, 25.0))
+
+    def test_trigger_from_okx_info_field(self):
+        o = {'side': 'sell', 'info': {'slTriggerPx': '98.5', 'sz': '25'}}
+        self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
+
+
+if __name__ == '__main__':
+    unittest.main()

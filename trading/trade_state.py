@@ -1,0 +1,357 @@
+import copy
+import json
+import logging
+import os
+import shutil
+import tempfile
+import threading
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+_file_lock = threading.RLock()
+TRADING_FEE_RATE = 0.00045
+
+
+class TradeStatePersistenceError(RuntimeError):
+    """交易状态持久化失败。"""
+
+
+def atomic_write_json(filepath, data):
+    """原子写入JSON文件：写临时文件 → fsync → rename。
+
+    fsync 保证 rename 时数据已真正落盘——否则掉电/断电瞬间可能留下空文件或半截文件，
+    对 trade_state.json 这类命脉文件不可接受。encoding 显式 utf-8，
+    避免 systemd 等 C locale 环境下写中文（如品种备注）时 UnicodeEncodeError。
+    """
+    dir_name = os.path.dirname(os.path.abspath(filepath))
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
+        return True
+    except Exception as e:
+        logger.error(f'原子写入失败 {filepath}: {e}')
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def calculate_closed_trade_metrics(side, entry_price, exit_price, position_size, fee_rate=TRADING_FEE_RATE):
+    """按合约价值计算开/平仓手续费，并返回净盈亏口径。"""
+    entry_price = float(entry_price or 0)
+    exit_price = float(exit_price or 0)
+    position_size = float(position_size or 0)
+
+    entry_notional = entry_price * position_size
+    exit_notional = exit_price * position_size
+
+    if side == 'long':
+        gross_pnl = (exit_price - entry_price) * position_size
+    else:
+        gross_pnl = (entry_price - exit_price) * position_size
+
+    entry_fee = entry_notional * fee_rate
+    exit_fee = exit_notional * fee_rate
+    total_fee = entry_fee + exit_fee
+    net_pnl = gross_pnl - total_fee
+    pnl_percent = (net_pnl / entry_notional * 100) if entry_notional > 0 else 0
+
+    return {
+        'fee_rate': fee_rate,
+        'entry_notional': entry_notional,
+        'exit_notional': exit_notional,
+        'gross_pnl': gross_pnl,
+        'entry_fee': entry_fee,
+        'exit_fee': exit_fee,
+        'total_fee': total_fee,
+        'pnl': net_pnl,
+        'pnl_percent': pnl_percent,
+    }
+
+
+def enrich_closed_trade_with_fees(trade, fee_rate=TRADING_FEE_RATE):
+    """对历史已平仓记录统一按当前手续费口径重算，避免新旧数据不一致。"""
+    enriched = copy.deepcopy(trade)
+    side = enriched.get('side')
+    entry_price = enriched.get('entry_price')
+    exit_price = enriched.get('exit_price')
+    position_size = enriched.get('position_size')
+
+    if side not in ('long', 'short') or not entry_price or not exit_price or not position_size:
+        enriched.setdefault('fee_rate', fee_rate)
+        enriched.setdefault('entry_fee', 0)
+        enriched.setdefault('exit_fee', 0)
+        enriched.setdefault('total_fee', 0)
+        enriched.setdefault('gross_pnl', enriched.get('pnl', 0))
+        return enriched
+
+    enriched.update(
+        calculate_closed_trade_metrics(
+            side,
+            entry_price,
+            exit_price,
+            position_size,
+            fee_rate=fee_rate,
+        )
+    )
+    return enriched
+
+
+class TradeState:
+    def __init__(self, state_file='trade_state.json'):
+        self.state_file = state_file
+        self.lock = _file_lock
+        self.state = self.load_state()
+
+    def load_state(self):
+        """加载账本，fail-closed 语义：
+
+        - 主文件与 .bak 都不存在：全新部署，返回默认空状态；
+        - 主文件不存在但 .bak 仍在：疑似误删，拒绝启动（人工恢复备份或删 .bak 确认重置）；
+        - 主文件可读：正常加载；
+        - 主文件损坏、备份可读：从 .bak 恢复；
+        - 主文件损坏、备份也不可读：抛 TradeStatePersistenceError 拒绝启动。
+
+        账本无法确认时绝不「失忆」运行：不仅会漏管旧仓，日检还会把有真实仓位的
+        品种当空仓重复开仓（单向模式下同向叠加敞口/反向误减仓）。
+        """
+        backup = self.state_file + '.bak'
+        if not os.path.exists(self.state_file):
+            if os.path.exists(backup):
+                # 不自动恢复：.bak 是上次保存前的副本，可能落后于被删的主文件，
+                # 静默复活等于凭空捏造持仓；也不空启动：那是失忆。留给人工显式二选一。
+                raise TradeStatePersistenceError(
+                    f'主账本 {self.state_file} 不存在，但备份 {backup} 仍在（疑似误删）。'
+                    f'拒绝以空状态启动。请人工二选一：'
+                    f'1) 恢复账本：cp {backup} {self.state_file} 后重启；'
+                    f'2) 确认全新重置：删除 {backup} 后重启'
+                )
+            return self.get_default_state()
+        try:
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f'读取交易状态失败({self.state_file}): {e}，尝试从备份恢复')
+            try:
+                with open(backup, 'r', encoding='utf-8') as f:
+                    recovered = json.load(f)
+                logger.warning(f'交易状态已从备份恢复: {backup}')
+                return recovered
+            except Exception as be:
+                raise TradeStatePersistenceError(
+                    f'交易状态主文件损坏且备份不可恢复（主: {e}；备: {be}）。'
+                    f'拒绝以空状态启动，请人工修复 {self.state_file} 或其 .bak 后重启'
+                ) from e
+
+    def get_default_state(self):
+        return {
+            'open_positions': {},
+            'closed_trades': [],
+            'last_check_time': None,
+            'signal_states': {}
+        }
+
+    def _snapshot_locked(self):
+        return copy.deepcopy(self.state)
+
+    def _ensure_signal_states_locked(self):
+        if 'signal_states' not in self.state:
+            self.state['signal_states'] = {}
+
+    def _set_signal_state_locked(self, symbol, mid_line_crossed):
+        self._ensure_signal_states_locked()
+        self.state['signal_states'][symbol] = {
+            'mid_line_crossed': mid_line_crossed,
+            'last_update': datetime.now().isoformat()
+        }
+
+    def save_state(self):
+        with self.lock:
+            snapshot = self._snapshot_locked()
+            try:
+                if os.path.exists(self.state_file):
+                    shutil.copy2(self.state_file, self.state_file + '.bak')
+            except Exception:
+                pass
+            if not atomic_write_json(self.state_file, snapshot):
+                raise TradeStatePersistenceError(f'保存状态失败: {self.state_file}')
+            return True
+
+    def _save_or_rollback_locked(self, snapshot):
+        """落盘失败时把内存回滚到修改前再抛出（事务语义）。
+
+        否则内存会留下与磁盘、交易所都不一致的状态（如开仓保存失败后的「假仓」：
+        交易所侧已回滚平仓，内存却还有 position——前端显示假持仓，巡检还会把它
+        当「交易所无仓」再记一笔假平仓）。需要「交易所动作已发生、内存必须强制
+        反映现实」的场景，由调用方在捕获异常后使用 force_runtime_* 系列方法。
+        """
+        try:
+            self.save_state()
+        except TradeStatePersistenceError:
+            self.state = snapshot
+            raise
+
+    def add_open_position(self, symbol, side, entry_price, position_size, stop_loss_price, stop_order_id=None, strategy=None):
+        with self.lock:
+            snapshot = self._snapshot_locked()
+            position = {
+                'symbol': symbol,
+                'side': side,
+                'entry_price': entry_price,
+                'position_size': position_size,
+                'stop_loss_price': stop_loss_price,
+                'stop_order_id': stop_order_id,
+                'strategy': strategy,
+                'open_time': datetime.now().isoformat()
+            }
+            self.state['open_positions'][symbol] = position
+            self._set_signal_state_locked(symbol, False)
+            self._save_or_rollback_locked(snapshot)
+            return copy.deepcopy(position)
+
+    def get_open_position(self, symbol):
+        with self.lock:
+            position = self.state['open_positions'].get(symbol)
+            return copy.deepcopy(position) if position is not None else None
+
+    def update_stop_loss(self, symbol, new_stop_price, new_stop_order_id):
+        with self.lock:
+            if symbol not in self.state['open_positions']:
+                return None
+            snapshot = self._snapshot_locked()
+            position = self.state['open_positions'][symbol]
+            position['stop_loss_price'] = new_stop_price
+            position['stop_order_id'] = new_stop_order_id
+            position['last_stop_update'] = datetime.now().isoformat()
+            self._save_or_rollback_locked(snapshot)
+            return copy.deepcopy(position)
+
+    def force_runtime_update_stop_loss(self, symbol, new_stop_price, new_stop_order_id):
+        with self.lock:
+            if symbol not in self.state['open_positions']:
+                return None
+            position = self.state['open_positions'][symbol]
+            position['stop_loss_price'] = new_stop_price
+            position['stop_order_id'] = new_stop_order_id
+            position['last_stop_update'] = datetime.now().isoformat()
+            return copy.deepcopy(position)
+
+    def _close_position_locked(self, symbol, exit_price):
+        if symbol not in self.state['open_positions']:
+            return None
+
+        position = self.state['open_positions'][symbol]
+        if not exit_price or exit_price <= 0:
+            exit_price = position['entry_price']
+
+        position['exit_price'] = exit_price
+        position['close_time'] = datetime.now().isoformat()
+        position.update(
+            calculate_closed_trade_metrics(
+                position['side'],
+                position['entry_price'],
+                exit_price,
+                position['position_size'],
+            )
+        )
+
+        self.state['closed_trades'].append(position)
+        del self.state['open_positions'][symbol]
+        return copy.deepcopy(position)
+
+    def close_position(self, symbol, exit_price):
+        with self.lock:
+            snapshot = self._snapshot_locked()
+            position = self._close_position_locked(symbol, exit_price)
+            if position is None:
+                return None
+            self._save_or_rollback_locked(snapshot)
+            return position
+
+    def force_runtime_close_position(self, symbol, exit_price):
+        with self.lock:
+            return self._close_position_locked(symbol, exit_price)
+
+    def get_all_open_positions(self):
+        with self.lock:
+            return self._snapshot_locked()['open_positions']
+
+    def get_closed_trades(self):
+        with self.lock:
+            return self._snapshot_locked()['closed_trades']
+
+    def update_last_check_time(self):
+        with self.lock:
+            self.state['last_check_time'] = datetime.now().isoformat()
+            self.save_state()
+
+    def set_signal_state(self, symbol, mid_line_crossed):
+        """设置品种的中轨穿越状态。"""
+        with self.lock:
+            self._set_signal_state_locked(symbol, mid_line_crossed)
+            self.save_state()
+
+    def get_signal_state(self, symbol):
+        """获取品种的中轨穿越状态。"""
+        with self.lock:
+            self._ensure_signal_states_locked()
+            if symbol not in self.state['signal_states']:
+                self._set_signal_state_locked(symbol, False)
+                self.save_state()
+            return self.state['signal_states'][symbol].get('mid_line_crossed', False)
+
+    def mark_mid_line_crossed(self, symbol):
+        """标记品种已穿越中轨。"""
+        self.set_signal_state(symbol, True)
+
+    def set_position_strategy(self, symbol, strategy):
+        """为已有持仓补写策略字段（老仓缺 strategy 时兜底，避免删除后误按默认策略托管）。"""
+        with self.lock:
+            if symbol not in self.state['open_positions']:
+                return None
+            self.state['open_positions'][symbol]['strategy'] = strategy
+            self.save_state()
+            return copy.deepcopy(self.state['open_positions'][symbol])
+
+    # ---- 止损残留标记：旧止损单撤销无法确认时阻断该品种新开仓，直到确认清理 ----
+
+    def mark_stop_residue(self, symbol):
+        """标记该品种可能残留未撤销的止损单（撤销不可确认），持久化。"""
+        with self.lock:
+            self.state.setdefault('stop_residues', {})[symbol] = datetime.now().isoformat()
+            self.save_state()
+
+    def clear_stop_residue(self, symbol):
+        with self.lock:
+            residues = self.state.get('stop_residues') or {}
+            if symbol in residues:
+                del residues[symbol]
+                self.save_state()
+
+    def has_stop_residue(self, symbol):
+        with self.lock:
+            return symbol in (self.state.get('stop_residues') or {})
+
+    def get_stop_residues(self):
+        with self.lock:
+            return dict(self.state.get('stop_residues') or {})
+
+    def get_owner_exchange(self):
+        """读取状态文件归属的交易所标记（None 表示尚未标记）。"""
+        with self.lock:
+            return self.state.get('exchange')
+
+    def claim_owner_exchange(self, exchange_id):
+        """把当前状态文件标记为某交易所所有（仅应在安全情形下调用：空状态或已确认归属）。"""
+        with self.lock:
+            self.state['exchange'] = exchange_id
+            self.save_state()
+            return exchange_id
