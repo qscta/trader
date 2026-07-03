@@ -1,0 +1,18 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  stdlib-tests:
+    name: 纯标准库测试（116 用例，无第三方依赖）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run stdlib-only test suite
+        working-directory: trading
+        run: python3 -m unittest discover -s . -p "test_*.py" -v
