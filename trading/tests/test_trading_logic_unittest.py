@@ -1093,5 +1093,36 @@ class StartupSyncCompensationTests(unittest.TestCase):
         system.notifier.notify_error.assert_called_once()
 
 
+class LoginBackoffTests(unittest.TestCase):
+    """登录防爆破：连续失败按 IP 锁定，成功登录清零计数。"""
+
+    def setUp(self):
+        self.client = api_server.app.test_client()
+        api_server._login_failures.clear()
+        self.addCleanup(api_server._login_failures.clear)
+        patcher = patch.object(api_server, "LOGIN_PASSWORD", "right-pass")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _login(self, password):
+        return self.client.post("/api/login", json={"password": password})
+
+    def test_lockout_after_max_failures(self):
+        for _ in range(api_server.LOGIN_MAX_FAILURES):
+            self.assertEqual(self._login("wrong").status_code, 401)
+        resp = self._login("wrong")
+        self.assertEqual(resp.status_code, 429)
+        # 锁定期内连正确密码也被拒（退避先于校验）
+        self.assertEqual(self._login("right-pass").status_code, 429)
+
+    def test_success_clears_failure_streak(self):
+        for _ in range(api_server.LOGIN_MAX_FAILURES - 1):
+            self.assertEqual(self._login("wrong").status_code, 401)
+        self.assertEqual(self._login("right-pass").status_code, 200)
+        # 计数已清零：再错一次只是普通 401，不触发锁定
+        self.assertEqual(self._login("wrong").status_code, 401)
+        self.assertEqual(self._login("right-pass").status_code, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

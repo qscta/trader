@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+import time
 import os
 import secrets
 from datetime import datetime
@@ -39,6 +40,11 @@ app.secret_key = os.environ.get('FLASK_SECRET_KEY')
 if not app.secret_key:
     raise RuntimeError('未配置 FLASK_SECRET_KEY，拒绝启动')
 
+# 会话 Cookie 加固：SameSite 显式 Lax；Secure 由部署方按是否走 HTTPS 决定——
+# 设 TRADING_COOKIE_SECURE=1 开启，不无条件写死（内网纯 HTTP 部署会被弄坏）
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('TRADING_COOKIE_SECURE') == '1'
+
 LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
 
 # 全局单交易所系统（由 wsgi / __main__ 注入）
@@ -49,6 +55,12 @@ logger = logging.getLogger(__name__)
 # 手动检查防重入标记
 _manual_check_running = False
 _manual_check_guard = threading.Lock()
+
+# 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 60
+_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+_login_guard = threading.Lock()
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 
@@ -127,10 +139,26 @@ def index():
 def api_login():
     if not LOGIN_PASSWORD:
         return jsonify({'success': False, 'message': '服务器未配置登录密码，请使用API Token'}), 503
+    ip = request.remote_addr or 'unknown'
+    now = time.time()
+    with _login_guard:
+        _fails, locked_until = _login_failures.get(ip, (0, 0.0))
+        if now < locked_until:
+            return jsonify({'success': False,
+                            'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
     data = request.get_json() or {}
     if data.get('password', '') == LOGIN_PASSWORD:
+        with _login_guard:
+            _login_failures.pop(ip, None)
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
+    with _login_guard:
+        fails, _ = _login_failures.get(ip, (0, 0.0))
+        fails += 1
+        locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
+        _login_failures[ip] = (fails, locked_until)
+        if locked_until:
+            logger.warning(f"登录连续失败 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
     return jsonify({'success': False, 'message': '密码错误'}), 401
 
 
