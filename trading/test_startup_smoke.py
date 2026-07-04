@@ -133,6 +133,28 @@ class StartupSmokeTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         TradingSystem(config_file=path)
 
+    def test_out_of_range_strategy_param_rejected(self):
+        """手写 config.json 的非法范围值：启动即拒（与前端/API 改参同口径），
+        不带着 channel_period=0（通道计算崩溃）/ 负风险度（负仓位）等危险配置运行。"""
+        bad_cases = [
+            {'channel_period': 0},                    # 周期下限
+            {'channel_period': 501},                  # 周期上限
+            {'default_risk_per_trade': -0.1},         # 负风险度
+            {'default_risk_per_trade': 0},            # 零风险度
+            {'default_risk_per_trade': 0.6},          # 超 50% 上限
+            {'ma_short_period': 28, 'ma_long_period': 28},  # 短 >= 长
+            {'ma_short_period': 30, 'ma_long_period': 20},  # 短 > 长
+        ]
+        for bad in bad_cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg['strategy'].update(bad)
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝非法配置: {bad}"):
+                        TradingSystem(config_file=path)
+
     def test_example_config_is_bootable(self):
         """config.example.json 填上凭据即可启动——保证示例配置永远与代码同步。"""
         with tempfile.TemporaryDirectory() as tmp:

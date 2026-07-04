@@ -174,19 +174,58 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if not okx.get('apiKey') or not okx.get('secret') or not okx.get('password'):
             raise ValueError('未配置 OKX API 凭据（apiKey/secret/passphrase），请在 config.json 或环境变量中提供')
         config.setdefault('strategy', {})
-        # 策略必需键做前置校验：channel_period / default_risk_per_trade 在装配层是直接下标
-        # 访问（非 .get 兜底），缺失会在启动时抛裸 KeyError。与上面凭据缺失同标准，
-        # 改为清晰的 ValueError——fail-loud 但给出可操作信息，不静默塞默认值（真钱系统
-        # 默认策略参数比拒绝启动更危险）。ma_* 三键有 .get 默认值，不在此列。
-        _missing = [k for k in ('channel_period', 'default_risk_per_trade') if config['strategy'].get(k) is None]
-        if _missing:
-            raise ValueError(
-                f"config.strategy 缺少必需参数 {_missing}，请对照 config.example.json 补全后再启动")
+        self._validate_strategy_config(config['strategy'])
         config.setdefault('trading', {'symbols': []})
         config['trading'].setdefault('symbols', [])
         config.setdefault('scheduler', {})
         config.setdefault('dingtalk', {})
         return config
+
+    # 策略参数范围口径——必须与 api_server.update_strategy_params / MAX_RISK_PER_TRADE 保持一致：
+    # 周期整数 [2,500]、默认风险度 (0,50%]、EMA 短期 < 长期。手写 config.json 的启动校验
+    # 与前端/API 改参的运行时校验用同一套规则，避免"文件边界与接口边界两套标准"。
+    _PERIOD_MIN, _PERIOD_MAX = 2, 500
+    _MAX_RISK_PER_TRADE = 0.5
+
+    def _validate_strategy_config(self, strategy):
+        """启动前校验策略参数：必需键存在 + 数值范围合法。
+
+        channel_period / default_risk_per_trade 在装配层是直接下标访问（非 .get 兜底），
+        缺失或非法会在运行中抛裸异常或产出危险仓位（如 channel_period=0 让通道计算崩溃、
+        default_risk_per_trade<0 让以损定量算出负仓位）。与凭据缺失同标准 fail-loud，
+        给清晰 ValueError，绝不静默塞默认值（真钱系统默认策略参数比拒绝启动更危险）。
+        """
+        missing = [k for k in ('channel_period', 'default_risk_per_trade') if strategy.get(k) is None]
+        if missing:
+            raise ValueError(
+                f"config.strategy 缺少必需参数 {missing}，请对照 config.example.json 补全后再启动")
+
+        # 周期类：channel_period 必校；ma_* 三键有 .get 默认值，仅当显式提供时校验
+        for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
+            if strategy.get(key) is None:
+                continue
+            try:
+                v = int(strategy[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"config.strategy.{key} 不是有效整数: {strategy[key]!r}")
+            if not (self._PERIOD_MIN <= v <= self._PERIOD_MAX):
+                raise ValueError(
+                    f"config.strategy.{key} 超出允许范围 [{self._PERIOD_MIN}, {self._PERIOD_MAX}]: {v}")
+
+        try:
+            risk = float(strategy['default_risk_per_trade'])
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"config.strategy.default_risk_per_trade 不是有效数字: {strategy['default_risk_per_trade']!r}")
+        if not (0 < risk <= self._MAX_RISK_PER_TRADE):
+            raise ValueError(
+                f"config.strategy.default_risk_per_trade 超出允许范围 (0, {self._MAX_RISK_PER_TRADE*100:.0f}%]: {risk}")
+
+        # EMA 短期必须小于长期（用生效值判定：缺省短 7 / 长 28，与构造处默认一致）
+        eff_short = int(strategy.get('ma_short_period', 7))
+        eff_long = int(strategy.get('ma_long_period', 28))
+        if eff_short >= eff_long:
+            raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
 
     def _migrate_okx_legacy_state(self):
         """旧多所版把欧易状态存在 data/okx/，收敛单所时迁回根目录。
