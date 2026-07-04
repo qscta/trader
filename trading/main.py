@@ -3,7 +3,7 @@ import time
 import logging
 import logging.handlers
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 from okx_api import OkxApi
@@ -76,6 +76,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
         self.notifier = DingTalkNotifier(webhook)
+        # 时区守卫：日检时点、T+1 记录、求索指数切日全用系统本地时间，部署要求
+        # Asia/Shanghai（UTC+8）。不符只在启动时告警一次、不阻断——不给调度器单独
+        # 钉时区（那会造出「调度上海时、业务本地时」的双时钟系统）。
+        _tz_offset = datetime.now().astimezone().utcoffset()
+        if _tz_offset != timedelta(hours=8):
+            _tz_msg = (f'[{self.label}] 服务器时区异常：当前 UTC 偏移 {_tz_offset}，部署要求 UTC+8'
+                       f'（Asia/Shanghai）。日检时点/T+1 记录/求索指数切日均依赖本地时间，'
+                       f'请尽快修正服务器时区！')
+            logger.critical(_tz_msg)
+            try:
+                self.notifier.notify_error(_tz_msg)
+            except Exception:
+                pass
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
