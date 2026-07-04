@@ -7,7 +7,7 @@ import threading
 import os
 import secrets
 from datetime import datetime
-from trade_state import TradeStatePersistenceError, enrich_closed_trade_with_fees
+from trade_state import enrich_closed_trade_with_fees
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）
 _SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
@@ -784,17 +784,11 @@ def close_position():
             if not system._cancel_stop_order_confirmed(symbol_name, ccxt_symbol, position.get('stop_order_id')):
                 logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
 
-            try:
-                closed_position = system.trade_state.close_position(symbol_name, actual_price)
-            except TradeStatePersistenceError as e:
-                system.trade_state.force_runtime_close_position(symbol_name, actual_price)
-                getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
-                logger.critical(f"[{system.label}] {symbol_name} 手动平仓后本地状态保存失败: {e}")
-                system.notifier.notify_error(
-                    f"[{system.label}] {symbol_name} 手动平仓已在交易所执行，但本地状态保存失败，请立即核对")
+            # 记平 + 落盘失败的运行时补偿 + 告警 + 止损异常警示清理，统一复用主系统的收口方法
+            closed_position, state_saved = system._close_trade_state_with_runtime_fallback(
+                symbol_name, actual_price, "手动平仓")
+            if not state_saved:
                 return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
-            # 仓位已结束：清除该品种的止损异常警示
-            getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
 
             direction_text = '做多' if position['side'] == 'long' else '做空'
             send_dingtalk(f'[{system.label}-手动平仓] {symbol_name} {direction_text}\n'
