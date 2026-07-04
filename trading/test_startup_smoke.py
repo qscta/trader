@@ -120,6 +120,19 @@ class StartupSmokeTest(unittest.TestCase):
                     if v is not None:
                         os.environ[k] = v
 
+    def test_missing_strategy_key_rejected(self):
+        """策略必需键（channel_period / default_risk_per_trade）缺失：清晰 ValueError 拒绝，
+        不裸 KeyError 崩溃、更不静默塞默认值（真钱系统默认策略参数比拒启更危险）。"""
+        for missing_key in ('channel_period', 'default_risk_per_trade'):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                del cfg['strategy'][missing_key]
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError):
+                        TradingSystem(config_file=path)
+
     def test_example_config_is_bootable(self):
         """config.example.json 填上凭据即可启动——保证示例配置永远与代码同步。"""
         with tempfile.TemporaryDirectory() as tmp:

@@ -174,6 +174,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if not okx.get('apiKey') or not okx.get('secret') or not okx.get('password'):
             raise ValueError('未配置 OKX API 凭据（apiKey/secret/passphrase），请在 config.json 或环境变量中提供')
         config.setdefault('strategy', {})
+        # 策略必需键做前置校验：channel_period / default_risk_per_trade 在装配层是直接下标
+        # 访问（非 .get 兜底），缺失会在启动时抛裸 KeyError。与上面凭据缺失同标准，
+        # 改为清晰的 ValueError——fail-loud 但给出可操作信息，不静默塞默认值（真钱系统
+        # 默认策略参数比拒绝启动更危险）。ma_* 三键有 .get 默认值，不在此列。
+        _missing = [k for k in ('channel_period', 'default_risk_per_trade') if config['strategy'].get(k) is None]
+        if _missing:
+            raise ValueError(
+                f"config.strategy 缺少必需参数 {_missing}，请对照 config.example.json 补全后再启动")
         config.setdefault('trading', {'symbols': []})
         config['trading'].setdefault('symbols', [])
         config.setdefault('scheduler', {})
