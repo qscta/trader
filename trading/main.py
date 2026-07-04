@@ -1,5 +1,4 @@
 import json
-import re
 import time
 import logging
 import logging.handlers
@@ -18,6 +17,7 @@ from stop_guardian import StopGuardianMixin
 from reporting import ReportingMixin
 from signal_handlers import SignalHandlersMixin
 from trade_executor import TradeExecutorMixin
+import config_validation as cfgv
 
 # 日志轮转（10MB自动切割，保留5个备份）。路径锚定项目目录，避免 systemd/cron 等不同 cwd 下日志写错位置
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
@@ -183,32 +183,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         config.setdefault('dingtalk', {})
         return config
 
-    # 配置校验口径——必须与 api_server 保持一致（周期整数 [2,500]、风险度 (0,50%]、
-    # EMA 短期 < 长期、交易对名 ^[A-Z0-9]{1,20}USDT$、策略白名单）。手写 config.json 的
-    # 启动校验与前端/API 改参的运行时校验用同一套规则，避免"文件边界与接口边界两套标准"。
-    _PERIOD_MIN, _PERIOD_MAX = 2, 500
-    _MAX_RISK_PER_TRADE = 0.5
-    _SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
-    _STRATEGY_WHITELIST = ('turtle', 'ma_cross')
-
-    @staticmethod
-    def _strict_int(value, field):
-        """严格整数：接受 28 / 28.0 / "28"，拒绝 28.9 / "28.9"（不静默截断）。"""
-        try:
-            f = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{field} 不是有效数字: {value!r}")
-        if f != int(f):
-            raise ValueError(f"{field} 必须是整数，不接受小数: {value!r}")
-        return int(f)
-
     def _validate_strategy_config(self, strategy):
         """启动前校验并**规范化**策略参数（就地写回 config，消除类型漂移）。
 
-        channel_period / default_risk_per_trade 在装配层是直接下标访问（非 .get 兜底），
-        缺失或非法会在运行中抛裸异常或产出危险仓位（如 channel_period=0 让通道计算崩溃、
-        default_risk_per_trade<0 让以损定量算出负仓位）。且校验后必须写回规范类型——
-        否则 "28"/"0.01" 字符串能通过 int()/float() 校验却仍是字符串，构造
+        口径全部取自 config_validation（与前端/API 同一事实源）。channel_period /
+        default_risk_per_trade 在装配层是直接下标访问（非 .get 兜底），缺失或非法会在
+        运行中抛裸异常或产出危险仓位（channel_period=0 让通道计算崩溃、风险度<0 算出负仓位）。
+        校验后必须写回规范类型——否则 "28"/"0.01" 字符串能通过校验却仍是字符串，构造
         TurtleStrategy("28")→盘中 `int < str` TypeError、RiskManager 权益×"0.01"→TypeError。
         与凭据缺失同标准 fail-loud，绝不静默塞默认值（真钱系统默认策略参数比拒启更危险）。
         """
@@ -221,10 +202,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
             if strategy.get(key) is None:
                 continue
-            v = self._strict_int(strategy[key], f'config.strategy.{key}')
-            if not (self._PERIOD_MIN <= v <= self._PERIOD_MAX):
+            v = cfgv.strict_int(strategy[key], f'config.strategy.{key}')
+            if not (cfgv.PERIOD_MIN <= v <= cfgv.PERIOD_MAX):
                 raise ValueError(
-                    f"config.strategy.{key} 超出允许范围 [{self._PERIOD_MIN}, {self._PERIOD_MAX}]: {v}")
+                    f"config.strategy.{key} 超出允许范围 [{cfgv.PERIOD_MIN}, {cfgv.PERIOD_MAX}]: {v}")
             strategy[key] = v
 
         try:
@@ -232,9 +213,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         except (TypeError, ValueError):
             raise ValueError(
                 f"config.strategy.default_risk_per_trade 不是有效数字: {strategy['default_risk_per_trade']!r}")
-        if not (0 < risk <= self._MAX_RISK_PER_TRADE):
+        if not (0 < risk <= cfgv.MAX_RISK_PER_TRADE):
             raise ValueError(
-                f"config.strategy.default_risk_per_trade 超出允许范围 (0, {self._MAX_RISK_PER_TRADE*100:.0f}%]: {risk}")
+                f"config.strategy.default_risk_per_trade 超出允许范围 (0, {cfgv.MAX_RISK_PER_TRADE*100:.0f}%]: {risk}")
         strategy['default_risk_per_trade'] = risk
 
         # EMA 短期必须小于长期（用生效值判定：缺省短 7 / 长 28，与构造处默认一致）
@@ -244,7 +225,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
 
     def _validate_symbol_configs(self, symbols):
-        """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径。
+        """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
 
         手写 config.json 的品种 risk_per_trade / strategy / name 此前无启动校验：
         risk_per_trade=1.0（100%）会直接进 _execute_open 的仓位计算放大到全仓风险；
@@ -256,7 +237,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if not isinstance(s, dict):
                 raise ValueError(f"config.trading.symbols[{i}] 不是对象: {s!r}")
             name = s.get('name')
-            if not name or not self._SYMBOL_RE.match(name):
+            if not name or not cfgv.SYMBOL_RE.match(name):
                 raise ValueError(
                     f"config.trading.symbols[{i}] 交易对名不合法: {name!r}"
                     f"（须大写字母/数字且以 USDT 结尾，如 BTCUSDT）")
@@ -269,13 +250,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     r = float(s['risk_per_trade'])
                 except (TypeError, ValueError):
                     raise ValueError(f"{name} risk_per_trade 不是有效数字: {s['risk_per_trade']!r}")
-                if not (0 < r <= self._MAX_RISK_PER_TRADE):
+                if not (0 < r <= cfgv.MAX_RISK_PER_TRADE):
                     raise ValueError(
-                        f"{name} risk_per_trade 超出允许范围 (0, {self._MAX_RISK_PER_TRADE*100:.0f}%]: {r}")
+                        f"{name} risk_per_trade 超出允许范围 (0, {cfgv.MAX_RISK_PER_TRADE*100:.0f}%]: {r}")
                 s['risk_per_trade'] = r  # 规范化写回 float
 
             strat = s.get('strategy')
-            if strat is not None and strat not in self._STRATEGY_WHITELIST:
+            if strat is not None and strat not in cfgv.STRATEGY_WHITELIST:
                 raise ValueError(f"{name} 未知策略: {strat!r}（只支持 turtle / ma_cross）")
 
     def _migrate_okx_legacy_state(self):

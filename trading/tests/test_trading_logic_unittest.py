@@ -398,6 +398,16 @@ class SymbolInputValidationTests(unittest.TestCase):
             resp = self.client.put("/api/strategy_params", json={"default_risk_per_trade": 0.9})
         self.assertEqual(resp.status_code, 400)
 
+    def test_strategy_params_rejects_fractional_period(self):
+        """API 与启动校验同源 strict_int：小数周期 28.9 拒绝而非截断为 28（三入口口径一致）。"""
+        self.system.config = {"strategy": {"channel_period": 28}}
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.put("/api/strategy_params", json={"channel_period": 28.9})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.system.config["strategy"]["channel_period"], 28)  # 未写入截断值
+
     def test_update_symbol_rejects_out_of_range_risk(self):
         self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "risk_per_trade": 0.01}]}}
         with patch.object(api_server, "trading_system", self.system), patch.object(

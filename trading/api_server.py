@@ -2,7 +2,6 @@ from flask import Flask, jsonify, request, send_from_directory, session
 from functools import wraps
 import json
 import logging
-import re
 import threading
 import time
 import os
@@ -10,14 +9,15 @@ import secrets
 from datetime import datetime
 from trade_state import enrich_closed_trade_with_fees
 
-# 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）
-_SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
-MAX_RISK_PER_TRADE = 0.5  # 单笔风险上限 50%：防止把 1 当 1% 输（API 直调时）这类数量级笔误
+# 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
+# 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
+# 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
+from config_validation import MAX_RISK_PER_TRADE, SYMBOL_RE, STRATEGY_WHITELIST, strict_int
 
 
 def _validate_symbol_input(name, risk_per_trade=None, strategy=None):
     """返回错误信息字符串；None 表示通过。"""
-    if not name or not _SYMBOL_RE.match(name):
+    if not name or not SYMBOL_RE.match(name):
         return f'交易对名不合法: {name!r}（须为大写字母/数字且以 USDT 结尾，如 BTCUSDT）'
     if risk_per_trade is not None:
         try:
@@ -26,7 +26,7 @@ def _validate_symbol_input(name, risk_per_trade=None, strategy=None):
             return f'风险度不是有效数字: {risk_per_trade!r}'
         if not (0 < r <= MAX_RISK_PER_TRADE):
             return f'风险度超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}'
-    if strategy is not None and strategy not in ('turtle', 'ma_cross'):
+    if strategy is not None and strategy not in STRATEGY_WHITELIST:
         return f'未知策略: {strategy!r}（只支持 turtle / ma_cross）'
     return None
 
@@ -621,12 +621,13 @@ def update_strategy_params():
         data = request.get_json(silent=True)
         if not data:
             return jsonify({'error': '缺少参数'}), 400
-        # 范围硬校验：非法值 400，不写配置、不 reload（周期正整数；短期必须小于长期；风险度限幅）
+        # 范围硬校验：非法值 400，不写配置、不 reload（周期严格整数；短期必须小于长期；风险度限幅）
+        # strict_int 与启动校验同源：28.9 拒绝而非截断，三入口口径完全一致
         try:
             parsed = {}
             for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
                 if key in data:
-                    v = int(data[key])
+                    v = strict_int(data[key], key)
                     if not (2 <= v <= 500):
                         return jsonify({'error': f'{key} 超出允许范围 [2, 500]: {v}'}), 400
                     parsed[key] = v
