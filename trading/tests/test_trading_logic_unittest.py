@@ -627,6 +627,10 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system.exchange_api.exchange.fetch_ticker.return_value = {"last": 100}
         system.exchange_api.open_position.return_value = {"average": 100}
         system.exchange_api.create_stop_loss_order.return_value = None
+        # 用同一父 mock 记录调用顺序：清扫孤儿止损单必须在回滚平仓之前
+        calls = Mock()
+        calls.attach_mock(system.exchange_api.cancel_all_orders, "cancel_all_orders")
+        calls.attach_mock(system.exchange_api.close_position, "close_position")
 
         system._execute_open(
             "BTCUSDT",
@@ -637,6 +641,13 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         )
 
         system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 2.5)
+        # 止损创建失败回滚前，必须先撤光该品种挂单以清扫可能的孤儿止损单（防未来错价触发）
+        system.exchange_api.cancel_all_orders.assert_called_once_with("BTC/USDT")
+        self.assertEqual(
+            [c[0] for c in calls.mock_calls],
+            ["cancel_all_orders", "close_position"],
+            "必须先清扫挂单再回滚平仓",
+        )
         system.trade_state.add_open_position.assert_not_called()
         system.notifier.notify_trade_opened.assert_not_called()
 
