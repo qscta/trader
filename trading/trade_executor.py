@@ -212,6 +212,13 @@ class TradeExecutorMixin:
         if not stop_order:
             logger.error(f"{symbol} 创建止损单失败")
             self.notifier.notify_error(f"{symbol} 创建止损单失败，请手动设置止损！")
+            # 先清扫可能的孤儿止损单再回滚平仓：create_stop_loss_order 返回 None 的一种情形是
+            # 下单超时→实际已在交易所创建→复查因触发价被交易所按 tick 取整、与我方原始价差超
+            # 1ppm 未匹配上。这张 reduce-only 孤儿单本地无记录、止损自愈只查「记录的单是否在」
+            # 检测不到它，会在该品种下次开仓时错价触发误平新仓。回滚要平的就是本次仓位，撤光该
+            # 品种挂单是安全的（幂等）。
+            if not self.exchange_api.cancel_all_orders(ccxt_symbol):
+                logger.warning(f"{symbol} 回滚前清扫挂单未确认，可能残留孤儿止损单，请人工核对欧易委托")
             rollback = self.exchange_api.close_position(ccxt_symbol, side, position_size)
             if rollback:
                 logger.warning(f"{symbol} 已执行紧急回滚平仓，避免裸仓风险")
