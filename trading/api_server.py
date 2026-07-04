@@ -12,23 +12,32 @@ from trade_state import enrich_closed_trade_with_fees
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
-from config_validation import MAX_RISK_PER_TRADE, SYMBOL_RE, STRATEGY_WHITELIST, strict_int
+from config_validation import (MAX_RISK_PER_TRADE, STRATEGY_WHITELIST, strict_int,
+                               strict_risk_per_trade, strict_bool, normalize_symbol_name,
+                               strict_float_finite)
 
 
-def _validate_symbol_input(name, risk_per_trade=None, strategy=None):
-    """返回错误信息字符串；None 表示通过。"""
-    if not name or not SYMBOL_RE.match(name):
-        return f'交易对名不合法: {name!r}（须为大写字母/数字且以 USDT 结尾，如 BTCUSDT）'
-    if risk_per_trade is not None:
-        try:
-            r = float(risk_per_trade)
-        except (TypeError, ValueError):
-            return f'风险度不是有效数字: {risk_per_trade!r}'
-        if not (0 < r <= MAX_RISK_PER_TRADE):
-            return f'风险度超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}'
-    if strategy is not None and strategy not in STRATEGY_WHITELIST:
-        return f'未知策略: {strategy!r}（只支持 turtle / ma_cross）'
-    return None
+def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
+    """校验并**规范化**品种写入字段（与启动校验 main._validate_symbol_configs 同源）。
+
+    返回 (clean, error)：error 非 None 时 clean 为 None；否则 clean 仅含传入（非 None）
+    字段的规范化值——name 恒有；risk_per_trade→float、enabled→bool、strategy 原样（已白名单）。
+    路由必须用 clean 的值写入 config，杜绝 "0.01"/"false" 等字符串混入下单/开仓资格路径。
+    """
+    clean = {}
+    try:
+        clean['name'] = normalize_symbol_name(name)
+        if risk_per_trade is not None:
+            clean['risk_per_trade'] = strict_risk_per_trade(risk_per_trade)
+        if enabled is not None:
+            clean['enabled'] = strict_bool(enabled)
+    except ValueError as e:
+        return None, str(e)
+    if strategy is not None:
+        if strategy not in STRATEGY_WHITELIST:
+            return None, f'未知策略: {strategy!r}（只支持 turtle / ma_cross）'
+        clean['strategy'] = strategy
+    return clean, None
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
@@ -259,15 +268,15 @@ def add_symbol():
         if not data or 'name' not in data:
             return jsonify({'error': '缺少必要参数'}), 400
 
-        new_symbol = {
-            'name': data['name'].upper(),
-            'enabled': data.get('enabled', True),
-            'risk_per_trade': data.get('risk_per_trade', 0.01),
-            'strategy': data.get('strategy', 'turtle')
-        }
-        invalid = _validate_symbol_input(new_symbol['name'], new_symbol['risk_per_trade'], new_symbol['strategy'])
+        clean, invalid = _validate_symbol_input(
+            data.get('name'), data.get('risk_per_trade', 0.01),
+            data.get('strategy', 'turtle'), data.get('enabled', True))
         if invalid:
             return jsonify({'error': invalid}), 400
+        new_symbol = {  # 全部用规范化值：name 大写、risk float、enabled 真 bool
+            'name': clean['name'], 'enabled': clean['enabled'],
+            'risk_per_trade': clean['risk_per_trade'], 'strategy': clean['strategy'],
+        }
         for s in system.config['trading']['symbols']:
             if s['name'] == new_symbol['name']:
                 return jsonify({'error': '交易对已存在'}), 400
@@ -327,27 +336,29 @@ def update_symbol(symbol):
         data = request.get_json(silent=True)
         if not data:
             return jsonify({'error': '缺少参数'}), 400
-        invalid = _validate_symbol_input(
-            symbol.upper(),
+        clean, invalid = _validate_symbol_input(
+            symbol,
             data.get('risk_per_trade') if 'risk_per_trade' in data else None,
             data.get('strategy') if 'strategy' in data else None,
+            data.get('enabled') if 'enabled' in data else None,
         )
         if invalid:
             return jsonify({'error': invalid}), 400
+        symbol_u = clean['name']
         # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
-        if 'strategy' in data and system.trade_state.get_open_position(symbol.upper()):
-            return jsonify({'error': f'{symbol.upper()} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
+        if 'strategy' in data and system.trade_state.get_open_position(symbol_u):
+            return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
                                      '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
         with trading_system._config_lock:
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             for s in system.config['trading']['symbols']:
-                if s['name'] == symbol.upper():
+                if s['name'] == symbol_u:
                     if 'enabled' in data:
-                        s['enabled'] = bool(data['enabled'])
+                        s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
                     if 'risk_per_trade' in data:
-                        s['risk_per_trade'] = float(data['risk_per_trade'])
+                        s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
                     if 'strategy' in data:
-                        s['strategy'] = data['strategy']
+                        s['strategy'] = clean['strategy']
 
                     err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
                     if err_resp:
@@ -355,14 +366,14 @@ def update_symbol(symbol):
 
                     changes = []
                     if 'enabled' in data:
-                        changes.append(f'状态: {"启用" if data["enabled"] else "禁用"}')
+                        changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
                     if 'risk_per_trade' in data:
-                        changes.append(f'风险度: {data["risk_per_trade"]*100:.1f}%')
+                        changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
                     if 'strategy' in data:
-                        strategy_text = '海龟通道' if data['strategy'] == 'turtle' else '双均线EMA'
+                        strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
                         changes.append(f'策略: {strategy_text}')
-                    send_dingtalk(f'[{system.label}] 更新交易对: {symbol}, {", ".join(changes)}')
-                    return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已更新'})
+                    send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
+                    return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已更新'})
         return jsonify({'error': '交易对不存在'}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -541,9 +552,10 @@ def equity_sync():
         flow_amount = data.get('flow_amount')
         if flow_amount is not None:
             try:
-                flow_amount = float(flow_amount)
-            except (TypeError, ValueError):
-                return jsonify({'error': f'净变动金额不是有效数字: {flow_amount!r}'}), 400
+                # 有限数校验：nan/inf/-inf 会写出 nan/0.0 的求索指数除数，污染资金曲线
+                flow_amount = strict_float_finite(flow_amount, '净变动金额')
+            except ValueError as e:
+                return jsonify({'error': str(e)}), 400
         result = system.equity_tracker.equity_sync(flow_amount=flow_amount)
         flow_line = (f'净变动: {result["flow_amount"]:+.2f} USDT（精确锚定）\n'
                      if result.get('flow_amount') is not None else '锚定方式: 最近指数值\n')
@@ -683,12 +695,13 @@ def instant_open():
             if not data or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
 
-            symbol_name = data['name'].upper()
-            risk_per_trade = data.get('risk_per_trade', 0.01)
-            strategy_type = data.get('strategy', 'turtle')
-            invalid = _validate_symbol_input(symbol_name, risk_per_trade, strategy_type)
+            clean, invalid = _validate_symbol_input(
+                data.get('name'), data.get('risk_per_trade', 0.01), data.get('strategy', 'turtle'))
             if invalid:
                 return jsonify({'error': invalid}), 400
+            symbol_name = clean['name']
+            risk_per_trade = clean['risk_per_trade']  # 规范化 float，杜绝字符串进仓位计算
+            strategy_type = clean['strategy']
 
             if system.trade_state.get_open_position(symbol_name):
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400

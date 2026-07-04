@@ -208,15 +208,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     f"config.strategy.{key} 超出允许范围 [{cfgv.PERIOD_MIN}, {cfgv.PERIOD_MAX}]: {v}")
             strategy[key] = v
 
-        try:
-            risk = float(strategy['default_risk_per_trade'])
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"config.strategy.default_risk_per_trade 不是有效数字: {strategy['default_risk_per_trade']!r}")
-        if not (0 < risk <= cfgv.MAX_RISK_PER_TRADE):
-            raise ValueError(
-                f"config.strategy.default_risk_per_trade 超出允许范围 (0, {cfgv.MAX_RISK_PER_TRADE*100:.0f}%]: {risk}")
-        strategy['default_risk_per_trade'] = risk
+        strategy['default_risk_per_trade'] = cfgv.strict_risk_per_trade(
+            strategy['default_risk_per_trade'], 'config.strategy.default_risk_per_trade')
 
         # EMA 短期必须小于长期（用生效值判定：缺省短 7 / 长 28，与构造处默认一致）
         eff_short = strategy.get('ma_short_period', 7)
@@ -236,28 +229,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         for i, s in enumerate(symbols):
             if not isinstance(s, dict):
                 raise ValueError(f"config.trading.symbols[{i}] 不是对象: {s!r}")
-            name = s.get('name')
-            if not name or not cfgv.SYMBOL_RE.match(name):
-                raise ValueError(
-                    f"config.trading.symbols[{i}] 交易对名不合法: {name!r}"
-                    f"（须大写字母/数字且以 USDT 结尾，如 BTCUSDT）")
+            name = cfgv.normalize_symbol_name(s.get('name'), f"config.trading.symbols[{i}] 交易对名")
             if name in seen:
                 raise ValueError(f"config.trading.symbols 存在重复交易对: {name}")
             seen.add(name)
+            s['name'] = name  # 规范化写回（去空格/转大写）
 
             if s.get('risk_per_trade') is not None:  # 缺省时由 default_risk_per_trade 兜底（既有行为）
-                try:
-                    r = float(s['risk_per_trade'])
-                except (TypeError, ValueError):
-                    raise ValueError(f"{name} risk_per_trade 不是有效数字: {s['risk_per_trade']!r}")
-                if not (0 < r <= cfgv.MAX_RISK_PER_TRADE):
-                    raise ValueError(
-                        f"{name} risk_per_trade 超出允许范围 (0, {cfgv.MAX_RISK_PER_TRADE*100:.0f}%]: {r}")
-                s['risk_per_trade'] = r  # 规范化写回 float
-
-            strat = s.get('strategy')
-            if strat is not None and strat not in cfgv.STRATEGY_WHITELIST:
-                raise ValueError(f"{name} 未知策略: {strat!r}（只支持 turtle / ma_cross）")
+                s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
+            if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
+                s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
+            if s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
+                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 turtle / ma_cross）")
 
     def _migrate_okx_legacy_state(self):
         """旧多所版把欧易状态存在 data/okx/，收敛单所时迁回根目录。

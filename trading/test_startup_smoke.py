@@ -159,11 +159,14 @@ class StartupSmokeTest(unittest.TestCase):
         """手写 config.json 的品种池非法值：启动即拒（与增删品种的 API 入口同口径），
         堵住「手写配置绕过风控」——100% 风险度 / 非法策略名 / 脏交易对名都不得带病启动。"""
         bad_symbol_lists = [
-            [{'name': 'btcusdt', 'strategy': 'turtle'}],            # 非大写/非法名
             [{'name': 'BTC-USDT', 'strategy': 'turtle'}],           # 含非法字符
+            [{'name': 'BTCUSD', 'strategy': 'turtle'}],             # 非 USDT 结尾
+            [{'name': 123, 'strategy': 'turtle'}],                  # 非字符串名
             [{'name': 'BTCUSDT', 'risk_per_trade': 1.0}],           # 风险度 100% 超上限
             [{'name': 'BTCUSDT', 'risk_per_trade': -0.01}],         # 负风险度
+            [{'name': 'BTCUSDT', 'risk_per_trade': 'inf'}],         # 非有限风险度
             [{'name': 'BTCUSDT', 'strategy': 'foobar'}],            # 非法策略名（否则静默落海龟）
+            [{'name': 'BTCUSDT', 'enabled': 'maybe'}],             # 非法布尔（歧义值拒绝）
             [{'name': 'BTCUSDT', 'strategy': 'turtle'},
              {'name': 'BTCUSDT', 'strategy': 'ma_cross'}],          # 重复交易对
         ]
@@ -179,19 +182,36 @@ class StartupSmokeTest(unittest.TestCase):
 
     def test_string_typed_params_normalized(self):
         """字符串数值（"28" / "0.01"）通过校验后必须规范化为 int/float 写回——
-        否则构造 TurtleStrategy("28")/RiskManager 权益×"0.01" 会在盘中 TypeError。"""
+        否则构造 TurtleStrategy("28")/RiskManager 权益×"0.01" 会在盘中 TypeError。
+        品种名小写/带空格规范化为大写；字符串 "true"/"false" 解析为真 bool。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_config(tmp)
             cfg = _jload(path)
             cfg['strategy']['channel_period'] = "28"
             cfg['strategy']['default_risk_per_trade'] = "0.01"
-            cfg['trading']['symbols'] = [{'name': 'BTCUSDT', 'risk_per_trade': "0.02", 'strategy': 'turtle'}]
+            cfg['trading']['symbols'] = [
+                {'name': ' btcusdt ', 'risk_per_trade': "0.02", 'strategy': 'turtle', 'enabled': 'true'}]
             _jdump(cfg, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi):
                 system = TradingSystem(config_file=path)
             self.assertIsInstance(system.config['strategy']['channel_period'], int)
             self.assertIsInstance(system.config['strategy']['default_risk_per_trade'], float)
-            self.assertIsInstance(system.config['trading']['symbols'][0]['risk_per_trade'], float)
+            sym = system.config['trading']['symbols'][0]
+            self.assertEqual(sym['name'], 'BTCUSDT')                 # 去空格+大写
+            self.assertIsInstance(sym['risk_per_trade'], float)
+            self.assertIs(sym['enabled'], True)                     # "true" → 真 bool
+
+    def test_string_false_enabled_parsed_not_truthy(self):
+        """关键回归：字符串 "false" 必须解析为 False（Python bool("false")==True 的陷阱），
+        否则被禁用的品种会被当成启用继续开仓。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            cfg['trading']['symbols'] = [{'name': 'BTCUSDT', 'enabled': 'false', 'strategy': 'turtle'}]
+            _jdump(cfg, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            self.assertIs(system.config['trading']['symbols'][0]['enabled'], False)
 
     def test_fractional_period_rejected(self):
         """严格整数：小数周期（28.9 / "28.9"）拒绝而非静默截断为 28；

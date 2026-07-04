@@ -17,6 +17,7 @@ import time
 from datetime import datetime, date, timedelta
 
 from trade_state import atomic_write_json
+import config_validation as cfgv
 
 logger = logging.getLogger(__name__)
 
@@ -763,7 +764,10 @@ class EquityTracker:
             qiusuo_state = self.ensure_qiusuo_index_state(current_equity=current_equity, now=now, persist=True)
             old_divisor = qiusuo_state.get('current_divisor') or (current_equity / (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE))
             if flow_amount is not None:
-                pre_flow_equity = current_equity - float(flow_amount)
+                # 状态边界 fail-closed：nan/inf 会写出 nan/0.0 的除数污染求索指数，
+                # 不依赖调用方（API 已挡一层，这里是最后防线）
+                flow_amount = cfgv.strict_float_finite(flow_amount, '净变动金额')
+                pre_flow_equity = current_equity - flow_amount
                 if pre_flow_equity <= 0:
                     raise ValueError(
                         f'净变动金额不合理：当前权益 {current_equity:.2f}，净变动 {float(flow_amount):.2f}，'

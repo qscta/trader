@@ -23,20 +23,64 @@ SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
 STRATEGY_WHITELIST = ('turtle', 'ma_cross')
 
 
-def strict_int(value, field):
-    """严格整数：接受 28 / 28.0 / "28"，拒绝 28.9 / "28.9"（不静默截断，fail-loud）。
-
-    抛 ValueError（附字段名）供调用方转成清晰错误。周期是窗口长度，语义上必须是
-    整数——静默把 28.9 截成 28 会让"我设的参数"与"实际生效"悄悄不一致。
-    """
+def strict_float_finite(value, field):
+    """有限浮点：拒绝 nan / inf / -inf（否则会污染求索指数除数等下游状态）。抛 ValueError。"""
     try:
         f = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"{field} 不是有效数字: {value!r}")
-    # inf/-inf/nan 先挡下：否则 "inf" 的 int(f) 抛 OverflowError（非 ValueError），
-    # 会绕过 API/启动的 (TypeError, ValueError) 捕获，畸形输入变成 500/崩溃而非干净拒绝
     if not math.isfinite(f):
-        raise ValueError(f"{field} 不是有效数字: {value!r}")
+        raise ValueError(f"{field} 不是有限数字: {value!r}")
+    return f
+
+
+def strict_int(value, field):
+    """严格整数：接受 28 / 28.0 / "28"，拒绝 28.9 / "28.9" / nan / inf（不静默截断，fail-loud）。
+
+    抛 ValueError（附字段名）供调用方转成清晰错误。周期是窗口长度，语义上必须是
+    整数——静默把 28.9 截成 28 会让"我设的参数"与"实际生效"悄悄不一致。
+    inf/-inf/nan 经 strict_float_finite 先挡下：否则 "inf" 的 int() 抛 OverflowError（非
+    ValueError），会绕过 API/启动的 (TypeError, ValueError) 捕获，畸形输入变成 500/崩溃。
+    """
+    f = strict_float_finite(value, field)
     if f != int(f):
         raise ValueError(f"{field} 必须是整数，不接受小数: {value!r}")
     return int(f)
+
+
+def strict_risk_per_trade(value, field='风险度'):
+    """规范化单笔风险度为 (0, MAX_RISK_PER_TRADE] 内的有限 float。抛 ValueError。"""
+    r = strict_float_finite(value, field)
+    if not (0 < r <= MAX_RISK_PER_TRADE):
+        raise ValueError(f"{field}超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}")
+    return r
+
+
+def strict_bool(value, field='enabled'):
+    """规范化布尔：真布尔原样返回；字符串仅接受 true/false（不区分大小写）。
+
+    关键：Python `bool("false") == True`——手写/直调传字符串 "false" 若不显式解析，
+    会被当成"启用"继续开仓。其余值一律拒绝（不猜测），fail-loud。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low == 'true':
+            return True
+        if low == 'false':
+            return False
+    raise ValueError(f"{field} 不是有效布尔值: {value!r}（请用 true/false）")
+
+
+def normalize_symbol_name(value, field='交易对名'):
+    """规范化交易对名：必须是字符串，去空格后转大写，须匹配 SYMBOL_RE。抛 ValueError。
+
+    非字符串（None/int 等）显式拒绝——否则 .upper() 会抛 AttributeError 变成 500。
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field}必须是字符串: {value!r}")
+    name = value.strip().upper()
+    if not SYMBOL_RE.match(name):
+        raise ValueError(f"{field}不合法: {value!r}（须为大写字母/数字且以 USDT 结尾，如 BTCUSDT）")
+    return name

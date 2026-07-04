@@ -354,6 +354,35 @@ class SymbolInputValidationTests(unittest.TestCase):
         resp = self._post("/api/instant_open", {"name": "btc;rm -rf", "risk_per_trade": 0.01})
         self.assertEqual(resp.status_code, 400)
 
+    def test_validate_symbol_input_normalizes(self):
+        """API 归一化契约：返回规范化 clean——name 大写、risk→float、enabled→真 bool。
+        杜绝 "0.01"/"false" 字符串混入下单/开仓资格路径（否则盘中 TypeError 或被当启用）。"""
+        clean, err = api_server._validate_symbol_input("btcusdt", "0.01", "turtle", "false")
+        self.assertIsNone(err)
+        self.assertEqual(clean["name"], "BTCUSDT")
+        self.assertIsInstance(clean["risk_per_trade"], float)
+        self.assertEqual(clean["risk_per_trade"], 0.01)
+        self.assertIs(clean["enabled"], False)   # "false" 解析为 False，而非 Python 真值陷阱
+        self.assertEqual(clean["strategy"], "turtle")
+
+    def test_validate_symbol_input_rejects_non_string_name(self):
+        clean, err = api_server._validate_symbol_input(123)
+        self.assertIsNotNone(err)
+        self.assertIsNone(clean)
+
+    def test_validate_symbol_input_rejects_ambiguous_enabled(self):
+        clean, err = api_server._validate_symbol_input("BTCUSDT", enabled="maybe")
+        self.assertIsNotNone(err)
+
+    def test_equity_sync_rejects_nonfinite_flow_amount(self):
+        """资金同步净变动金额必须有限：nan/inf/-inf 会写出 nan/0.0 除数污染求索指数，须 400。"""
+        for bad in ("nan", "inf", "-inf"):
+            with patch.object(api_server, "trading_system", self.system), patch.object(
+                api_server, "send_dingtalk", Mock()
+            ):
+                resp = self.client.post("/api/equity_sync", json={"flow_amount": bad})
+            self.assertEqual(resp.status_code, 400, msg=f"flow_amount={bad!r} 应 400")
+
     def test_update_symbol_without_body_returns_400(self):
         """无 JSON body：优雅 400，而非 data.get 抛异常变 500。"""
         with patch.object(api_server, "trading_system", self.system), patch.object(
