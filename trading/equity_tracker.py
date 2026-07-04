@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def _coerce_positive_float(value):
     try:
-        value = float(value)
+        value = cfgv.strict_float_finite(value, '正数')
     except Exception:
         return None
     return value if value > 0 else None

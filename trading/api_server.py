@@ -12,9 +12,8 @@ from trade_state import enrich_closed_trade_with_fees
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
-from config_validation import (MAX_RISK_PER_TRADE, STRATEGY_WHITELIST, strict_int,
-                               strict_risk_per_trade, strict_bool, normalize_symbol_name,
-                               strict_float_finite)
+from config_validation import (STRATEGY_WHITELIST, strict_int, strict_risk_per_trade,
+                               strict_bool, normalize_symbol_name, strict_float_finite)
 
 
 def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
@@ -644,10 +643,9 @@ def update_strategy_params():
                         return jsonify({'error': f'{key} 超出允许范围 [2, 500]: {v}'}), 400
                     parsed[key] = v
             if 'default_risk_per_trade' in data:
-                r = float(data['default_risk_per_trade'])
-                if not (0 < r <= MAX_RISK_PER_TRADE):
-                    return jsonify({'error': f'默认风险度超出允许范围 (0, {MAX_RISK_PER_TRADE*100:.0f}%]: {r}'}), 400
-                parsed['default_risk_per_trade'] = r
+                parsed['default_risk_per_trade'] = strict_risk_per_trade(
+                    data['default_risk_per_trade'], '默认风险度'
+                )
         except (TypeError, ValueError) as e:
             return jsonify({'error': f'参数不是有效数字: {e}'}), 400
         cur = system.config.get('strategy', {})
@@ -814,7 +812,10 @@ def close_position():
             if not data or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
 
-            symbol_name = data['name'].upper()
+            try:
+                symbol_name = normalize_symbol_name(data['name'])
+            except ValueError as e:
+                return jsonify({'error': str(e)}), 400
             position = system.trade_state.get_open_position(symbol_name)
             if not position:
                 return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400

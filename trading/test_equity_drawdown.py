@@ -36,6 +36,16 @@ def _jdump(data, path):
     with open(path, 'w') as f:
         json.dump(data, f)
 
+
+class CoercePositiveFloatTest(unittest.TestCase):
+    def test_rejects_nonfinite_values(self):
+        for bad in ("inf", "-inf", "nan", float('inf'), float('nan')):
+            self.assertIsNone(eqt._coerce_positive_float(bad), msg=repr(bad))
+
+    def test_accepts_positive_finite_values(self):
+        self.assertEqual(eqt._coerce_positive_float("123.45"), 123.45)
+
+
 class DrawdownStatsTest(unittest.TestCase):
     def test_not_new_high_includes_current_streak(self):
         """当前未创新高：历史最长 = max(历史已记录, 当前未创新高天数)。"""

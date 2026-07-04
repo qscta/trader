@@ -5,8 +5,9 @@
 严格整数）。此前这些常量与逻辑在 main.py 与 api_server.py 各存一份，靠人工同步——
 本模块把原语收敛于一处，让三入口的一致性由构造保证，而非碰巧相等。
 
-只放"叶子原语"（常量 + strict_int）；各入口的编排（启动校验全量 config vs
-API 校验增量 delta）形态不同，仍各自保留，不强行统一成一个更难读的函数。
+只放"叶子原语"（常量 + strict_int / strict_float_finite / strict_bool / risk / symbol）；
+各入口的编排（启动校验全量 config vs API 校验增量 delta）形态不同，仍各自保留，
+不强行统一成一个更难读的函数。
 """
 
 import math

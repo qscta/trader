@@ -383,6 +383,14 @@ class SymbolInputValidationTests(unittest.TestCase):
                 resp = self.client.post("/api/equity_sync", json={"flow_amount": bad})
             self.assertEqual(resp.status_code, 400, msg=f"flow_amount={bad!r} 应 400")
 
+    def test_manual_close_rejects_non_string_name(self):
+        """手动平仓也走同源交易对规范化：非字符串 name 应干净 400，而非 .upper() 500。"""
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.post("/api/close_position", json={"name": 123})
+        self.assertEqual(resp.status_code, 400)
+
     def test_update_symbol_without_body_returns_400(self):
         """无 JSON body：优雅 400，而非 data.get 抛异常变 500。"""
         with patch.object(api_server, "trading_system", self.system), patch.object(
@@ -426,6 +434,16 @@ class SymbolInputValidationTests(unittest.TestCase):
         ):
             resp = self.client.put("/api/strategy_params", json={"default_risk_per_trade": 0.9})
         self.assertEqual(resp.status_code, 400)
+
+    def test_strategy_params_rejects_nonfinite_default_risk(self):
+        self.system.config = {"strategy": {"default_risk_per_trade": 0.01}}
+        for bad in ("nan", "inf", "-inf"):
+            with patch.object(api_server, "trading_system", self.system), patch.object(
+                api_server, "send_dingtalk", Mock()
+            ):
+                resp = self.client.put("/api/strategy_params", json={"default_risk_per_trade": bad})
+            self.assertEqual(resp.status_code, 400, msg=f"default_risk={bad!r} 应 400")
+            self.assertEqual(self.system.config["strategy"]["default_risk_per_trade"], 0.01)
 
     def test_strategy_params_rejects_fractional_period(self):
         """API 与启动校验同源 strict_int：小数周期 28.9 拒绝而非截断为 28（三入口口径一致）。"""
