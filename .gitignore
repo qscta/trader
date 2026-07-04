@@ -19,6 +19,7 @@ trading/data/
 trading/backups/
 
 # ===== 编辑器/进程留下的副本 =====
+.DS_Store
 *.bak
 *.bak.*
 *.tmp
