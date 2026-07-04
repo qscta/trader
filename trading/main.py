@@ -137,6 +137,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         if account_equity is None:
             logger.critical('系统启动失败：3次尝试后仍无法获取初始账户权益！请检查API密钥和网络连接。')
+            # 退出前尽力补发钉钉：系统静默死掉是最贵的故障模式（与账本损坏路径同标准）
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
+                    f'进程即将退出，请检查API密钥和网络连接！')
+            except Exception:
+                pass
             import sys
             sys.exit(1)
 
