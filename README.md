@@ -54,8 +54,12 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 | 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC） |
 | `gunicorn -w 1`（单 worker） | 多 worker 会重复初始化交易系统（wsgi.py 有文件锁兜底，多余 worker 直接拒启） |
 | 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；缺 SECRET_KEY 拒绝启动 |
+| 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时设置） | 会话 cookie 加 Secure 标志，仅经 HTTPS 传输；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
 | 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
 | 上实盘前跑通 `python verify_okx.py`（sandbox） | 张数换算/止损算法单/撤单/单向模式只能真连交易所自证，代码审查不能替代 |
+
+> **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——
+> 锁文件必须来自实际运行环境（ccxt 行为随版本漂移，正是适配层反复警示的风险），不要在 CI/开发机生成。
 
 ## 测试
 

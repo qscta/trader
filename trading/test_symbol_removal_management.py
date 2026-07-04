@@ -177,6 +177,52 @@ class StartupCatchupTest(unittest.TestCase):
             self.assertEqual(calls, [])
 
 
+class DailyCheckFallbackJobTest(unittest.TestCase):
+    """日检兜底任务：register_jobs 注册每 30 分钟的幂等兜底补跑，
+    主执行与 +1 分钟重试整窗失败（如恰逢网络故障）后当日仍能补上。"""
+
+    def _register(self, tmp):
+        system, _ = _build_system(tmp, config_symbols=[])
+        system.config['scheduler'] = {'check_hour': 8, 'check_minute': 0}
+        system.exchange_id = 'okx'
+        system.label = '欧易'
+        jobs = {}
+        system.scheduler = SimpleNamespace(
+            add_job=lambda func, trigger, **kw: jobs.__setitem__(kw.get('id'), (func, trigger, kw)))
+        system._record_equity_tick_with_alert = lambda: None
+        calls = []
+        system.check_and_execute_trades = lambda: calls.append(1)
+        system.register_jobs(system.config['scheduler'])
+        return system, jobs, calls
+
+    def test_fallback_job_registered_every_30_minutes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _system, jobs, _calls = self._register(tmp)
+            self.assertIn('okx_daily_check_fallback', jobs)
+            func, trigger, kw = jobs['okx_daily_check_fallback']
+            self.assertEqual(trigger, 'cron')
+            self.assertEqual(kw.get('minute'), '*/30')
+            self.assertEqual(kw.get('max_instances'), 1)
+            self.assertTrue(kw.get('coalesce'))
+
+    def test_fallback_triggers_when_past_due_and_not_done(self):
+        """到点未跑：兜底任务触发当日日检补跑。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _system, jobs, calls = self._register(tmp)
+            func, _trigger, _kw = jobs['okx_daily_check_fallback']
+            func(now=datetime(2026, 7, 3, 15, 0))
+            self.assertEqual(calls, [1])
+
+    def test_fallback_skips_when_already_done_today(self):
+        """今日已跑：兜底任务空转，不重复执行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, jobs, calls = self._register(tmp)
+            system._last_check_date = date.today().isoformat()
+            func, _trigger, _kw = jobs['okx_daily_check_fallback']
+            func(now=datetime(2026, 7, 3, 15, 0))
+            self.assertEqual(calls, [])
+
+
 class MaCrossFlipResidueTest(unittest.TestCase):
     """翻转平仓后旧止损撤销不可确认：不反手，但记录 T+1 交由次日重入（恢复永远在市）。"""
 
@@ -193,6 +239,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda s: s,
             exchange=SimpleNamespace(fetch_ticker=lambda s: {'last': 2900.0}),
+            get_last_price=lambda s: 2900.0,
             close_position=lambda *a, **k: {'average': 2900.0},
             cancel_order=lambda *a, **k: cancel_ok,
             cancel_all_orders=lambda *a, **k: cancel_ok or None)

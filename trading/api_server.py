@@ -4,10 +4,11 @@ import json
 import logging
 import re
 import threading
+import time
 import os
 import secrets
 from datetime import datetime
-from trade_state import TradeStatePersistenceError, enrich_closed_trade_with_fees
+from trade_state import enrich_closed_trade_with_fees
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）
 _SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
@@ -39,6 +40,11 @@ app.secret_key = os.environ.get('FLASK_SECRET_KEY')
 if not app.secret_key:
     raise RuntimeError('未配置 FLASK_SECRET_KEY，拒绝启动')
 
+# 会话 Cookie 加固：SameSite 显式 Lax；Secure 由部署方按是否走 HTTPS 决定——
+# 设 TRADING_COOKIE_SECURE=1 开启，不无条件写死（内网纯 HTTP 部署会被弄坏）
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('TRADING_COOKIE_SECURE') == '1'
+
 LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
 
 # 全局单交易所系统（由 wsgi / __main__ 注入）
@@ -49,6 +55,12 @@ logger = logging.getLogger(__name__)
 # 手动检查防重入标记
 _manual_check_running = False
 _manual_check_guard = threading.Lock()
+
+# 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 60
+_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+_login_guard = threading.Lock()
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 
@@ -127,10 +139,26 @@ def index():
 def api_login():
     if not LOGIN_PASSWORD:
         return jsonify({'success': False, 'message': '服务器未配置登录密码，请使用API Token'}), 503
+    ip = request.remote_addr or 'unknown'
+    now = time.time()
+    with _login_guard:
+        _fails, locked_until = _login_failures.get(ip, (0, 0.0))
+        if now < locked_until:
+            return jsonify({'success': False,
+                            'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
     data = request.get_json() or {}
     if data.get('password', '') == LOGIN_PASSWORD:
+        with _login_guard:
+            _login_failures.pop(ip, None)
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
+    with _login_guard:
+        fails, _ = _login_failures.get(ip, (0, 0.0))
+        fails += 1
+        locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
+        _login_failures[ip] = (fails, locked_until)
+        if locked_until:
+            logger.warning(f"登录连续失败 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
     return jsonify({'success': False, 'message': '密码错误'}), 401
 
 
@@ -385,8 +413,7 @@ def get_positions():
             for symbol, pos in positions.items():
                 try:
                     ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                    current_price = ticker['last']
+                    current_price = system.exchange_api.get_last_price(ccxt_symbol)
                     pos['current_price'] = current_price
                     entry = pos['entry_price']
                     size = pos['position_size']
@@ -666,8 +693,7 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} K线数据不足'}), 400
 
             try:
-                ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                current_price = float(ticker['last'])
+                current_price = system.exchange_api.get_last_price(ccxt_symbol)
             except Exception as e:
                 current_price = float(df['close'].iloc[-1])
                 logger.warning(f"{symbol_name} 获取实时市价失败({e})，回退收盘价: {current_price}")
@@ -779,25 +805,18 @@ def close_position():
                 actual_price = float(actual_price)
             if not actual_price:
                 try:
-                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                    actual_price = ticker['last'] if ticker else position['entry_price']
+                    actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
                 except Exception:
                     actual_price = position['entry_price']
 
             if not system._cancel_stop_order_confirmed(symbol_name, ccxt_symbol, position.get('stop_order_id')):
                 logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
 
-            try:
-                closed_position = system.trade_state.close_position(symbol_name, actual_price)
-            except TradeStatePersistenceError as e:
-                system.trade_state.force_runtime_close_position(symbol_name, actual_price)
-                getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
-                logger.critical(f"[{system.label}] {symbol_name} 手动平仓后本地状态保存失败: {e}")
-                system.notifier.notify_error(
-                    f"[{system.label}] {symbol_name} 手动平仓已在交易所执行，但本地状态保存失败，请立即核对")
+            # 记平 + 落盘失败的运行时补偿 + 告警 + 止损异常警示清理，统一复用主系统的收口方法
+            closed_position, state_saved = system._close_trade_state_with_runtime_fallback(
+                symbol_name, actual_price, "手动平仓")
+            if not state_saved:
                 return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
-            # 仓位已结束：清除该品种的止损异常警示
-            getattr(system, '_stop_anomalies', {}).pop(symbol_name, None)
 
             direction_text = '做多' if position['side'] == 'long' else '做空'
             send_dingtalk(f'[{system.label}-手动平仓] {symbol_name} {direction_text}\n'

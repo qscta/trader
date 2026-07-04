@@ -3,7 +3,7 @@ import time
 import logging
 import logging.handlers
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 from okx_api import OkxApi
@@ -76,6 +76,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
         self.notifier = DingTalkNotifier(webhook)
+        # 时区守卫：日检时点、T+1 记录、求索指数切日全用系统本地时间，部署要求
+        # Asia/Shanghai（UTC+8）。不符只在启动时告警一次、不阻断——不给调度器单独
+        # 钉时区（那会造出「调度上海时、业务本地时」的双时钟系统）。
+        _tz_offset = datetime.now().astimezone().utcoffset()
+        if _tz_offset != timedelta(hours=8):
+            _tz_msg = (f'[{self.label}] 服务器时区异常：当前 UTC 偏移 {_tz_offset}，部署要求 UTC+8'
+                       f'（Asia/Shanghai）。日检时点/T+1 记录/求索指数切日均依赖本地时间，'
+                       f'请尽快修正服务器时区！')
+            logger.critical(_tz_msg)
+            try:
+                self.notifier.notify_error(_tz_msg)
+            except Exception:
+                pass
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
@@ -124,6 +137,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         if account_equity is None:
             logger.critical('系统启动失败：3次尝试后仍无法获取初始账户权益！请检查API密钥和网络连接。')
+            # 退出前尽力补发钉钉：系统静默死掉是最贵的故障模式（与账本损坏路径同标准）
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
+                    f'进程即将退出，请检查API密钥和网络连接！')
+            except Exception:
+                pass
             import sys
             sys.exit(1)
 
@@ -282,8 +302,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
                 try:
                     ccxt_sym = self.exchange_api.to_ccxt_symbol(symbol)
-                    ticker = self.exchange_api.exchange.fetch_ticker(ccxt_sym)
-                    exit_price = ticker['last'] if ticker and ticker.get('last') else open_positions[symbol]['entry_price']
+                    exit_price = self.exchange_api.get_last_price(ccxt_sym) or open_positions[symbol]['entry_price']
                 except Exception:
                     exit_price = open_positions[symbol]['entry_price']
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
@@ -542,7 +561,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
 
     def _run_startup_catchup_check(self, now=None):
-        """启动补跑：已过今日检查时间而今日未执行过日检时，立即补跑一轮。
+        """兜底补跑：已过今日检查时间而今日未执行过日检时，立即补跑一轮
+        （启动时调用一次 + 每 30 分钟周期兜底，守卫幂等，已跑则空转）。
 
         场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
         新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
@@ -558,7 +578,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return
         if self._last_check_date == date.today().isoformat():
             return
-        logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，启动补跑一轮日检")
+        logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，兜底补跑一轮日检")
         self.check_and_execute_trades()
 
     def start(self):
@@ -606,6 +626,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                   hour=check_hour, minute=check_minute + 1, second=0)
         else:
             logger.warning(f"[{self.label}] check_minute=59，跳过 +1 分钟重试任务")
+        # 日检兜底：主执行与 +1 分钟重试整窗失败（如恰逢网络故障）后当日再无触发点——
+        # 每 30 分钟由幂等守卫补跑（时间窗 + _last_check_date + 交易锁，已跑则空转）
+        self.scheduler.add_job(self._run_startup_catchup_check, 'cron',
+                              id=f'{ex}_daily_check_fallback', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              minute='*/30', second=0)
         # 每日持仓汇总保持独立兜底调度，避免交易检查提前返回/异常时漏推
         self.scheduler.add_job(self.send_daily_position_summary_if_due, 'cron',
                               id=f'{ex}_daily_summary', max_instances=1, coalesce=True, misfire_grace_time=120,

@@ -178,3 +178,14 @@ class ExchangeApi:
     @retry_on_network_error(max_retries=3)
     def get_balance(self):
         return self.exchange.fetch_balance()
+
+    @retry_on_network_error(max_retries=3)
+    def get_last_price(self, symbol):
+        """最新成交价（float）。symbol 可传内部符号或 ccxt 符号，内部统一归一。
+
+        上层读市价的唯一入口（收口此前散落各处的 exchange.fetch_ticker 直调，
+        顺带获得网络重试保护）。失败/无价向上抛出，回退逻辑由调用方自持。
+        """
+        ccxt_symbol = symbol if '/' in symbol else self.to_ccxt_symbol(symbol)
+        ticker = self.exchange.fetch_ticker(ccxt_symbol)
+        return float(ticker['last'])

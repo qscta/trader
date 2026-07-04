@@ -30,8 +30,7 @@ class TradeExecutorMixin:
         # 获取实时市价用于记录平仓价
         exit_price = signal['current_close']
         try:
-            ticker = self.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-            exit_price = float(ticker['last'])
+            exit_price = self.exchange_api.get_last_price(ccxt_symbol)
             logger.info(f"{symbol} [双均线] 翻转使用实时市价: {exit_price}")
         except Exception as e:
             logger.warning(f"{symbol} [双均线] 获取实时市价失败({e})，使用收盘价: {exit_price}")
@@ -127,8 +126,7 @@ class TradeExecutorMixin:
         # ====== 核心修复：用实时市场价替代信号收盘价计算仓位 ======
         calc_price = entry_price  # 默认回退值
         try:
-            ticker = self.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-            market_price = float(ticker['last'])
+            market_price = self.exchange_api.get_last_price(ccxt_symbol)
             price_diff_pct = abs(market_price - entry_price) / entry_price * 100
             logger.info(f"{symbol} 实时市价={market_price}, 信号价={entry_price}, 偏差={price_diff_pct:.2f}%")
             calc_price = market_price  # 用实时价格计算仓位

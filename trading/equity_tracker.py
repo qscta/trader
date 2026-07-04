@@ -174,8 +174,7 @@ class EquityTracker:
             side = pos.get('side', 'long')
             try:
                 ccxt_symbol = self.system.exchange_api.to_ccxt_symbol(symbol)
-                ticker = self.system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                current_price = ticker['last']
+                current_price = self.system.exchange_api.get_last_price(ccxt_symbol)
                 if side == 'long':
                     unrealized = (current_price - entry_price) * position_size
                     stop_loss_loss = (entry_price - stop_loss_price) * position_size
