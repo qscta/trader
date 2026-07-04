@@ -537,10 +537,20 @@ def equity_sync():
     if err:
         return err
     try:
-        result = system.equity_tracker.equity_sync()
+        data = request.get_json(silent=True) or {}
+        flow_amount = data.get('flow_amount')
+        if flow_amount is not None:
+            try:
+                flow_amount = float(flow_amount)
+            except (TypeError, ValueError):
+                return jsonify({'error': f'净变动金额不是有效数字: {flow_amount!r}'}), 400
+        result = system.equity_tracker.equity_sync(flow_amount=flow_amount)
+        flow_line = (f'净变动: {result["flow_amount"]:+.2f} USDT（精确锚定）\n'
+                     if result.get('flow_amount') is not None else '锚定方式: 最近指数值\n')
         send_dingtalk(f'[{system.label}] 资金变动同步\n'
                       f'原基准: {result["old_initial"]:.2f} USDT\n'
                       f'新基准: {result["new_initial"]:.2f} USDT\n'
+                      f'{flow_line}'
                       f'求索指数锚点: {result["qiusuo_index"]:.2f}\n'
                       f'除数: {result["old_divisor"]:.6f} -> {result["new_divisor"]:.6f}\n'
                       f'时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')

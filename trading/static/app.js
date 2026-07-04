@@ -506,13 +506,27 @@ async function saveStrategyParams() {
 }
 
 async function syncEquity() {
-    if (!confirm('确认把当前权益设为新基准？（仅在入金/出金后使用）')) return;
+    const flowInput = el('syncFlowAmount');
+    const raw = flowInput ? flowInput.value.trim() : '';
+    const body = {};
+    let tip = '锚定方式：最近指数值（须在入金/出金后 5 分钟内点击才准确）';
+    if (raw !== '') {
+        const v = parseFloat(raw);
+        if (isNaN(v)) { showAlert('净变动金额无效', 'error'); return; }
+        body.flow_amount = v;
+        tip = `净变动 ${v >= 0 ? '+' : ''}${v} USDT，按变动前权益精确锚定（不受点击时间影响）`;
+    }
+    if (!confirm(`确认把当前权益设为新基准？（仅在入金/出金后使用）\n${tip}`)) return;
     const out = el('syncResult');
     out.className = 'result-line'; out.textContent = '同步中...';
     try {
-        const res = await postJSON('/api/equity_sync', {});
+        const res = await postJSON('/api/equity_sync', body);
         const data = await res.json();
-        if (res.ok) { out.className = 'result-line ok'; out.textContent = data.message || '已同步'; loadAccountStats(); loadEquityKline(); }
+        if (res.ok) {
+            out.className = 'result-line ok'; out.textContent = data.message || '已同步';
+            if (flowInput) flowInput.value = '';
+            loadAccountStats(); loadEquityKline();
+        }
         else { out.className = 'result-line err'; out.textContent = data.error || '同步失败'; }
     } catch (e) { out.className = 'result-line err'; out.textContent = '网络错误'; }
 }

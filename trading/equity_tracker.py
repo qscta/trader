@@ -741,8 +741,16 @@ class EquityTracker:
         except Exception as e:
             logger.warning(f"压缩日内采样失败（不影响交易）: {e}")
 
-    def equity_sync(self):
-        """入金/出金后同步权益基准，尽量保持求索指数连续。返回结果 dict。"""
+    def equity_sync(self, flow_amount=None):
+        """入金/出金后同步权益基准，尽量保持求索指数连续。返回结果 dict。
+
+        flow_amount（净变动金额：入金为正、出金为负）提供时，锚点指数按
+        「(当前权益 − 净流入) ÷ 旧除数」精确反推——即使点击时距资金到账已隔了
+        若干个采样周期（期间 5 分钟 tick 已用旧除数把入金误记成一根"盈利"），
+        指数水平也会被校正回真实盈亏轨迹，同步不再有时效压力。
+        不提供时维持旧行为：以最近一次已记录的指数值为锚——须在资金到账后的
+        第一个采样周期内（5 分钟）尽快点击，否则被污染的采样点会成为锚。
+        """
         balance = self.system.exchange_api.get_balance()
         if not balance:
             raise RuntimeError('获取账户余额失败')
@@ -754,8 +762,17 @@ class EquityTracker:
         with self._lock:
             qiusuo_state = self.ensure_qiusuo_index_state(current_equity=current_equity, now=now, persist=True)
             old_divisor = qiusuo_state.get('current_divisor') or (current_equity / (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE))
-            qiusuo_anchor, anchor_time = self._latest_qiusuo_index_anchor(qiusuo_state)
-            qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
+            if flow_amount is not None:
+                pre_flow_equity = current_equity - float(flow_amount)
+                if pre_flow_equity <= 0:
+                    raise ValueError(
+                        f'净变动金额不合理：当前权益 {current_equity:.2f}，净变动 {float(flow_amount):.2f}，'
+                        f'反推的变动前权益不为正，请核对金额与正负号')
+                qiusuo_anchor = pre_flow_equity / old_divisor
+                anchor_time = now.isoformat(timespec='seconds')
+            else:
+                qiusuo_anchor, anchor_time = self._latest_qiusuo_index_anchor(qiusuo_state)
+                qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
             new_divisor = current_equity / qiusuo_anchor
 
             peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
@@ -763,7 +780,9 @@ class EquityTracker:
                 raise RuntimeError('保存峰值权益失败')
 
             eq_hist = self.load_equity_history()
-            old_initial = eq_hist.get('initial_equity', 0)
+            # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），
+            # 原实现在下方 :.2f 格式化处直接抛 TypeError → 路由 500
+            old_initial = eq_hist.get('initial_equity') or 0
             eq_hist['initial_equity'] = current_equity
             eq_hist['initial_time'] = now.isoformat()
             eq_hist['year_start_equity'] = current_equity
@@ -796,10 +815,12 @@ class EquityTracker:
 
             self.record_equity_tick(equity=current_equity, now=now)
 
-        logger.info(f"权益基准已同步: {old_initial:.2f} -> {current_equity:.2f}")
+        logger.info(f"权益基准已同步: {old_initial:.2f} -> {current_equity:.2f}"
+                    f"{f'（净变动 {float(flow_amount):+.2f}，精确锚定）' if flow_amount is not None else '（按最近指数锚定）'}")
         return {
             'old_initial': old_initial,
             'new_initial': current_equity,
+            'flow_amount': float(flow_amount) if flow_amount is not None else None,
             'qiusuo_index': qiusuo_anchor,
             'old_divisor': old_divisor,
             'new_divisor': new_divisor,

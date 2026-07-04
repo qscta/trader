@@ -72,5 +72,53 @@ class DrawdownStatsTest(unittest.TestCase):
         self.assertEqual(d['longest_drawdown_days'], 5)
 
 
+class EquitySyncFlowTest(unittest.TestCase):
+    """资金变动同步：提供净变动金额时按「变动前权益 ÷ 旧除数」精确锚定，不受点击时机影响。"""
+
+    def _tracker(self, tmp, equity=1000.0):
+        bal = {'equity': equity}
+        system = SimpleNamespace(
+            exchange_api=SimpleNamespace(
+                get_balance=lambda: {'total': {'USDT': bal['equity']}, 'free': {'USDT': bal['equity']}}),
+            trade_state=SimpleNamespace(get_all_open_positions=lambda: {}))
+        return eqt.EquityTracker(tmp, system), bal
+
+    def test_flow_amount_corrects_polluted_tick(self):
+        """入金后 5 分钟采样先跑（指数被旧除数记成暴涨）→ 迟到的同步只要填了净变动，
+        锚点仍精确回到真实盈亏轨迹——时效性问题消除。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            t, bal = self._tracker(tmp)
+            self.assertTrue(t.record_equity_tick(equity=1000.0))   # 基线：指数 1853
+            self.assertTrue(t.record_equity_tick(equity=1500.0))   # 入金 500 后采样先跑：指数被污染
+            self.assertAlmostEqual(t.calculate_qiusuo_index(1500.0), 2779.5, places=4)
+
+            bal['equity'] = 1500.0
+            r = t.equity_sync(flow_amount=500.0)                    # 迟到的同步，但填了净变动
+
+            self.assertAlmostEqual(r['qiusuo_index'], 1853.0, places=6)           # 锚点校正回真实轨迹
+            self.assertAlmostEqual(t.calculate_qiusuo_index(1500.0), 1853.0, places=6)
+
+    def test_unreasonable_flow_rejected(self):
+        """净变动 ≥ 当前权益（反推变动前权益不为正）：拒绝，防正负号/数量级填错。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            t, _bal = self._tracker(tmp, equity=1500.0)
+            t.record_equity_tick(equity=1500.0)
+            with self.assertRaises(ValueError):
+                t.equity_sync(flow_amount=1500.0)
+            with self.assertRaises(ValueError):
+                t.equity_sync(flow_amount=2000.0)
+
+    def test_legacy_no_flow_uses_latest_tick_anchor(self):
+        """留空净变动 = 旧行为：以最近已记录指数为锚——在采样跑过之前及时点击仍然正确。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            t, bal = self._tracker(tmp)
+            t.record_equity_tick(equity=1000.0)     # 指数 1853；入金到账但采样尚未跑
+            bal['equity'] = 1500.0
+            r = t.equity_sync()                     # 及时点击（时效窗口内）
+
+            self.assertAlmostEqual(r['qiusuo_index'], 1853.0, places=4)
+            self.assertAlmostEqual(t.calculate_qiusuo_index(1500.0), 1853.0, places=4)
+
+
 if __name__ == '__main__':
     unittest.main()

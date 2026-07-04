@@ -375,7 +375,9 @@ table.data tbody tr:last-child td { border-bottom: none; }
             <div class="card">
                 <div class="card-header"><h2>资金管理</h2></div>
                 <div class="card-body">
-                    <p class="muted" style="font-size:12.5px;margin-bottom:14px;">入金 / 出金后点此把权益基准与求索指数锚点对齐，避免被记成盈亏。</p>
+                    <p class="muted" style="font-size:12.5px;margin-bottom:14px;">入金 / 出金后点此把权益基准与求索指数锚点对齐，避免被记成盈亏。<br>填写净变动金额可<b>精确锚定</b>（不受点击时间影响）；留空则按最近指数锚定（须在到账后 5 分钟内点击）。</p>
+                    <div class="form-group"><label>净变动金额 (USDT，入金为正 / 出金为负，可留空)</label>
+                        <input type="number" id="syncFlowAmount" step="0.01" placeholder="如 +5000 或 -2000"></div>
                     <button class="btn btn-ghost btn-block" id="syncEquityBtn">同步权益基准</button>
                     <div class="result-line" id="syncResult"></div>
                 </div>
@@ -400,6 +402,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
 </div>
 
 <script src="/static/lwc.js"></script>
-<script src="/static/app.js?v=20260703"></script>
+<script src="/static/app.js?v=20260704"></script>
 </body>
 </html>
