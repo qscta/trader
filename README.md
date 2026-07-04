@@ -58,6 +58,9 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 | 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
 | 上实盘前跑通 `python verify_okx.py`（sandbox） | 张数换算/止损算法单/撤单/单向模式只能真连交易所自证，代码审查不能替代 |
 
+> **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——
+> 锁文件必须来自实际运行环境（ccxt 行为随版本漂移，正是适配层反复警示的风险），不要在 CI/开发机生成。
+
 ## 测试
 
 ```bash
