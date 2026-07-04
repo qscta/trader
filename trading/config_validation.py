@@ -9,6 +9,7 @@
 API 校验增量 delta）形态不同，仍各自保留，不强行统一成一个更难读的函数。
 """
 
+import math
 import re
 
 # 策略周期允许范围（整数，含端点）
@@ -31,6 +32,10 @@ def strict_int(value, field):
     try:
         f = float(value)
     except (TypeError, ValueError):
+        raise ValueError(f"{field} 不是有效数字: {value!r}")
+    # inf/-inf/nan 先挡下：否则 "inf" 的 int(f) 抛 OverflowError（非 ValueError），
+    # 会绕过 API/启动的 (TypeError, ValueError) 捕获，畸形输入变成 500/崩溃而非干净拒绝
+    if not math.isfinite(f):
         raise ValueError(f"{field} 不是有效数字: {value!r}")
     if f != int(f):
         raise ValueError(f"{field} 必须是整数，不接受小数: {value!r}")

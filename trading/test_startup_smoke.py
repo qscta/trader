@@ -194,15 +194,16 @@ class StartupSmokeTest(unittest.TestCase):
             self.assertIsInstance(system.config['trading']['symbols'][0]['risk_per_trade'], float)
 
     def test_fractional_period_rejected(self):
-        """严格整数：小数周期（28.9 / "28.9"）拒绝而非静默截断为 28。"""
-        for bad_period in (28.9, "28.9"):
+        """严格整数：小数周期（28.9 / "28.9"）拒绝而非静默截断为 28；
+        inf/-inf/nan 走干净 ValueError（而非 OverflowError 崩溃/500）。"""
+        for bad_period in (28.9, "28.9", "inf", "-inf", "nan"):
             with tempfile.TemporaryDirectory() as tmp:
                 path = _write_config(tmp)
                 cfg = _jload(path)
                 cfg['strategy']['channel_period'] = bad_period
                 _jdump(cfg, path)
                 with patch.object(main, 'OkxApi', _FakeOkxApi):
-                    with self.assertRaises(ValueError, msg=f"应拒绝小数周期: {bad_period!r}"):
+                    with self.assertRaises(ValueError, msg=f"应以 ValueError 拒绝: {bad_period!r}"):
                         TradingSystem(config_file=path)
 
     def test_example_config_is_bootable(self):
