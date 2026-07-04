@@ -155,6 +155,56 @@ class StartupSmokeTest(unittest.TestCase):
                     with self.assertRaises(ValueError, msg=f"应拒绝非法配置: {bad}"):
                         TradingSystem(config_file=path)
 
+    def test_out_of_range_symbol_config_rejected(self):
+        """手写 config.json 的品种池非法值：启动即拒（与增删品种的 API 入口同口径），
+        堵住「手写配置绕过风控」——100% 风险度 / 非法策略名 / 脏交易对名都不得带病启动。"""
+        bad_symbol_lists = [
+            [{'name': 'btcusdt', 'strategy': 'turtle'}],            # 非大写/非法名
+            [{'name': 'BTC-USDT', 'strategy': 'turtle'}],           # 含非法字符
+            [{'name': 'BTCUSDT', 'risk_per_trade': 1.0}],           # 风险度 100% 超上限
+            [{'name': 'BTCUSDT', 'risk_per_trade': -0.01}],         # 负风险度
+            [{'name': 'BTCUSDT', 'strategy': 'foobar'}],            # 非法策略名（否则静默落海龟）
+            [{'name': 'BTCUSDT', 'strategy': 'turtle'},
+             {'name': 'BTCUSDT', 'strategy': 'ma_cross'}],          # 重复交易对
+        ]
+        for bad in bad_symbol_lists:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg['trading']['symbols'] = bad
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝非法品种池: {bad}"):
+                        TradingSystem(config_file=path)
+
+    def test_string_typed_params_normalized(self):
+        """字符串数值（"28" / "0.01"）通过校验后必须规范化为 int/float 写回——
+        否则构造 TurtleStrategy("28")/RiskManager 权益×"0.01" 会在盘中 TypeError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            cfg['strategy']['channel_period'] = "28"
+            cfg['strategy']['default_risk_per_trade'] = "0.01"
+            cfg['trading']['symbols'] = [{'name': 'BTCUSDT', 'risk_per_trade': "0.02", 'strategy': 'turtle'}]
+            _jdump(cfg, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            self.assertIsInstance(system.config['strategy']['channel_period'], int)
+            self.assertIsInstance(system.config['strategy']['default_risk_per_trade'], float)
+            self.assertIsInstance(system.config['trading']['symbols'][0]['risk_per_trade'], float)
+
+    def test_fractional_period_rejected(self):
+        """严格整数：小数周期（28.9 / "28.9"）拒绝而非静默截断为 28。"""
+        for bad_period in (28.9, "28.9"):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg['strategy']['channel_period'] = bad_period
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝小数周期: {bad_period!r}"):
+                        TradingSystem(config_file=path)
+
     def test_example_config_is_bootable(self):
         """config.example.json 填上凭据即可启动——保证示例配置永远与代码同步。"""
         with tempfile.TemporaryDirectory() as tmp:
