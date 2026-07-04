@@ -180,8 +180,43 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         config['trading'].setdefault('symbols', [])
         self._validate_symbol_configs(config['trading']['symbols'])
         config.setdefault('scheduler', {})
+        self._validate_scheduler_config(config['scheduler'])
         config.setdefault('dingtalk', {})
         return config
+
+    def _validate_scheduler_config(self, scheduler):
+        """启动前校验并规范化调度参数（就地写回 config，消除类型漂移）。
+
+        这些整数直接流入 register_jobs 的算术与格式化（check_minute + 1、
+        {check_hour:02d}）和 APScheduler 的 hour/minute 字段。此前无校验：手写
+        config.json 把 check_minute 写成字符串 "0" 会让 `check_minute + 1` 抛
+        TypeError、把 check_hour 写成 25 会让 APScheduler 抛内部错——都是难懂的
+        启动崩溃。与 strategy/symbols 同源、同标准 fail-loud：给清晰 ValueError。
+        全部为可选键（缺省由 register_jobs 的 .get 默认值兜底），仅当显式提供时校验。
+        """
+        hour_keys = ('check_hour', 'summary_hour', 'weekly_hour')
+        minute_keys = ('check_minute', 'summary_minute', 'weekly_minute')
+        for key in hour_keys:
+            if scheduler.get(key) is None:
+                continue
+            v = cfgv.strict_int(scheduler[key], f'config.scheduler.{key}')
+            if not (0 <= v <= 23):
+                raise ValueError(f"config.scheduler.{key} 超出允许范围 [0, 23]: {v}")
+            scheduler[key] = v
+        for key in minute_keys:
+            if scheduler.get(key) is None:
+                continue
+            v = cfgv.strict_int(scheduler[key], f'config.scheduler.{key}')
+            if not (0 <= v <= 59):
+                raise ValueError(f"config.scheduler.{key} 超出允许范围 [0, 59]: {v}")
+            scheduler[key] = v
+        if scheduler.get('stop_loss_scan_interval_minutes') is not None:
+            v = cfgv.strict_int(scheduler['stop_loss_scan_interval_minutes'],
+                                'config.scheduler.stop_loss_scan_interval_minutes')
+            if not (1 <= v <= 1440):
+                raise ValueError(
+                    f"config.scheduler.stop_loss_scan_interval_minutes 超出允许范围 [1, 1440]: {v}")
+            scheduler['stop_loss_scan_interval_minutes'] = v
 
     def _validate_strategy_config(self, strategy):
         """启动前校验并**规范化**策略参数（就地写回 config，消除类型漂移）。

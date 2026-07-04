@@ -238,6 +238,44 @@ class StartupSmokeTest(unittest.TestCase):
                 system = TradingSystem(config_file=path)
             self.assertEqual(system.exchange_id, 'okx')
 
+    def test_out_of_range_scheduler_config_rejected(self):
+        """手写 config.json 的调度参数非法值：启动即拒（给清晰 ValueError，
+        而非 register_jobs 里 check_minute+1 的 TypeError / APScheduler 内部错）。"""
+        bad_cases = [
+            {'check_hour': 24},                         # 小时上限
+            {'check_hour': -1},                         # 小时下限
+            {'check_minute': 60},                       # 分钟上限
+            {'summary_minute': "xx"},                   # 非数字字符串
+            {'weekly_hour': 25},                        # 小时越界
+            {'stop_loss_scan_interval_minutes': 0},     # 间隔下限
+            {'check_minute': 28.9},                     # 非整数
+        ]
+        for bad in bad_cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg.setdefault('scheduler', {}).update(bad)
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝非法调度配置: {bad}"):
+                        TradingSystem(config_file=path)
+
+    def test_string_typed_scheduler_params_normalized(self):
+        """字符串数值（"8" / "0"）通过校验后规范化为 int 写回——
+        否则 register_jobs 的 check_minute + 1 / {check_hour:02d} 会 TypeError。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            cfg.setdefault('scheduler', {}).update(
+                {'check_hour': "8", 'check_minute': "0", 'stop_loss_scan_interval_minutes': "5"})
+            _jdump(cfg, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            sched = system.config['scheduler']
+            self.assertIsInstance(sched['check_hour'], int)
+            self.assertIsInstance(sched['check_minute'], int)
+            self.assertIsInstance(sched['stop_loss_scan_interval_minutes'], int)
+
 
 if __name__ == '__main__':
     unittest.main()
