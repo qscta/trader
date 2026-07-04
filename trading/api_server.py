@@ -385,8 +385,7 @@ def get_positions():
             for symbol, pos in positions.items():
                 try:
                     ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                    current_price = ticker['last']
+                    current_price = system.exchange_api.get_last_price(ccxt_symbol)
                     pos['current_price'] = current_price
                     entry = pos['entry_price']
                     size = pos['position_size']
@@ -666,8 +665,7 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} K线数据不足'}), 400
 
             try:
-                ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                current_price = float(ticker['last'])
+                current_price = system.exchange_api.get_last_price(ccxt_symbol)
             except Exception as e:
                 current_price = float(df['close'].iloc[-1])
                 logger.warning(f"{symbol_name} 获取实时市价失败({e})，回退收盘价: {current_price}")
@@ -779,8 +777,7 @@ def close_position():
                 actual_price = float(actual_price)
             if not actual_price:
                 try:
-                    ticker = system.exchange_api.exchange.fetch_ticker(ccxt_symbol)
-                    actual_price = ticker['last'] if ticker else position['entry_price']
+                    actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
                 except Exception:
                     actual_price = position['entry_price']
 

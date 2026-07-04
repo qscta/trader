@@ -302,8 +302,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
                 try:
                     ccxt_sym = self.exchange_api.to_ccxt_symbol(symbol)
-                    ticker = self.exchange_api.exchange.fetch_ticker(ccxt_sym)
-                    exit_price = ticker['last'] if ticker and ticker.get('last') else open_positions[symbol]['entry_price']
+                    exit_price = self.exchange_api.get_last_price(ccxt_sym) or open_positions[symbol]['entry_price']
                 except Exception:
                     exit_price = open_positions[symbol]['entry_price']
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(

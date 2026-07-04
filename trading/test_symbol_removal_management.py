@@ -239,6 +239,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda s: s,
             exchange=SimpleNamespace(fetch_ticker=lambda s: {'last': 2900.0}),
+            get_last_price=lambda s: 2900.0,
             close_position=lambda *a, **k: {'average': 2900.0},
             cancel_order=lambda *a, **k: cancel_ok,
             cancel_all_orders=lambda *a, **k: cancel_ok or None)

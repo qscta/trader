@@ -248,6 +248,7 @@ class InstantOpenApiTests(unittest.TestCase):
                 "stop_order_id": "stop-1",
             }
 
+        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
         system = SimpleNamespace(
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
@@ -255,7 +256,8 @@ class InstantOpenApiTests(unittest.TestCase):
                 fetch_ohlcv=Mock(return_value=[[1]] * 120),
                 ohlcv_to_dataframe=Mock(return_value=df_marker),
                 filter_closed_candles=filter_mock,
-                exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45})),
+                exchange=exchange_stub,
+                get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
             turtle_strategy=SimpleNamespace(
                 check_current_state=Mock(
@@ -514,9 +516,11 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             risk_per_trade=0.01,
             calculate_position_size=Mock(return_value=2.5),
         )
+        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 100}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
-            exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 100})),
+            exchange=exchange_stub,
+            get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             get_balance=Mock(return_value={"total": {"USDT": 10000}}),
             round_quantity=Mock(return_value=2.5),
             get_quantity_precision=Mock(return_value=3),
@@ -676,6 +680,7 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
             }
 
         original_config = {"trading": {"symbols": []}}
+        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
         fake_system = SimpleNamespace(
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
@@ -683,7 +688,8 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
                 fetch_ohlcv=Mock(return_value=[[1]] * 120),
                 ohlcv_to_dataframe=Mock(return_value=[None] * 30),
                 filter_closed_candles=Mock(return_value=[None] * 30),
-                exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45})),
+                exchange=exchange_stub,
+                get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
             turtle_strategy=SimpleNamespace(
                 check_current_state=Mock(
@@ -872,9 +878,11 @@ class MaCrossFlipTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 111}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
-            exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 111})),
+            exchange=exchange_stub,
+            get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             close_position=Mock(return_value={"average": 112}),
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(),
@@ -1047,13 +1055,15 @@ class StartupSyncCompensationTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
             get_position=Mock(return_value=None),
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(return_value=True),
             list_position_symbols=Mock(return_value=[]),
-            exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45})),
+            exchange=exchange_stub,
+            get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
         )
         system.trade_state = SimpleNamespace(
             get_all_open_positions=Mock(
