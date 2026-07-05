@@ -8,6 +8,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -15,6 +16,13 @@ import subprocess
 import requests
 import logging
 from datetime import datetime
+
+# 抹掉错误串里可能随 requests 连接异常带出的 webhook access_token，避免泄露到 mem_monitor.log
+_ACCESS_TOKEN_RE = re.compile(r'(access_token=)[^&\s\'"]+', re.IGNORECASE)
+
+
+def _redact_secrets(text):
+    return _ACCESS_TOKEN_RE.sub(r'\1***', str(text))
 
 # ====== 配置 ======
 CHECK_INTERVAL = 300        # 检查间隔：5分钟（秒）
@@ -68,7 +76,7 @@ def send_dingtalk(webhook, msg):
         else:
             logger.warning(f"钉钉推送返回非200: {resp.status_code}")
     except Exception as e:
-        logger.error(f"钉钉推送失败: {e}")
+        logger.error(f"钉钉推送失败: {_redact_secrets(e)}")
 
 
 def get_memory_usage():

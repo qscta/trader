@@ -1258,6 +1258,23 @@ class LoginBackoffTests(unittest.TestCase):
         self.assertEqual(self._login("right-pass").status_code, 200)
 
 
+class DingtalkRedactionTests(unittest.TestCase):
+    """钉钉 webhook access_token 不得随 requests 连接异常泄露到日志。"""
+
+    def test_access_token_redacted_from_connection_error(self):
+        import dingtalk_notifier
+        # 复刻 requests ConnectionError 的真实形态（含完整 URL + token）
+        leaked = ("HTTPSConnectionPool(host='oapi.dingtalk.com', port=443): Max retries "
+                  "exceeded with url: /robot/send?access_token=SECRET_abc123def (Caused by ...)")
+        red = dingtalk_notifier._redact_secrets(leaked)
+        self.assertNotIn("SECRET_abc123def", red)
+        self.assertIn("access_token=***", red)
+
+    def test_redaction_leaves_ordinary_text_intact(self):
+        import dingtalk_notifier
+        self.assertEqual(dingtalk_notifier._redact_secrets("connection refused"), "connection refused")
+
+
 class SchedulerIntervalTests(unittest.TestCase):
     """盘中止损巡检间隔的调度注册——用真实 BackgroundScheduler 触发 APScheduler
     的表达式校验（标准库套件把调度器换成 Dummy 桩，测不到这条真实崩溃路径）。

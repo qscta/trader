@@ -1,9 +1,21 @@
+import re
 import requests
 import logging
 import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# requests 的连接/超时异常字符串常带完整 URL（...robot/send?access_token=xxx）。
+# 钉钉 webhook 的 access_token 是可轮换的密钥，原样进 trading.log 会经 /api/logs 面板
+# 与备份泄露——记录任何含 URL 的错误串前，必须先抹掉 token。
+_ACCESS_TOKEN_RE = re.compile(r'(access_token=)[^&\s\'"]+', re.IGNORECASE)
+
+
+def _redact_secrets(text):
+    """抹掉错误串里的钉钉 webhook access_token，供安全落日志。"""
+    return _ACCESS_TOKEN_RE.sub(r'\1***', str(text))
+
 
 class DingTalkNotifier:
     SEND_RETRY_DELAY_SECONDS = 1.0  # 首发失败后重试一次的间隔（网络抖动是常态，告警丢失不可接受）
@@ -30,7 +42,8 @@ class DingTalkNotifier:
                     return True
                 last_err = f"http={resp.status_code}, body={payload or resp.text[:200]}"
             except Exception as e:
-                last_err = str(e)
+                # 抹掉可能随异常带出的 access_token（requests 连接异常常含完整 URL）
+                last_err = _redact_secrets(e)
             if attempt == 1:
                 logger.warning(f"钉钉推送首次失败({last_err})，{self.SEND_RETRY_DELAY_SECONDS}s 后重试: {title}")
                 time.sleep(self.SEND_RETRY_DELAY_SECONDS)
