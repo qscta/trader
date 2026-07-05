@@ -486,8 +486,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             all_open_positions = self.trade_state.get_all_open_positions()
             symbols_to_check = set()
 
+            # 手动池快照：本轮检查全程用同一份一致视图。API 写路由（增删改品种）在
+            # _config_lock 下会原地改 enabled 或替换列表，否则同一轮里三处独立读
+            # （下方 enabled 过滤 / manual_names / 配置查找）可能读到不一致的中间态。
+            # 锁序 _trade_lock→_config_lock 与 instant_open 一致，且此处已持 _trade_lock，无死锁。
+            with self._config_lock:
+                manual_symbols_snapshot = [dict(s) for s in self.config['trading']['symbols']]
+
             # 添加手动池交易对
-            for s in self.config['trading']['symbols']:
+            for s in manual_symbols_snapshot:
                 if s.get('enabled', True):
                     symbols_to_check.add(s['name'])
 
@@ -506,7 +513,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 try:
                     # 检查是否应该监控该交易对（必须在手动池中或有持仓）
                     if symbol not in all_open_positions:
-                        manual_names = [s['name'] for s in self.config['trading']['symbols'] if s.get('enabled', True)]
+                        manual_names = [s['name'] for s in manual_symbols_snapshot if s.get('enabled', True)]
                         if symbol not in manual_names:
                             logger.debug(f"{symbol} 不在手动品种池中，跳过")
                             continue
@@ -515,7 +522,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     strategy_type = 'turtle'
                     symbol_config = None
 
-                    for s in self.config['trading']['symbols']:
+                    for s in manual_symbols_snapshot:
                         if s['name'] == symbol:
                             symbol_config = s
                             strategy_type = s.get('strategy', 'turtle')

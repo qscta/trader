@@ -392,7 +392,11 @@ def delete_symbol(symbol):
     if err:
         return err
     try:
-        symbol_u = symbol.upper()
+        # 与增/改品种同源：规范化（去空格+大写+格式校验），杜绝带空格/畸形名绕过匹配
+        try:
+            symbol_u = normalize_symbol_name(symbol)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
         with trading_system._config_lock:
             # 品种不在池中：直接 404，与 update_symbol 的语义一致。否则「删不存在的品种」
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
@@ -416,8 +420,8 @@ def delete_symbol(symbol):
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，删除已回滚')
             if err_resp:
                 return err_resp
-        send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
-        return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
+        send_dingtalk(f'[{system.label}] 删除交易对: {symbol_u}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已删除'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

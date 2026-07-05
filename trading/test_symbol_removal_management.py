@@ -27,6 +27,7 @@ def _build_system(tmpdir, config_symbols):
     system.config = {'trading': {'symbols': config_symbols},
                      'strategy': {'default_risk_per_trade': 0.01}}
     system._trade_lock = threading.Lock()
+    system._config_lock = threading.RLock()  # check_and_execute_trades 快照手动池时用（与真实 __init__ 一致）
     system._stop_anomalies = {}
     system._last_check_date = None
     system._last_failure_notify_ts = 0
