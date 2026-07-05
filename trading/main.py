@@ -671,7 +671,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         sched = self.config.get('scheduler', {})
         check_hour = sched.get('check_hour', 8)
         check_minute = sched.get('check_minute', 0)
-        if (now.hour, now.minute) < (check_hour, check_minute + 2):
+        # 按当日绝对分钟数比较，避免 check_minute 接近 59 时 check_minute+2 溢出
+        # 让缓冲窗口错误地跨过整点（如 08:59 的缓冲应到 09:01，而非落在 (8,61) 的元组里）
+        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
             return
         if self._last_check_date == date.today().isoformat():
             return
