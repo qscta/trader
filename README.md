@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-143%20stdlib%20%2B%2059%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-144%20stdlib%20%2B%2059%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -30,7 +30,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线保证「止损永远在、账本永远真」**——账本 fail-closed（损坏/误删拒绝启动，绝不失忆运行）、验证式撤单（以「查不到该单」为撤销成功标准）、止损自愈巡检（每 5 分钟三态校验，缺失自动补挂）。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **202 个测试**——143 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 59 个依赖版集成用例。
+- **203 个测试**——144 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 59 个依赖版集成用例。
 
 ## 🏗️ 架构
 
@@ -76,8 +76,15 @@ pip install -r requirements.txt
 cp config.example.json config.json        # 填入 OKX 凭据与钉钉 webhook（或用环境变量）
 
 python verify_okx.py BTCUSDT               # 只读检查；上实盘前必须用模拟盘跑完整验证
-gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
+gunicorn -w 1 -b 127.0.0.1:5000 wsgi:application   # 只绑本机回环，公网访问经反代/Tunnel 转发
 ```
+
+> [!IMPORTANT]
+> **只绑 `127.0.0.1:5000`，不要绑 `0.0.0.0`。** 应用启用了 `ProxyFix`（信任 1 跳
+> `X-Forwarded-For`）以还原真实客户端 IP，这只在「单反代直连」拓扑下成立。若 5000 端口
+> 公网可达，任何人可直连绕过 Cloudflare/Zero Trust/HTTPS，还能伪造 `X-Forwarded-For`
+> 欺骗登录限流的按 IP 计数。外层用 Cloudflare Tunnel 或 nginx 反代转发到回环地址，并在
+> 防火墙/安全组上禁止公网访问 5000。
 
 凭据也可用环境变量注入（优先于 config.json）：
 `OKX_API_KEY` / `OKX_API_SECRET` / `OKX_API_PASSPHRASE` / `DINGTALK_WEBHOOK`。
@@ -90,7 +97,8 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 | `gunicorn -w 1`（单 worker） | 多 worker 会重复初始化交易系统；`wsgi.py` 文件锁兜底，多余 worker 直接拒启 |
 | 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；缺 `FLASK_SECRET_KEY` 拒绝启动 |
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
-| 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
+| gunicorn 只绑 `127.0.0.1:5000`，防火墙禁公网访问 5000 | `ProxyFix` 信任 `X-Forwarded-For` 仅在单反代直连下成立；5000 公网可达会绕过反代、伪造真实 IP、削弱登录限流 |
+| 公网访问须经 HTTPS 反向代理 / Tunnel | 登录密码与会话 cookie 不得明文传输；反代统一收口便于加防护 |
 | 上实盘前跑通 `python verify_okx.py`（sandbox） | 张数换算 / 止损算法单 / 撤单 / 单向模式只能真连交易所自证，代码审查不能替代 |
 
 > **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——
@@ -101,7 +109,7 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 ```bash
 cd trading
 
-# 143 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 144 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
 # 59 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）

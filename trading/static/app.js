@@ -490,11 +490,13 @@ async function loadStrategyParams() {
 
 async function saveStrategyParams() {
     const out = el('strategyParamResult');
+    // 周期为窗口长度，原样透传给后端由 strict_int 严格校验（28.9 拒绝而非前端静默截断），
+    // 避免 parseInt 把 28.9 悄悄变 28 让后端整数校验形同虚设——与手写 config.json 口径一致
     const body = {
-        channel_period: parseInt(el('paramChannelPeriod').value),
-        ma_short_period: parseInt(el('paramMaShort').value),
-        ma_long_period: parseInt(el('paramMaLong').value),
-        ma_stop_period: parseInt(el('paramMaStop').value),
+        channel_period: el('paramChannelPeriod').value.trim(),
+        ma_short_period: el('paramMaShort').value.trim(),
+        ma_long_period: el('paramMaLong').value.trim(),
+        ma_stop_period: el('paramMaStop').value.trim(),
         default_risk_per_trade: parseFloat(el('paramDefaultRisk').value) / 100,
     };
     try {

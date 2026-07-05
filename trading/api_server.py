@@ -558,7 +558,12 @@ def equity_sync():
     if err:
         return err
     try:
-        data = request.get_json(silent=True) or {}
+        # 要求 JSON body（空 {} 即可）：其余写接口因解析 JSON 天然免疫跨站表单，
+        # 本接口补上同等门槛，避免非 JSON/空请求误触发旧式最近指数锚定（防 CSRF）
+        data = request.get_json(silent=True)
+        if data is None:
+            return jsonify({'error': '请求须携带 JSON body（空对象 {} 即可），'
+                                     '例如: curl -X POST -H "Content-Type: application/json" -d "{}"'}), 400
         flow_amount = data.get('flow_amount')
         if flow_amount is not None:
             try:

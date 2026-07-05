@@ -71,8 +71,10 @@
 pip install -r requirements.txt   # ccxt, pandas, flask, apscheduler, requests, gunicorn
 python main.py                  # 直接运行（仅交易调度，无 Web）
 # 或 Web + 交易一体（推荐，gunicorn 走 wsgi）
-FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
+FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 127.0.0.1:5000 wsgi:application
 ```
+
+- **绑定地址**：只绑 `127.0.0.1:5000`（本机回环），公网访问经 Cloudflare Tunnel / nginx 反代转发，并在防火墙/安全组禁止公网直连 5000。应用已启用 `ProxyFix`（信任 1 跳 `X-Forwarded-For`）以在单反代直连拓扑下还原真实客户端 IP；一旦 5000 公网可达，攻击者可直连绕过 HTTPS/Zero Trust 并伪造 `X-Forwarded-For` 欺骗登录限流的按 IP 计数。
 
 - **时区**：每日 08:00 检查等 cron 任务按**服务器系统本地时区**触发。部署前确认时区符合预期（如 `timedatectl set-timezone Asia/Shanghai`），否则 UTC 服务器上 08:00 实际是北京时间 16:00。
 - 务必用 **1 个 worker**（`-w 1`）：交易线程与状态需单实例，`wsgi.py` 已用文件锁防重复启动（抢不到锁直接退出）。
@@ -95,22 +97,24 @@ FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 ws
 
 ## 七、测试
 
-无需第三方依赖、可本机运行并通过（共 95 用例，已验证同进程任意顺序全绿）：
+无需第三方依赖、可本机运行并通过（共 144 用例，已验证同进程任意顺序全绿）。
+一次性跑全部：`python3 -m unittest discover -s . -p "test_*.py"`（144 通过）。分模块：
 
 ```bash
-python -m unittest test_startup_smoke               # 5 通过（启动装配全链冒烟：配置/迁移/护栏/装配）
-python -m unittest test_final_judgment              # 10 通过（时间边界/并发混沌/灾难恢复/风控性质/孤儿仓告警）
-python -m unittest test_equity_drawdown             # 3 通过（未创新高统计三场景）
+python -m unittest test_config_validation           # 11 通过（三入口共享配置校验原语：严格整数/风险度/布尔/符号）
+python -m unittest test_startup_smoke               # 13 通过（启动装配全链冒烟：配置/迁移/护栏/装配）
+python -m unittest test_final_judgment              # 15 通过（时间边界/并发混沌/灾难恢复/风控性质/孤儿仓告警）
+python -m unittest test_equity_drawdown             # 9 通过（未创新高统计三场景）
 python -m unittest test_daily_summary_delivery      # 7 通过（钉钉汇总/缓冲）
-python -m unittest test_symbol_removal_management   # 33 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈）
-python -m unittest test_okx_adapter_safety          # 24 通过（面值 fail-closed + 验证式撤单/合并查询/复验 + 止损严格匹配/三态判定）
+python -m unittest test_symbol_removal_management   # 50 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈）
+python -m unittest test_okx_adapter_safety          # 28 通过（面值 fail-closed + 验证式撤单/合并查询/复验 + 止损严格匹配/三态判定）
 python -m unittest test_trade_state_fees            # 3 通过（手续费/盈亏）
 python -m unittest test_turtle_strategy_regression  # 8 通过（海龟信号回归）
 ```
 
 测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。
 
-> `tests/test_trading_logic_unittest.py` 需要 pandas/ccxt/flask 才能运行（本机未装）。它已**适配单所结构**：api_server 路由测试直接 patch `api_server.trading_system`（用 `_prep_system` 补 `_config_lock`/`persist_config`/`config_file`），`filter_closed_candles` 测试改用基类 `exchange_base.ExchangeApi`，并新增 `DeleteSymbolApiTests`（4 用例：删除只动配置不平仓不撤单 / 缺 strategy 从配置补写 / 无从知晓策略时拒删）。请在依赖齐全的环境运行验证：
+> `tests/test_trading_logic_unittest.py`（依赖版，59 用例）需要 pandas/ccxt/flask 才能运行（本机未装）。它已**适配单所结构**：api_server 路由测试直接 patch `api_server.trading_system`（用 `_prep_system` 补 `_config_lock`/`persist_config`/`config_file`），`filter_closed_candles` 测试改用基类 `exchange_base.ExchangeApi`，并新增 `DeleteSymbolApiTests`（4 用例：删除只动配置不平仓不撤单 / 缺 strategy 从配置补写 / 无从知晓策略时拒删）。请在依赖齐全的环境运行验证：
 > ```bash
 > python -m unittest tests.test_trading_logic_unittest
 > ```
