@@ -1258,6 +1258,25 @@ class LoginBackoffTests(unittest.TestCase):
         self.assertEqual(self._login("right-pass").status_code, 200)
 
 
+class ApiTokenAuthTests(unittest.TestCase):
+    """API Token 认证：非 ASCII token 头不得触发 compare_digest 的 TypeError → 500。"""
+
+    def setUp(self):
+        self.client = api_server.app.test_client()
+        patcher = patch.object(api_server, "API_TOKEN", "real-token-abc")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_non_ascii_token_returns_401_not_500(self):
+        # 此前 compare_digest(str,str) 对非 ASCII 抛 TypeError（装饰器无捕获）→ 500；现应干净 401
+        resp = self.client.get("/api/status", headers={"X-API-Token": "café-café"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_token_returns_401(self):
+        resp = self.client.get("/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 401)
+
+
 class DingtalkRedactionTests(unittest.TestCase):
     """钉钉 webhook access_token 不得随 requests 连接异常泄露到日志。"""
 

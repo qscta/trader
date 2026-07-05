@@ -90,7 +90,10 @@ def require_auth(f):
         if session.get('authenticated'):
             return f(*args, **kwargs)
         token = request.headers.get('X-API-Token')
-        if API_TOKEN and token and secrets.compare_digest(token, API_TOKEN):
+        # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
+        # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
+        # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
+        if API_TOKEN and token and secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
             return f(*args, **kwargs)
         return jsonify({'error': '认证失败，请登录或提供有效的API Token'}), 401
     return decorated
