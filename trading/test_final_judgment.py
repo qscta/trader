@@ -229,8 +229,7 @@ class RiskInvariantTest(unittest.TestCase):
             if size > 0:
                 actual_risk = (entry - stop) * size
                 budget = equity * risk
-                # round(size, 3) 最多引入 +0.0005 的数量偏差 → 风险超出上界为 0.0005*(entry-stop)
-                tolerance = 0.0005 * (entry - stop) + 1e-9
+                tolerance = max(1e-9, budget * 1e-12)
                 self.assertLessEqual(actual_risk, budget + tolerance,
                                      f'风险超预算: equity={equity}, entry={entry}, stop={stop}, risk={risk}')
 
@@ -238,6 +237,15 @@ class RiskInvariantTest(unittest.TestCase):
         rm = RiskManager(10000, 0.01)
         self.assertEqual(rm.calculate_position_size(100, 100), 0)   # 止损=入场
         self.assertEqual(rm.calculate_position_size(0, 90), 0)      # 零价格
+
+    def test_position_size_keeps_sub_milli_precision_for_exchange_rounding(self):
+        rm = RiskManager(1000, 0.01)
+
+        size = rm.calculate_position_size(50000, 36242.09078404402)
+
+        self.assertGreater(size, 0)
+        self.assertLess(size, 0.001)
+        self.assertNotEqual(size, round(size, 3))
 
 
 if __name__ == '__main__':

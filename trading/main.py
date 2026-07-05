@@ -537,8 +537,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     logger.info(f"检查 {symbol} (策略: {strategy_type})...")
 
                     ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+                    required_closed_candles = cfgv.required_closed_candles_for_strategy(
+                        strategy_type, self.config.get('strategy', {}))
+                    fetch_limit = cfgv.ohlcv_fetch_limit_for_strategy(
+                        strategy_type, self.config.get('strategy', {}))
 
-                    ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=365)
+                    ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
                     if not ohlcv:
                         logger.warning(f"{symbol} 获取K线数据失败")
                         continue
@@ -547,6 +551,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     df = self.exchange_api.filter_closed_candles(df, timeframe='1d')
                     if len(df) == 0:
                         logger.warning(f"{symbol} 无已收盘K线，跳过本轮检查")
+                        continue
+                    if len(df) < required_closed_candles:
+                        logger.warning(
+                            f"{symbol} K线数据不足：{strategy_type} 策略配置至少需要 "
+                            f"{required_closed_candles} 根已收盘K线，本轮仅取得 {len(df)} 根"
+                            f"（请求 {fetch_limit} 根），请检查周期配置或交易所历史K线供应")
                         continue
 
                     if strategy_type == 'turtle':
@@ -572,7 +582,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         signal = strategy.check_signal(df)
 
                     if not signal:
-                        logger.warning(f"{symbol} K线数据不足，暂不计算信号")
+                        logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
                         continue
 
                     current_close = float(df['close'].iloc[-1])
@@ -623,7 +633,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.info("信号检查完毕，刷新账户统计状态...")
             self.equity_tracker.refresh_account_stats_state()
             logger.info("信号检查完毕，推送每日持仓汇总...")
-            self.send_daily_position_summary_if_due()
+            self.send_daily_position_summary_if_due(mark_sent=not manual_run)
             if failed_symbols:
                 # 不标记当日完成：让 +1 分钟的重试调度整轮重跑（开仓/止损/平仓均有幂等防护）
                 logger.error(f"本轮 {len(failed_symbols)} 个品种检查异常: {', '.join(sorted(failed_symbols))}，"

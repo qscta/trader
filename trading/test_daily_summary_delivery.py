@@ -95,6 +95,75 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         self.assertFalse(system.send_daily_position_summary_if_due())
         self.assertEqual(2, system.notifier.calls)
 
+    def test_daily_summary_can_send_without_marking_day_as_sent(self):
+        system = self._build_system(notify_result=True)
+
+        self.assertTrue(system.send_daily_position_summary_if_due(mark_sent=False))
+        self.assertIsNone(system._last_summary_date)
+        self.assertEqual(1, system.notifier.calls)
+
+    def test_manual_trade_check_summary_does_not_consume_scheduled_summary(self):
+        system = self._build_system(notify_result=True)
+        summary_calls = []
+        system._trade_lock = SimpleNamespace(acquire=lambda blocking=False: True, release=lambda: None)
+        system._last_check_date = None
+        system._last_failure_notify_ts = 0
+        system.equity_tracker = SimpleNamespace(
+            record_daily_equity_snapshot=lambda: None,
+            refresh_account_stats_state=lambda: None,
+        )
+        system.trade_state = SimpleNamespace(
+            get_all_open_positions=lambda: {},
+            get_open_position=lambda symbol: None,
+            get_signal_state=lambda symbol: False,
+            set_signal_state=lambda symbol, value: None,
+        )
+        system.config = {'strategy': {'channel_period': 28}, 'trading': {'symbols': []}}
+        system._retry_clear_stop_residues = lambda: None
+        system._flush_pending_trade_notifications = lambda: None
+        system.send_daily_position_summary_if_due = (
+            lambda force=False, mark_sent=True: summary_calls.append((force, mark_sent)) or True
+        )
+
+        system.check_and_execute_trades(manual_run=True)
+
+        self.assertEqual([(False, False)], summary_calls)
+        self.assertIsNone(system._last_check_date)
+
+    def test_daily_check_fetch_limit_tracks_large_turtle_config(self):
+        system = self._build_system(notify_result=True)
+        requested_limits = []
+        system._trade_lock = SimpleNamespace(acquire=lambda blocking=False: True, release=lambda: None)
+        system._last_check_date = None
+        system._last_failure_notify_ts = 0
+        system.equity_tracker = SimpleNamespace(
+            record_daily_equity_snapshot=lambda: None,
+            refresh_account_stats_state=lambda: None,
+        )
+        system.trade_state = SimpleNamespace(
+            get_all_open_positions=lambda: {},
+            get_open_position=lambda symbol: None,
+            get_signal_state=lambda symbol: False,
+            set_signal_state=lambda symbol, value: None,
+        )
+        system.config = {
+            'strategy': {'channel_period': 500},
+            'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'turtle'}]},
+        }
+        system.exchange_api = SimpleNamespace(
+            to_ccxt_symbol=lambda symbol: symbol,
+            fetch_ohlcv=lambda symbol, timeframe='1d', limit=100: requested_limits.append(limit) or [],
+        )
+        system.turtle_strategy = SimpleNamespace()
+        system.ma_cross_strategy = SimpleNamespace()
+        system._retry_clear_stop_residues = lambda: None
+        system._flush_pending_trade_notifications = lambda: None
+        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: True
+
+        system.check_and_execute_trades()
+
+        self.assertEqual([503], requested_limits)
+
     def test_stop_loss_update_is_buffered_for_summary_notification(self):
         system = TradingSystem.__new__(TradingSystem)
         system.exchange_api = _FakeExchangeApi()
@@ -141,7 +210,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         )
         system.config = {'trading': {'symbols': []}}
         system.exchange_api = SimpleNamespace(fetch_ohlcv=lambda *args, **kwargs: [], get_balance=lambda: {'total': {'USDT': 1000}})
-        system.send_daily_position_summary_if_due = lambda force=False: False
+        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: False
 
         system.notifier.notify_stop_loss_updates_summary(system._pending_stop_loss_updates)
 

@@ -68,5 +68,25 @@ class NormalizeSymbolTest(unittest.TestCase):
                 cv.normalize_symbol_name(v)
 
 
+class StrategyOhlcvLimitTest(unittest.TestCase):
+    def test_turtle_limit_tracks_channel_period_and_open_candle_buffer(self):
+        config = {'channel_period': 500}
+
+        self.assertEqual(cv.required_closed_candles_for_strategy('turtle', config), 502)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 503)
+
+    def test_ma_cross_limit_tracks_longest_required_window(self):
+        config = {'ma_long_period': 250, 'ma_stop_period': 400}
+
+        self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 500)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 501)
+
+    def test_default_periods_keep_existing_fetch_floor(self):
+        config = {'channel_period': 28, 'ma_long_period': 28, 'ma_stop_period': 28}
+
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 365)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 365)
+
+
 if __name__ == '__main__':
     unittest.main()

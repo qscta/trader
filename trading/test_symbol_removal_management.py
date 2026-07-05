@@ -40,7 +40,7 @@ def _build_system(tmpdir, config_symbols):
         send_message=lambda *a, **k: True,
         notify_error=lambda *a, **k: True,
         notify_stop_loss_updates_summary=lambda *a, **k: True)
-    system.send_daily_position_summary_if_due = lambda force=False: False
+    system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: False
 
     checked = []  # [(symbol, strategy_type)]，由策略选择处记录
 

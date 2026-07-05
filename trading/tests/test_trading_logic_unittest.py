@@ -316,6 +316,29 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(entry_price, 123.45)
         self.assertEqual(stop_loss_price, 100)
         self.assertEqual(symbol_config["strategy"], "turtle")
+        fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=365)
+
+    def test_instant_open_fetch_limit_tracks_large_turtle_config(self):
+        self.authenticate()
+        fake_system = self.make_system()
+        fake_system.config = {
+            "strategy": {"channel_period": 500},
+            "trading": {"symbols": []},
+        }
+        df_marker = [None] * 502
+        fake_system.exchange_api.ohlcv_to_dataframe.return_value = df_marker
+        fake_system.exchange_api.filter_closed_candles.return_value = df_marker
+
+        with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.post(
+                "/api/instant_open",
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=503)
 
 
 class SymbolInputValidationTests(unittest.TestCase):
@@ -739,7 +762,7 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
 
         trade_state.get_open_position = get_open_position
 
-        def execute_open(symbol, side, entry_price, stop_loss_price, symbol_config):
+        def execute_open(symbol, side, entry_price, stop_loss_price, symbol_config, buffer_notification=True):
             trade_state.position = {
                 "entry_price": entry_price,
                 "position_size": 1.0,

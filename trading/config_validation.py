@@ -16,12 +16,43 @@ import re
 # 策略周期允许范围（整数，含端点）
 PERIOD_MIN = 2
 PERIOD_MAX = 500
+# 主循环默认至少拉取约一年日线；大周期策略按实际配置自动上调。
+DEFAULT_OHLCV_FETCH_LIMIT = 365
+# fetch_ohlcv 可能包含当前未收盘 K 线，过滤后要仍满足策略最低已收盘根数。
+OPEN_CANDLE_FETCH_BUFFER = 1
 # 单笔风险度上限 50%：防止把 1 当 1% 输这类数量级笔误直接放大到全仓
 MAX_RISK_PER_TRADE = 0.5
 # 内部交易对名：大写字母/数字，以 USDT 结尾（U 本位永续）
 SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
 # 支持的策略
 STRATEGY_WHITELIST = ('turtle', 'ma_cross')
+
+
+def _strategy_period(strategy_config, key, default):
+    """读取策略周期：缺省键走默认值，显式值仍用 strict_int 保持三入口同口径。"""
+    strategy_config = strategy_config or {}
+    value = strategy_config.get(key)
+    if value is None:
+        value = default
+    return strict_int(value, f'config.strategy.{key}')
+
+
+def required_closed_candles_for_strategy(strategy_type, strategy_config=None):
+    """返回策略计算所需的最低“已收盘”K 线根数。"""
+    if strategy_type == 'ma_cross':
+        long_period = _strategy_period(strategy_config, 'ma_long_period', 28)
+        stop_period = _strategy_period(strategy_config, 'ma_stop_period', 28)
+        return max(long_period * 2, stop_period + 1)
+    if strategy_type == 'turtle':
+        channel_period = _strategy_period(strategy_config, 'channel_period', 28)
+        return channel_period + 2
+    raise ValueError(f'未知策略: {strategy_type!r}')
+
+
+def ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config=None):
+    """返回主数据管线应请求的 K 线根数，与策略窗口配置同源。"""
+    required = required_closed_candles_for_strategy(strategy_type, strategy_config)
+    return max(DEFAULT_OHLCV_FETCH_LIMIT, required + OPEN_CANDLE_FETCH_BUFFER)
 
 
 def strict_float_finite(value, field):

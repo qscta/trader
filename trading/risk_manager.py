@@ -30,4 +30,4 @@ class RiskManager:
         position_value = risk_amount / price_risk_pct
         position_size = position_value / entry_price
 
-        return round(position_size, 3)
+        return position_size

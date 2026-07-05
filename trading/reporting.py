@@ -101,7 +101,7 @@ class ReportingMixin:
             logger.error(f"推送持仓汇总失败: {e}")
             return False
 
-    def send_daily_position_summary_if_due(self, force=False):
+    def send_daily_position_summary_if_due(self, force=False, mark_sent=True):
         """每天最多推送一次持仓汇总；失败时允许后续重试。
 
         加锁保证「查重→推送→标记」原子：独立兜底调度(08:00:50/08:01:20)与
@@ -114,7 +114,10 @@ class ReportingMixin:
                 return False
 
             if self.send_daily_position_summary():
-                self._last_summary_date = today
+                if mark_sent:
+                    self._last_summary_date = today
+                else:
+                    logger.info(f"今日({today})每日持仓汇总已推送，本次不标记去重日期")
                 return True
 
             logger.warning(f"今日({today})每日持仓汇总推送未成功，等待后续重试")

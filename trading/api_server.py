@@ -13,8 +13,11 @@ from trade_state import enrich_closed_trade_with_fees
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
-from config_validation import (STRATEGY_WHITELIST, strict_int, strict_risk_per_trade,
-                               strict_bool, normalize_symbol_name, strict_float_finite)
+from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
+                               ohlcv_fetch_limit_for_strategy,
+                               required_closed_candles_for_strategy, strict_int,
+                               strict_risk_per_trade, strict_bool,
+                               normalize_symbol_name, strict_float_finite)
 
 
 def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
@@ -310,17 +313,25 @@ def add_symbol():
             try:
                 symbol_name = new_symbol['name']
                 ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-                ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=365)
+                fetch_limit = ohlcv_fetch_limit_for_strategy('turtle', system.config.get('strategy', {}))
+                required_closed = required_closed_candles_for_strategy('turtle', system.config.get('strategy', {}))
+                ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
                 if ohlcv:
                     df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
                     df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
-                    strategy = system.get_strategy_for_symbol({'strategy': 'turtle'})[0]
-                    armed = strategy.is_first_breakout_armed(df)
-                    if armed:
-                        system.trade_state.set_signal_state(symbol_name, True)
-                        logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为可开仓状态")
+                    if len(df) < required_closed:
+                        logger.warning(
+                            f"[{system.label}] {symbol_name} 历史回溯K线不足：海龟策略配置至少需要 "
+                            f"{required_closed} 根已收盘K线，本轮仅取得 {len(df)} 根"
+                            f"（请求 {fetch_limit} 根）")
                     else:
-                        logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为未激活状态")
+                        strategy = system.get_strategy_for_symbol({'strategy': 'turtle'})[0]
+                        armed = strategy.is_first_breakout_armed(df)
+                        if armed:
+                            system.trade_state.set_signal_state(symbol_name, True)
+                            logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为可开仓状态")
+                        else:
+                            logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为未激活状态")
             except Exception as e:
                 logger.warning(f"初始化 {new_symbol['name']} 状态失败: {e}")
 
@@ -650,8 +661,8 @@ def update_strategy_params():
             for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
                 if key in data:
                     v = strict_int(data[key], key)
-                    if not (2 <= v <= 500):
-                        return jsonify({'error': f'{key} 超出允许范围 [2, 500]: {v}'}), 400
+                    if not (PERIOD_MIN <= v <= PERIOD_MAX):
+                        return jsonify({'error': f'{key} 超出允许范围 [{PERIOD_MIN}, {PERIOD_MAX}]: {v}'}), 400
                     parsed[key] = v
             if 'default_risk_per_trade' in data:
                 parsed['default_risk_per_trade'] = strict_risk_per_trade(
@@ -716,14 +727,17 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-            ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=120)
+            fetch_limit = ohlcv_fetch_limit_for_strategy(strategy_type, system.config.get('strategy', {}))
+            required_closed = required_closed_candles_for_strategy(strategy_type, system.config.get('strategy', {}))
+            ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
             if not ohlcv:
                 return jsonify({'error': f'{symbol_name} 获取K线数据失败'}), 500
 
             df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
             df = system.exchange_api.filter_closed_candles(df, '1d')
-            if len(df) < 30:
-                return jsonify({'error': f'{symbol_name} K线数据不足'}), 400
+            if len(df) < required_closed:
+                return jsonify({'error': f'{symbol_name} K线数据不足：{strategy_type} 策略至少需要 '
+                                         f'{required_closed} 根已收盘K线，当前仅 {len(df)} 根'}), 400
 
             try:
                 current_price = system.exchange_api.get_last_price(ccxt_symbol)
@@ -879,11 +893,19 @@ def get_channel_data():
         if not symbol:
             return jsonify({'error': '缺少symbol参数'}), 400
 
-        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-        ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=60)
-        df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+        strategy_config = system.config.get('strategy', {})
+        period = strategy_config.get('channel_period', 28)  # 兜底与 TurtleStrategy 默认一致
+        required_closed = required_closed_candles_for_strategy('turtle', strategy_config)
+        fetch_limit = max(60, required_closed + 1)
 
-        period = system.config.get('strategy', {}).get('channel_period', 28)  # 兜底与 TurtleStrategy 默认一致
+        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
+        ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
+        df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+        df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
+        if len(df) < period + 1:
+            return jsonify({'error': f'{symbol} K线数据不足：海龟通道周期 {period} 至少需要 '
+                                     f'{period + 1} 根已收盘K线，当前仅 {len(df)} 根'}), 400
+
         closes = df['close'].values
         upper_list, lower_list = [], []
         for i in range(len(closes)):
