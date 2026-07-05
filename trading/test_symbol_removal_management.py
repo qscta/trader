@@ -176,6 +176,23 @@ class StartupCatchupTest(unittest.TestCase):
             system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
             self.assertEqual(calls, [])
 
+    def test_deploy_restart_skip_marks_today_done(self):
+        """部署晚间重启可显式跳过启动兜底，避免重启后立刻再跑一轮日检。"""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            system, calls = self._system(tmp)
+            with patch.dict(os.environ, {'TRADING_SKIP_STARTUP_CATCHUP_ONCE': '1'}):
+                self.assertTrue(system._apply_deploy_restart_skip_catchup())
+            self.assertEqual(system._last_check_date, date.today().isoformat())
+            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
+            self.assertEqual(calls, [])
+
+    def test_deploy_restart_skip_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _calls = self._system(tmp)
+            self.assertFalse(system._apply_deploy_restart_skip_catchup())
+            self.assertIsNone(system._last_check_date)
+
     def test_buffer_window_spans_hour_boundary(self):
         """check_minute 接近整点时缓冲窗口须跨整点：check_minute=59 的缓冲应到 09:01，
         08:59–09:00 内不抢跑（让正点 cron 先走），09:01 起才补跑。"""

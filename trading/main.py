@@ -690,13 +690,33 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，兜底补跑一轮日检")
         self.check_and_execute_trades()
 
+    def _apply_deploy_restart_skip_catchup(self):
+        """部署重启专用护栏：显式要求时只跳过今天的启动兜底日检。
+
+        实盘晚间滚动代码时，重启会让内存级 _last_check_date 丢失；若已过 08:00，
+        启动兜底会立刻按上一根已收盘日线再跑一轮，可能管理当前实盘仓位。部署方可在
+        本次重启的进程环境里设 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1，把今日标记为已
+        日检，避免启动/30分钟兜底补跑；次日自然恢复正常 08:00 日检。
+        """
+        if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
+            return False
+        today = date.today().isoformat()
+        self._last_check_date = today
+        logger.warning(
+            f"[{self.label}] 已按 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 标记今日({today})已日检，"
+            "本次部署重启跳过启动兜底补跑；次日正常恢复"
+        )
+        return True
+
     def start(self):
         """启动交易系统：注册定时任务、启动调度、阻塞主循环。"""
         logger.info("启动交易系统...")
+        skip_startup_catchup = self._apply_deploy_restart_skip_catchup()
         self.register_jobs(self.config.get('scheduler', {}))
         self.scheduler.start()
         logger.info(f"[{self.label}] 调度已启动，等待定时任务...")
-        self._run_startup_catchup_check()
+        if not skip_startup_catchup:
+            self._run_startup_catchup_check()
         try:
             while True:
                 time.sleep(60)
