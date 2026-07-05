@@ -394,6 +394,10 @@ def delete_symbol(symbol):
     try:
         symbol_u = symbol.upper()
         with trading_system._config_lock:
+            # 品种不在池中：直接 404，与 update_symbol 的语义一致。否则「删不存在的品种」
+            # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
+            if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
+                return jsonify({'error': '交易对不存在'}), 404
             # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，必须先把策略固化进持仓，
             # 否则删除后 check_and_execute 会按默认 turtle 托管，双均线仓位会被错误管理。
             held = system.trade_state.get_open_position(symbol_u)
