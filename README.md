@@ -109,7 +109,7 @@ pip install -r requirements.txt
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-CI（`.github/workflows/tests.yml`）在 Python 3.10–3.13 上跑标准库套件，并在 3.11 上跑依赖版套件。
+CI（`.github/workflows/tests.yml`）在 Python 3.10–3.13 上跑标准库套件，在 3.11 上跑依赖版套件，并对前端 `app.js` 做 `node --check` 语法检查。
 
 ## 🔒 安全须知
 
