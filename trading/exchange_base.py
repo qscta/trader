@@ -127,11 +127,14 @@ class ExchangeApi:
 
     @staticmethod
     def _normalize_precision(value):
-        """把步长/小数位统一转换成小数位数（整数）。
-        ccxt 合约 precision.amount 可能是步长格式：
+        """把 ccxt 合约 precision.amount 的**步长**转换成小数位数（整数）。
+        OKX（本项目唯一对接的交易所）的 precision.amount 恒为步长格式：
         - 1.0 / 1 -> 0 位（只能整数）
         - 0.1 -> 1 位, 0.01 -> 2 位, 1e-05 -> 5 位
-        也可能本身就是小数位数（整数），此处一并兼容。
+        注意：>=1 一律按步长语义判 0 位。若未来接入以「小数位数整数」表达精度的
+        交易所（如 precision.amount=5 表示 5 位），此函数会误判为 0 位——那种语义
+        与步长无法从单个数值区分，须在对应适配层另行处理，不要指望这里兼容。
+        本值仅用于日志展示与换算兜底，实际下单走 ccxt amount_to_precision。
         """
         if value is None:
             return 3

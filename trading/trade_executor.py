@@ -142,8 +142,10 @@ class TradeExecutorMixin:
             return
 
         balance = self.exchange_api.get_balance()
-        if balance:
-            account_equity = balance['total']['USDT']
+        # 防御式取值：balance 为空、缺 total 段、或该段无 USDT 键，统一回退上次记录的权益
+        # （与启动/统计路径的 .get 口径一致；直接 balance['total']['USDT'] 遇缺键会抛 KeyError）
+        account_equity = balance.get('total', {}).get('USDT') if balance else None
+        if account_equity is not None:
             self.risk_manager.account_equity = account_equity
             logger.info(f"已更新账户权益: {account_equity} USDT")
         else:

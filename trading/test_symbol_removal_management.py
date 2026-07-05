@@ -176,6 +176,19 @@ class StartupCatchupTest(unittest.TestCase):
             system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
             self.assertEqual(calls, [])
 
+    def test_buffer_window_spans_hour_boundary(self):
+        """check_minute 接近整点时缓冲窗口须跨整点：check_minute=59 的缓冲应到 09:01，
+        08:59–09:00 内不抢跑（让正点 cron 先走），09:01 起才补跑。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, calls = self._system(tmp)
+            system.config['scheduler'] = {'check_hour': 8, 'check_minute': 59}
+            # 09:00 仍在 2 分钟缓冲窗口内（08:59 正点 + 2 分钟 = 09:01），不补跑
+            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 9, 0))
+            self.assertEqual(calls, [])
+            # 09:02 已过缓冲窗口且今日未跑：补跑一轮
+            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 9, 2))
+            self.assertEqual(calls, [1])
+
 
 class DailyCheckFallbackJobTest(unittest.TestCase):
     """日检兜底任务：register_jobs 注册每 30 分钟的幂等兜底补跑，
