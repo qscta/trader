@@ -31,31 +31,3 @@ class RiskManager:
         position_size = position_value / entry_price
 
         return round(position_size, 3)
-
-    def calculate_stop_loss(self, entry_price, lower_channel, upper_channel, side):
-        """
-        计算止损价格
-        做多：止损价 = 下轨
-        做空：止损价 = 上轨
-        """
-        if side == 'long':
-            return lower_channel
-        elif side == 'short':
-            return upper_channel
-        else:
-            return None
-
-    def validate_trade(self, account_equity, entry_price, stop_loss_price, min_position_size=0.001):
-        """验证交易是否有效"""
-        if entry_price == stop_loss_price:
-            return False, "入场价和止损价相同"
-
-        if account_equity <= 0:
-            return False, "账户权益不足"
-
-        position_size = self.calculate_position_size(entry_price, stop_loss_price)
-
-        if position_size < min_position_size:
-            return False, f"头寸大小过小: {position_size}"
-
-        return True, "验证通过"

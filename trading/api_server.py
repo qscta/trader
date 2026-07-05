@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, send_from_directory, session
 from functools import wraps
+from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import logging
 import threading
@@ -39,6 +40,12 @@ def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=Non
     return clean, None
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
+# 部署要求（README）：公网访问须经 HTTPS 反向代理直连本 gunicorn。反代场景下
+# request.remote_addr 原本是反代自身地址（对所有访客都一样）——登录防爆破按 IP
+# 计数会失效为全局计数：任何人故意登录失败 5 次就会把管理员自己也锁 60 秒，
+# 且可反复触发形成持续锁定。只信任 1 跳 X-Forwarded-For（对应"单反代直连"这一
+# 已声明的部署拓扑），让 remote_addr 还原为真实客户端 IP。
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
 try:
     app.json.ensure_ascii = False     # Flask >= 2.2（JSON_AS_ASCII 已废弃）
