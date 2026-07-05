@@ -1215,5 +1215,44 @@ class LoginBackoffTests(unittest.TestCase):
         self.assertEqual(self._login("right-pass").status_code, 200)
 
 
+class SchedulerIntervalTests(unittest.TestCase):
+    """盘中止损巡检间隔的调度注册——用真实 BackgroundScheduler 触发 APScheduler
+    的表达式校验（标准库套件把调度器换成 Dummy 桩，测不到这条真实崩溃路径）。
+
+    缺陷背景：_validate_scheduler_config 放行 stop_loss_scan_interval_minutes ∈ [1,1440]，
+    但 register_jobs 曾一律用 cron minute='*/N'——N≥60 时 APScheduler 抛
+    "step value higher than the total range (59)"，在 start() 的守护线程里让整个调度
+    注册崩溃：Web 面板照常，但日检/巡检/采样一个都不注册（静默僵死）。
+    """
+
+    def _make(self):
+        from apscheduler.schedulers.background import BackgroundScheduler
+        system = object.__new__(main.TradingSystem)
+        system.scheduler = BackgroundScheduler()
+        system.exchange_id = "okx"
+        system.label = "欧易"
+        # register_jobs 末尾会真正调用一次采样；其余 add_job 只登记 bound method 不执行
+        system._record_equity_tick_with_alert = lambda: None
+        return system
+
+    def test_large_interval_registers_via_interval_trigger(self):
+        from apscheduler.triggers.interval import IntervalTrigger
+        for interval in (60, 120, 1440):
+            system = self._make()
+            # 旧实现在此对 '*/60' 抛 ValueError；修复后走 interval 触发器
+            system.register_jobs({"stop_loss_scan_interval_minutes": interval})
+            job = system.scheduler.get_job("okx_stoploss_scan")
+            self.assertIsNotNone(job, f"间隔 {interval} 分钟应注册出巡检任务")
+            self.assertIsInstance(job.trigger, IntervalTrigger)
+
+    def test_sub_hour_interval_stays_cron(self):
+        from apscheduler.triggers.cron import CronTrigger
+        system = self._make()
+        system.register_jobs({"stop_loss_scan_interval_minutes": 5})
+        job = system.scheduler.get_job("okx_stoploss_scan")
+        self.assertIsNotNone(job)
+        self.assertIsInstance(job.trigger, CronTrigger)
+
+
 if __name__ == "__main__":
     unittest.main()

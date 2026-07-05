@@ -721,9 +721,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                               minute='*/5', second=15)
 
         stop_loss_scan_interval = max(1, int(scheduler_config.get('stop_loss_scan_interval_minutes', 5)))
-        self.scheduler.add_job(self.reconcile_intraday_stop_losses, 'cron',
-                              id=f'{ex}_stoploss_scan', max_instances=1, coalesce=True, misfire_grace_time=120,
-                              minute=f'*/{stop_loss_scan_interval}', second=45)
+        if stop_loss_scan_interval <= 59:
+            # cron 分钟步长仅支持 [1,59]：对齐到每 N 分钟的 :45 秒，错开权益采样(:15)与日检(:05/20/40)
+            self.scheduler.add_job(self.reconcile_intraday_stop_losses, 'cron',
+                                  id=f'{ex}_stoploss_scan', max_instances=1, coalesce=True, misfire_grace_time=120,
+                                  minute=f'*/{stop_loss_scan_interval}', second=45)
+        else:
+            # 间隔 ≥ 60 分钟：cron 的 minute='*/N' 会被 APScheduler 拒绝（步长 > 59，抛
+            # "step value higher than the total range"）——那会在守护线程里让整个调度注册崩溃，
+            # 交易线程静默死亡（Web 面板照常、日检/巡检/采样全部不跑）。改用 interval 触发器，
+            # 覆盖 _validate_scheduler_config 放行的 [60,1440] 全区间，与校验口径一致。
+            self.scheduler.add_job(self.reconcile_intraday_stop_losses, 'interval',
+                                  id=f'{ex}_stoploss_scan', max_instances=1, coalesce=True, misfire_grace_time=120,
+                                  minutes=stop_loss_scan_interval)
 
         # 主执行 + 短窗口重试（成功一次后由 _last_check_date 拦截重复）
         self.scheduler.add_job(self.check_and_execute_trades, 'cron',

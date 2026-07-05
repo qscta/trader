@@ -276,6 +276,24 @@ class StartupSmokeTest(unittest.TestCase):
             self.assertIsInstance(sched['check_minute'], int)
             self.assertIsInstance(sched['stop_loss_scan_interval_minutes'], int)
 
+    def test_large_scan_interval_passes_validation(self):
+        """巡检间隔 ≥ 60 分钟必须通过启动校验（_validate_scheduler_config 放行 [1,1440]）。
+
+        注意：本标准库套件把 BackgroundScheduler 换成 Dummy 桩，add_job 空转、不校验
+        cron 表达式——所以「register_jobs 对 '*/60' 是否崩溃」只能在装了真 apscheduler
+        的依赖套件（tests/test_trading_logic_unittest.SchedulerIntervalTests）里验证。
+        这里只锁定「校验放行」这半边契约，与那边的「注册不崩」共同构成完整回归。"""
+        for interval in (60, 120, 1440):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg.setdefault('scheduler', {})['stop_loss_scan_interval_minutes'] = interval
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    system = TradingSystem(config_file=path)   # 校验须放行、不抛
+                self.assertEqual(
+                    system.config['scheduler']['stop_loss_scan_interval_minutes'], interval)
+
 
 if __name__ == '__main__':
     unittest.main()
