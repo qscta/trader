@@ -161,7 +161,7 @@ def api_login():
         if now < locked_until:
             return jsonify({'success': False,
                             'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     if data.get('password', '') == LOGIN_PASSWORD:
         with _login_guard:
             _login_failures.pop(ip, None)
@@ -310,7 +310,8 @@ def add_symbol():
             try:
                 symbol_name = new_symbol['name']
                 ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-                ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=365)
+                ohlcv = system.exchange_api.fetch_ohlcv(
+                    ccxt_symbol, '1d', limit=getattr(system, 'kline_fetch_limit', lambda: 365)())
                 if ohlcv:
                     df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
                     df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
@@ -716,7 +717,8 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-            ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=120)
+            ohlcv = system.exchange_api.fetch_ohlcv(
+                ccxt_symbol, '1d', limit=getattr(system, 'kline_fetch_limit', lambda: 365)())
             if not ohlcv:
                 return jsonify({'error': f'{symbol_name} 获取K线数据失败'}), 500
 

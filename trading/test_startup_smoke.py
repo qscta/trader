@@ -238,6 +238,27 @@ class StartupSmokeTest(unittest.TestCase):
                 system = TradingSystem(config_file=path)
             self.assertEqual(system.exchange_id, 'okx')
 
+    def test_kline_fetch_limit_scales_with_periods(self):
+        """日线拉取根数随策略周期增长：常见配置恒为 365（既有行为不变），
+        大周期（校验允许到 500）时按需放大，消除「校验放行、拉取写死 365/120 服务不了」的缺口。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._boot(tmp)
+            # 默认周期（≤28）：与历史写死值一致，proven 路径逐字不变
+            self.assertEqual(system.kline_fetch_limit(), 365)
+
+            # 双均线长周期 200：min_required = long*2 = 400 > 365，必须放大到能覆盖
+            system.config['strategy']['ma_long_period'] = 200
+            self.assertGreaterEqual(system.kline_fetch_limit(), 405)
+
+            # 海龟长通道 400：需 channel_period + 2，同样放大
+            system.config['strategy']['ma_long_period'] = 28
+            system.config['strategy']['channel_period'] = 400
+            self.assertGreaterEqual(system.kline_fetch_limit(), 402)
+
+            # 极端上限封顶，不发无意义超大请求
+            system.config['strategy']['ma_long_period'] = 500
+            self.assertLessEqual(system.kline_fetch_limit(), 1500)
+
     def test_out_of_range_scheduler_config_rejected(self):
         """手写 config.json 的调度参数非法值：启动即拒（给清晰 ValueError，
         而非 register_jobs 里 check_minute+1 的 TypeError / APScheduler 内部错）。"""

@@ -434,6 +434,31 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         else:
             return self.turtle_strategy, 'turtle'
 
+    def kline_fetch_limit(self):
+        """按当前策略参数推导日线拉取根数（下限 365 保持既有已验证行为，上限 1500 防极端配置发超大请求）。
+
+        校验层允许周期到 PERIOD_MAX(500)，但拉取根数此前写死（日检 365 / 即时开仓 120）：
+        当 ma_long_period≥183（需 >365 根）或 channel_period/ma_stop_period>363 时，check_signal
+        每轮因数据不足返回 None → 该品种静默不交易（只留一条「K线数据不足」warning），
+        且即时开仓（原拉 120）与日检对「同配置能否交易」判定不一致。让拉取量随配置增长，
+        消除「校验放行、运行时服务不了」的缺口。常见配置（周期≤~180）结果恒为 365，既有行为逐字不变；
+        真正超出交易所可返回历史的极端配置仍安全退化为原有的「数据不足」warning，无回归。
+        """
+        s = self.config.get('strategy', {})
+
+        def _p(key, default):
+            try:
+                return int(s.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        needed = max(
+            _p('channel_period', 28) + 5,       # 海龟 check_signal 需 channel_period + 2，留冗余
+            _p('ma_long_period', 28) * 2 + 5,   # 双均线 min_required = max(long*2, stop+1)
+            _p('ma_stop_period', 28) + 5,
+        )
+        return max(365, min(needed, 1500))
+
     def _load_stop_loss_dates(self):
         """从文件加载止损日期记录"""
         if os.path.exists(self.stop_loss_file):
@@ -538,7 +563,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
                     ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
-                    ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=365)
+                    ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=self.kline_fetch_limit())
                     if not ohlcv:
                         logger.warning(f"{symbol} 获取K线数据失败")
                         continue
