@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 class SignalHandlersMixin:
 
+    def _mark_ma_cross_reentry_pending(self, symbol, side, signal, reason):
+        """双均线开仓腿失败后统一收口：记 T+1「重入待定」标记 + 告警。
+
+        双均线「永远在市」：任一开仓腿失败（初始金叉/死叉开仓、翻转反手、T+1 重入）若不留
+        恢复线索，该品种会一直空到下一次全新 EMA 交叉。记 T+1 让次日 handle_no_position_ma_cross
+        的重入逻辑按当时 EMA 方向自动补回持仓——与止损后 T+1 重入同一套机制。
+        （标记记为当天：当日不再抢开，交由次日重入；同日 08:01 整轮重试对孤立失败本不触发，
+        故不抑制既有恢复。）
+        """
+        self.record_stop_loss(symbol)
+        self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
+
     def handle_no_position_turtle(self, symbol, signal, symbol_config, df):
         """海龟策略：处理没有开仓头寸的情况"""
         logger.info(f"{symbol} [海龟] 没有开仓头寸，检查是否有开仓信号...")
@@ -203,12 +215,11 @@ class SignalHandlersMixin:
             stop_loss_price = signal['lower_stop']
             self._execute_open(symbol, 'long', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._notify_missing_position_after_signal(
+                self._mark_ma_cross_reentry_pending(
                     symbol,
-                    'ma_cross',
                     'long',
                     signal,
-                    '双均线做多信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
+                    '双均线做多信号已出现，但本轮检查结束后仍无持仓，已记 T+1 次日按 EMA 方向重入'
                 )
         elif signal['action'] == 'short':
             logger.info(f"{symbol} [双均线] 死叉信号，准备做空...")
@@ -216,12 +227,11 @@ class SignalHandlersMixin:
             stop_loss_price = signal['upper_stop']
             self._execute_open(symbol, 'short', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._notify_missing_position_after_signal(
+                self._mark_ma_cross_reentry_pending(
                     symbol,
-                    'ma_cross',
                     'short',
                     signal,
-                    '双均线做空信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
+                    '双均线做空信号已出现，但本轮检查结束后仍无持仓，已记 T+1 次日按 EMA 方向重入'
                 )
         else:
             yesterday_str = None
@@ -239,16 +249,21 @@ class SignalHandlersMixin:
                         stop_loss_price = reentry_signal['upper_stop']
                     logger.info(f"{symbol} [双均线] T+1重入: 方向={side}, EMA仍然{'看多' if side == 'long' else '看空'}")
                     self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
-                    if not self.trade_state.get_open_position(symbol):
+                    if self.trade_state.get_open_position(symbol):
+                        # 重入成功：解除 T+1 标记，回归常规「永远在市」
+                        del self.stop_loss_dates[symbol]
+                        self._save_stop_loss_dates()
+                    else:
+                        # 重入开仓未成功（价格已穿止损/超时未确认/残留阻断等）：**保留** T+1 标记，
+                        # 次日 EMA 方向仍成立则再重试重入，不放弃「永远在市」（此前无条件删除会永久放弃）
                         self._notify_missing_position_after_signal(
                             symbol,
                             'ma_cross',
                             side,
                             reentry_signal,
-                            '双均线 T+1 重入信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
+                            '双均线 T+1 重入开仓未成功，已保留标记次日按 EMA 方向重试，请复核交易所与日志'
                         )
-                    del self.stop_loss_dates[symbol]
-                    self._save_stop_loss_dates()
+                        logger.warning(f"{symbol} [双均线] T+1 重入开仓未成功，保留标记次日重试")
                 else:
                     logger.info(f"{symbol} [双均线] 重入条件不满足（EMA方向已变），不重入")
                     if symbol in self.stop_loss_dates:

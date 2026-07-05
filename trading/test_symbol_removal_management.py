@@ -248,7 +248,8 @@ class MaCrossFlipResidueTest(unittest.TestCase):
         system._pending_trade_close_notifications = []
         system.stop_loss_file = os.path.join(tmp, 'stop_loss_dates.json')
         system.stop_loss_dates = {}
-        system.notifier = SimpleNamespace(notify_error=lambda *a, **k: True)
+        system.notifier = SimpleNamespace(notify_error=lambda *a, **k: True,
+                                          notify_signal_missed=lambda *a, **k: True)
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda s: s,
             exchange=SimpleNamespace(fetch_ticker=lambda s: {'last': 2900.0}),
@@ -257,7 +258,14 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             cancel_order=lambda *a, **k: cancel_ok,
             cancel_all_orders=lambda *a, **k: cancel_ok or None)
         opened = []
-        system._execute_open = lambda *a, **k: opened.append(a)
+
+        def _fake_open(*a, **k):
+            # 桩须模拟真实 _execute_open 成功建仓（add_open_position），否则 get_open_position
+            # 仍返回 None，会被翻转的「开仓腿失败」检测误判为失败并错记 T+1
+            opened.append(a)
+            system.trade_state.add_open_position(a[0], a[1], 2900.0, 1.0, 2800.0,
+                                                 'stop-new', strategy='ma_cross')
+        system._execute_open = _fake_open
         return system, opened
 
     def test_unconfirmed_cancel_records_t1_and_blocks_reopen(self):

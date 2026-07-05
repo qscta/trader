@@ -216,6 +216,34 @@ class MaCrossTPlusOneTests(unittest.TestCase):
         self.assertNotIn("ETHUSDT", system.stop_loss_dates)
         system._save_stop_loss_dates.assert_called()
 
+    def test_next_day_reentry_keeps_marker_when_open_fails(self):
+        """T+1 重入开仓腿失败（成交后仍无持仓）：保留 T+1 标记，次日再重试重入，
+        不放弃「永远在市」（此前无条件删除标记会永久放弃）。"""
+        system = self.make_system()
+        system.trade_state.get_open_position = Mock(return_value=None)  # 开仓腿失败
+        system.stop_loss_dates["ETHUSDT"] = "2000-01-01"
+        system.ma_cross_strategy.check_reentry_condition.return_value = (
+            True, "long", {"current_close": 100, "lower_stop": 90, "upper_stop": 110},
+        )
+        signal = {"action": None}
+        system.handle_no_position_ma_cross("ETHUSDT", signal, {"name": "ETHUSDT"}, df=object())
+
+        system._execute_open.assert_called_once()
+        self.assertIn("ETHUSDT", system.stop_loss_dates)          # 标记保留
+        system.notifier.notify_signal_missed.assert_called_once()
+
+    def test_initial_open_failure_records_tplus1_for_reentry(self):
+        """初始金叉/死叉开仓腿失败：记 T+1，次日按 EMA 方向自动重入恢复「永远在市」。"""
+        system = self.make_system()
+        system.trade_state.get_open_position = Mock(return_value=None)  # 开仓腿失败
+        signal = {"action": "long", "current_close": 100, "lower_stop": 90, "upper_stop": 110}
+        system.handle_no_position_ma_cross("ETHUSDT", signal, {"name": "ETHUSDT"}, df=object())
+
+        system._execute_open.assert_called_once()
+        today = main.date.today().strftime("%Y-%m-%d")
+        self.assertEqual(system.stop_loss_dates.get("ETHUSDT"), today)  # 记了 T+1
+        system.notifier.notify_signal_missed.assert_called_once()
+
 
 class InstantOpenApiTests(unittest.TestCase):
     def setUp(self):
@@ -1025,6 +1053,21 @@ class MaCrossFlipTests(unittest.TestCase):
         system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
         system._execute_open.assert_not_called()
         system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记 T+1，次日按 EMA 方向重入
+
+    def test_flip_records_tplus1_when_reopen_leg_fails(self):
+        """翻转平旧成功、反手开新腿失败（成交后仍无持仓）：记 T+1，次日按 EMA 方向重入，
+        恢复「永远在市」（此前失败后不留恢复线索，会空到下一次全新交叉）。"""
+        system = self.make_system()
+        system.notifier.notify_signal_missed = Mock()
+        system.trade_state.get_open_position = Mock(return_value=None)  # 反手开仓腿失败
+        old_position = {"side": "short", "position_size": 2.0, "stop_order_id": "stop-1"}
+        signal = {"current_close": 110, "lower_stop": 95, "upper_stop": 125}
+
+        system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
+
+        system._execute_open.assert_called_once()                 # 尝试了反手
+        system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记 T+1 次日重入
+        system.notifier.notify_signal_missed.assert_called_once()
 
     def test_handle_open_position_ma_cross_records_stop_loss_and_returns_when_exchange_position_missing(self):
         system = self.make_system()

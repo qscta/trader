@@ -165,7 +165,11 @@ def api_login():
             return jsonify({'success': False,
                             'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
     data = request.get_json() or {}
-    if data.get('password', '') == LOGIN_PASSWORD:
+    # 恒定时间比较，消除密码校验的计时侧信道（与 API Token 的 compare_digest 口径一致）。
+    # 必须编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，含中文等非 ASCII 密码
+    # 会抛 TypeError 令登录彻底失效；bytes 无此限制。str() 兜底防 password 传非字符串。
+    if secrets.compare_digest(str(data.get('password', '')).encode('utf-8'),
+                              LOGIN_PASSWORD.encode('utf-8')):
         with _login_guard:
             _login_failures.pop(ip, None)
         session['authenticated'] = True
@@ -623,7 +627,9 @@ def get_qiusuo_index_ohlc():
     except (TypeError, ValueError):
         return jsonify({'error': 'days 参数无效'}), 400
     if days > 0:
-        days = max(7, days)   # 去掉 730 上限，允许更长区间
+        # 下限 7；上限 100000 天（≈274 年，对任何真实数据集等价于「全部」）——
+        # 不设上限时 days=1000万 会让 datetime.now()-timedelta(days) 抛 OverflowError → 500
+        days = max(7, min(days, 100000))
     # days <= 0 表示「全部」，由 EquityTracker 返回完整历史
     try:
         return jsonify(system.equity_tracker.build_qiusuo_index_ohlc(days=days))
