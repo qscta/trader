@@ -416,8 +416,8 @@ def delete_symbol(symbol):
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，删除已回滚')
             if err_resp:
                 return err_resp
-        send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
-        return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
+        send_dingtalk(f'[{system.label}] 删除交易对: {symbol_u}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已删除'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

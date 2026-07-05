@@ -82,6 +82,44 @@ class DrawdownStatsTest(unittest.TestCase):
         self.assertEqual(d['longest_drawdown_days'], 5)
 
 
+class MalformedBalanceTest(unittest.TestCase):
+    """balance 为真但缺 total/free 段（异常 ccxt 响应）时，统计不因直接下标抛 KeyError。
+
+    全仓约定用防御式 `.get('total', {}).get('USDT', 0)`；此前 equity_tracker 部分路径
+    直接 `balance['total']` 下标，缺键会把统计/同步路由冲成 500。
+    """
+
+    def _tracker(self, tmp, balance):
+        system = SimpleNamespace(
+            exchange_api=SimpleNamespace(
+                get_balance=lambda: balance,
+                to_ccxt_symbol=lambda s: s,
+                exchange=SimpleNamespace(fetch_ticker=lambda s: {'last': 1})),
+            trade_state=SimpleNamespace(get_all_open_positions=lambda: {}))
+        return eqt.EquityTracker(tmp, system)
+
+    def test_missing_free_segment_defaults_to_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = self._tracker(tmp, {'total': {'USDT': 100.0}})   # 缺 free 段
+            d = t.build_account_stats(persist=False)
+            self.assertEqual(d['current_equity'], 100.0)
+            self.assertEqual(d['free_balance'], 0)
+
+    def test_missing_total_and_free_segments_default_to_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = self._tracker(tmp, {'used': {'USDT': 5.0}})      # 真但缺 total/free
+            d = t.build_account_stats(persist=False)             # 旧实现在此抛 KeyError
+            self.assertEqual(d['current_equity'], 0)
+            self.assertEqual(d['free_balance'], 0)
+
+    def test_snapshot_and_tick_survive_missing_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = self._tracker(tmp, {'used': {'USDT': 5.0}})      # 缺 total 段
+            # 采样/每日快照读到畸形余额时静默跳过（equity 归 0 → _coerce 返回 None），不崩
+            self.assertFalse(t.record_equity_tick())
+            t.record_daily_equity_snapshot()                     # 不得抛 KeyError
+
+
 class EquitySyncFlowTest(unittest.TestCase):
     """资金变动同步：提供净变动金额时按「变动前权益 ÷ 旧除数」精确锚定，不受点击时机影响。"""
 

@@ -162,8 +162,10 @@ class EquityTracker:
         if not balance:
             raise RuntimeError('获取账户余额失败')
 
-        current_equity = balance['total'].get('USDT', 0)
-        free_balance = balance['free'].get('USDT', 0)
+        # 防御式取值：与 main/trade_executor 同口径。balance 为真但缺 total/free 段
+        # （异常 ccxt 响应）时直接下标会抛 KeyError → 统计路由 500；.get 兜底降级为 0
+        current_equity = balance.get('total', {}).get('USDT', 0)
+        free_balance = balance.get('free', {}).get('USDT', 0)
         open_positions = self.system.trade_state.get_all_open_positions()
         total_unrealized_pnl = 0
         total_stop_loss_amount = 0
@@ -541,7 +543,7 @@ class EquityTracker:
                 balance = self.system.exchange_api.get_balance()
                 if not balance:
                     return False
-                equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+                equity = _coerce_positive_float(balance.get('total', {}).get('USDT', 0))
                 if equity is None:
                     return False
 
@@ -666,7 +668,7 @@ class EquityTracker:
             balance = self.system.exchange_api.get_balance()
             if not balance:
                 return
-            equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+            equity = _coerce_positive_float(balance.get('total', {}).get('USDT', 0))
             if equity is None:
                 return
             now = datetime.now()
@@ -755,7 +757,7 @@ class EquityTracker:
         balance = self.system.exchange_api.get_balance()
         if not balance:
             raise RuntimeError('获取账户余额失败')
-        current_equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+        current_equity = _coerce_positive_float(balance.get('total', {}).get('USDT', 0))
         if current_equity is None:
             raise ValueError('当前权益为0，无法同步')
 

@@ -87,7 +87,9 @@ class ReportingMixin:
             symbols_config = self.config['trading']['symbols']
             try:
                 balance = self.exchange_api.get_balance()
-                total_equity = float(balance['total']['USDT']) if balance else None
+                # 防御式取值：balance 为真但缺 total 段/无 USDT 键时不抛 KeyError，降级为「权益未知」
+                _usdt = balance.get('total', {}).get('USDT') if balance else None
+                total_equity = float(_usdt) if _usdt is not None else None
             except Exception as e:
                 logger.warning(f"获取权益失败: {e}")
                 total_equity = None
