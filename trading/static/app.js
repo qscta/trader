@@ -343,11 +343,23 @@ async function loadPositions() {
         const entries = Object.entries(positions || {});
         _positionSymbols = entries.map(([s]) => s);
         if (!entries.length) { box.innerHTML = '<div class="empty">当前无持仓</div>'; return; }
+        let totalPnl = 0;
+        let totalNotional = 0;
+        let totalStopRisk = 0;
         let rows = entries.map(([symbol, p]) => {
             const sideBadge = p.side === 'long' ? '<span class="badge badge-long">多</span>' : '<span class="badge badge-short">空</span>';
             const cur = p.current_price != null ? fmt(p.current_price, 4) : '-';
             const pnl = p.unrealized_pnl != null ? `<span class="${pnlClass(p.unrealized_pnl)}">${p.unrealized_pnl>=0?'+':''}${fmt(p.unrealized_pnl)}</span>` : '-';
             const days = p.holding_days != null ? p.holding_days + ' 天' : '-';
+            const entry = Number(p.entry_price);
+            const size = Number(p.position_size);
+            const mark = p.current_price != null ? Number(p.current_price) : entry;
+            const stop = Number(p.stop_loss_price);
+            if (!isNaN(p.unrealized_pnl)) totalPnl += Number(p.unrealized_pnl);
+            if (!isNaN(mark) && !isNaN(size)) totalNotional += Math.abs(mark * size);
+            if (!isNaN(entry) && !isNaN(size) && !isNaN(stop)) {
+                totalStopRisk += Math.max(0, (p.side === 'long' ? entry - stop : stop - entry) * size);
+            }
             return `<tr>
                 <td><span class="symbol-name">${symbol}</span></td>
                 <td>${sideBadge}</td>
@@ -358,9 +370,15 @@ async function loadPositions() {
                 <td class="center-cell"><button class="btn-close-pos" data-action="close" data-symbol="${symbol}" data-side="${p.side}" data-size="${p.position_size}">平仓</button></td>
             </tr>`;
         }).join('');
-        box.innerHTML = `<div class="table-wrap"><table class="data"><thead><tr>
+        const pnlSign = totalPnl >= 0 ? '+' : '';
+        const summary = `<div class="position-summary">
+            <div class="position-summary-item"><span class="position-summary-label">浮动盈亏</span><span class="position-summary-value ${totalPnl >= 0 ? 'green' : 'red'}">${pnlSign}${fmt(totalPnl)}U</span></div>
+            <div class="position-summary-item"><span class="position-summary-label">名义价值</span><span class="position-summary-value">${fmt(totalNotional)}U</span></div>
+            <div class="position-summary-item"><span class="position-summary-label">止损风险</span><span class="position-summary-value red">${fmt(totalStopRisk)}U</span></div>
+        </div>`;
+        box.innerHTML = `<div class="positions-table-wrap"><table class="data"><thead><tr>
             <th>交易对</th><th>方向</th><th class="number-cell">入场价</th><th class="number-cell">现价</th>
-            <th class="number-cell">浮动盈亏</th><th>持仓</th><th class="center-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+            <th class="number-cell">浮动盈亏</th><th>持仓</th><th class="center-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>${summary}`;
     } catch (e) {
         box.innerHTML = '<div class="empty">持仓加载失败</div>';
     }
