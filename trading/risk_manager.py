@@ -1,3 +1,6 @@
+import math
+
+
 class RiskManager:
     def __init__(self, account_equity, risk_per_trade=0.01):
         """
@@ -30,4 +33,7 @@ class RiskManager:
         position_value = risk_amount / price_risk_pct
         position_size = position_value / entry_price
 
-        return round(position_size, 3)
+        # 向下取整（floor），不用 round：round 是四舍五入会进位，把偏大的币数喂给下游
+        # 张数截断后可能比严格 floor 多一个张步 = 轻微超仓，与「以损定量、绝不超风险」相悖。
+        # 最终下单张数仍由 round_quantity 按整张截断，这里先按 3 位小数向下取整保持粒度一致。
+        return math.floor(position_size * 1000) / 1000
