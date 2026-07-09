@@ -106,7 +106,7 @@ def run_side(api, ccxt_symbol, coin, side):
             time.sleep(2)
 
             algos = api._fetch_algo_orders(ccxt_symbol)
-            print(f"[{side}] 查到算法/条件单 {len(algos)} 个:")
+            print(f"[{side}] 查到算法/条件单 {len(algos)} 个（原生 orders-algo-pending 端点）:")
             for o in algos:
                 info = o.get('info') or {}
                 print("    -", {'id': o.get('id'), 'side': o.get('side'),
@@ -114,7 +114,19 @@ def run_side(api, ccxt_symbol, coin, side):
                                 'ordType': info.get('ordType'),
                                 'slTriggerPx': info.get('slTriggerPx')})
             if not algos:
-                print(f"[{side}] ⚠️ 没查到算法止损单！可能没挂上或查询参数不匹配。")
+                print(f"[{side}] ⚠️ 没查到算法止损单！可能没挂上或查询路径异常。")
+                ok = False
+
+            # 三态判定全链路：原生查询 + 方向/触发价/张数严格匹配（止损自愈巡检同一路径）
+            try:
+                state = api.find_stop_order_state(
+                    ccxt_symbol, side, coin, stop_px, (stop or {}).get('id'))
+                print(f"[{side}] find_stop_order_state = {state}（应为 intact）")
+                if state != 'intact':
+                    print(f"[{side}] ⚠️ 三态判定未返回 intact！严格匹配（触发价 tick 取整/张数）需人工核对。")
+                    ok = False
+            except Exception as e:
+                print(f"[{side}] ⚠️ 三态判定异常: {e}")
                 ok = False
 
             print(f"[{side}] 撤止损 ...")

@@ -454,26 +454,57 @@ class OkxApi(ExchangeApi):
 
     # ===================== 撤单（含算法单） =====================
 
-    def _fetch_algo_orders(self, ccxt_symbol):
-        """查询未触发的算法/条件单（止损单）。不同 ccxt 版本参数名不同。
+    # 待触发算法单查询覆盖的 ordType 全集：系统自建止损恒为 conditional；
+    # oco/trigger/move_order_stop 覆盖人工挂单，让 cancel_all_orders 清扫路径可见
+    # （iceberg/twap 等高级委托不属止损语义，历史实现同样不可见，不纳入）。
+    ALGO_ORDER_TYPES = ('conditional', 'oco', 'trigger', 'move_order_stop')
 
-        三种参数组合**全部尝试并按订单 id 合并**：某个组合可能"成功但返回空"，
-        真正能查到算法单的是另一个组合，只取第一个成功结果会误判「无算法单」。
-        只有全部组合都失败才抛出（返回空列表会被当成"已撤干净"，绝不允许）。
+    @staticmethod
+    def _to_inst_id(ccxt_symbol):
+        """BTC/USDT:USDT -> BTC-USDT-SWAP（OKX U 本位永续 instId 命名规则）。
+
+        确定性字符串变换，不依赖 load_markets 缓存是否加载成功——本适配器只服务
+        U 本位永续，ccxt 符号与 OKX instId 本就按这同一条规则互相推导。
         """
-        merged = {}
-        any_success = False
-        last_err = None
-        for params in ({'ordType': 'conditional'}, {'trigger': True}, {'stop': True}):
-            try:
-                for o in self.exchange.fetch_open_orders(ccxt_symbol, params=params):
-                    merged.setdefault(str(o.get('id')), o)
-                any_success = True
-            except Exception as e:
-                last_err = e
-        if not any_success:
-            raise last_err if last_err else RuntimeError('查询算法单失败')
-        return list(merged.values())
+        return f"{ccxt_symbol.split('/')[0]}-USDT-SWAP"
+
+    @retry_on_network_error(max_retries=3)
+    def _fetch_algo_pending_raw(self, inst_id, ord_type):
+        """单一 ordType 的原生待触发算法单查询（带网络重试）。
+
+        响应信封（code=='0' 且 data 为数组）由交易所自证请求已被正确理解——
+        这是对「成功但答非所问」的结构性防护；信封异常一律抛出（fail-loud）。
+        instId 过滤下单品种的算法单数远小于单页上限(100)，无需分页。
+        """
+        resp = self.exchange.privateGetTradeOrdersAlgoPending(
+            {'ordType': ord_type, 'instId': inst_id})
+        if not isinstance(resp, dict) or resp.get('code') != '0' or not isinstance(resp.get('data'), list):
+            raise RuntimeError(f'算法单查询响应异常(ordType={ord_type}): {str(resp)[:200]}')
+        return resp['data']
+
+    def _fetch_algo_orders(self, ccxt_symbol):
+        """查询未触发的算法/条件单——直调 OKX 原生 orders-algo-pending 端点。
+
+        历史实现经 ccxt fetch_open_orders 的三种参数组合猜谜并合并：某组合可能因
+        统一接口跨版本参数映射漂移「成功但答非所问返回空」，合并清单不完整会让
+        验证式撤单误判「已撤干净」（历轮审查的保留观察项）。原生端点是该数据的
+        唯一权威来源：问题只有一种问法，不存在映射漂移。任一 ordType 查询失败
+        （重试后）即整体抛出——绝不基于可能不完整的清单下「不存在」的结论
+        （调用方对异常一律 fail-safe：跳过本轮 / 标记残留 / 阻断开仓）。
+        返回结构与 _algo_order_matches / 调用方约定一致：id/side/reduceOnly + 原生 info。
+        """
+        ccxt_symbol = self._resolve_symbol(ccxt_symbol)
+        inst_id = self._to_inst_id(ccxt_symbol)
+        orders = []
+        for ord_type in self.ALGO_ORDER_TYPES:
+            for item in self._fetch_algo_pending_raw(inst_id, ord_type):
+                orders.append({
+                    'id': str(item.get('algoId') or ''),
+                    'side': item.get('side'),
+                    'reduceOnly': item.get('reduceOnly') in (True, 'true'),
+                    'info': item,
+                })
+        return orders
 
     def _algo_order_absent(self, ccxt_symbol, order_id):
         """查询算法单列表，确认目标 id 已不存在。查询失败时向上抛出（不可确认 ≠ 已撤干净）。"""
