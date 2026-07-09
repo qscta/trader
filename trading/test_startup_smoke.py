@@ -61,6 +61,22 @@ def _write_config(tmp, extra=None):
     return path
 
 
+class _FailingBalanceOkxApi(_FakeOkxApi):
+    """启动权益获取抛异常（网络重试耗尽/鉴权错的真实形态：get_balance 抛出而非返回 None）。"""
+    calls = 0
+
+    def get_balance(self):
+        type(self).calls += 1
+        raise RuntimeError('网络不通')
+
+
+class _NoneTotalOkxApi(_FakeOkxApi):
+    """交易所返回 total 键在但值为 None 的畸形余额。"""
+
+    def get_balance(self):
+        return {'total': None}
+
+
 class StartupSmokeTest(unittest.TestCase):
     def _boot(self, tmp):
         with patch.object(main, 'OkxApi', _FakeOkxApi):
@@ -79,6 +95,41 @@ class StartupSmokeTest(unittest.TestCase):
             # 归属护栏已认领全新状态（trade_state / equity_tracker 为真实现）
             self.assertEqual(system.trade_state.get_owner_exchange(), 'okx')
             self.assertEqual(system.equity_tracker.data_dir, tmp)
+
+    def test_startup_balance_exception_retries_then_exits(self):
+        """关键回归：启动权益获取抛异常必须纳入重试并走 sys.exit(1) 退出路径。
+
+        get_balance 带网络重试装饰器，耗尽后**抛出**而非返回 None——此前 for 循环
+        不接异常，最常见的两种启动失败（网络不通/密钥错）会带 traceback 冲出
+        __init__，「重试 + 钉钉补发 + 退出」防线一次都走不到。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _FailingBalanceOkxApi.calls = 0
+            with patch.object(main, 'OkxApi', _FailingBalanceOkxApi), \
+                 patch.object(main.time, 'sleep', lambda s: None):
+                with self.assertRaises(SystemExit):
+                    TradingSystem(config_file=_write_config(tmp))
+            self.assertEqual(_FailingBalanceOkxApi.calls, 3)  # 异常计入 3 次重试
+
+    def test_startup_balance_none_total_exits_not_crashes(self):
+        """余额返回 {'total': None}：按获取失败重试退出，不得 TypeError 崩溃。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(main, 'OkxApi', _NoneTotalOkxApi), \
+                 patch.object(main.time, 'sleep', lambda s: None):
+                with self.assertRaises(SystemExit):
+                    TradingSystem(config_file=_write_config(tmp))
+
+    def test_prune_stale_stop_loss_dates(self):
+        """T+1 标记卫生：既不在品种池也无持仓的品种，其标记在日检时清除；
+        在池（含禁用）或有持仓的品种标记保留（重入线索不可丢）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._boot(tmp)
+            system.stop_loss_dates = {
+                'BTCUSDT': '2026-01-01',    # 在池中 → 保留
+                'HELDUSDT': '2026-01-02',   # 有持仓（监控集合内）→ 保留
+                'GONEUSDT': '2026-01-01',   # 已彻底离场 → 清除
+            }
+            system._prune_stale_stop_loss_dates({'BTCUSDT', 'HELDUSDT'})
+            self.assertEqual(set(system.stop_loss_dates), {'BTCUSDT', 'HELDUSDT'})
 
     def test_register_jobs_smoke(self):
         """定时任务注册链路可空转（调度器为桩）。"""

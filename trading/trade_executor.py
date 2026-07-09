@@ -149,10 +149,16 @@ class TradeExecutorMixin:
             logger.error(f"{symbol} 开仓中止: 空单止损价({stop_loss_price})必须高于实时计算价({calc_price})")
             return
 
-        balance = self.exchange_api.get_balance()
-        # 防御式取值：balance 为空、缺 total 段、或该段无 USDT 键，统一回退上次记录的权益
-        # （与启动/统计路径的 .get 口径一致；直接 balance['total']['USDT'] 遇缺键会抛 KeyError）
-        account_equity = balance.get('total', {}).get('USDT') if balance else None
+        # 防御式取值：查询异常、balance 为空、缺 total 段、或该段无 USDT 键，统一回退
+        # 上次记录的权益。异常必须在这里接住——get_balance 重试耗尽后抛出而非返回 None，
+        # 不接住的话下方「使用上次记录的权益」的回退分支永远走不到（死代码假安全网）。
+        # or {}：防交易所返回 total 键在但值为 None（.get 默认值只覆盖键缺失）。
+        try:
+            balance = self.exchange_api.get_balance()
+        except Exception as e:
+            logger.warning(f"{symbol} 查询账户余额异常({e})，回退使用上次记录的权益")
+            balance = None
+        account_equity = (balance.get('total') or {}).get('USDT') if balance else None
         if account_equity is not None:
             self.risk_manager.account_equity = account_equity
             logger.info(f"已更新账户权益: {account_equity} USDT")

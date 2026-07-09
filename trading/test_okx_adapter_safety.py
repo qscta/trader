@@ -140,6 +140,26 @@ class CancelAlgoVerifiedTest(unittest.TestCase):
         self.assertFalse(api._cancel_algo_order('BTC/USDT:USDT', 'stop-1'))
 
 
+class OpenPreQueryFailClosedTest(unittest.TestCase):
+    """开仓前持仓基线查询失败必须拒绝开仓（fail-closed）。
+
+    超时确认靠「post > pre」裁决：基线未知按 0 处理的话，该品种若恰有人工/孤儿
+    仓位，下单超时且实际未成交也会被误判「已成交」——把人工仓记成本次开仓。
+    开仓是可放弃动作，错过一次信号远比误认仓位便宜。"""
+
+    def test_pre_query_failure_aborts_open_without_order(self):
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._leverage_done = {'BTC/USDT:USDT'}
+        api.exchange.amount_to_precision.return_value = '10'
+        api.exchange.fetch_positions.side_effect = RuntimeError('查询失败')
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.open_position('BTC/USDT:USDT', 'long', 0.1)
+        self.assertIsNone(order)
+        api.exchange.create_order.assert_not_called()  # 未发出任何下单指令
+
+
 class TimeoutConfirmCoinUnitsTest(unittest.TestCase):
     """下单超时后经持仓查询确认的返回单，amount 必须换算回币数——张数不外泄的分层契约。"""
 

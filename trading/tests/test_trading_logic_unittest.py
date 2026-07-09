@@ -587,6 +587,42 @@ class SymbolInputValidationTests(unittest.TestCase):
         self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)
 
 
+class AddSymbolExchangeVerifyTests(unittest.TestCase):
+    """新增品种的交易所验证：网络故障与「品种不存在」必须给不同结论——
+    临时断网若也报「不是有效交易对」，会误导用户改名重试。"""
+
+    def setUp(self):
+        self.client = api_server.app.test_client()
+        with self.client.session_transaction() as sess:
+            sess["authenticated"] = True
+
+    def _system(self, fetch_exc):
+        system = _prep_system(SimpleNamespace())
+        system.config = {"trading": {"symbols": []}, "strategy": {}}
+        system.exchange_api = SimpleNamespace(
+            to_ccxt_symbol=_fake_to_ccxt,
+            fetch_ohlcv=Mock(side_effect=fetch_exc),
+        )
+        return system
+
+    def _post(self, system):
+        with patch.object(api_server, "trading_system", system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            return self.client.post("/api/symbols", json={"name": "AAAUSDT"})
+
+    def test_network_error_reported_as_retryable(self):
+        import ccxt
+        resp = self._post(self._system(ccxt.NetworkError("连不上")))
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("网络", resp.get_json()["error"])
+
+    def test_other_error_reported_as_invalid_symbol(self):
+        resp = self._post(self._system(RuntimeError("bad symbol")))
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("不是有效", resp.get_json()["error"])
+
+
 class DeleteSymbolApiTests(unittest.TestCase):
     """删除交易对语义：只移出品种池，不平仓不撤单；老仓缺 strategy 须兜底。"""
 
@@ -1259,6 +1295,7 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
 class StartupSyncCompensationTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
+        system.label = "欧易"
         system._stop_anomalies = {}
         exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
         system.exchange_api = SimpleNamespace(
@@ -1297,6 +1334,29 @@ class StartupSyncCompensationTests(unittest.TestCase):
         system.trade_state.force_runtime_close_position.assert_called_once_with("BTCUSDT", 123.45)
         system.notifier.notify_error.assert_called_once()
 
+    def test_single_symbol_query_failure_isolated(self):
+        """关键回归：单品种持仓查询异常不得让整个启动同步（乃至 __init__）崩溃——
+        跳过该品种、其余品种照常核对、汇总告警。"""
+        system = self.make_system()
+        system.trade_state.get_all_open_positions = Mock(return_value={
+            "AAAUSDT": {"entry_price": 50, "position_size": 1.0, "side": "long"},
+            "BTCUSDT": {"entry_price": 100, "position_size": 2.0, "side": "long"},
+        })
+
+        def get_position(ccxt_symbol):
+            if ccxt_symbol.startswith("AAA"):
+                raise RuntimeError("网络异常")
+            return None
+
+        system.exchange_api.get_position = Mock(side_effect=get_position)
+
+        system.sync_positions_on_startup()  # 不应抛异常
+
+        # BTCUSDT 照常按「交易所已无仓」记平；AAAUSDT 保留原状态并进入汇总告警
+        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 123.45)
+        warn_messages = [str(c.args[0]) for c in system.notifier.notify_error.call_args_list]
+        self.assertTrue(any("AAAUSDT" in m for m in warn_messages))
+
 
 class LoginBackoffTests(unittest.TestCase):
     """登录防爆破：连续失败按 IP 锁定，成功登录清零计数。"""
@@ -1327,6 +1387,16 @@ class LoginBackoffTests(unittest.TestCase):
         # 计数已清零：再错一次只是普通 401，不触发锁定
         self.assertEqual(self._login("wrong").status_code, 401)
         self.assertEqual(self._login("right-pass").status_code, 200)
+
+    def test_stale_failure_entries_pruned(self):
+        """失败表卫生：过期且未锁定的条目在表膨胀后清理，长期运行不无限吃内存。"""
+        now = api_server.time.time()
+        stale_ts = now - api_server.LOGIN_FAILURE_TTL_SECONDS - 1
+        with api_server._login_guard:
+            for i in range(api_server.LOGIN_FAILURE_PRUNE_THRESHOLD):
+                api_server._login_failures[f"10.0.{i // 250}.{i % 250}"] = (1, 0.0, stale_ts)
+        self._login("wrong")  # 任意一次登录尝试触发清理
+        self.assertLess(len(api_server._login_failures), 10)
 
 
 class ApiTokenAuthTests(unittest.TestCase):
@@ -1402,6 +1472,16 @@ class SchedulerIntervalTests(unittest.TestCase):
         job = system.scheduler.get_job("okx_stoploss_scan")
         self.assertIsNotNone(job)
         self.assertIsInstance(job.trigger, CronTrigger)
+
+    def test_weekly_job_has_misfire_grace(self):
+        """周报任务须与全家族同标准配 coalesce/misfire_grace_time：APScheduler 默认
+        宽限仅 1 秒，调度线程晚醒一秒本周周报就静默跳过且无重试点。"""
+        system = self._make()
+        system.register_jobs({})
+        job = system.scheduler.get_job("okx_weekly")
+        self.assertIsNotNone(job)
+        self.assertEqual(job.misfire_grace_time, 120)
+        self.assertTrue(job.coalesce)
 
 
 if __name__ == "__main__":

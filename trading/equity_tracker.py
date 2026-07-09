@@ -157,11 +157,12 @@ class EquityTracker:
                     return dict(self._stats_cache)
 
         balance = self.system.exchange_api.get_balance()
-        if not balance:
+        # or {}：防 total/free 键缺失或值为 None（直接下标会 KeyError/TypeError）。
+        # USDT 读不到必须抛出而非按 0 计——权益 0 会把峰值回撤等统计悄悄污染成 100%
+        current_equity = ((balance or {}).get('total') or {}).get('USDT')
+        if current_equity is None:
             raise RuntimeError('获取账户余额失败')
-
-        current_equity = balance['total'].get('USDT', 0)
-        free_balance = balance['free'].get('USDT', 0)
+        free_balance = (balance.get('free') or {}).get('USDT', 0)
         open_positions = self.system.trade_state.get_all_open_positions()
         total_unrealized_pnl = 0
         total_stop_loss_amount = 0
@@ -539,7 +540,7 @@ class EquityTracker:
                 balance = self.system.exchange_api.get_balance()
                 if not balance:
                     return False
-                equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+                equity = _coerce_positive_float((balance.get('total') or {}).get('USDT', 0))
                 if equity is None:
                     return False
 
@@ -664,7 +665,7 @@ class EquityTracker:
             balance = self.system.exchange_api.get_balance()
             if not balance:
                 return
-            equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+            equity = _coerce_positive_float((balance.get('total') or {}).get('USDT', 0))
             if equity is None:
                 return
             now = datetime.now()
@@ -753,7 +754,7 @@ class EquityTracker:
         balance = self.system.exchange_api.get_balance()
         if not balance:
             raise RuntimeError('获取账户余额失败')
-        current_equity = _coerce_positive_float(balance['total'].get('USDT', 0))
+        current_equity = _coerce_positive_float((balance.get('total') or {}).get('USDT', 0))
         if current_equity is None:
             raise ValueError('当前权益为0，无法同步')
 

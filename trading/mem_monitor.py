@@ -15,6 +15,7 @@ import time
 import subprocess
 import requests
 import logging
+import logging.handlers
 
 # 抹掉错误串里可能随 requests 连接异常带出的 webhook access_token，避免泄露到 mem_monitor.log
 _ACCESS_TOKEN_RE = re.compile(r'(access_token=)[^&\s\'"]+', re.IGNORECASE)
@@ -30,13 +31,14 @@ DISK_THRESHOLD = 90         # 磁盘告警阈值：90%
 ALERT_COOLDOWN = 1800       # 告警冷却时间：30分钟（秒）
 TOP_PROCESS_COUNT = 5       # 告警时展示的Top进程数量
 
-# 日志配置
+# 日志配置：轮转上限 5MB×2——每 5 分钟一条心跳日志，无轮转的话磁盘监控进程
+# 自己就会慢慢吃满磁盘
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mem_monitor.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=2, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )

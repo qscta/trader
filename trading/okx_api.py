@@ -225,11 +225,15 @@ class OkxApi(ExchangeApi):
             logger.error(f"{ccxt_symbol} 开仓张数为0（amount={amount}币，不足一张），放弃开仓")
             return None
 
-        pre_position = None
+        # 开仓前基线必须查询成功，失败即放弃本次开仓（fail-closed）：超时确认靠
+        # 「post > pre」裁决，基线未知按 0 处理的话，该品种若恰有人工/孤儿仓位，
+        # 超时且实际未成交也会被误判「已成交」——把别人的仓记成本次开仓。开仓是
+        # 可放弃动作，错过一次信号远比误认仓位便宜（平仓路径相反：宁可重复不可漏平）。
         try:
             pre_position = self.get_position(ccxt_symbol)
         except Exception as e:
-            logger.warning(f"开仓前查询持仓失败: {e}，继续开仓...")
+            logger.error(f"{ccxt_symbol} 开仓前查询持仓失败: {e}，基线不明拒绝开仓（防超时确认误认人工仓）")
+            return None
         pre_contracts = abs(float(pre_position['contracts'])) if pre_position and pre_position.get('contracts') else 0.0
 
         try:

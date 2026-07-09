@@ -93,8 +93,19 @@ _manual_check_guard = threading.Lock()
 # 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
-_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+LOGIN_FAILURE_TTL_SECONDS = 3600     # 条目过期：最后一次失败超过 1 小时即可清
+LOGIN_FAILURE_PRUNE_THRESHOLD = 256  # 表超过该规模才触发清理（正常使用永远到不了）
+_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳, 最后失败时间戳)
 _login_guard = threading.Lock()
+
+
+def _prune_login_failures_locked(now):
+    """清理过期的登录失败条目，防止长期运行下按 IP 无限膨胀（须持 _login_guard 调用）。"""
+    if len(_login_failures) < LOGIN_FAILURE_PRUNE_THRESHOLD:
+        return
+    for ip in [ip for ip, (_f, locked, last) in _login_failures.items()
+               if now >= locked and now - last > LOGIN_FAILURE_TTL_SECONDS]:
+        del _login_failures[ip]
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 
@@ -179,7 +190,8 @@ def api_login():
     ip = request.remote_addr or 'unknown'
     now = time.time()
     with _login_guard:
-        _fails, locked_until = _login_failures.get(ip, (0, 0.0))
+        _prune_login_failures_locked(now)
+        _fails, locked_until, _last = _login_failures.get(ip, (0, 0.0, 0.0))
         if now < locked_until:
             return jsonify({'success': False,
                             'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
@@ -194,10 +206,10 @@ def api_login():
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
     with _login_guard:
-        fails, _ = _login_failures.get(ip, (0, 0.0))
+        fails, _locked, _last = _login_failures.get(ip, (0, 0.0, 0.0))
         fails += 1
         locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
-        _login_failures[ip] = (fails, locked_until)
+        _login_failures[ip] = (fails, locked_until, now)
         if locked_until:
             logger.warning(f"登录连续失败 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
     return jsonify({'success': False, 'message': '密码错误'}), 401
@@ -326,7 +338,13 @@ def add_symbol():
             test_ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=5)
             if not test_ohlcv or len(test_ohlcv) == 0:
                 return jsonify({'error': f"交易所不存在永续合约 {new_symbol['name']}，请检查名称是否正确"}), 400
-        except Exception:
+        except Exception as e:
+            # 区分网络故障与品种不存在：临时断网若也报「不是有效交易对」，会误导用户
+            # 改名重试。按异常 MRO 类名判 NetworkError（不在此处 import ccxt——
+            # 纯标准库测试环境须可导入本模块）。
+            if any(c.__name__ == 'NetworkError' for c in type(e).__mro__):
+                logger.warning(f"验证交易对 {new_symbol['name']} 时网络异常: {e}")
+                return jsonify({'error': f"交易所验证 {new_symbol['name']} 时网络异常，请稍后重试"}), 502
             return jsonify({'error': f"交易所验证失败: {new_symbol['name']} 不是有效的永续合约交易对"}), 400
 
         with system._config_lock:
@@ -927,70 +945,8 @@ def close_position():
         return jsonify({'error': f'手动平仓异常: {str(e)}'}), 500
 
 
-@app.route('/api/channel_data', methods=['GET'])
-@require_auth
-def get_channel_data():
-    """获取某个持仓的K线和通道数据。"""
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        symbol = request.args.get('symbol', '')
-        if not symbol:
-            return jsonify({'error': '缺少symbol参数'}), 400
-
-        strategy_config = system.config.get('strategy', {})
-        period = strategy_config.get('channel_period', 28)  # 兜底与 TurtleStrategy 默认一致
-        required_closed = required_closed_candles_for_strategy('turtle', strategy_config)
-        fetch_limit = max(60, required_closed + 1)
-
-        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-        ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
-        df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
-        df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
-        if len(df) < period + 1:
-            return jsonify({'error': f'{symbol} K线数据不足：海龟通道周期 {period} 至少需要 '
-                                     f'{period + 1} 根已收盘K线，当前仅 {len(df)} 根'}), 400
-
-        closes = df['close'].values
-        upper_list, lower_list = [], []
-        for i in range(len(closes)):
-            if i < period:
-                upper_list.append(None)
-                lower_list.append(None)
-            else:
-                upper_list.append(max(closes[i-period:i]))
-                lower_list.append(min(closes[i-period:i]))
-        df['upper'] = upper_list
-        df['lower'] = lower_list
-        df = df.dropna(subset=['upper', 'lower']).copy()
-        df['middle'] = (df['upper'] + df['lower']) / 2
-
-        positions = system.trade_state.get_all_open_positions()
-        pos = positions.get(symbol, {})
-        dates = df['timestamp'].dt.strftime('%m-%d').tolist()
-        result = {
-            'dates': dates, 'closes': df['close'].tolist(),
-            'upper': df['upper'].tolist(), 'lower': df['lower'].tolist(), 'middle': df['middle'].tolist(),
-            'entry_price': pos.get('entry_price'), 'stop_loss': pos.get('stop_loss_price'),
-            'current_price': df['close'].iloc[-1] if len(df) > 0 else None,
-            'side': pos.get('side', ''), 'unrealized_pnl': None, 'unrealized_pnl_pct': None
-        }
-        if result['entry_price'] and result['current_price']:
-            ep = result['entry_price']
-            cp = result['current_price']
-            size = pos.get('position_size', 0)
-            if pos.get('side') == 'long':
-                result['unrealized_pnl'] = (cp - ep) * size
-                result['unrealized_pnl_pct'] = (cp - ep) / ep * 100
-            else:
-                result['unrealized_pnl'] = (ep - cp) * size
-                result['unrealized_pnl_pct'] = (ep - cp) / ep * 100
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"获取通道数据失败: {e}")
-        return jsonify({'error': str(e)}), 500
-
+# /api/channel_data（持仓通道图数据）已删除：前端早已不再使用，且它对双均线持仓
+# 也按海龟通道绘制，展示与实际托管策略不符——废弃接口留着只会误导。
 
 def _set_manual_check_running(value):
     global _manual_check_running

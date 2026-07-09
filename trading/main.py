@@ -130,12 +130,21 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             retention_days=self.config.get('equity_tick_retention_days'),
         )
 
-        # 启动时必须成功获取权益，重试3次
+        # 启动时必须成功获取权益，重试3次。异常必须接住计入重试：get_balance 带网络
+        # 重试装饰器，耗尽后**抛出**而非返回 None（鉴权错更是立即抛）——不接住的话，
+        # 最常见的两种启动失败（网络不通/密钥错）会直接冲出 __init__，下方精心设计的
+        # 「钉钉补发 + 退出」路径一次都走不到，进程静默带 traceback 崩掉
         account_equity = None
         for _retry_i in range(3):
-            balance = self.exchange_api.get_balance()
-            if balance and 'USDT' in balance.get('total', {}):
-                account_equity = balance['total']['USDT']
+            try:
+                balance = self.exchange_api.get_balance()
+            except Exception as e:
+                logger.warning(f'[{self.label}] 启动时获取账户权益异常: {e}')
+                balance = None
+            # or {}：防交易所返回 total 键在但值为 None（.get 默认值只覆盖键缺失）
+            usdt = (balance.get('total') or {}).get('USDT') if balance else None
+            if usdt is not None:
+                account_equity = usdt
                 break
             logger.warning(f'[{self.label}] 启动时获取账户权益失败，10秒后重试... (第{_retry_i+1}/3次)')
             time.sleep(10)
@@ -400,22 +409,37 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         logger.info("开始同步持仓状态...")
         open_positions = self.trade_state.get_all_open_positions()
 
+        failed_symbols = []
         for symbol in list(open_positions.keys()):
-            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
-            position = self.exchange_api.get_position(ccxt_symbol)
+            # 单品种异常只跳过该品种（与日检/巡检同一隔离标准）：一个品种的持仓查询
+            # 网络异常若不隔离，会让整个 __init__ 崩掉、系统拒绝启动且无告警——
+            # 查询失败的品种保留本地记录不动，交由盘中巡检/日检继续核对
+            try:
+                ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+                position = self.exchange_api.get_position(ccxt_symbol)
 
-            if position is None or position.get('contracts', 0) == 0:
-                logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
-                try:
-                    exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
-                except Exception:
-                    exit_price = open_positions[symbol]['entry_price']
-                closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
-                    symbol, ccxt_symbol, open_positions[symbol], exit_price, "启动同步平仓")
-                if not closed_position:
-                    logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
-            else:
-                logger.info(f"{symbol} 持仓同步成功")
+                if position is None or position.get('contracts', 0) == 0:
+                    logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
+                    try:
+                        exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
+                    except Exception:
+                        exit_price = open_positions[symbol]['entry_price']
+                    closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
+                        symbol, ccxt_symbol, open_positions[symbol], exit_price, "启动同步平仓")
+                    if not closed_position:
+                        logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
+                else:
+                    logger.info(f"{symbol} 持仓同步成功")
+            except Exception as sym_e:
+                logger.exception(f"{symbol} 启动同步异常，跳过该品种继续: {sym_e}")
+                failed_symbols.append(symbol)
+        if failed_symbols:
+            try:
+                self.notifier.notify_error(
+                    f"[{self.label}] 启动持仓同步部分品种失败: {', '.join(sorted(failed_symbols))}。"
+                    f"本地记录已保留，将由盘中巡检/日检继续核对，请留意后续告警")
+            except Exception:
+                pass
 
         # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓）——
         # 该仓不会被系统托管（不推止损、不检查平仓），静默存在比报错更危险，必须告警
@@ -472,6 +496,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.stop_loss_dates[symbol] = date.today().strftime('%Y-%m-%d')
         self._save_stop_loss_dates()
 
+    def _prune_stale_stop_loss_dates(self, monitored_symbols):
+        """清理已彻底离场品种的 T+1 标记：既不在品种池（含禁用，禁用重启用仍需重入线索）
+        也无持仓的品种，其标记再无消费者，会在文件里永久残留。纯卫生，无行为影响。"""
+        pool_symbols = {s['name'] for s in self.config['trading']['symbols']}
+        stale = [s for s in self.stop_loss_dates
+                 if s not in pool_symbols and s not in monitored_symbols]
+        if stale:
+            for s in stale:
+                del self.stop_loss_dates[s]
+            self._save_stop_loss_dates()
+            logger.info(f"已清理离场品种的止损 T+1 标记: {', '.join(sorted(stale))}")
+
     def check_and_execute_trades(self, manual_run=False):
         """检查并执行交易"""
         # 三重防护：线程锁 + 日期检查 + APScheduler max_instances
@@ -501,6 +537,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
             self._retry_clear_stop_residues()
+
+            # 清理已彻底离场品种的 T+1 标记（失败不影响交易）
+            try:
+                self._prune_stale_stop_loss_dates(symbols_to_check)
+            except Exception as e:
+                logger.warning(f"清理陈旧止损日期标记失败（不影响交易）: {e}")
 
             # 账本瘦身：超出保留窗口的平仓历史搬进只追加的史书文件（失败不影响交易）
             try:
@@ -787,8 +829,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                   hour=summary_hour, minute=summary_minute + 1, second=20)
         else:
             logger.warning(f"[{self.label}] summary_minute=59，跳过 +1 分钟持仓汇总重试任务")
+        # coalesce/misfire_grace_time 与其余任务同标准：APScheduler 默认宽限仅 1 秒，
+        # 调度线程晚醒一秒本周周报就静默跳过且无重试点
         self.scheduler.add_job(self.send_weekly_report, 'cron',
-                              id=f'{ex}_weekly', day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
+                              id=f'{ex}_weekly', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
 
         # 启动即采一次权益
         self._record_equity_tick_with_alert()
