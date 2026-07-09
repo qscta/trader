@@ -20,7 +20,6 @@
     5) 账户是否单向(净)持仓模式（本系统的硬前提）
 """
 import os
-import sys
 import time
 import argparse
 

@@ -6,7 +6,6 @@ TradeState/EquityTracker 装配 → 权益获取 → RiskManager → 启动持�
 """
 import json
 import os
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch

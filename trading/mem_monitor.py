@@ -15,7 +15,6 @@ import time
 import subprocess
 import requests
 import logging
-from datetime import datetime
 
 # 抹掉错误串里可能随 requests 连接异常带出的 webhook access_token，避免泄露到 mem_monitor.log
 _ACCESS_TOKEN_RE = re.compile(r'(access_token=)[^&\s\'"]+', re.IGNORECASE)
