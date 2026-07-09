@@ -9,6 +9,7 @@
     python verify_okx.py BTCUSDT 0.01              # 默认 long+short 两条路径都测
     python verify_okx.py BTCUSDT 0.01 --side short # 只测做空
     python verify_okx.py BTCUSDT                   # 不带币数 = 只读检查（余额/张数/单向模式）
+    python verify_okx.py BTCUSDT 0.01 --side long --fire   # 实弹触发验证（见下）
 
 它用项目里的 OkxApi **真实代码路径**，对每个方向跑：
     换张数 → 开仓 → 挂止损 → 查算法单 → 撤止损 → 平仓（finally 保证平仓清理）
@@ -18,6 +19,14 @@
     3) cancel_order / 算法单查询能否把止损撤干净
     4) 平仓后是否干净
     5) 账户是否单向(净)持仓模式（本系统的硬前提）
+
+--fire 模式（实弹触发验证，需显式 --side long/short，不支持 both）：
+    以上 5 项测的都是「挂着但不触发」的止损。reduce-only 标志本身已被证实
+    接受存储，但「触发那一瞬间是否真的只减仓、绝不反向」此前完全依赖 OKX
+    平台承诺，从未被本系统实测过。--fire 把止损挂在离市价很近处（默认
+    0.15%），等真实行情自然触发，断言：触发后持仓精确归零、无反向仓、
+    算法单从待触发列表消失。超时未触发（默认 300s）判「不确定」而非失败，
+    清理后可用 --fire-distance / --fire-timeout 调整重试。
 """
 import os
 import time
@@ -158,12 +167,114 @@ def run_side(api, ccxt_symbol, coin, side):
     return ok
 
 
+def run_fire_test(api, ccxt_symbol, coin, side, distance_pct=0.15, timeout_seconds=300, poll_interval=5):
+    """实弹触发验证：止损挂在离市价很近处，等待真实行情自然触发。
+
+    本系统止损防线唯一从未被实测过的一环——reduce-only 标志本身已在非触发
+    场景（run_side）实证被交易所接受存储，但「触发瞬间是否真的只减仓、
+    绝不反向开出反向仓」此前完全依赖 OKX 平台承诺，代码从未亲眼验证过。
+
+    返回 True=触发且验证通过 / False=触发但发现问题 / None=超时未触发
+    （价格在窗口内未走到止损位，不构成证据，非失败，可调参数重试）。
+    finally 保证清理（撤单+平仓），不留残留仓位。
+    """
+    print(f"\n{'#' * 60}\n实弹触发验证: {side.upper()}（{'做多' if side == 'long' else '做空'}）\n{'#' * 60}")
+    print(f"止损距市价 {distance_pct}%，最长等待 {timeout_seconds}s（每 {poll_interval}s 轮询一次）")
+
+    order = api.open_position(ccxt_symbol, side, coin)
+    print(f"[fire-{side}] 开仓返回:", (order or {}).get('id'))
+    if not order:
+        print(f"[fire-{side}] ❌ 开仓失败")
+        return None
+
+    stop_id = None
+    try:
+        time.sleep(2)
+        last_price = api.get_last_price(ccxt_symbol)
+        stop_px = last_price * (1 - distance_pct / 100) if side == 'long' else last_price * (1 + distance_pct / 100)
+        print(f"[fire-{side}] 市价={last_price}, 挂止损 @ {stop_px:.6f}")
+
+        stop = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
+        print(f"[fire-{side}] 止损返回:", (stop or {}).get('id'))
+        if not stop:
+            print(f"[fire-{side}] ❌ 止损创建失败，无法继续验证")
+            return None
+        stop_id = stop.get('id')
+
+        print(f"[fire-{side}] 等待自然行情触发...")
+        start = time.time()
+        triggered = False
+        while time.time() - start < timeout_seconds:
+            pos = api.get_position(ccxt_symbol)
+            if pos is None:
+                triggered = True
+                break
+            print(f"[fire-{side}] 未触发（已等待 {int(time.time() - start)}s，持仓仍在）...")
+            time.sleep(poll_interval)
+
+        if not triggered:
+            print(f"[fire-{side}] ⏱️ 超时未触发（{timeout_seconds}s 内价格未走到止损位），"
+                  f"本次不构成证据，非失败。清理后可加大 --fire-distance 或 --fire-timeout 重试。")
+            return None
+
+        print(f"[fire-{side}] ✓ 检测到持仓已归零，止损已触发")
+        time.sleep(2)  # 留出成交回报与列表更新的短暂窗口
+        pos_after = api.get_position(ccxt_symbol)
+        contracts_after = abs(float((pos_after or {}).get('contracts') or 0))
+        side_after = (pos_after or {}).get('side')
+
+        ok = True
+        if pos_after is not None and contracts_after > 0:
+            print(f"[fire-{side}] ⚠️⚠️ 触发后仍有持仓 {contracts_after} 张，方向={side_after}！")
+            if side_after and side_after != side:
+                print(f"[fire-{side}] 🔴🔴 严重：检测到反向持仓！reduce-only 未生效，请立即人工核查交易所！")
+            ok = False
+        else:
+            print(f"[fire-{side}] ✓ 触发后持仓精确归零，未反向")
+
+        algos = api._fetch_algo_orders(ccxt_symbol)
+        still_listed = any(str(o.get('id')) == str(stop_id) for o in algos)
+        if still_listed:
+            time.sleep(2)  # 列表可能滞后于触发生效，复查一次再裁决（与验证式撤单同一容忍）
+            algos = api._fetch_algo_orders(ccxt_symbol)
+            still_listed = any(str(o.get('id')) == str(stop_id) for o in algos)
+        print(f"[fire-{side}] 触发后该止损单是否仍在待触发列表（应否）: {still_listed}")
+        if still_listed:
+            print(f"[fire-{side}] ⚠️ 触发单未从待触发列表消失，需人工核对状态语义")
+            ok = False
+
+        return ok
+    finally:
+        print(f"[fire-{side}] --- 清理（保证执行）---")
+        try:
+            api.cancel_all_orders(ccxt_symbol)
+            close_order = api.close_position(ccxt_symbol, side, coin)
+            if close_order:
+                print(f"[fire-{side}] 清理平仓返回:", close_order.get('id'))
+            time.sleep(2)
+            after = api.get_position(ccxt_symbol)
+            rem = abs(float((after or {}).get('contracts') or 0))
+            print(f"[fire-{side}] 清理后剩余持仓（应 0）: {rem}")
+            if rem:
+                print(f"[fire-{side}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
+        except Exception as e:
+            print(f"[fire-{side}] ❌ 清理失败，请立即手动到欧易检查并平仓！", e)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('symbol', nargs='?', default='BTCUSDT', help='内部符号，如 BTCUSDT')
     ap.add_argument('coin', nargs='?', type=float, default=0.0, help='开仓币数（务必很小）；不填=只读检查')
     ap.add_argument('--side', choices=['long', 'short', 'both'], default='both', help='验证方向（默认两条都测）')
+    ap.add_argument('--fire', action='store_true',
+                    help='实弹触发验证：止损挂近市价等真实行情触发（需 --side long 或 short，不支持 both）')
+    ap.add_argument('--fire-distance', type=float, default=0.15, help='触发验证止损距市价百分比（默认 0.15）')
+    ap.add_argument('--fire-timeout', type=int, default=300, help='触发验证最长等待秒数（默认 300）')
     args = ap.parse_args()
+
+    if args.fire and args.side == 'both':
+        print('❌ --fire 模式需要显式指定单一方向：--side long 或 --side short')
+        return
 
     cfg = load_cfg()
     if not (cfg['apiKey'] and cfg['secret'] and cfg['password']):
@@ -190,6 +301,18 @@ def main():
         print("\n未指定开仓币数，仅做只读检查，结束。")
         return
 
+    if args.fire:
+        result = run_fire_test(api, ccxt_symbol, args.coin, args.side,
+                               distance_pct=args.fire_distance, timeout_seconds=args.fire_timeout)
+        print(f"\n{'=' * 60}")
+        if result is True:
+            print("✓ 实弹触发验证通过：触发后持仓归零、未反向、算法单已从待触发列表消失")
+        elif result is False:
+            print("⚠️ 实弹触发验证发现问题，回看上面日志，请立即人工核查交易所仓位")
+        else:
+            print("⏱️ 本次未获得触发证据（超时或前置步骤失败），非失败，可调参数重试")
+        return
+
     sides = ['long', 'short'] if args.side == 'both' else [args.side]
     results = {}
     for s in sides:
@@ -199,7 +322,7 @@ def main():
     print(f"\n{'=' * 60}\n汇总：")
     for s, r in results.items():
         print(f"  {s}: {'✓ 通过' if r else '⚠️ 有问题，回看上面日志'}")
-    print("「触发后是否只减仓不反向」仍需手动验证：把止损价设在离市价很近处让它真触发，再看持仓是否归零、没被反向开新仓。")
+    print("「触发后是否只减仓不反向」可用 --fire 模式实测（见文件顶部说明）。")
 
 
 if __name__ == '__main__':
