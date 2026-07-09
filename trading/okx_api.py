@@ -369,10 +369,25 @@ class OkxApi(ExchangeApi):
             return False
         return abs(amount - float(contracts)) <= max(1e-8, abs(float(contracts)) * 1e-6)
 
+    def _align_stop_price(self, ccxt_symbol, stop_price):
+        """把止损触发价对齐到交易所价格步长（tick）。
+
+        实盘验证实证：OKX 会把非对齐触发价按 tick 取整后存储（39.384→39.38），
+        本地原始价与交易所存储价的差会让严格匹配（创建超时确认/三态判定）误判
+        不匹配/mismatch。发单前先用交易所元数据对齐——发送值与存储值必然一致；
+        比对侧用同一函数对齐本地记录，历史留存的非对齐价也能正确匹配。
+        精度元数据不可得时按原价返回（匹配退化为对齐前行为，fail-safe 不阻断）。
+        """
+        try:
+            return float(self.exchange.price_to_precision(ccxt_symbol, stop_price))
+        except Exception:
+            return stop_price
+
     def create_stop_loss_order(self, symbol, side, amount, stop_price):
         """创建止损算法单（reduce-only，触发后市价平仓）。amount 单位为币数。"""
         ccxt_symbol = self._resolve_symbol(symbol)
         stop_side = 'sell' if side == 'long' else 'buy'
+        stop_price = self._align_stop_price(ccxt_symbol, stop_price)
 
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
         if contracts <= 0:
@@ -444,6 +459,9 @@ class OkxApi(ExchangeApi):
         ccxt_symbol = self._resolve_symbol(symbol)
         stop_side = 'sell' if side == 'long' else 'buy'
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
+        # 本地记录价与交易所存储价须同一口径：交易所按 tick 取整存储，
+        # 比对前用同一对齐函数归一本地价（详见 _align_stop_price）
+        stop_price = self._align_stop_price(ccxt_symbol, stop_price)
         algos = self._fetch_algo_orders(ccxt_symbol)
         for o in algos:
             if self._algo_order_matches(o, stop_side, stop_price, contracts):
@@ -516,16 +534,17 @@ class OkxApi(ExchangeApi):
     def _cancel_algo_order(self, ccxt_symbol, order_id):
         """撤销算法单，并以「列表里查不到该 id」为成功标准。
 
-        不能把 OrderNotFound 直接当成功：某种参数组合下交易所把该 id 当普通单
-        查找也会报 OrderNotFound，实际算法单可能还活着。撤销必须可验证。
-        首次复核仍在列表时，等待片刻复查一次再裁决——列表可能滞后于撤单生效。
+        撤销指令直调 OKX 原生 cancel-algos 端点（与查询同一权威接口族，消除
+        ccxt 统一撤单参数映射漂移的最后一处依赖）。指令自身的返回不构成任何
+        结论——成败一律以原生查询清单裁决：首次复核仍在列表时，等待片刻复查
+        一次再裁决（交易所列表可能滞后于撤单生效）。
         """
-        for params in ({'trigger': True}, {'stop': True}, {'algo': True}):
-            try:
-                self.exchange.cancel_order(order_id, ccxt_symbol, params)
-                break
-            except Exception:
-                continue
+        ccxt_symbol = self._resolve_symbol(ccxt_symbol)
+        try:
+            self.exchange.privatePostTradeCancelAlgos(
+                [{'algoId': str(order_id), 'instId': self._to_inst_id(ccxt_symbol)}])
+        except Exception as e:
+            logger.warning(f"撤销算法单指令异常（成败以清单裁决，不据此下结论）: {order_id}: {e}")
         try:
             if self._algo_order_absent(ccxt_symbol, order_id):
                 return True
