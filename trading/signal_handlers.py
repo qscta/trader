@@ -33,46 +33,30 @@ class SignalHandlersMixin:
         self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
 
     def handle_no_position_turtle(self, symbol, signal, symbol_config, df):
-        """海龟策略：处理没有开仓头寸的情况"""
+        """海龟策略：处理没有开仓头寸的情况（多空对称，只差方向字面量）"""
         logger.info(f"{symbol} [海龟] 没有开仓头寸，检查是否有开仓信号...")
+
+        side = signal['action']
+        if side not in ('long', 'short'):
+            return
 
         mid_line_crossed = self.trade_state.get_signal_state(symbol)
         bootstrap_direct_entry = bool(signal.get('bootstrap_direct_entry'))
+        if not (mid_line_crossed or bootstrap_direct_entry):
+            logger.info(f"{symbol} [海龟] 检测到非标准信号 {side}，忽略")
+            return
 
-        if signal['action'] == 'long' and (mid_line_crossed or bootstrap_direct_entry):
-            if bootstrap_direct_entry:
-                logger.info(f"{symbol} [海龟] 检测到新币启动期直通信号 LONG，执行开仓")
-            else:
-                logger.info(f"{symbol} [海龟] 检测到标准信号 LONG，执行开仓")
-            self.handle_open_signal_turtle(symbol, 'long', signal, symbol_config)
-            if not self.trade_state.get_open_position(symbol):
-                self._notify_missing_position_after_signal(
-                    symbol,
-                    'turtle',
-                    'long',
-                    signal,
-                    '新币启动期直通 LONG 信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
-                    if bootstrap_direct_entry
-                    else '标准 LONG 信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
-                )
-        elif signal['action'] == 'short' and (mid_line_crossed or bootstrap_direct_entry):
-            if bootstrap_direct_entry:
-                logger.info(f"{symbol} [海龟] 检测到新币启动期直通信号 SHORT，执行开仓")
-            else:
-                logger.info(f"{symbol} [海龟] 检测到标准信号 SHORT，执行开仓")
-            self.handle_open_signal_turtle(symbol, 'short', signal, symbol_config)
-            if not self.trade_state.get_open_position(symbol):
-                self._notify_missing_position_after_signal(
-                    symbol,
-                    'turtle',
-                    'short',
-                    signal,
-                    '新币启动期直通 SHORT 信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
-                    if bootstrap_direct_entry
-                    else '标准 SHORT 信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
-                )
-        elif signal['action'] in ('long', 'short'):
-            logger.info(f"{symbol} [海龟] 检测到非标准信号 {signal['action']}，忽略")
+        label = '新币启动期直通' if bootstrap_direct_entry else '标准'
+        logger.info(f"{symbol} [海龟] 检测到{label}信号 {side.upper()}，执行开仓")
+        self.handle_open_signal_turtle(symbol, side, signal, symbol_config)
+        if not self.trade_state.get_open_position(symbol):
+            self._notify_missing_position_after_signal(
+                symbol,
+                'turtle',
+                side,
+                signal,
+                f'{label} {side.upper()} 信号已出现，但本轮检查结束后仍无持仓，请复核交易所与日志'
+            )
 
     def handle_open_position_turtle(self, symbol, signal, position, symbol_config):
         """海龟策略：处理已开仓头寸"""
@@ -112,11 +96,12 @@ class SignalHandlersMixin:
                     else:
                         self.trade_state.set_signal_state(symbol, False)
                         logger.info(f"{symbol} [海龟] 止损平仓，价格已穿越到另一侧，等待重新穿越中轨")
+                # 出场价传原始数值（与盘中巡检同口径），不做 .4f 假精度格式化
                 self.notifier.notify_stop_loss_triggered(
                     symbol,
                     self._get_strategy_display_name('turtle'),
                     position.get('side', ''),
-                    f"{exit_price:.4f}",
+                    exit_price,
                     source='日检确认'
                 )
                 if not stop_cleared:
@@ -289,11 +274,12 @@ class SignalHandlersMixin:
                     logger.warning(f"{symbol} [双均线] 止损确认已执行，但本地状态落盘失败，本轮不记录 T+1")
                     return
                 self.record_stop_loss(symbol)
+                # 出场价传原始数值（与盘中巡检同口径），不做 .4f 假精度格式化
                 self.notifier.notify_stop_loss_triggered(
                     symbol,
                     self._get_strategy_display_name('ma_cross'),
                     position.get('side', ''),
-                    f"{exit_price:.4f}",
+                    exit_price,
                     source='日检确认（T+1 已记录）'
                 )
                 logger.info(f"{symbol} [双均线] 止损已记录，T+1将检查重入")

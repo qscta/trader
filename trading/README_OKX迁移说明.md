@@ -95,15 +95,16 @@ FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 ws
 
 ## 七、测试
 
-无需第三方依赖、可本机运行并通过（共 95 用例，已验证同进程任意顺序全绿）：
+无需第三方依赖、可本机运行并通过（共 156 用例，已验证同进程任意顺序全绿）：
 
 ```bash
-python -m unittest test_startup_smoke               # 5 通过（启动装配全链冒烟：配置/迁移/护栏/装配）
-python -m unittest test_final_judgment              # 10 通过（时间边界/并发混沌/灾难恢复/风控性质/孤儿仓告警）
-python -m unittest test_equity_drawdown             # 3 通过（未创新高统计三场景）
-python -m unittest test_daily_summary_delivery      # 7 通过（钉钉汇总/缓冲）
-python -m unittest test_symbol_removal_management   # 33 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈）
-python -m unittest test_okx_adapter_safety          # 24 通过（面值 fail-closed + 验证式撤单/合并查询/复验 + 止损严格匹配/三态判定）
+python -m unittest test_startup_smoke               # 15 通过（启动装配全链冒烟：配置校验/迁移/护栏/装配）
+python -m unittest test_final_judgment              # 16 通过（时间边界/并发混沌/灾难恢复/风控性质/孤儿仓告警）
+python -m unittest test_equity_drawdown             # 9 通过（未创新高统计/权益采样/资金同步）
+python -m unittest test_daily_summary_delivery      # 10 通过（钉钉汇总/缓冲/去重）
+python -m unittest test_symbol_removal_management   # 53 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈 + 调度兜底）
+python -m unittest test_okx_adapter_safety          # 28 通过（面值 fail-closed + 验证式撤单/合并查询/复验 + 止损严格匹配/三态判定）
+python -m unittest test_config_validation           # 14 通过（三入口共享校验原语边界）
 python -m unittest test_trade_state_fees            # 3 通过（手续费/盈亏）
 python -m unittest test_turtle_strategy_regression  # 8 通过（海龟信号回归）
 ```

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 # ====== 安全重试装饰器（仅用于读操作和幂等操作） ======
-def retry_on_network_error(max_retries=3, backoff_seconds=[1, 2, 4]):
+def retry_on_network_error(max_retries=3, backoff_seconds=(1, 2, 4)):
     """对网络超时、频率限制等可恢复异常自动重试。"""
     def decorator(func):
         @wraps(func)

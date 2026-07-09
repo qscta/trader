@@ -55,21 +55,6 @@ class DingTalkNotifier:
         content = f"### ⚠️ 交易系统警告\n\n{error_msg}\n\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         return self.send_message("系统警告", content)
 
-    def notify_trade_opened(self, symbol, side, price, size, stop_loss_price):
-        """发送开仓通知"""
-        side_cn = "做多" if side == 'long' else "做空"
-        emoji = "🟢" if side == 'long' else "🔴"
-        content = (
-            f"### {emoji} 交易系统开仓通知 - {symbol}\n\n"
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"交易对: {symbol}\n\n"
-            f"方向: {side_cn}\n\n"
-            f"入场价: {price}\n\n"
-            f"头寸: {size}\n\n"
-            f"止损价: {stop_loss_price}"
-        )
-        return self.send_message(f"[交易系统] 开仓通知 - {symbol}", content)
-
     def notify_trade_opened_summary(self, trades):
         """发送本轮开仓通知汇总。"""
         if not trades:
@@ -89,20 +74,6 @@ class DingTalkNotifier:
             f"{chr(10).join(lines)}"
         )
         return self.send_message("[交易系统] 开仓通知汇总", content)
-
-    def notify_trade_closed(self, symbol, side, exit_price, pnl, pnl_pct):
-        """发送平仓通知"""
-        side_cn = "多" if side == 'long' else "空"
-        emoji = "💰" if pnl >= 0 else "💔"
-        content = (
-            f"### {emoji} 交易系统平仓通知 - {symbol}\n\n"
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"交易对: {symbol}\n\n"
-            f"方向: {side_cn}\n\n"
-            f"平仓价: {exit_price}\n\n"
-            f"盈亏: {pnl:.2f}U ({pnl_pct:.2f}%)"
-        )
-        return self.send_message(f"[交易系统] 平仓通知 - {symbol}", content)
 
     def notify_trade_closed_summary(self, trades):
         """发送本轮平仓通知汇总。"""
@@ -195,10 +166,12 @@ class DingTalkNotifier:
             entry = pos.get('entry_price', 0)
             stop = pos.get('stop_loss_price', 0)
             size = pos.get('position_size', 0)
+            # 有向亏损并钳到 ≥0（与前端持仓面板同口径）：止损已推进到盈利侧时
+            # 风险为 0（利润已锁定），按绝对值算会把锁定利润虚报成风险
             if pos.get('side') == 'long':
-                loss = abs(entry - stop) * size if stop else 0
+                loss = max(0, (entry - stop) * size) if stop else 0
             else:
-                loss = abs(stop - entry) * size if stop else 0
+                loss = max(0, (stop - entry) * size) if stop else 0
             total_risk += loss
             details.append(f"    {sym}({side_cn}): 入场{entry}, 止损{stop}, 损失{loss:.2f}U")
 

@@ -1,6 +1,3 @@
-import pandas as pd
-import numpy as np
-
 class MaCrossStrategy:
     def __init__(self, short_period=7, long_period=28, stop_loss_period=28):
         """

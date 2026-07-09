@@ -231,7 +231,7 @@ def get_status():
         open_positions = system.trade_state.get_all_open_positions()
         last_symbol_update = None
         try:
-            mtime = os.path.getmtime(trading_system.config_file)
+            mtime = os.path.getmtime(system.config_file)
             last_symbol_update = datetime.fromtimestamp(mtime).isoformat()
         except Exception as e:
             logger.warning(f"忽略异常: {e}")
@@ -284,9 +284,16 @@ def add_symbol():
         if not data or 'name' not in data:
             return jsonify({'error': '缺少必要参数'}), 400
 
+        # 显式 null 与缺省同义：.get 的默认值只覆盖「键不存在」，覆盖不了 "risk_per_trade": null——
+        # None 会穿过校验（视为未提供），随后 clean[键] 抛 KeyError 变 500 而非干净 400/默认值
+        risk_in = data.get('risk_per_trade')
+        strategy_in = data.get('strategy')
+        enabled_in = data.get('enabled')
         clean, invalid = _validate_symbol_input(
-            data.get('name'), data.get('risk_per_trade', 0.01),
-            data.get('strategy', 'turtle'), data.get('enabled', True))
+            data.get('name'),
+            0.01 if risk_in is None else risk_in,
+            'turtle' if strategy_in is None else strategy_in,
+            True if enabled_in is None else enabled_in)
         if invalid:
             return jsonify({'error': invalid}), 400
         new_symbol = {  # 全部用规范化值：name 大写、risk float、enabled 真 bool
@@ -306,7 +313,7 @@ def add_symbol():
         except Exception:
             return jsonify({'error': f"交易所验证失败: {new_symbol['name']} 不是有效的永续合约交易对"}), 400
 
-        with trading_system._config_lock:
+        with system._config_lock:
             if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对已存在'}), 400
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
@@ -361,27 +368,27 @@ def update_symbol(symbol):
         if not data:
             return jsonify({'error': '缺少参数'}), 400
         clean, invalid = _validate_symbol_input(
-            symbol,
-            data.get('risk_per_trade') if 'risk_per_trade' in data else None,
-            data.get('strategy') if 'strategy' in data else None,
-            data.get('enabled') if 'enabled' in data else None,
-        )
+            symbol, data.get('risk_per_trade'), data.get('strategy'), data.get('enabled'))
         if invalid:
             return jsonify({'error': invalid}), 400
+        # 以 clean 为准判断「提供了哪些字段」：显式 null 会穿过校验（视为未提供），
+        # 按 data 判断会在 clean[键] 处抛 KeyError 变 500；null 与缺省统一按未提供处理
+        if not any(k in clean for k in ('risk_per_trade', 'strategy', 'enabled')):
+            return jsonify({'error': '缺少可更新字段（risk_per_trade / strategy / enabled）'}), 400
         symbol_u = clean['name']
         # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
-        if 'strategy' in data and system.trade_state.get_open_position(symbol_u):
+        if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
             return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
                                      '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
-        with trading_system._config_lock:
+        with system._config_lock:
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             for s in system.config['trading']['symbols']:
                 if s['name'] == symbol_u:
-                    if 'enabled' in data:
+                    if 'enabled' in clean:
                         s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
-                    if 'risk_per_trade' in data:
+                    if 'risk_per_trade' in clean:
                         s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
-                    if 'strategy' in data:
+                    if 'strategy' in clean:
                         s['strategy'] = clean['strategy']
 
                     err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
@@ -389,11 +396,11 @@ def update_symbol(symbol):
                         return err_resp
 
                     changes = []
-                    if 'enabled' in data:
+                    if 'enabled' in clean:
                         changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
-                    if 'risk_per_trade' in data:
+                    if 'risk_per_trade' in clean:
                         changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
-                    if 'strategy' in data:
+                    if 'strategy' in clean:
                         strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
                         changes.append(f'策略: {strategy_text}')
                     send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
@@ -411,7 +418,7 @@ def delete_symbol(symbol):
         return err
     try:
         symbol_u = symbol.upper()
-        with trading_system._config_lock:
+        with system._config_lock:
             # 品种不在池中：直接 404，与 update_symbol 的语义一致。否则「删不存在的品种」
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
             if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
@@ -550,7 +557,7 @@ def get_config():
         return jsonify({
             'strategy': system.config.get('strategy', {}),
             'trading': system.config.get('trading', {}),
-            'scheduler': trading_system.config.get('scheduler', {})
+            'scheduler': system.config.get('scheduler', {})
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -686,7 +693,7 @@ def update_strategy_params():
             return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
 
         changed = []
-        with trading_system._config_lock:
+        with system._config_lock:
             backup = json.loads(json.dumps(system.config.get('strategy', {})))
             sp = system.config.setdefault('strategy', {})
 
@@ -724,8 +731,13 @@ def instant_open():
             if not data or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
 
+            # 显式 null 与缺省同义（同 add_symbol：防 None 穿过校验后 clean[键] KeyError → 500）
+            risk_in = data.get('risk_per_trade')
+            strategy_in = data.get('strategy')
             clean, invalid = _validate_symbol_input(
-                data.get('name'), data.get('risk_per_trade', 0.01), data.get('strategy', 'turtle'))
+                data.get('name'),
+                0.01 if risk_in is None else risk_in,
+                'turtle' if strategy_in is None else strategy_in)
             if invalid:
                 return jsonify({'error': invalid}), 400
             symbol_name = clean['name']
@@ -734,6 +746,15 @@ def instant_open():
 
             if system.trade_state.get_open_position(symbol_name):
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
+
+            # 品种池已有该交易对且策略不同：拒绝。日检对在池品种一律按池内策略托管，
+            # 按请求策略开出的仓会立刻被另一套止损/出场逻辑接管（与「有持仓禁改策略」同一护栏）
+            pool_cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_name), None)
+            if pool_cfg and pool_cfg.get('strategy', 'turtle') != strategy_type:
+                pool_strategy = pool_cfg.get('strategy', 'turtle')
+                return jsonify({'error': f'{symbol_name} 已在品种池中且策略为 {pool_strategy}，'
+                                         f'与本次请求的 {strategy_type} 不一致——开仓后将被日检按池内策略托管。'
+                                         '请改按池内策略开仓，或先在品种池中调整该交易对的策略'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
             fetch_limit = ohlcv_fetch_limit_for_strategy(strategy_type, system.config.get('strategy', {}))
@@ -797,7 +818,7 @@ def instant_open():
             if not new_position:
                 return jsonify({'error': f'{symbol_name} 开仓执行失败，请查看日志'}), 500
 
-            with trading_system._config_lock:
+            with system._config_lock:
                 exists = any(s['name'] == symbol_name for s in system.config['trading']['symbols'])
                 if not exists:
                     backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
@@ -926,9 +947,8 @@ def get_channel_data():
                 lower_list.append(min(closes[i-period:i]))
         df['upper'] = upper_list
         df['lower'] = lower_list
-        df['middle'] = df.apply(lambda r: (r['upper']+r['lower'])/2 if r['upper'] is not None else None, axis=1)
-        df = df.dropna(subset=['upper', 'lower'])
-        df = df.dropna()
+        df = df.dropna(subset=['upper', 'lower']).copy()
+        df['middle'] = (df['upper'] + df['lower']) / 2
 
         positions = system.trade_state.get_all_open_positions()
         pos = positions.get(symbol, {})

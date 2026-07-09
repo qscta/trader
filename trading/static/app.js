@@ -21,12 +21,6 @@ async function authFetch(url, opts = {}) {
     return res;
 }
 
-function exQuery(extra) {
-    const p = new URLSearchParams(extra || {});
-    const s = p.toString();
-    return s ? ('?' + s) : '';
-}
-
 async function postJSON(path, body) {
     return authFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
 }
@@ -136,7 +130,7 @@ function bootData() {
 /* ---------------- 单所：状态 / 权益 ---------------- */
 async function refreshStatus() {
     try {
-        const res = await authFetch('/api/status' + exQuery());
+        const res = await authFetch('/api/status');
         const data = await res.json();
         el('statusDot').className = 'status-dot';
         setText('statusText', '运行中 · ' + (data.label || '欧易'));
@@ -190,7 +184,7 @@ function setEquityNA() {
 
 async function loadAccountStats() {
     try {
-        const res = await authFetch('/api/account_stats' + exQuery());
+        const res = await authFetch('/api/account_stats');
         if (!res.ok) { setEquityNA(); return; }
         const d = await res.json();
         const ytd = el('ytdReturn');
@@ -318,7 +312,7 @@ async function loadEquityKline() {
     const ctx = ensureKlineChart('equityChart', 'equityTooltip');
     if (!ctx) { el('equityChart').innerHTML = '<div class="chart-empty">图表库加载失败（缺 static/lwc.js）</div>'; return; }
     try {
-        const res = await authFetch('/api/equity_ohlc' + exQuery({ days: equityKlineDays }));
+        const res = await authFetch('/api/equity_ohlc?days=' + equityKlineDays);
         renderKline(ctx, await res.json(), 'equityKlineSummary');
     } catch (e) {
         el('equityKlineSummary').innerHTML = '<span class="muted">求索指数加载失败</span>';
@@ -338,7 +332,7 @@ window.setEquityKlineRange = setEquityKlineRange;
 async function loadPositions() {
     const box = el('positionsList');
     try {
-        const res = await authFetch('/api/positions' + exQuery());
+        const res = await authFetch('/api/positions');
         const positions = await res.json();
         const entries = Object.entries(positions || {});
         _positionSymbols = entries.map(([s]) => s);
@@ -388,7 +382,7 @@ async function loadPositions() {
 async function loadSymbols() {
     const box = el('symbolsList');
     try {
-        const res = await authFetch('/api/symbols' + exQuery());
+        const res = await authFetch('/api/symbols');
         const symbols = await res.json();
         window._symbolsData = symbols;
         // 品种池构成直接在此更新，不依赖 loadAccountStats 的返回时序
@@ -428,12 +422,10 @@ async function addSymbol() {
     } catch (e) { showAlert('网络错误', 'error'); }
 }
 
-function exLabel() { return '欧易'; }
-
 async function deleteSymbol(symbol) {
-    if (!confirm(`确认从【${exLabel()}】删除交易对 ${symbol}？\n删除后将从品种池移除，不再新开仓；如已有持仓，系统会继续按持仓记录的策略跟踪、更新止损并等待平仓。`)) return;
+    if (!confirm(`确认从【欧易】删除交易对 ${symbol}？\n删除后将从品种池移除，不再新开仓；如已有持仓，系统会继续按持仓记录的策略跟踪、更新止损并等待平仓。`)) return;
     try {
-        const res = await authFetch('/api/symbols/' + symbol + exQuery(), { method: 'DELETE' });
+        const res = await authFetch('/api/symbols/' + symbol, { method: 'DELETE' });
         const data = await res.json();
         if (res.ok) { showAlert('已删除', 'success'); loadSymbols(); refreshStatus(); }
         else showAlert(data.error || '删除失败', 'error');
@@ -442,7 +434,7 @@ async function deleteSymbol(symbol) {
 
 async function toggleSymbol(symbol, enabled) {
     try {
-        const res = await authFetch('/api/symbols/' + symbol + exQuery(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !enabled }) });
+        const res = await authFetch('/api/symbols/' + symbol, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !enabled }) });
         if (res.ok) { loadSymbols(); refreshStatus(); } else showAlert('更新失败', 'error');
     } catch (e) { showAlert('网络错误', 'error'); }
 }
@@ -453,7 +445,7 @@ async function updateSymbolRisk(symbol, currentRisk) {
     const risk = parseFloat(v) / 100;
     if (isNaN(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
     try {
-        const res = await authFetch('/api/symbols/' + symbol + exQuery(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ risk_per_trade: risk }) });
+        const res = await authFetch('/api/symbols/' + symbol, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ risk_per_trade: risk }) });
         if (res.ok) { showAlert('已更新', 'success'); loadSymbols(); } else showAlert('更新失败', 'error');
     } catch (e) { showAlert('网络错误', 'error'); }
 }
@@ -482,7 +474,7 @@ async function instantOpen() {
 
 async function closePosition(symbol, side, size) {
     const dir = side === 'long' ? '做多' : (side === 'short' ? '做空' : (side || '-'));
-    const input = prompt(`⚠️ 平仓确认（真实下单，不可撤销）\n交易所：${exLabel()}\n交易对：${symbol}\n方向：${dir}\n数量：${size != null ? size : '-'}\n\n确认无误请输入交易对名 “${symbol}” 以继续：`);
+    const input = prompt(`⚠️ 平仓确认（真实下单，不可撤销）\n交易所：欧易\n交易对：${symbol}\n方向：${dir}\n数量：${size != null ? size : '-'}\n\n确认无误请输入交易对名 “${symbol}” 以继续：`);
     if (input == null) return;
     if (input.trim().toUpperCase() !== symbol.toUpperCase()) { showAlert('输入与交易对不匹配，已取消平仓', 'error'); return; }
     try {
@@ -496,7 +488,7 @@ async function closePosition(symbol, side, size) {
 /* ---------------- 策略参数 / 资金同步 ---------------- */
 async function loadStrategyParams() {
     try {
-        const res = await authFetch('/api/strategy_params' + exQuery());
+        const res = await authFetch('/api/strategy_params');
         const p = await res.json();
         el('paramChannelPeriod').value = p.channel_period ?? '';
         el('paramMaShort').value = p.ma_short_period ?? '';
@@ -516,7 +508,7 @@ async function saveStrategyParams() {
         default_risk_per_trade: parseFloat(el('paramDefaultRisk').value) / 100,
     };
     try {
-        const res = await authFetch('/api/strategy_params' + exQuery(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const res = await authFetch('/api/strategy_params', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const data = await res.json();
         if (res.ok) { out.className = 'result-line ok'; out.textContent = '策略参数已保存'; }
         else { out.className = 'result-line err'; out.textContent = data.error || '保存失败'; }
@@ -554,8 +546,8 @@ async function loadTrades() {
     const box = el('tradesList');
     try {
         const [tr, sr] = await Promise.all([
-            authFetch('/api/trades' + exQuery()),
-            authFetch('/api/trades_summary' + exQuery()),
+            authFetch('/api/trades'),
+            authFetch('/api/trades_summary'),
         ]);
         const trades = await tr.json();
         const summary = await sr.json();

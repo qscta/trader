@@ -1,4 +1,6 @@
 import json
+import shutil
+import sys
 import time
 import logging
 import logging.handlers
@@ -145,7 +147,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     f'进程即将退出，请检查API密钥和网络连接！')
             except Exception:
                 pass
-            import sys
             sys.exit(1)
 
         self.risk_manager = RiskManager(account_equity, self.config['strategy']['default_risk_per_trade'])
@@ -181,6 +182,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._validate_symbol_configs(config['trading']['symbols'])
         config.setdefault('scheduler', {})
         self._validate_scheduler_config(config['scheduler'])
+        if config.get('equity_tick_retention_days') is not None:
+            # 与 strategy/scheduler 同标准 fail-loud：EquityTracker 虽有 try/except 防御，
+            # 但静默吞掉非法值会让「我配的保留天数」与实际生效值悄悄不一致
+            v = cfgv.strict_int(config['equity_tick_retention_days'], 'config.equity_tick_retention_days')
+            if not (7 <= v <= 3650):
+                raise ValueError(f"config.equity_tick_retention_days 超出允许范围 [7, 3650]: {v}")
+            config['equity_tick_retention_days'] = v
         config.setdefault('dingtalk', {})
         return config
 
@@ -286,7 +294,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         - 两边都有持仓：无法自动裁决，拒绝启动等人工；
         - 任一文件读取失败：拒绝启动（不能在持仓不明的情况下继续）。
         """
-        import shutil
         legacy_dir = os.path.join(self.base_dir, 'data', 'okx')
         if not os.path.isdir(legacy_dir):
             return
@@ -398,8 +405,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if position is None or position.get('contracts', 0) == 0:
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
                 try:
-                    ccxt_sym = self.exchange_api.to_ccxt_symbol(symbol)
-                    exit_price = self.exchange_api.get_last_price(ccxt_sym) or open_positions[symbol]['entry_price']
+                    exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
                 except Exception:
                     exit_price = open_positions[symbol]['entry_price']
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
@@ -472,7 +478,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return
         try:
             self.equity_tracker.record_daily_equity_snapshot()  # 记录每日权益快照
-            # (文件顶部已导入date)
             today = date.today().isoformat()
             if self._last_check_date == today and not manual_run:
                 logger.warning(f"今日({today})已执行过交易检查，跳过重复执行")
@@ -482,16 +487,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._pending_trade_close_notifications = []
             self._pending_stop_loss_updates = []
 
-        # 获取所有需要监控的交易对
+            # 本轮监控集合 = 手动池启用品种 ∪ 有持仓品种。品种池取轮次开始时的
+            # 快照视图（与盘中巡检同一模式）：循环中途 API 增删品种不影响本轮的
+            # 一致性，也免去逐品种重扫池子
             all_open_positions = self.trade_state.get_all_open_positions()
-            symbols_to_check = set()
-
-            # 添加手动池交易对
-            for s in self.config['trading']['symbols']:
-                if s.get('enabled', True):
-                    symbols_to_check.add(s['name'])
-
-            # 添加有开仓的交易对
+            symbol_config_map = {s['name']: s for s in self.config['trading']['symbols']}
+            symbols_to_check = {name for name, s in symbol_config_map.items() if s.get('enabled', True)}
             symbols_to_check.update(all_open_positions.keys())
 
             logger.info(f"本轮检查交易对数: {len(symbols_to_check)}")
@@ -499,28 +500,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
             self._retry_clear_stop_residues()
 
-            # 第三步：逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
+            # 逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
             failed_symbols = []
             for symbol in sorted(symbols_to_check):
                 # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
                 try:
-                    # 检查是否应该监控该交易对（必须在手动池中或有持仓）
-                    if symbol not in all_open_positions:
-                        manual_names = [s['name'] for s in self.config['trading']['symbols'] if s.get('enabled', True)]
-                        if symbol not in manual_names:
-                            logger.debug(f"{symbol} 不在手动品种池中，跳过")
-                            continue
-
-                    # 获取策略配置
-                    strategy_type = 'turtle'
-                    symbol_config = None
-
-                    for s in self.config['trading']['symbols']:
-                        if s['name'] == symbol:
-                            symbol_config = s
-                            strategy_type = s.get('strategy', 'turtle')
-                            break
-
+                    symbol_config = symbol_config_map.get(symbol)
                     if symbol_config is None:
                         # 品种已从手动池删除但仍有持仓：优先用「持仓记录的策略」，避免错按 turtle 退出
                         held = all_open_positions.get(symbol) or {}
@@ -531,7 +516,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
                             'strategy': held_strategy
                         }
-                        strategy_type = held_strategy
 
                     strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
                     logger.info(f"检查 {symbol} (策略: {strategy_type})...")
@@ -685,22 +669,36 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         # 让缓冲窗口错误地跨过整点（如 08:59 的缓冲应到 09:01，而非落在 (8,61) 的元组里）
         if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
             return
-        if self._last_check_date == date.today().isoformat():
+        if self._last_check_date == now.date().isoformat():
             return
         logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，兜底补跑一轮日检")
         self.check_and_execute_trades()
 
-    def _apply_deploy_restart_skip_catchup(self):
+    def _apply_deploy_restart_skip_catchup(self, now=None):
         """部署重启专用护栏：显式要求时只跳过今天的启动兜底日检。
 
         实盘晚间滚动代码时，重启会让内存级 _last_check_date 丢失；若已过 08:00，
         启动兜底会立刻按上一根已收盘日线再跑一轮，可能管理当前实盘仓位。部署方可在
         本次重启的进程环境里设 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1，把今日标记为已
         日检，避免启动/30分钟兜底补跑；次日自然恢复正常 08:00 日检。
+
+        只在已过今日检查窗口（与 _run_startup_catchup_check 同一阈值）时生效：
+        未到检查时间本就没有兜底补跑可跳，若此时也标记，当天正点日检会被
+        _last_check_date 拦截，整日的新信号与止损推进丢失——标志按无效处理并告警。
         """
         if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
             return False
-        today = date.today().isoformat()
+        now = now or datetime.now()
+        sched = self.config.get('scheduler', {})
+        check_hour = sched.get('check_hour', 8)
+        check_minute = sched.get('check_minute', 0)
+        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
+            logger.warning(
+                f"[{self.label}] TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 已忽略：尚未到今日 "
+                f"{check_hour:02d}:{check_minute:02d} 日检时间，无兜底补跑可跳过；"
+                "若此时标记会吞掉今天的正点日检")
+            return False
+        today = now.date().isoformat()
         self._last_check_date = today
         logger.warning(
             f"[{self.label}] 已按 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 标记今日({today})已日检，"
@@ -735,10 +733,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         weekly_hour = scheduler_config.get('weekly_hour', 8)
         weekly_minute = scheduler_config.get('weekly_minute', 1)
 
-        # 日内权益采样（默认5分钟）用于前端求索指数
+        # 日内权益采样（间隔与 EquityTracker 分桶常量同源）用于前端求索指数
+        equity_tick_interval = EquityTracker.EQUITY_TICK_INTERVAL_MINUTES
         self.scheduler.add_job(self._record_equity_tick_with_alert, 'cron',
                               id=f'{ex}_equity_tick', max_instances=1, coalesce=True, misfire_grace_time=120,
-                              minute='*/5', second=15)
+                              minute=f'*/{equity_tick_interval}', second=15)
 
         stop_loss_scan_interval = max(1, int(scheduler_config.get('stop_loss_scan_interval_minutes', 5)))
         if stop_loss_scan_interval <= 59:

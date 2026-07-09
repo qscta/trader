@@ -276,6 +276,29 @@ class StartupSmokeTest(unittest.TestCase):
             self.assertIsInstance(sched['check_minute'], int)
             self.assertIsInstance(sched['stop_loss_scan_interval_minutes'], int)
 
+    def test_equity_tick_retention_days_validated(self):
+        """equity_tick_retention_days 与其余数值配置同标准 fail-loud：
+        非法值启动即拒（此前由 EquityTracker 静默吞掉，配置值与生效值悄悄不一致）；
+        合法字符串数值规范化为 int 写回。"""
+        for bad in (0, 6, 3651, "abc", 28.9):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                cfg['equity_tick_retention_days'] = bad
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝非法保留天数: {bad!r}"):
+                        TradingSystem(config_file=path)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            cfg['equity_tick_retention_days'] = "30"
+            _jdump(cfg, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            self.assertEqual(system.config['equity_tick_retention_days'], 30)
+            self.assertEqual(system.equity_tracker.EQUITY_TICK_RETENTION_DAYS, 30)
+
     def test_large_scan_interval_passes_validation(self):
         """巡检间隔 ≥ 60 分钟必须通过启动校验（_validate_scheduler_config 放行 [1,1440]）。
 

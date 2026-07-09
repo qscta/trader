@@ -155,7 +155,6 @@ class TradeState:
         return {
             'open_positions': {},
             'closed_trades': [],
-            'last_check_time': None,
             'signal_states': {}
         }
 
@@ -288,11 +287,6 @@ class TradeState:
         with self.lock:
             return self._snapshot_locked()['closed_trades']
 
-    def update_last_check_time(self):
-        with self.lock:
-            self.state['last_check_time'] = datetime.now().isoformat()
-            self.save_state()
-
     def set_signal_state(self, symbol, mid_line_crossed):
         """设置品种的中轨穿越状态。"""
         with self.lock:
@@ -307,10 +301,6 @@ class TradeState:
                 self._set_signal_state_locked(symbol, False)
                 self.save_state()
             return self.state['signal_states'][symbol].get('mid_line_crossed', False)
-
-    def mark_mid_line_crossed(self, symbol):
-        """标记品种已穿越中轨。"""
-        self.set_signal_state(symbol, True)
 
     def set_position_strategy(self, symbol, strategy):
         """为已有持仓补写策略字段（老仓缺 strategy 时兜底，避免删除后误按默认策略托管）。"""

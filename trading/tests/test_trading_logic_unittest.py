@@ -368,6 +368,44 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=503)
 
+    def test_instant_open_null_optional_fields_use_defaults(self):
+        """显式 null 与缺省同义：risk/strategy 传 null 应按默认值开仓，而非 clean[键] KeyError → 500。"""
+        self.authenticate()
+        fake_system = self.make_system()
+
+        with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.post(
+                "/api/instant_open",
+                json={"name": "BTCUSDT", "risk_per_trade": None, "strategy": None},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(fake_system.execute_calls), 1)
+        _sym, _side, _entry, _stop, symbol_config = fake_system.execute_calls[0]
+        self.assertEqual(symbol_config["risk_per_trade"], 0.01)
+        self.assertEqual(symbol_config["strategy"], "turtle")
+
+    def test_instant_open_rejects_pool_strategy_conflict(self):
+        """品种池已有该交易对且策略不同：拒绝——开出的仓会被日检按池内策略托管，
+        止损/出场逻辑与请求的策略不一致（与「有持仓禁改策略」同一护栏）。"""
+        self.authenticate()
+        fake_system = self.make_system()
+        fake_system.config = {"trading": {"symbols": [
+            {"name": "BTCUSDT", "enabled": True, "risk_per_trade": 0.01, "strategy": "ma_cross"}]}}
+
+        with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.post(
+                "/api/instant_open",
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(fake_system.execute_calls, [])
+
 
 class SymbolInputValidationTests(unittest.TestCase):
     """品种写接口输入校验：脏 symbol / 越界风险度 / 未知策略一律 400，不得入 config 或下单路径。"""
@@ -512,6 +550,18 @@ class SymbolInputValidationTests(unittest.TestCase):
             api_server, "send_dingtalk", Mock()
         ):
             resp = self.client.put("/api/symbols/BTCUSDT", json={"risk_per_trade": 0.9})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)
+
+    def test_update_symbol_all_null_fields_returns_400(self):
+        """全部字段为显式 null（视为未提供）：干净 400，而非 clean[键] KeyError → 500。"""
+        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "risk_per_trade": 0.01}]}}
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.put(
+                "/api/symbols/BTCUSDT",
+                json={"risk_per_trade": None, "strategy": None, "enabled": None})
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)
 

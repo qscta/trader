@@ -172,7 +172,7 @@ class StartupCatchupTest(unittest.TestCase):
     def test_no_catchup_when_already_done_today(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, calls = self._system(tmp)
-            system._last_check_date = date.today().isoformat()
+            system._last_check_date = '2026-07-03'
             system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
             self.assertEqual(calls, [])
 
@@ -182,10 +182,23 @@ class StartupCatchupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system, calls = self._system(tmp)
             with patch.dict(os.environ, {'TRADING_SKIP_STARTUP_CATCHUP_ONCE': '1'}):
-                self.assertTrue(system._apply_deploy_restart_skip_catchup())
-            self.assertEqual(system._last_check_date, date.today().isoformat())
-            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
+                self.assertTrue(system._apply_deploy_restart_skip_catchup(now=datetime(2026, 7, 3, 21, 0)))
+            self.assertEqual(system._last_check_date, '2026-07-03')
+            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 21, 30))
             self.assertEqual(calls, [])
+
+    def test_deploy_restart_skip_ignored_before_check_time(self):
+        """未到今日检查时间的重启：标志必须失效——此时本无兜底可跳，
+        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与止损推进丢失。"""
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            system, calls = self._system(tmp)
+            with patch.dict(os.environ, {'TRADING_SKIP_STARTUP_CATCHUP_ONCE': '1'}):
+                self.assertFalse(system._apply_deploy_restart_skip_catchup(now=datetime(2026, 7, 3, 7, 30)))
+            self.assertIsNone(system._last_check_date)
+            # 正点后兜底照常可跑（标志未生效，没有吞掉当日日检）
+            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 8, 30))
+            self.assertEqual(calls, [1])
 
     def test_deploy_restart_skip_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,7 +260,7 @@ class DailyCheckFallbackJobTest(unittest.TestCase):
         """今日已跑：兜底任务空转，不重复执行。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, jobs, calls = self._register(tmp)
-            system._last_check_date = date.today().isoformat()
+            system._last_check_date = '2026-07-03'
             func, _trigger, _kw = jobs['okx_daily_check_fallback']
             func(now=datetime(2026, 7, 3, 15, 0))
             self.assertEqual(calls, [])

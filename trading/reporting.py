@@ -12,6 +12,8 @@ label / _pending_* 缓冲 / _summary_lock / _last_summary_date / _equity_tick_* 
 import logging
 from datetime import datetime, date
 
+from equity_tracker import EquityTracker
+
 logger = logging.getLogger(__name__)
 
 
@@ -185,9 +187,10 @@ class ReportingMixin:
             self._equity_tick_fail_streak += 1
             logger.warning(f"[{self.label}] 记录权益采样失败（连续{self._equity_tick_fail_streak}次）: {e}")
             if self._equity_tick_fail_streak >= 3 and not self._equity_tick_alert_sent:
+                streak_minutes = self._equity_tick_fail_streak * EquityTracker.EQUITY_TICK_INTERVAL_MINUTES
                 self.notifier.send_message(
                     f"[{self.label}] 权益采样告警",
-                    f"权益采样已连续失败 {self._equity_tick_fail_streak} 次（约 {self._equity_tick_fail_streak * 5} 分钟），"
+                    f"权益采样已连续失败 {self._equity_tick_fail_streak} 次（约 {streak_minutes} 分钟），"
                     f"最近错误: {e}\n时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
                 self._equity_tick_alert_sent = True
