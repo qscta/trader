@@ -346,6 +346,25 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(symbol_config["strategy"], "turtle")
         fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=365)
 
+    def test_instant_open_null_risk_and_strategy_fall_back_to_defaults(self):
+        """JSON null 的 risk/strategy 视同缺省（0.01 / turtle），
+        而非 clean 缺键抛 KeyError 变 500（回归：'risk_per_trade' KeyError）。"""
+        self.authenticate()
+        fake_system = self.make_system()
+
+        with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.post(
+                "/api/instant_open",
+                json={"name": "BTCUSDT", "risk_per_trade": None, "strategy": None},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        _, _, _, _, symbol_config = fake_system.execute_calls[0]
+        self.assertEqual(symbol_config["risk_per_trade"], 0.01)
+        self.assertEqual(symbol_config["strategy"], "turtle")
+
     def test_instant_open_fetch_limit_tracks_large_turtle_config(self):
         self.authenticate()
         fake_system = self.make_system()
@@ -514,6 +533,37 @@ class SymbolInputValidationTests(unittest.TestCase):
             resp = self.client.put("/api/symbols/BTCUSDT", json={"risk_per_trade": 0.9})
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)
+
+    def test_update_symbol_all_null_fields_returns_400(self):
+        """JSON null 字段视同「不修改」：全 null 的 body 应干净 400，
+        而非 clean 缺键抛 KeyError 变 500（回归：'risk_per_trade' KeyError）。"""
+        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "risk_per_trade": 0.01}]}}
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.put(
+                "/api/symbols/BTCUSDT",
+                json={"risk_per_trade": None, "enabled": None, "strategy": None},
+            )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)  # 未被改动
+
+    def test_update_symbol_without_updatable_field_returns_400(self):
+        """body 只含无关键：不做空转提交、不发空改动钉钉，直接 400。"""
+        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "risk_per_trade": 0.01}]}}
+        dingtalk = Mock()
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", dingtalk
+        ):
+            resp = self.client.put("/api/symbols/BTCUSDT", json={"foo": 1})
+        self.assertEqual(resp.status_code, 400)
+        dingtalk.assert_not_called()
+
+    def test_json_field_treats_null_as_default(self):
+        """_json_field 契约：显式 null 与缺键同义，均落到默认值。"""
+        self.assertEqual(api_server._json_field({"k": None}, "k", 0.01), 0.01)
+        self.assertEqual(api_server._json_field({}, "k", 0.01), 0.01)
+        self.assertEqual(api_server._json_field({"k": 0.02}, "k", 0.01), 0.02)
 
 
 class DeleteSymbolApiTests(unittest.TestCase):

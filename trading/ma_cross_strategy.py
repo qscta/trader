@@ -44,14 +44,12 @@ class MaCrossStrategy:
         双均线交叉逻辑（永远在市）：
         - EMA短期上穿EMA长期 → 做多信号
         - EMA短期下穿EMA长期 → 做空信号
-        - 反向交叉时，先平仓再反向开仓
+        - 反向交叉时由调用方先平仓再反向开仓（本方法只报方向，不产生独立平仓信号）
 
         返回信号字典，action 可能的值：
         - 'long': 做多（含从空翻多）
         - 'short': 做空（含从多翻空）
-        - 'close_long': 平多（EMA死叉）
-        - 'close_short': 平空（EMA金叉）
-        - None: 无信号
+        - None: 无交叉信号
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
         if len(df) < min_required:

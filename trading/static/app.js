@@ -319,6 +319,7 @@ async function loadEquityKline() {
     if (!ctx) { el('equityChart').innerHTML = '<div class="chart-empty">图表库加载失败（缺 static/lwc.js）</div>'; return; }
     try {
         const res = await authFetch('/api/equity_ohlc' + exQuery({ days: equityKlineDays }));
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         renderKline(ctx, await res.json(), 'equityKlineSummary');
     } catch (e) {
         el('equityKlineSummary').innerHTML = '<span class="muted">求索指数加载失败</span>';
@@ -339,6 +340,7 @@ async function loadPositions() {
     const box = el('positionsList');
     try {
         const res = await authFetch('/api/positions' + exQuery());
+        if (!res.ok) throw new Error('HTTP ' + res.status);   // 错误 JSON 不能当持仓数据渲染
         const positions = await res.json();
         const entries = Object.entries(positions || {});
         _positionSymbols = entries.map(([s]) => s);
@@ -389,6 +391,7 @@ async function loadSymbols() {
     const box = el('symbolsList');
     try {
         const res = await authFetch('/api/symbols' + exQuery());
+        if (!res.ok) throw new Error('HTTP ' + res.status);   // 错误 JSON 不能污染 _symbolsData
         const symbols = await res.json();
         window._symbolsData = symbols;
         // 品种池构成直接在此更新，不依赖 loadAccountStats 的返回时序
@@ -419,6 +422,7 @@ async function addSymbol() {
     const name = el('symbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
     const risk = parseFloat(el('riskPerTrade').value) / 100;
+    if (isNaN(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }   // NaN 会序列化成 null 静默丢字段
     const strategy = el('symbolStrategy').value;
     try {
         const res = await postJSON('/api/symbols', { name, risk_per_trade: risk, strategy });
@@ -443,7 +447,8 @@ async function deleteSymbol(symbol) {
 async function toggleSymbol(symbol, enabled) {
     try {
         const res = await authFetch('/api/symbols/' + symbol + exQuery(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !enabled }) });
-        if (res.ok) { loadSymbols(); refreshStatus(); } else showAlert('更新失败', 'error');
+        if (res.ok) { loadSymbols(); refreshStatus(); }
+        else { const data = await res.json().catch(() => ({})); showAlert(data.error || '更新失败', 'error'); }
     } catch (e) { showAlert('网络错误', 'error'); }
 }
 
@@ -454,7 +459,8 @@ async function updateSymbolRisk(symbol, currentRisk) {
     if (isNaN(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
     try {
         const res = await authFetch('/api/symbols/' + symbol + exQuery(), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ risk_per_trade: risk }) });
-        if (res.ok) { showAlert('已更新', 'success'); loadSymbols(); } else showAlert('更新失败', 'error');
+        if (res.ok) { showAlert('已更新', 'success'); loadSymbols(); }
+        else { const data = await res.json().catch(() => ({})); showAlert(data.error || '更新失败', 'error'); }
     } catch (e) { showAlert('网络错误', 'error'); }
 }
 
@@ -463,6 +469,7 @@ async function instantOpen() {
     const name = el('instantSymbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
     const risk = parseFloat(el('instantRiskPerTrade').value) / 100;
+    if (isNaN(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }   // NaN 会序列化成 null 静默丢字段
     const strategy = el('instantStrategy').value;
     const out = el('instantResult');
     out.className = 'result-line'; out.textContent = '检测信号并开仓中...';

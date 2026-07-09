@@ -6,7 +6,7 @@
 所有状态文件落在该交易所自己的 data_dir 下，互不串扰。
 
 逻辑与原 api_server 实现保持一致，仅做了：路径实例化、全局单例改为 self.system 反向引用、
-锁实例化、以及持久化失败/消息推送改为回调。
+锁实例化、以及持久化失败告警改为回调。
 """
 
 import json
@@ -45,18 +45,16 @@ class EquityTracker:
     EQUITY_TICK_RETENTION_DAYS = 30   # 安全网：每日切日会把采样压成日线OHLC，正常只剩当天；此值仅在压缩失效时兜底，可由 config 覆盖
     EQUITY_OHLC_DEFAULT_DAYS = 120
 
-    def __init__(self, data_dir, system, notify_failure=None, send_message=None, retention_days=None):
+    def __init__(self, data_dir, system, notify_failure=None, retention_days=None):
         """
         data_dir: 本交易所的数据目录（状态文件落在这里）
         system:   反向引用所属 TradingSystem，用其 exchange_api / trade_state
         notify_failure(label, filepath): 持久化失败告警回调
-        send_message(text): 普通文本推送回调（用于资金同步）
         retention_days: 日内采样保留天数（覆盖默认 EQUITY_TICK_RETENTION_DAYS）
         """
         self.data_dir = data_dir
         self.system = system
         self.notify_failure = notify_failure or (lambda label, filepath: None)
-        self.send_message = send_message or (lambda text: None)
         if retention_days:
             try:
                 self.EQUITY_TICK_RETENTION_DAYS = max(7, int(retention_days))

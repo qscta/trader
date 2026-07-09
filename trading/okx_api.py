@@ -583,4 +583,4 @@ class OkxApi(ExchangeApi):
             logger.error(f"{ccxt_symbol} 撤销普通挂单失败，可能存在残留订单！")
         if not algo_ok:
             logger.error(f"{ccxt_symbol} 撤销算法单失败，可能存在残留止损单！")
-        return None
+        return False

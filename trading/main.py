@@ -398,8 +398,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if position is None or position.get('contracts', 0) == 0:
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
                 try:
-                    ccxt_sym = self.exchange_api.to_ccxt_symbol(symbol)
-                    exit_price = self.exchange_api.get_last_price(ccxt_sym) or open_positions[symbol]['entry_price']
+                    exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
                 except Exception:
                     exit_price = open_positions[symbol]['entry_price']
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
@@ -780,8 +779,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                   hour=summary_hour, minute=summary_minute + 1, second=20)
         else:
             logger.warning(f"[{self.label}] summary_minute=59，跳过 +1 分钟持仓汇总重试任务")
+        # 与其余任务同一防护口径：APScheduler 默认 misfire_grace_time=1 秒，周一恰逢
+        # 日检占线/重启窗口会静默跳过整周报告，宽限 2 分钟内补发
         self.scheduler.add_job(self.send_weekly_report, 'cron',
-                              id=f'{ex}_weekly', day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
+                              id=f'{ex}_weekly', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
 
         # 启动即采一次权益
         self._record_equity_tick_with_alert()
