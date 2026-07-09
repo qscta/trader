@@ -43,12 +43,28 @@ def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=Non
     return clean, None
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
-# 部署要求（README）：公网访问须经 HTTPS 反向代理直连本 gunicorn。反代场景下
-# request.remote_addr 原本是反代自身地址（对所有访客都一样）——登录防爆破按 IP
-# 计数会失效为全局计数：任何人故意登录失败 5 次就会把管理员自己也锁 60 秒，
-# 且可反复触发形成持续锁定。只信任 1 跳 X-Forwarded-For（对应"单反代直连"这一
-# 已声明的部署拓扑），让 remote_addr 还原为真实客户端 IP。
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+
+
+def _parse_proxyfix_hops(value):
+    """解析 TRADING_PROXYFIX_X_FOR（信任的反代跳数）。非法值拒绝启动——
+    登录防爆破按它从 X-Forwarded-For 还原真实客户端 IP，配错即整个功能失效
+    （与 FLASK_SECRET_KEY 缺失同标准 fail-loud）。"""
+    try:
+        hops = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise RuntimeError(f'TRADING_PROXYFIX_X_FOR 必须是 0-10 的整数（反代跳数）: {value!r}')
+    if not (0 <= hops <= 10):
+        raise RuntimeError(f'TRADING_PROXYFIX_X_FOR 必须是 0-10 的整数（反代跳数）: {value!r}')
+    return hops
+
+
+# 反代跳数由部署方声明（代码无法安全地自动探测——盲信 X-Forwarded-For 本身就是漏洞）：
+# 0 = 无反代直连（完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（默认，真实客户端 IP
+# 在链尾）；2 = CDN→nginx 双层。登录防爆破按还原后的 remote_addr 计数——跳数配错时
+# 计数键要么可被伪造（绕过锁定）、要么全体访客共享（互相连坐锁定）。
+_PROXYFIX_HOPS = _parse_proxyfix_hops(os.environ.get('TRADING_PROXYFIX_X_FOR', '1'))
+if _PROXYFIX_HOPS > 0:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_PROXYFIX_HOPS, x_proto=1)
 app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
 try:
     app.json.ensure_ascii = False     # Flask >= 2.2（JSON_AS_ASCII 已废弃）

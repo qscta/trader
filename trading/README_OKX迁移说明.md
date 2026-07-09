@@ -8,7 +8,7 @@
 ```
         TradingSystem (main.py)               ← 单实例：加载配置、调度、执行
           ├── OkxApi      (适配器, okx_api.py)  ← 继承 ExchangeApi (exchange_base.py)
-          ├── TradeState   trade_state.json     ← 本地持仓/止损/信号状态（项目根目录）
+          ├── TradeState   trade_state.json     ← 本地持仓/止损/信号状态（恒定大小；平仓历史归档在 closed_trades_archive.json）
           └── EquityTracker *.json              ← 权益历史/峰值/日快照/求索指数
 ```
 
@@ -95,7 +95,7 @@ FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 ws
 
 ## 七、测试
 
-无需第三方依赖、可本机运行并通过（共 156 用例，已验证同进程任意顺序全绿）：
+无需第三方依赖、可本机运行并通过（共 164 用例，已验证同进程任意顺序全绿）：
 
 ```bash
 python -m unittest test_startup_smoke               # 15 通过（启动装配全链冒烟：配置校验/迁移/护栏/装配）
@@ -104,6 +104,7 @@ python -m unittest test_equity_drawdown             # 9 通过（未创新高统
 python -m unittest test_daily_summary_delivery      # 10 通过（钉钉汇总/缓冲/去重）
 python -m unittest test_symbol_removal_management   # 53 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈 + 调度兜底）
 python -m unittest test_okx_adapter_safety          # 28 通过（面值 fail-closed + 验证式撤单/合并查询/复验 + 止损严格匹配/三态判定）
+python -m unittest test_closed_trades_archive       # 8 通过（账本/史书分离：归档/降级/去重/日检接线）
 python -m unittest test_config_validation           # 14 通过（三入口共享校验原语边界）
 python -m unittest test_trade_state_fees            # 3 通过（手续费/盈亏）
 python -m unittest test_turtle_strategy_regression  # 8 通过（海龟信号回归）

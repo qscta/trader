@@ -415,6 +415,19 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(fake_system.execute_calls, [])
 
 
+class ProxyfixHopsTests(unittest.TestCase):
+    """反代跳数解析：登录防爆破的客户端 IP 还原依赖它，非法值必须拒绝启动（fail-loud）。"""
+
+    def test_valid_hops_parsed(self):
+        for value, want in (("0", 0), ("1", 1), ("2", 2), (10, 10), (" 1 ", 1)):
+            self.assertEqual(api_server._parse_proxyfix_hops(value), want)
+
+    def test_invalid_hops_rejected(self):
+        for bad in ("abc", "", None, -1, 11, "1.5"):
+            with self.assertRaises(RuntimeError, msg=f"{bad!r} 应拒绝启动"):
+                api_server._parse_proxyfix_hops(bad)
+
+
 class SymbolInputValidationTests(unittest.TestCase):
     """品种写接口输入校验：脏 symbol / 越界风险度 / 未知策略一律 400，不得入 config 或下单路径。"""
 

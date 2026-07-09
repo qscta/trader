@@ -106,8 +106,16 @@ def enrich_closed_trade_with_fees(trade, fee_rate=TRADING_FEE_RATE):
 
 
 class TradeState:
-    def __init__(self, state_file='trade_state.json'):
+    # 账本内保留的最近平仓记录条数：超出部分由 compact_closed_trades 搬进只追加的
+    # 史书文件。命脉账本（持仓/止损/信号状态）从此恒定大小，每次落盘不再全量重写
+    # 逐年增长的历史；史书损坏只影响历史展示，绝不阻断启动（与账本 fail-closed 相区分）。
+    KEEP_RECENT_CLOSED = 200
+
+    def __init__(self, state_file='trade_state.json', keep_recent_closed=None):
         self.state_file = state_file
+        self.archive_file = os.path.join(
+            os.path.dirname(os.path.abspath(state_file)), 'closed_trades_archive.json')
+        self.keep_recent_closed = keep_recent_closed or self.KEEP_RECENT_CLOSED
         self.lock = _file_lock
         self.state = self.load_state()
 
@@ -283,9 +291,55 @@ class TradeState:
         with self.lock:
             return self._snapshot_locked()['open_positions']
 
+    def _read_archive(self):
+        """读平仓历史史书。返回 (records, ok)：文件不存在视为空史书（ok=True）；
+        损坏时 ok=False——调用方 fail-safe（展示只出近期、归档跳过本轮），绝不静默清空。"""
+        if not os.path.exists(self.archive_file):
+            return [], True
+        try:
+            with open(self.archive_file, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                raise ValueError(f'史书顶层不是数组: {type(records).__name__}')
+            return records, True
+        except Exception as e:
+            logger.error(f'读取平仓历史史书失败（历史展示降级为近期记录，归档暂停）: {self.archive_file}: {e}')
+            return [], False
+
     def get_closed_trades(self):
+        """全部平仓历史 = 史书（旧）+ 账本近期（新），按时间先后拼接。"""
         with self.lock:
-            return self._snapshot_locked()['closed_trades']
+            recent = self._snapshot_locked()['closed_trades']
+        archive, _ok = self._read_archive()
+        return archive + recent
+
+    def compact_closed_trades(self):
+        """把账本中超出保留窗口的最旧平仓记录搬进只追加的史书文件，返回搬移条数。
+
+        fail-safe 顺序：先写史书、成功后才收缩账本（任一失败都不动账本，绝不丢史料）。
+        账本落盘失败走既有回滚——此时史书里可能多出一批「已写入但账本未收缩」的记录，
+        下一轮用内容级去重消除（同一批记录 deepcopy 后内容完全相等）。
+        """
+        with self.lock:
+            closed = self.state['closed_trades']
+            overflow_count = len(closed) - self.keep_recent_closed
+            if overflow_count <= 0:
+                return 0
+            archive, ok = self._read_archive()
+            if not ok:
+                return 0  # 史书损坏：保留账本全部记录等人工修复，_read_archive 已记日志
+            overflow = closed[:overflow_count]
+            # 内容级去重：只需比对史书尾部（重复只可能来自上一轮的窄窗口）
+            tail = archive[-(overflow_count + self.keep_recent_closed):]
+            to_append = [t for t in overflow if t not in tail]
+            if to_append and not atomic_write_json(self.archive_file, archive + to_append):
+                logger.error(f'平仓历史归档写入失败，本轮跳过（账本保留全部记录）: {self.archive_file}')
+                return 0
+            snapshot = self._snapshot_locked()
+            self.state['closed_trades'] = closed[overflow_count:]
+            self._save_or_rollback_locked(snapshot)
+            logger.info(f'已把 {overflow_count} 条最旧平仓记录归档到史书（账本保留最近 {self.keep_recent_closed} 条）')
+            return overflow_count
 
     def set_signal_state(self, symbol, mid_line_crossed):
         """设置品种的中轨穿越状态。"""

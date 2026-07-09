@@ -502,6 +502,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
             self._retry_clear_stop_residues()
 
+            # 账本瘦身：超出保留窗口的平仓历史搬进只追加的史书文件（失败不影响交易）
+            try:
+                self.trade_state.compact_closed_trades()
+            except Exception as e:
+                logger.warning(f"平仓历史归档失败（不影响交易，账本保留全部记录）: {e}")
+
             # 逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
             failed_symbols = []
             for symbol in sorted(symbols_to_check):
