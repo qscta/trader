@@ -173,12 +173,18 @@ class TradeState:
         if 'signal_states' not in self.state:
             self.state['signal_states'] = {}
 
-    def _set_signal_state_locked(self, symbol, mid_line_crossed):
+    def _set_signal_state_locked(self, symbol, mid_line_crossed, sticky=False):
         self._ensure_signal_states_locked()
-        self.state['signal_states'][symbol] = {
+        entry = {
             'mid_line_crossed': mid_line_crossed,
             'last_update': datetime.now().isoformat()
         }
+        if sticky and mid_line_crossed:
+            # 止损重入豁免标记：该 True 由「止损后价格仍在原方向一侧」的重入规则设置，
+            # 无法从 K 线历史推导（历史只看到突破已消耗），日检的历史回溯不得清洗它。
+            # 开仓成功（add_open_position 重写本条目）或价格穿到另一侧置 False 时自然解除。
+            entry['rearm_sticky'] = True
+        self.state['signal_states'][symbol] = entry
 
     def save_state(self):
         with self.lock:
@@ -221,6 +227,8 @@ class TradeState:
             }
             self.state['open_positions'][symbol] = position
             self._set_signal_state_locked(symbol, False)
+            # 持仓已形成 = 已恢复在市：遗留的重入待裁决标记随之作废，防止未来误重入
+            (self.state.get('turtle_rearm_pending') or {}).pop(symbol, None)
             self._save_or_rollback_locked(snapshot)
             return copy.deepcopy(position)
 
@@ -341,10 +349,10 @@ class TradeState:
             logger.info(f'已把 {overflow_count} 条最旧平仓记录归档到史书（账本保留最近 {self.keep_recent_closed} 条）')
             return overflow_count
 
-    def set_signal_state(self, symbol, mid_line_crossed):
-        """设置品种的中轨穿越状态。"""
+    def set_signal_state(self, symbol, mid_line_crossed, sticky=False):
+        """设置品种的中轨穿越状态。sticky=True 表示止损重入豁免（历史回溯不清洗）。"""
         with self.lock:
-            self._set_signal_state_locked(symbol, mid_line_crossed)
+            self._set_signal_state_locked(symbol, mid_line_crossed, sticky=sticky)
             self.save_state()
 
     def get_signal_state(self, symbol):
@@ -355,6 +363,34 @@ class TradeState:
                 self._set_signal_state_locked(symbol, False)
                 self.save_state()
             return self.state['signal_states'][symbol].get('mid_line_crossed', False)
+
+    def is_signal_rearm_sticky(self, symbol):
+        """该品种当前的开仓资格是否带止损重入豁免标记（历史回溯不得清洗）。"""
+        with self.lock:
+            entry = (self.state.get('signal_states') or {}).get(symbol) or {}
+            return bool(entry.get('rearm_sticky'))
+
+    # ---- 海龟止损重入待裁决标记：盘中巡检发现止损时记下，次日日检按中轨规则统一裁决 ----
+    # 盘中巡检拿不到当日已收盘信号（无中轨），无法当场套用「价格仍在原方向一侧则保持
+    # 允许开仓」的重入规则；标记持久化后由 handle_no_position_turtle 用日检信号裁决，
+    # 让盘中路径与日检路径对同一次止损给出同一套重入语义。
+
+    def mark_turtle_rearm_pending(self, symbol, side):
+        with self.lock:
+            self.state.setdefault('turtle_rearm_pending', {})[symbol] = {
+                'side': side,
+                'marked_at': datetime.now().isoformat(),
+            }
+            self.save_state()
+
+    def pop_turtle_rearm_pending(self, symbol):
+        """取出并清除该品种的重入待裁决标记；无标记返回 None。"""
+        with self.lock:
+            pending = self.state.get('turtle_rearm_pending') or {}
+            entry = pending.pop(symbol, None)
+            if entry is not None:
+                self.save_state()
+            return copy.deepcopy(entry) if entry is not None else None
 
     def set_position_strategy(self, symbol, strategy):
         """为已有持仓补写策略字段（老仓缺 strategy 时兜底，避免删除后误按默认策略托管）。"""

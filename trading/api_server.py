@@ -17,7 +17,8 @@ from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
                                ohlcv_fetch_limit_for_strategy,
                                required_closed_candles_for_strategy, strict_int,
                                strict_risk_per_trade, strict_bool,
-                               normalize_symbol_name, strict_float_finite)
+                               normalize_symbol_name, strict_float_finite,
+                               validate_strategy_supply)
 
 
 def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
@@ -93,8 +94,22 @@ _manual_check_guard = threading.Lock()
 # 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
-_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+LOGIN_FAILURE_TTL_SECONDS = 3600     # 陈旧失败记录的惰性清理年龄（防表无限增长吃内存）
+LOGIN_FAILURE_PRUNE_THRESHOLD = 256  # 表超过该大小才触发清理（平时零开销）
+_login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳, 最近失败时间戳)
 _login_guard = threading.Lock()
+
+
+def _prune_login_failures_locked(now):
+    """惰性清理陈旧登录失败记录（须持有 _login_guard）。分布式爆破/长期运行下
+    _login_failures 只在登录成功时 pop，会无限增长——超阈值时剔除已过锁定期且
+    长时间无新失败的条目。"""
+    if len(_login_failures) < LOGIN_FAILURE_PRUNE_THRESHOLD:
+        return
+    stale = [ip for ip, (_f, locked_until, last_ts) in _login_failures.items()
+             if now >= locked_until and now - last_ts > LOGIN_FAILURE_TTL_SECONDS]
+    for ip in stale:
+        _login_failures.pop(ip, None)
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 
@@ -179,7 +194,7 @@ def api_login():
     ip = request.remote_addr or 'unknown'
     now = time.time()
     with _login_guard:
-        _fails, locked_until = _login_failures.get(ip, (0, 0.0))
+        _fails, locked_until, _last_ts = _login_failures.get(ip, (0, 0.0, 0.0))
         if now < locked_until:
             return jsonify({'success': False,
                             'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
@@ -194,10 +209,11 @@ def api_login():
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
     with _login_guard:
-        fails, _ = _login_failures.get(ip, (0, 0.0))
+        _prune_login_failures_locked(now)
+        fails, _, _ = _login_failures.get(ip, (0, 0.0, 0.0))
         fails += 1
         locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
-        _login_failures[ip] = (fails, locked_until)
+        _login_failures[ip] = (fails, locked_until, now)
         if locked_until:
             logger.warning(f"登录连续失败 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
     return jsonify({'success': False, 'message': '密码错误'}), 401
@@ -433,7 +449,11 @@ def delete_symbol(symbol):
     if err:
         return err
     try:
-        symbol_u = symbol.upper()
+        # 与 add/update 同口径规范化（去空格/大写/格式校验），非法名干净 400 而非 404
+        try:
+            symbol_u = normalize_symbol_name(symbol)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
         with system._config_lock:
             # 品种不在池中：直接 404，与 update_symbol 的语义一致。否则「删不存在的品种」
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
@@ -707,6 +727,11 @@ def update_strategy_params():
         eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
         if eff_short >= eff_long:
             return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
+        # 生效配置的周期需求不得超过交易所单次 K 线供应上限（与启动校验同源）
+        try:
+            validate_strategy_supply({**cur, **parsed})
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
 
         changed = []
         with system._config_lock:

@@ -412,7 +412,10 @@ async function loadSymbols() {
 async function addSymbol() {
     const name = el('symbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
+    // 空/非数字风险度就地拦下：parseFloat('') 的 NaN 会被 JSON 序列化成 null，
+    // 后端按“未提供”静默落默认值——用户清空输入框不该被悄悄替换成 1%
     const risk = parseFloat(el('riskPerTrade').value) / 100;
+    if (isNaN(risk) || risk <= 0) { showAlert('风险度无效，请填写大于 0 的百分比', 'error'); return; }
     const strategy = el('symbolStrategy').value;
     try {
         const res = await postJSON('/api/symbols', { name, risk_per_trade: risk, strategy });
@@ -455,6 +458,7 @@ async function instantOpen() {
     const name = el('instantSymbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
     const risk = parseFloat(el('instantRiskPerTrade').value) / 100;
+    if (isNaN(risk) || risk <= 0) { showAlert('风险度无效，请填写大于 0 的百分比', 'error'); return; }
     const strategy = el('instantStrategy').value;
     const out = el('instantResult');
     out.className = 'result-line'; out.textContent = '检测信号并开仓中...';
@@ -500,13 +504,19 @@ async function loadStrategyParams() {
 
 async function saveStrategyParams() {
     const out = el('strategyParamResult');
-    const body = {
-        channel_period: parseInt(el('paramChannelPeriod').value),
-        ma_short_period: parseInt(el('paramMaShort').value),
-        ma_long_period: parseInt(el('paramMaLong').value),
-        ma_stop_period: parseInt(el('paramMaStop').value),
-        default_risk_per_trade: parseFloat(el('paramDefaultRisk').value) / 100,
-    };
+    // 只提交填写了的字段：空输入框省略（后端按“不更新该项”处理），
+    // 不再把 parseInt('') 的 NaN 序列化成 null 送去吃 400
+    const body = {};
+    [['paramChannelPeriod', 'channel_period'], ['paramMaShort', 'ma_short_period'],
+     ['paramMaLong', 'ma_long_period'], ['paramMaStop', 'ma_stop_period']].forEach(([id, key]) => {
+        const v = el(id).value.trim();
+        if (v !== '') body[key] = Number(v);   // 保留小数原样送后端，由 strict_int 统一裁决
+    });
+    const dr = el('paramDefaultRisk').value.trim();
+    if (dr !== '') body.default_risk_per_trade = parseFloat(dr) / 100;
+    if (!Object.keys(body).length) {
+        out.className = 'result-line err'; out.textContent = '请至少填写一项参数'; return;
+    }
     try {
         const res = await authFetch('/api/strategy_params', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const data = await res.json();

@@ -143,6 +143,8 @@ class StartupSmokeTest(unittest.TestCase):
             {'default_risk_per_trade': 0.6},          # 超 50% 上限
             {'ma_short_period': 28, 'ma_long_period': 28},  # 短 >= 长
             {'ma_short_period': 30, 'ma_long_period': 20},  # 短 > 长
+            {'channel_period': 400},                  # 周期需求超过交易所单次K线供应(300)
+            {'ma_short_period': 7, 'ma_long_period': 200},  # long*2=400 超供应上限
         ]
         for bad in bad_cases:
             with tempfile.TemporaryDirectory() as tmp:
@@ -297,6 +299,69 @@ class StartupSmokeTest(unittest.TestCase):
                 system = TradingSystem(config_file=path)
             self.assertEqual(system.config['equity_tick_retention_days'], 30)
             self.assertEqual(system.equity_tracker.EQUITY_TICK_RETENTION_DAYS, 30)
+
+    def test_hedge_position_mode_refuses_startup(self):
+        """账户为对冲(双向)持仓模式：与单向硬前提冲突，必须拒绝启动（fail-closed）。"""
+        class _HedgeModeApi(_FakeOkxApi):
+            position_mode = 'long_short_mode'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(main, 'OkxApi', _HedgeModeApi):
+                with self.assertRaises(RuntimeError):
+                    TradingSystem(config_file=_write_config(tmp))
+
+    def test_net_position_mode_boots(self):
+        class _NetModeApi(_FakeOkxApi):
+            position_mode = 'net_mode'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(main, 'OkxApi', _NetModeApi):
+                system = TradingSystem(config_file=_write_config(tmp))
+            self.assertEqual(system.exchange_id, 'okx')
+
+    def test_unknown_position_mode_boots_with_warning_only(self):
+        """posMode 查询失败（未知）：只告警不阻断——网络抖动不该拦住启动。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._boot(tmp)   # _FakeOkxApi 无 position_mode 属性 → 未知
+            self.assertEqual(system.exchange_id, 'okx')
+
+    def test_persist_config_never_writes_env_credentials_to_disk(self):
+        """环境变量注入的凭据绝不落盘：persist_config 后 config.json 不得出现密钥。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            del cfg['okx']['apiKey']
+            del cfg['okx']['secret']
+            del cfg['okx']['password']
+            _jdump(cfg, path)
+            env = {'OKX_API_KEY': 'env-key', 'OKX_API_SECRET': 'env-secret',
+                   'OKX_API_PASSPHRASE': 'env-pass'}
+            with patch.dict(os.environ, env):
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    system = TradingSystem(config_file=path)
+                self.assertTrue(system.persist_config())
+            on_disk = _jload(path)['okx']
+            self.assertNotIn('apiKey', on_disk)
+            self.assertNotIn('secret', on_disk)
+            self.assertNotIn('password', on_disk)
+            # 内存里的运行时凭据不受影响
+            self.assertEqual(system.config['okx']['apiKey'], 'env-key')
+
+    def test_persist_config_keeps_original_file_credentials_under_env_override(self):
+        """文件本有凭据 + 环境变量覆盖：写盘保留文件原值，env 值只活在内存。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)   # 文件凭据 k/s/p
+            env = {'OKX_API_KEY': 'env-key', 'OKX_API_SECRET': 'env-secret',
+                   'OKX_API_PASSPHRASE': 'env-pass'}
+            with patch.dict(os.environ, env):
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    system = TradingSystem(config_file=path)
+                self.assertEqual(system.config['okx']['apiKey'], 'env-key')  # 运行时用 env
+                self.assertTrue(system.persist_config())
+            on_disk = _jload(path)['okx']
+            self.assertEqual(on_disk['apiKey'], 'k')          # 盘上仍是文件原值
+            self.assertEqual(on_disk['secret'], 's')
+            self.assertEqual(on_disk['password'], 'p')
 
     def test_large_scan_interval_passes_validation(self):
         """巡检间隔 ≥ 60 分钟必须通过启动校验（_validate_scheduler_config 放行 [1,1440]）。

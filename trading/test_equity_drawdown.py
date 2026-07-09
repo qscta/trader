@@ -46,6 +46,38 @@ class CoercePositiveFloatTest(unittest.TestCase):
         self.assertEqual(eqt._coerce_positive_float("123.45"), 123.45)
 
 
+class EquitySyncRollbackTest(unittest.TestCase):
+    def test_midway_failure_restores_already_written_files(self):
+        """equity_sync 跨多文件写入：求索指数状态写失败时，已重置的峰值/权益历史
+        必须回滚到同步前的落盘原状，不留「峰值已重置、除数未更新」的撕裂状态。"""
+        tmp, t = _make(equity=120, peak=100, peak_days_ago=5, longest=3)
+        original_peak = _jload(os.path.join(tmp, 'peak_equity.json'))
+        original_hist = _jload(os.path.join(tmp, 'equity_history.json'))
+        # 先让指数状态初始化成功，再在 equity_sync 的写入步骤上注入失败
+        t.ensure_qiusuo_index_state(current_equity=100, persist=True)
+        original_qiusuo = _jload(os.path.join(tmp, 'qiusuo_index.json'))
+
+        real_save = t.save_qiusuo_index_state
+        calls = {'n': 0}
+
+        def fail_on_sync_write(data):
+            calls['n'] += 1
+            # 第 1 次来自 equity_sync 开头 ensure_qiusuo_index_state 的前置持久化（放行），
+            # 第 2 次才是同步流程真正的新除数写入——在这里失败，此时峰值/权益历史已被
+            # 重置写盘，逼出回滚路径
+            if calls['n'] == 2:
+                return False
+            return real_save(data)
+
+        t.save_qiusuo_index_state = fail_on_sync_write
+        with self.assertRaises(RuntimeError):
+            t.equity_sync()
+
+        self.assertEqual(_jload(os.path.join(tmp, 'peak_equity.json')), original_peak)
+        self.assertEqual(_jload(os.path.join(tmp, 'equity_history.json')), original_hist)
+        self.assertEqual(_jload(os.path.join(tmp, 'qiusuo_index.json')), original_qiusuo)
+
+
 class DrawdownStatsTest(unittest.TestCase):
     def test_not_new_high_includes_current_streak(self):
         """当前未创新高：历史最长 = max(历史已记录, 当前未创新高天数)。"""

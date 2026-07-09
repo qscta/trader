@@ -2,6 +2,7 @@ import ccxt
 import logging
 import math
 import time
+import uuid
 
 from exchange_base import ExchangeApi, retry_on_network_error
 
@@ -153,12 +154,28 @@ class OkxApi(ExchangeApi):
     # ===================== 杠杆 / 持仓模式 =====================
 
     def _ensure_one_way_mode(self):
-        """切换为单向(净)持仓模式。若账户已有持仓/挂单或已是该模式会报错，记录即可。"""
+        """切换为单向(净)持仓模式，并读回账户实际 posMode 供上层护栏裁决。
+
+        单向模式是全系统硬前提（get_position 取首条持仓、reduce-only 止损语义都以此
+        为基），对冲模式下运行会错管仓位。set 失败常见且无害（已是该模式/已有持仓），
+        但实际模式必须读回确认：self.position_mode = 'net_mode' / 'long_short_mode' /
+        None(查询失败，未知)。TradingSystem 启动时据此 fail-closed（对冲模式拒启）。
+        """
         try:
             self.exchange.set_position_mode(False)  # False = 单向(net)
             logger.info("OKX 已设置为单向(净)持仓模式")
         except Exception as e:
             logger.info(f"OKX 设置单向持仓模式跳过/失败（可能已是该模式或已有持仓）: {e}")
+        self.position_mode = None
+        try:
+            acc = self.exchange.privateGetAccountConfig()
+            self.position_mode = ((acc.get('data') or [{}])[0]).get('posMode')
+            if self.position_mode == 'net_mode':
+                logger.info("OKX 持仓模式已确认: net_mode（单向）")
+            elif self.position_mode:
+                logger.critical(f"OKX 账户持仓模式为 {self.position_mode}，非单向(净)模式！")
+        except Exception as e:
+            logger.warning(f"OKX 持仓模式查询失败（无法确认单向模式，上层按未知处理）: {e}")
 
     def _leverage_for(self, ccxt_symbol):
         internal = self.to_internal_symbol(ccxt_symbol)
@@ -400,8 +417,15 @@ class OkxApi(ExchangeApi):
             logger.error(f"{ccxt_symbol} 止损单张数为0，放弃创建止损单")
             return None
 
-        # stopLossPrice 为 ccxt 统一参数：OKX 下会映射为条件单 slTriggerPx + 市价(slOrdPx=-1)
-        params = self._order_params(reduce_only=True, extra={'stopLossPrice': stop_price})
+        # stopLossPrice 为 ccxt 统一参数：OKX 下会映射为条件单 slTriggerPx + 市价(slOrdPx=-1)。
+        # algoClOrdId 幂等标识：本次创建的所有重试共用同一 ID——
+        #   a) 首次请求实际已被受理（仅回包超时）时，重试会被交易所以“重复客户订单ID”
+        #      拒绝，从结构上杜绝重试造出第二张止损（双止损→触发后残留孤儿单）；
+        #   b) 超时/业务异常后的确认查询优先按该 ID 精确认领，不再单纯依赖
+        #      触发价对齐的严格字段匹配（对齐失败时字段匹配可能认不出自己的单）。
+        algo_client_id = f"tf{uuid.uuid4().hex[:24]}"
+        params = self._order_params(reduce_only=True, extra={
+            'stopLossPrice': stop_price, 'algoClOrdId': algo_client_id})
 
         max_attempts = 3
         for attempt in range(max_attempts):
@@ -415,11 +439,11 @@ class OkxApi(ExchangeApi):
                 time.sleep(2)
 
                 try:
-                    for o in self._fetch_algo_orders(ccxt_symbol):
-                        # 必须方向+触发价+张数全匹配，防止把残留旧止损误认成本次新单
-                        if self._algo_order_matches(o, stop_side, stop_price, contracts):
-                            logger.info(f"确认本次止损单已存在: 订单ID={o.get('id')}")
-                            return o
+                    found = self._claim_algo_order(ccxt_symbol, algo_client_id,
+                                                   stop_side, stop_price, contracts)
+                    if found:
+                        logger.info(f"确认本次止损单已存在: 订单ID={found.get('id')}")
+                        return found
                 except Exception as check_e:
                     logger.warning(f"查询算法单失败: {check_e}")
 
@@ -428,6 +452,15 @@ class OkxApi(ExchangeApi):
                     time.sleep(2)
 
             except (ccxt.InsufficientFunds, ccxt.InvalidOrder, ccxt.BadRequest) as e:
+                # 可能是重试撞上「重复 algoClOrdId」（首次实际已受理）：按幂等 ID 认领后再下结论
+                try:
+                    found = self._claim_algo_order(ccxt_symbol, algo_client_id,
+                                                   stop_side, stop_price, contracts)
+                    if found:
+                        logger.info(f"止损单业务异常({e})，但按幂等ID确认本次止损单已存在: {found.get('id')}")
+                        return found
+                except Exception:
+                    pass
                 logger.error(f"止损单业务异常: {e}")
                 return None
             except Exception as e:
@@ -437,13 +470,32 @@ class OkxApi(ExchangeApi):
         logger.error(f"止损单创建失败（{max_attempts}次尝试）: {ccxt_symbol} @ {stop_price}")
         return None
 
+    def _claim_algo_order(self, ccxt_symbol, algo_client_id, stop_side, stop_price, contracts):
+        """在待触发算法单里认领「本次创建的那张止损单」：
+        优先按 algoClOrdId 精确认领；老路径（无 ID 可比时）退回方向+触发价+张数严格匹配。
+        查询失败向上抛出（不可确认 ≠ 不存在）。"""
+        algos = self._fetch_algo_orders(ccxt_symbol)
+        for o in algos:
+            if algo_client_id and (o.get('info') or {}).get('algoClOrdId') == algo_client_id:
+                return o
+        for o in algos:
+            if self._algo_order_matches(o, stop_side, stop_price, contracts):
+                return o
+        return None
+
     @retry_on_network_error(max_retries=3)
     def list_position_symbols(self):
-        """交易所端当前有实际持仓的内部符号列表（启动时反向核对孤儿仓用）。"""
+        """交易所端当前有实际持仓的符号列表（启动时反向核对孤儿仓用）。
+
+        仅 USDT 本位永续映射为内部符号；其余（币本位等）原样返回 ccxt 符号——
+        to_internal_symbol 的 base+USDT 拼接会把 BTC/USD:BTC 误映射成 BTCUSDT，
+        与本地 U 本位仓撞名（误报孤儿，或本地恰有同名仓时把币本位仓掩蔽掉）。
+        非 U 本位仓照样进孤儿告警，只是用真实符号露脸。"""
         symbols = []
         for p in self.exchange.fetch_positions() or []:
             if p and p.get('contracts') and abs(float(p['contracts'])) > 0 and p.get('symbol'):
-                symbols.append(self.to_internal_symbol(p['symbol']))
+                sym = p['symbol']
+                symbols.append(self.to_internal_symbol(sym) if sym.endswith('/USDT:USDT') else sym)
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
@@ -586,9 +638,12 @@ class OkxApi(ExchangeApi):
             logger.warning(f"按ID撤单失败: {e}，尝试撤销所有挂单...")
             return self.cancel_all_orders(ccxt_symbol)
 
-    @retry_on_network_error(max_retries=3)
     def cancel_all_orders(self, symbol):
-        """撤销某交易对的所有挂单：普通单 + 算法止损单都要撤干净。"""
+        """撤销某交易对的所有挂单：普通单 + 算法止损单都要撤干净。
+
+        不挂网络重试装饰器：函数体内所有异常都已被吞成 normal_ok/algo_ok 布尔结果，
+        装饰器永远看不到异常、从不生效（死代码）。重试语义由调用方按返回值自持
+        （残留标记 + 日检重试清理）。"""
         ccxt_symbol = self._resolve_symbol(symbol)
         normal_ok = True
         algo_ok = True

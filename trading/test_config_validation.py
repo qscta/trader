@@ -81,11 +81,38 @@ class StrategyOhlcvLimitTest(unittest.TestCase):
         self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 500)
         self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 501)
 
-    def test_default_periods_keep_existing_fetch_floor(self):
+    def test_default_periods_use_exchange_supply_cap_as_floor(self):
+        """默认请求根数 = 交易所单次供应上限 300（此前 365 的“约一年”从未真正拿到过）。"""
         config = {'channel_period': 28, 'ma_long_period': 28, 'ma_stop_period': 28}
 
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 365)
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 365)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 300)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 300)
+
+
+class StrategySupplyValidationTest(unittest.TestCase):
+    """周期需求 vs 交易所单次 K 线供应（OKX 硬上限 300，不分页）——超出必须 fail-loud，
+    否则品种通过全部校验入池后会每天“K线不足”静默跳过、永不交易。"""
+
+    def test_max_servable_periods_pass(self):
+        # 海龟需求 period+2 ≤ 299 → period 上限 297；双均线 long*2 ≤ 299 → long 上限 149
+        cv.validate_strategy_supply({'channel_period': 297,
+                                     'ma_short_period': 7, 'ma_long_period': 149,
+                                     'ma_stop_period': 298})  # stop+1 = 299 恰好可供
+
+    def test_turtle_period_beyond_supply_rejected(self):
+        with self.assertRaises(ValueError):
+            cv.validate_strategy_supply({'channel_period': 298})
+
+    def test_ma_long_period_beyond_supply_rejected(self):
+        with self.assertRaises(ValueError):
+            cv.validate_strategy_supply({'ma_long_period': 150})
+
+    def test_ma_stop_period_beyond_supply_rejected(self):
+        with self.assertRaises(ValueError):
+            cv.validate_strategy_supply({'ma_stop_period': 299})
+
+    def test_defaults_pass(self):
+        cv.validate_strategy_supply({})   # 全默认周期必然可供
 
 
 if __name__ == '__main__':

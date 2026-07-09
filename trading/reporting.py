@@ -70,17 +70,29 @@ class ReportingMixin:
         })
 
     def _flush_pending_trade_notifications(self):
+        """推送并清空开/平仓通知缓冲（幂等：清空后重复调用是空转）。
+        清空使「成功路径 flush 后、整轮异常路径再 flush」不会双发，
+        而中途异常时未发出的缓冲仍在，异常路径能补发（真实成交不允许静默丢通知）。"""
         if self._pending_trade_close_notifications:
             logger.info(
                 f"信号检查完毕，推送平仓通知汇总({len(self._pending_trade_close_notifications)}条)..."
             )
             self.notifier.notify_trade_closed_summary(self._pending_trade_close_notifications)
+            self._pending_trade_close_notifications = []
 
         if self._pending_trade_open_notifications:
             logger.info(
                 f"信号检查完毕，推送开仓通知汇总({len(self._pending_trade_open_notifications)}条)..."
             )
             self.notifier.notify_trade_opened_summary(self._pending_trade_open_notifications)
+            self._pending_trade_open_notifications = []
+
+    def _flush_pending_stop_loss_updates(self):
+        """推送并清空止损更新汇总缓冲（幂等，与 _flush_pending_trade_notifications 同语义）。"""
+        if self._pending_stop_loss_updates:
+            logger.info(f"信号检查完毕，推送止损更新汇总({len(self._pending_stop_loss_updates)}条)...")
+            self.notifier.notify_stop_loss_updates_summary(self._pending_stop_loss_updates)
+            self._pending_stop_loss_updates = []
 
     def send_daily_position_summary(self):
         """每天早上推送持仓汇总"""

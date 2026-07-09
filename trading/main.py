@@ -1,3 +1,4 @@
+import copy
 import json
 import shutil
 import sys
@@ -94,6 +95,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self.notifier.notify_error(_tz_msg)
             except Exception:
                 pass
+        # 单向(净)持仓模式硬护栏：适配层启动时已读回账户 posMode，这里 fail-closed 裁决
+        self._guard_position_mode()
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
@@ -168,6 +171,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             config.setdefault('strategy', okx_block.get('strategy', {}))
             config.setdefault('trading', okx_block.get('trading', {'symbols': []}))
         okx = config.setdefault('okx', {})
+        # 记录文件侧原始凭据：persist_config 只回写这些——环境变量注入的密钥绝不落盘
+        # （用 env 管密钥的部署，改品种/参数时把密钥固化进 config.json 等于静默泄露）
+        self._file_okx_credentials = {
+            k: okx[k] for k in ('apiKey', 'secret', 'password') if k in okx}
         if os.environ.get('OKX_API_KEY'):
             okx['apiKey'] = os.environ['OKX_API_KEY']
         if os.environ.get('OKX_API_SECRET'):
@@ -262,6 +269,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if eff_short >= eff_long:
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
 
+        # 周期需求不得超过交易所单次 K 线供应（否则品种会永远“K线不足”静默跳过）
+        cfgv.validate_strategy_supply(strategy)
+
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
 
@@ -348,6 +358,25 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             except Exception as e:
                 logger.error(f"标记迁移状态归属失败: {e}")
 
+    def _guard_position_mode(self):
+        """单向(净)持仓模式是全系统硬前提（get_position 取首条持仓、reduce-only 止损
+        语义都以此为基），对冲(双向)模式下运行会错管仓位——确认为对冲模式即拒绝启动
+        （fail-closed，与账本损坏同标准）。posMode 查询失败只告警不阻断：网络抖动不该
+        拦住启动，verify_okx.py 另有人工核验路径。"""
+        mode = getattr(self.exchange_api, 'position_mode', None)
+        if mode == 'long_short_mode':
+            msg = (f'[{self.label}] OKX 账户当前为对冲(双向)持仓模式，与系统单向(净)模式'
+                   f'硬前提冲突，已拒绝启动。请到欧易把合约持仓模式改为「单向持仓」后重启。')
+            logger.critical(msg)
+            try:
+                self.notifier.notify_error(msg)
+            except Exception:
+                pass
+            raise RuntimeError(msg)
+        if mode is None:
+            logger.warning(f'[{self.label}] 启动时未能确认 OKX 持仓模式（要求单向 net_mode），'
+                           f'请人工核验或用 verify_okx.py 检查')
+
     def _guard_state_owner(self):
         """启动前校验本地状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入。
 
@@ -378,9 +407,22 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         )
 
     def persist_config(self):
-        """把当前 config 原子写回磁盘（增删品种/改参数后调用）。"""
+        """把当前 config 原子写回磁盘（增删品种/改参数后调用）。
+
+        凭据按「文件里原本有什么就写回什么」处理：环境变量注入的 apiKey/secret/password
+        只存在于内存，绝不写盘——否则用 env 管密钥的部署会在任何一次品种/参数修改后
+        把密钥固化进 config.json（随备份/同步扩散）。"""
         with self._config_lock:
-            return atomic_write_json(self.config_file, self.config)
+            cfg = copy.deepcopy(self.config)
+            okx = cfg.get('okx')
+            file_creds = getattr(self, '_file_okx_credentials', None)
+            if isinstance(okx, dict) and file_creds is not None:
+                for key in ('apiKey', 'secret', 'password'):
+                    if key in file_creds:
+                        okx[key] = file_creds[key]
+                    else:
+                        okx.pop(key, None)
+            return atomic_write_json(self.config_file, cfg)
 
     def reload_strategies(self):
         """重新加载策略参数"""
@@ -558,12 +600,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             # 首次突破提前算成已消耗，否则会吞掉本轮本该执行的开仓信号。
                             armed = self.turtle_strategy.is_first_breakout_armed(df, include_latest_bar=False)
                             if armed != mid_line_crossed:
-                                self.trade_state.set_signal_state(symbol, armed)
-                                mid_line_crossed = armed
-                                if armed:
-                                    logger.info(f"{symbol} [海龟] 历史回溯判定为可开仓状态（中轨后尚未突破），已激活")
+                                if not armed and self.trade_state.is_signal_rearm_sticky(symbol):
+                                    # 止损重入豁免：该 True 由「止损后价格仍在原方向一侧」的重入
+                                    # 规则设置，K 线历史推不出来（历史只看到那次突破已消耗），
+                                    # 回溯不得清洗；开仓成功或价格穿到另一侧时自然解除。
+                                    logger.info(f"{symbol} [海龟] 止损重入资格保持（豁免历史回溯重置）")
                                 else:
-                                    logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
+                                    self.trade_state.set_signal_state(symbol, armed)
+                                    mid_line_crossed = armed
+                                    if armed:
+                                        logger.info(f"{symbol} [海龟] 历史回溯判定为可开仓状态（中轨后尚未突破），已激活")
+                                    else:
+                                        logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
                         except Exception as e:
                             logger.warning(f"{symbol} [海龟] 历史回溯开仓状态失败: {e}")
 
@@ -619,9 +667,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             # 信号检查完成后按汇总顺序推送，避免 08:00 单条消息过多触发限流
             self._flush_pending_trade_notifications()
-            if self._pending_stop_loss_updates:
-                logger.info(f"信号检查完毕，推送止损更新汇总({len(self._pending_stop_loss_updates)}条)...")
-                self.notifier.notify_stop_loss_updates_summary(self._pending_stop_loss_updates)
+            self._flush_pending_stop_loss_updates()
             logger.info("信号检查完毕，刷新账户统计状态...")
             self.equity_tracker.refresh_account_stats_state()
             logger.info("信号检查完毕，推送每日持仓汇总...")
@@ -643,6 +689,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self._last_check_date = today
         except Exception as e:
             logger.exception(f"交易检查异常: {e}")
+            # 整轮异常也要把已发生的开/平仓与止损更新通知补发出去：这些是已成交的
+            # 真实动作，不允许随 finally 清缓冲静默丢失（flush 幂等，成功路径已发的不会重发）
+            try:
+                self._flush_pending_trade_notifications()
+                self._flush_pending_stop_loss_updates()
+            except Exception as fe:
+                logger.warning(f"异常路径补发交易通知失败: {fe}")
             try:
                 now_ts = int(time.time())
                 if now_ts - self._last_failure_notify_ts >= 600:

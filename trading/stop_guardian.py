@@ -89,8 +89,12 @@ class StopGuardianMixin:
             return
 
         if strategy_type == 'turtle':
-            self.trade_state.set_signal_state(symbol, False)
-            logger.info(f"{symbol} [海龟] 盘中止损巡检已将开仓资格重置，等待下次日检按已收盘日线重新判定")
+            # 盘中拿不到当日已收盘信号（无中轨），无法当场套用「价格仍在原方向一侧则
+            # 保持允许开仓」的重入规则——记「重入待裁决」标记，次日日检
+            # handle_no_position_turtle 按中轨规则统一裁决，与日检路径亲自发现止损时
+            # 的重入语义完全一致（此前这里硬重置为 False，盘中发现的止损永远拿不到重入资格）。
+            self.trade_state.mark_turtle_rearm_pending(symbol, position.get('side', ''))
+            logger.info(f"{symbol} [海龟] 盘中止损巡检已记录重入待裁决标记，次日日检按中轨规则裁决开仓资格")
         else:
             self.record_stop_loss(symbol)
             logger.info(f"{symbol} [双均线] 盘中止损巡检已记录 T+1 限制")

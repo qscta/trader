@@ -760,6 +760,13 @@ class EquityTracker:
         now = datetime.now()
         with self._lock:
             qiusuo_state = self.ensure_qiusuo_index_state(current_equity=current_equity, now=now, persist=True)
+            # 多文件写入无真事务：先留底已落盘的原状，任一步失败时尽力回滚，
+            # 避免留下「峰值已重置、除数未更新」之类的撕裂状态（500 后重试即可续走）
+            _rollback_originals = (
+                (self.save_peak_equity, self.load_peak_equity()),
+                (self.save_equity_history, self.load_equity_history()),
+                (self.save_qiusuo_index_state, self.load_qiusuo_index_state()),
+            )
             old_divisor = qiusuo_state.get('current_divisor') or (current_equity / (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE))
             if flow_amount is not None:
                 # 状态边界 fail-closed：nan/inf 会写出 nan/0.0 的除数污染求索指数，
@@ -777,45 +784,54 @@ class EquityTracker:
                 qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
             new_divisor = current_equity / qiusuo_anchor
 
-            peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
-            if not self.save_peak_equity(peak_data):
-                raise RuntimeError('保存峰值权益失败')
+            try:
+                peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
+                if not self.save_peak_equity(peak_data):
+                    raise RuntimeError('保存峰值权益失败')
 
-            eq_hist = self.load_equity_history()
-            # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），
-            # 原实现在下方 :.2f 格式化处直接抛 TypeError → 路由 500
-            old_initial = eq_hist.get('initial_equity') or 0
-            eq_hist['initial_equity'] = current_equity
-            eq_hist['initial_time'] = now.isoformat()
-            eq_hist['year_start_equity'] = current_equity
-            eq_hist['year_start_time'] = now.isoformat()
-            eq_hist['max_drawdown'] = 0
-            eq_hist['max_dd_time'] = None
-            eq_hist['longest_drawdown_days'] = 0
-            eq_hist.pop('current_drawdown_start', None)  # 旧版遗留字段，顺带清掉
-            if not self.save_equity_history(eq_hist):
-                raise RuntimeError('保存权益历史失败')
+                eq_hist = self.load_equity_history()
+                # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），
+                # 原实现在下方 :.2f 格式化处直接抛 TypeError → 路由 500
+                old_initial = eq_hist.get('initial_equity') or 0
+                eq_hist['initial_equity'] = current_equity
+                eq_hist['initial_time'] = now.isoformat()
+                eq_hist['year_start_equity'] = current_equity
+                eq_hist['year_start_time'] = now.isoformat()
+                eq_hist['max_drawdown'] = 0
+                eq_hist['max_dd_time'] = None
+                eq_hist['longest_drawdown_days'] = 0
+                eq_hist.pop('current_drawdown_start', None)  # 旧版遗留字段，顺带清掉
+                if not self.save_equity_history(eq_hist):
+                    raise RuntimeError('保存权益历史失败')
 
-            qiusuo_history = list(qiusuo_state.get('history', []))
-            qiusuo_history.append({
-                'effective_from': now.isoformat(timespec='seconds'),
-                'divisor': new_divisor,
-                'anchor_equity': current_equity,
-                'anchor_index': qiusuo_anchor,
-                'reason': 'equity_sync'
-            })
-            qiusuo_state.update({
-                'current_divisor': new_divisor,
-                'anchor_equity': current_equity,
-                'anchor_index': qiusuo_anchor,
-                'anchor_time': now.isoformat(timespec='seconds'),
-                'history': qiusuo_history
-            })
-            qiusuo_state = self._normalize_qiusuo_index_state(qiusuo_state)
-            if not self.save_qiusuo_index_state(qiusuo_state):
-                raise RuntimeError('保存求索指数状态失败')
+                qiusuo_history = list(qiusuo_state.get('history', []))
+                qiusuo_history.append({
+                    'effective_from': now.isoformat(timespec='seconds'),
+                    'divisor': new_divisor,
+                    'anchor_equity': current_equity,
+                    'anchor_index': qiusuo_anchor,
+                    'reason': 'equity_sync'
+                })
+                qiusuo_state.update({
+                    'current_divisor': new_divisor,
+                    'anchor_equity': current_equity,
+                    'anchor_index': qiusuo_anchor,
+                    'anchor_time': now.isoformat(timespec='seconds'),
+                    'history': qiusuo_history
+                })
+                qiusuo_state = self._normalize_qiusuo_index_state(qiusuo_state)
+                if not self.save_qiusuo_index_state(qiusuo_state):
+                    raise RuntimeError('保存求索指数状态失败')
 
-            self.record_equity_tick(equity=current_equity, now=now)
+                self.record_equity_tick(equity=current_equity, now=now)
+            except Exception:
+                # 尽力回滚已写文件到同步前的落盘原状，避免撕裂（回滚失败只记日志，异常原样上抛）
+                for _save, _original in _rollback_originals:
+                    try:
+                        _save(_original)
+                    except Exception as re:
+                        logger.error(f'权益同步失败后的回滚写入异常: {re}')
+                raise
 
         logger.info(f"权益基准已同步: {old_initial:.2f} -> {current_equity:.2f}"
                     f"{f'（净变动 {float(flow_amount):+.2f}，精确锚定）' if flow_amount is not None else '（按最近指数锚定）'}")

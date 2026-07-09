@@ -235,6 +235,70 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         self.assertEqual(1, len(system._pending_trade_close_notifications))
         self.assertEqual('ETHUSDT', system._pending_trade_close_notifications[0]['symbol'])
 
+    def test_flush_is_idempotent_after_send(self):
+        """flush 发出后清空缓冲：重复调用不双发（成功路径发完，异常路径补发不会重复）。"""
+        system = self._build_system(notify_result=True)
+        system._pending_trade_close_notifications = [
+            {'symbol': 'SOLUSDT', 'side': 'long', 'exit_price': 99.1, 'pnl': 12.3, 'pnl_pct': 4.5}]
+        system._pending_stop_loss_updates = [
+            {'symbol': 'BTCUSDT', 'old_stop_loss_price': 100, 'new_stop_loss_price': 98}]
+
+        system._flush_pending_trade_notifications()
+        system._flush_pending_trade_notifications()
+        system._flush_pending_stop_loss_updates()
+        system._flush_pending_stop_loss_updates()
+
+        self.assertEqual(1, system.notifier.trade_close_summary_calls)
+        self.assertEqual(1, system.notifier.stop_loss_update_summary_calls)
+        self.assertEqual([], system._pending_trade_close_notifications)
+        self.assertEqual([], system._pending_stop_loss_updates)
+
+    def test_round_exception_still_delivers_buffered_trade_notifications(self):
+        """整轮异常时已成交的开/平仓通知必须补发，不得随 finally 清缓冲静默丢失。
+        模拟：成功路径 flush 首发即抛（钉钉抖动）→ 整轮 except 补发成功。"""
+        system = self._build_system(notify_result=True)
+        system._trade_lock = threading.Lock()
+        system._last_check_date = None
+        system._last_failure_notify_ts = 0
+        system.equity_tracker = SimpleNamespace(
+            record_daily_equity_snapshot=lambda: None,
+            refresh_account_stats_state=lambda: None)
+        system.trade_state = SimpleNamespace(
+            get_all_open_positions=lambda: {},
+            get_open_position=lambda symbol: None,
+            get_signal_state=lambda symbol: False,
+            set_signal_state=lambda symbol, value: None,
+            get_stop_residues=lambda: {},
+            compact_closed_trades=lambda: 0)
+        system.config = {'trading': {'symbols': []},
+                         'strategy': {'default_risk_per_trade': 0.01}}
+        system.exchange_api = SimpleNamespace(fetch_ohlcv=lambda *a, **k: [])
+        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: False
+        system._retry_clear_stop_residues = lambda: None
+
+        # 让检查循环“产出”一笔平仓缓冲：品种检查阶段本身无事，直接预填后由 flush 抛错
+        raised = {'n': 0}
+        real_flush = system._flush_pending_trade_notifications
+
+        def flush_raises_once():
+            if raised['n'] == 0:
+                raised['n'] += 1
+                raise RuntimeError('钉钉网络抖动')
+            return real_flush()
+
+        system._flush_pending_trade_notifications = flush_raises_once
+
+        def fill_buffer():
+            system._pending_trade_close_notifications.append(
+                {'symbol': 'SOLUSDT', 'side': 'long', 'exit_price': 99.1, 'pnl': 12.3, 'pnl_pct': 4.5})
+
+        system.trade_state.compact_closed_trades = lambda: fill_buffer() or 0
+
+        system.check_and_execute_trades()
+
+        self.assertEqual(1, system.notifier.trade_close_summary_calls)   # 异常路径补发成功
+        self.assertEqual('SOLUSDT', system.notifier.trade_close_summary_payload[0]['symbol'])
+
     def test_trade_open_and_close_summaries_are_sent_once(self):
         system = self._build_system(notify_result=True)
         system._pending_trade_open_notifications = [

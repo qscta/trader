@@ -267,6 +267,95 @@ class FetchAlgoNativeTest(unittest.TestCase):
         self.assertEqual(set(seen), {'DOGE-USDT-SWAP'})
 
 
+class StopOrderIdempotentClaimTest(unittest.TestCase):
+    """止损创建的幂等认领：同一次创建的所有重试共用 algoClOrdId——
+    首发实际已受理（仅回包超时）时，确认查询按该 ID 精确认领自己的单，
+    即使交易所把触发价按 tick 取整导致严格字段匹配失败，也不得再造第二张（双止损）。"""
+
+    def _api(self):
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api.exchange.amount_to_precision.return_value = '10'
+        api.exchange.price_to_precision.side_effect = RuntimeError('精度元数据不可得')  # 对齐退化
+        return api
+
+    def test_timeout_claims_own_order_by_client_id_despite_price_drift(self):
+        api = self._api()
+        sent = {}
+
+        def create_order(symbol, otype, side, amount, price, params):
+            sent['algoClOrdId'] = params.get('algoClOrdId')
+            raise RequestTimeout('回包超时')
+
+        api.exchange.create_order.side_effect = create_order
+
+        def pending(params):
+            if params.get('ordType') != 'conditional' or not sent.get('algoClOrdId'):
+                return {'code': '0', 'msg': '', 'data': []}
+            # 交易所已受理：触发价被 tick 取整成 39.3（我方原始价 39.384，严格匹配必失败）
+            item = _native_stop(algo_id='accepted-1', sz='10', px='39.3')
+            item['algoClOrdId'] = sent['algoClOrdId']
+            return {'code': '0', 'msg': '', 'data': [item]}
+
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = pending
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.create_stop_loss_order('BTC/USDT:USDT', 'long', 0.1, 39.384)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order['id'], 'accepted-1')
+        self.assertEqual(api.exchange.create_order.call_count, 1)  # 绝不重复下第二张
+
+    def test_duplicate_client_id_rejection_claims_existing_order(self):
+        """重试撞上「重复客户订单ID」类业务异常：按幂等 ID 认领已存在的单，而非误判失败。"""
+        api = self._api()
+        sent = {}
+
+        def create_order(symbol, otype, side, amount, price, params):
+            sent['algoClOrdId'] = params.get('algoClOrdId')
+            raise _ccxt.InvalidOrder('51016 clOrdId already exists')
+
+        api.exchange.create_order.side_effect = create_order
+
+        def pending(params):
+            if params.get('ordType') != 'conditional':
+                return {'code': '0', 'msg': '', 'data': []}
+            item = _native_stop(algo_id='accepted-2', sz='10', px='39.38')
+            item['algoClOrdId'] = sent.get('algoClOrdId')
+            return {'code': '0', 'msg': '', 'data': [item]}
+
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = pending
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.create_stop_loss_order('BTC/USDT:USDT', 'long', 0.1, 39.384)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(order['id'], 'accepted-2')
+
+    def test_timeout_without_accepted_order_returns_none_after_retries(self):
+        """交易所确实没受理：认领落空，按原语义重试后返回 None（挂止损失败走回滚）。"""
+        api = self._api()
+        api.exchange.create_order.side_effect = RequestTimeout('回包超时')
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub({})
+        api.exchange.fetch_positions.return_value = []
+        with patch.object(okx_api, 'time', Mock(sleep=lambda s: None)):
+            order = api.create_stop_loss_order('BTC/USDT:USDT', 'long', 0.1, 39.384)
+        self.assertIsNone(order)
+        self.assertEqual(api.exchange.create_order.call_count, 3)
+
+
+class ListPositionSymbolsMappingTest(unittest.TestCase):
+    def test_coin_margined_positions_not_mismapped_to_usdt_symbol(self):
+        """币本位仓位（BTC/USD:BTC）不得被拼成 BTCUSDT——那会与本地 U 本位仓撞名
+        （误报孤儿或互相掩蔽）；应原样返回真实符号，照样进孤儿告警。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 5, 'symbol': 'BTC/USD:BTC'},      # 币本位
+            {'contracts': 1, 'symbol': 'ETH/USDT:USDT'},    # U 本位
+            {'contracts': 0, 'symbol': 'SOL/USDT:USDT'},    # 空仓条目应剔除
+        ]
+        self.assertEqual(sorted(api.list_position_symbols()), ['BTC/USD:BTC', 'ETHUSDT'])
+
+
 class CancelOrderFallbackReverifyTest(unittest.TestCase):
     def test_normal_cancel_success_but_algo_still_listed_is_failure(self):
         """普通撤单 fallback 返回成功，但算法单列表仍有该 id：必须返回 False。"""

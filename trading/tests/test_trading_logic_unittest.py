@@ -115,8 +115,9 @@ class TurtleStopLossFollowupTests(unittest.TestCase):
                 self.closed = (symbol, exit_price)
                 return {"symbol": symbol, "exit_price": exit_price}
 
-            def set_signal_state(self, symbol, value):
+            def set_signal_state(self, symbol, value, sticky=False):
                 self.signal_state[symbol] = value
+                self.signal_sticky = sticky
 
             def get_signal_state(self, symbol):
                 return self.signal_state.get(symbol, False)
@@ -352,7 +353,7 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(entry_price, 123.45)
         self.assertEqual(stop_loss_price, 100)
         self.assertEqual(symbol_config["strategy"], "turtle")
-        fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=365)
+        fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=300)
 
     def test_instant_open_fetch_limit_tracks_large_turtle_config(self):
         self.authenticate()
@@ -554,6 +555,17 @@ class SymbolInputValidationTests(unittest.TestCase):
                 resp = self.client.put("/api/strategy_params", json={"default_risk_per_trade": bad})
             self.assertEqual(resp.status_code, 400, msg=f"default_risk={bad!r} 应 400")
             self.assertEqual(self.system.config["strategy"]["default_risk_per_trade"], 0.01)
+
+    def test_strategy_params_rejects_period_beyond_exchange_supply(self):
+        """周期需求超过交易所单次 K 线供应上限（OKX 300 根、不分页）：400 且不写入——
+        否则品种会通过校验入池后每天“K线数据不足”静默跳过、永不交易。"""
+        self.system.config = {"strategy": {"channel_period": 28}}
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.put("/api/strategy_params", json={"channel_period": 400})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.system.config["strategy"]["channel_period"], 28)  # 未写入
 
     def test_strategy_params_rejects_fractional_period(self):
         """API 与启动校验同源 strict_int：小数周期 28.9 拒绝而非截断为 28（三入口口径一致）。"""

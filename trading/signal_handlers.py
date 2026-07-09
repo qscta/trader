@@ -5,7 +5,7 @@
 
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
-宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
+宿主须提供：exchange_api / trade_state / notifier / turtle_strategy / ma_cross_strategy /
 stop_loss_dates / is_stop_loss_today / record_stop_loss / _save_stop_loss_dates /
 _handle_exchange_flat_close / _get_strategy_display_name /
 _notify_missing_position_after_signal / _execute_open / _update_stop_order /
@@ -32,10 +32,39 @@ class SignalHandlersMixin:
         self.record_stop_loss(symbol)
         self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
 
+    def _resolve_turtle_rearm_pending(self, symbol, signal):
+        """裁决盘中止损巡检留下的「重入待裁决」标记——与日检路径亲自发现止损时的重入规则同一条：
+        价格仍在原持仓方向一侧 → 保持允许开仓（sticky，历史回溯不清洗）；
+        已穿到另一侧 → 等待重新穿越中轨。当日本就发生有效中轨穿越时，常规资格链已重新
+        激活（主循环已按 mid_line_crossed 置位），标记直接作废，绝不反向覆盖新资格。"""
+        pending = self.trade_state.pop_turtle_rearm_pending(symbol)
+        if not pending:
+            return False
+        if signal.get('mid_line_crossed'):
+            logger.info(f"{symbol} [海龟] 盘中止损重入裁决：当日已有效穿越中轨，按常规资格链处理")
+            return False
+        current_close = signal.get('current_close', 0)
+        mid_line = signal.get('mid_line', 0)
+        side = pending.get('side', '')
+        if (side == 'short' and current_close < mid_line) or \
+           (side == 'long' and current_close > mid_line):
+            self.trade_state.set_signal_state(symbol, True, sticky=True)
+            logger.info(f"{symbol} [海龟] 盘中止损重入裁决：价格({current_close:.4f})仍在中轨({mid_line:.4f})原方向一侧，保持允许开仓")
+            return True
+        self.trade_state.set_signal_state(symbol, False)
+        logger.info(f"{symbol} [海龟] 盘中止损重入裁决：价格已穿越到另一侧，等待重新穿越中轨")
+        return False
+
     def handle_no_position_turtle(self, symbol, signal, symbol_config, df):
         """海龟策略：处理没有开仓头寸的情况（多空对称，只差方向字面量）"""
         logger.info(f"{symbol} [海龟] 没有开仓头寸，检查是否有开仓信号...")
 
+        if self._resolve_turtle_rearm_pending(symbol, signal):
+            # 裁决刚把开仓资格置回 True：当日信号是按旧资格(False)生成的，突破可能被
+            # can_open 拦成了 action=None——用新资格重算一遍，避免漏掉止损当日的再突破
+            refreshed = self.turtle_strategy.check_signal(df, mid_line_crossed=True)
+            if refreshed:
+                signal = refreshed
         side = signal['action']
         if side not in ('long', 'short'):
             return
@@ -86,12 +115,12 @@ class SignalHandlersMixin:
                     mid_line = signal.get('mid_line', 0)
                     side = position.get('side', '')
                     if side == 'short' and current_close < mid_line:
-                        # 开空被止损，价格回落到中轨下方，保持允许开仓
-                        self.trade_state.set_signal_state(symbol, True)
+                        # 开空被止损，价格回落到中轨下方，保持允许开仓（sticky：历史回溯不清洗）
+                        self.trade_state.set_signal_state(symbol, True, sticky=True)
                         logger.info(f"{symbol} [海龟] 空单止损，价格仍在中轨下方({current_close:.4f}<{mid_line:.4f})，保持允许开仓")
                     elif side == 'long' and current_close > mid_line:
-                        # 开多被止损，价格回落到中轨上方，保持允许开仓
-                        self.trade_state.set_signal_state(symbol, True)
+                        # 开多被止损，价格回落到中轨上方，保持允许开仓（sticky：历史回溯不清洗）
+                        self.trade_state.set_signal_state(symbol, True, sticky=True)
                         logger.info(f"{symbol} [海龟] 多单止损，价格仍在中轨上方({current_close:.4f}>{mid_line:.4f})，保持允许开仓")
                     else:
                         self.trade_state.set_signal_state(symbol, False)
