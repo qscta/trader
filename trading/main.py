@@ -21,10 +21,12 @@ from signal_handlers import SignalHandlersMixin
 from trade_executor import TradeExecutorMixin
 import config_validation as cfgv
 
-# 日志轮转（10MB自动切割，保留5个备份）。路径锚定项目目录，避免 systemd/cron 等不同 cwd 下日志写错位置
+# 日志轮转（10MB自动切割，保留5个备份）。路径锚定项目目录，避免 systemd/cron 等不同 cwd 下日志写错位置。
+# delay=True 懒打开：首条日志时才创建文件——测试进程导入 main 时（根 logger 已被测试挂
+# NullHandler，basicConfig 空转）不再凭空建文件/占句柄；生产启动毫秒内即写日志，行为等价
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
 log_handler = logging.handlers.RotatingFileHandler(
-    _LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+    _LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8', delay=True
 )
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 

@@ -18,6 +18,14 @@ if str(APP_DIR) not in sys.path:
 os.environ.setdefault("FLASK_SECRET_KEY", "test-secret")
 os.environ.setdefault("TRADING_API_TOKEN", "test-token")
 
+# 测试进程不落生产日志（与 _test_stubs.import_main 同一护栏）：下方 import main 会触发
+# logging.basicConfig(handlers=[RotatingFileHandler(trading.log), ...])，它仅在根 logger
+# 无 handler 时生效——先挂 NullHandler 让它空转，部署机上跑测试不再污染真实 trading.log
+import logging  # noqa: E402
+
+if not logging.getLogger().handlers:
+    logging.getLogger().addHandler(logging.NullHandler())
+
 import pandas as pd  # noqa: E402
 
 import threading  # noqa: E402

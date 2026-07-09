@@ -10,6 +10,7 @@
 trade_state / equity_tracker 是纯标准库实现，不桩，main 直接绑定真实现。
 """
 import importlib
+import logging
 import sys
 import types
 
@@ -37,6 +38,13 @@ _STUB_SPECS = (
 
 def import_main():
     """桩接依赖→导入 main→立即恢复 sys.modules，返回导入的 main 模块。"""
+    # 测试进程不落生产日志：main 导入时的 logging.basicConfig(handlers=[RotatingFileHandler
+    # (trading.log), StreamHandler]) 仅在根 logger 无 handler 时生效——先挂 NullHandler
+    # 让它空转。否则在部署机上跑测试会把模拟场景（止损残留/CRITICAL 告警等）写进真实
+    # trading.log，污染监控视野还会造成真假告警混淆。
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.NullHandler())
     saved = {}
     for name, attrs in _STUB_SPECS:
         saved[name] = sys.modules.get(name)
