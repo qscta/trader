@@ -90,7 +90,8 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 | `gunicorn -w 1`（单 worker） | 多 worker 会重复初始化交易系统；`wsgi.py` 文件锁兜底，多余 worker 直接拒启 |
 | 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；缺 `FLASK_SECRET_KEY` 拒绝启动 |
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
-| 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
+| 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输；防爆破按 X-Forwarded-For 单跳还原真实 IP（不经反代直连时设 `TRADING_TRUST_PROXY=0`） |
+| 进程工作目录必须是项目根（systemd `WorkingDirectory=`） | `config.json` 与全部状态文件锚定在进程 cwd，错位会读不到配置或把持仓账本写到别处 |
 | 上实盘前跑通 `python verify_okx.py`（sandbox） | 张数换算 / 止损算法单 / 撤单 / 单向模式只能真连交易所自证，代码审查不能替代 |
 
 > **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——

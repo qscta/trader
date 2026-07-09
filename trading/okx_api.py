@@ -62,6 +62,7 @@ class OkxApi(ExchangeApi):
 
         self._contract_size_cache = {}     # ccxt_symbol -> contractSize（每张多少币）
         self._amount_precision_cache = {}  # ccxt_symbol -> 张数小数位
+        self._price_tick_cache = {}        # ccxt_symbol -> 价格最小变动单位（tick）
         self._leverage_done = set()        # 本进程已设置过杠杆的 ccxt_symbol
 
         self._load_market_cache()
@@ -101,6 +102,9 @@ class OkxApi(ExchangeApi):
                     amount_step = (market.get('precision') or {}).get('amount')
                     if amount_step is not None:
                         self._amount_precision_cache[sym] = self._normalize_precision(amount_step)
+                    price_step = (market.get('precision') or {}).get('price')
+                    if price_step:
+                        self._price_tick_cache[sym] = float(price_step)
                     count += 1
             logger.info(f"OKX 市场缓存已加载: {count} 个 USDT 永续，合约面值 {len(self._contract_size_cache)} 个")
         except Exception as e:
@@ -149,6 +153,20 @@ class OkxApi(ExchangeApi):
         """返回“张数”的小数位（仅用于日志展示）。"""
         ccxt_symbol = self._resolve_symbol(symbol)
         return self._amount_precision_cache.get(ccxt_symbol, 0)
+
+    def _get_price_tick(self, ccxt_symbol):
+        """价格最小变动单位（tick）。取不到返回 None——止损单匹配退回原严格容差（fail-safe）。"""
+        if ccxt_symbol in self._price_tick_cache:
+            return self._price_tick_cache[ccxt_symbol]
+        try:
+            step = (self.exchange.market(ccxt_symbol).get('precision') or {}).get('price')
+            step = float(step) if step else None
+        except Exception:
+            return None
+        if step and step > 0:
+            self._price_tick_cache[ccxt_symbol] = step
+            return step
+        return None
 
     # ===================== 杠杆 / 持仓模式 =====================
 
@@ -342,11 +360,16 @@ class OkxApi(ExchangeApi):
             return None
 
     @staticmethod
-    def _algo_order_matches(order, stop_side, stop_price, contracts):
+    def _algo_order_matches(order, stop_side, stop_price, contracts, price_tick=None):
         """判断一张算法单是否就是「我们刚下的那张止损单」：方向 + 触发价 + 张数全部吻合。
 
         超时确认只按方向匹配会把残留的旧止损误认成新单，导致本地记录的止损价
         与交易所实际不一致。任何字段读不到一律视为不匹配（宁可重试创建，也不误认）。
+
+        price_tick 提供时，触发价容差放宽到一个 tick（×1.001 抗浮点）：交易所可能把
+        触发价按 tick 取整，严格 1ppm 匹配会把「实际已落单」误判成未落单——超时重试
+        路径因此再建一张，留下双止损/孤儿单。一个 tick 内不可能同时存在两张我方止损
+        （撤旧都是验证式确认后才建新，残留则直接阻断建新），放宽不引入误认。
         """
         if not order or order.get('side') != stop_side:
             return False
@@ -358,7 +381,10 @@ class OkxApi(ExchangeApi):
             stop_price = float(stop_price)
         except (TypeError, ValueError):
             return False
-        if abs(trigger - stop_price) > max(1e-8, abs(stop_price) * 1e-6):
+        tolerance = max(1e-8, abs(stop_price) * 1e-6)
+        if price_tick:
+            tolerance = max(tolerance, float(price_tick) * 1.001)
+        if abs(trigger - stop_price) > tolerance:
             return False
         amount = order.get('amount')
         if amount is None:
@@ -387,6 +413,7 @@ class OkxApi(ExchangeApi):
 
         # stopLossPrice 为 ccxt 统一参数：OKX 下会映射为条件单 slTriggerPx + 市价(slOrdPx=-1)
         params = self._order_params(reduce_only=True, extra={'stopLossPrice': stop_price})
+        price_tick = self._get_price_tick(ccxt_symbol)  # 超时确认按 tick 容差匹配，防交易所取整致重复建单
 
         max_attempts = 3
         for attempt in range(max_attempts):
@@ -402,7 +429,7 @@ class OkxApi(ExchangeApi):
                 try:
                     for o in self._fetch_algo_orders(ccxt_symbol):
                         # 必须方向+触发价+张数全匹配，防止把残留旧止损误认成本次新单
-                        if self._algo_order_matches(o, stop_side, stop_price, contracts):
+                        if self._algo_order_matches(o, stop_side, stop_price, contracts, price_tick=price_tick):
                             logger.info(f"确认本次止损单已存在: 订单ID={o.get('id')}")
                             return o
                 except Exception as check_e:
@@ -435,7 +462,8 @@ class OkxApi(ExchangeApi):
         """检查与「本地持仓记录」对应的止损算法单状态（供主层止损自愈巡检使用）。
 
         amount 为币数，张数换算在本方法内部完成（张数不外泄）。返回三态：
-          'intact'   — 存在方向+触发价+张数与本地记录严格一致的算法单（保护完整）；
+          'intact'   — 存在方向+触发价+张数与本地记录一致的算法单（触发价按一个 tick
+                       容差比对，抗交易所取整；方向与张数严格），保护完整；
           'mismatch' — 本地记录的 stop_order_id 还在列表里，但内容与本地记录不符
                        （异常状态：可能被人工改挂过，自动补挂会造成双止损，须人工核对）；
           'missing'  — 列表中不存在匹配的止损单（需要补挂）。
@@ -444,9 +472,10 @@ class OkxApi(ExchangeApi):
         ccxt_symbol = self._resolve_symbol(symbol)
         stop_side = 'sell' if side == 'long' else 'buy'
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
+        price_tick = self._get_price_tick(ccxt_symbol)  # 与创建路径同一容差口径（tick 取整不算 mismatch）
         algos = self._fetch_algo_orders(ccxt_symbol)
         for o in algos:
-            if self._algo_order_matches(o, stop_side, stop_price, contracts):
+            if self._algo_order_matches(o, stop_side, stop_price, contracts, price_tick=price_tick):
                 return 'intact'
         if stop_order_id and any(str(o.get('id')) == str(stop_order_id) for o in algos):
             return 'mismatch'

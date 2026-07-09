@@ -13,7 +13,8 @@ from trade_state import enrich_closed_trade_with_fees
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
-from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
+from config_validation import (MAX_REQUIRED_CLOSED_CANDLES, PERIOD_MAX, PERIOD_MIN,
+                               STRATEGY_WHITELIST,
                                ohlcv_fetch_limit_for_strategy,
                                required_closed_candles_for_strategy, strict_int,
                                strict_risk_per_trade, strict_bool,
@@ -58,7 +59,11 @@ app = Flask(__name__, static_folder='static', static_url_path='/static')
 # 计数会失效为全局计数：任何人故意登录失败 5 次就会把管理员自己也锁 60 秒，
 # 且可反复触发形成持续锁定。只信任 1 跳 X-Forwarded-For（对应"单反代直连"这一
 # 已声明的部署拓扑），让 remote_addr 还原为真实客户端 IP。
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+# 若确需**不经反代**直连暴露（不符合部署要求，仅内网调试等场景），必须设
+# TRADING_TRUST_PROXY=0 关闭还原——否则客户端可伪造 X-Forwarded-For 头
+# 冒充任意 IP，绕过登录限速甚至锁死他人计数。默认开启，匹配声明拓扑。
+if os.environ.get('TRADING_TRUST_PROXY', '1') != '0':
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
 try:
     app.json.ensure_ascii = False     # Flask >= 2.2（JSON_AS_ASCII 已废弃）
@@ -697,6 +702,16 @@ def update_strategy_params():
         eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
         if eff_short >= eff_long:
             return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
+        # 所需已收盘 K 线不得超过交易所单次供应上限（与启动校验同口径）：
+        # 超限周期永远取不够数据，该策略会静默停摆（日检每天警告跳过）
+        effective = dict(cur)
+        effective.update(parsed)
+        for st in STRATEGY_WHITELIST:
+            required = required_closed_candles_for_strategy(st, effective)
+            if required > MAX_REQUIRED_CLOSED_CANDLES:
+                return jsonify({'error': f'{st} 策略按此参数需要 {required} 根已收盘K线，超过交易所'
+                                         f'单次K线供应上限 {MAX_REQUIRED_CLOSED_CANDLES}'
+                                         f'（OKX 单次最多 300 根），将永远无法出信号，请调小周期'}), 400
 
         changed = []
         with system._config_lock:

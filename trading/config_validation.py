@@ -20,6 +20,11 @@ PERIOD_MAX = 500
 DEFAULT_OHLCV_FETCH_LIMIT = 365
 # fetch_ohlcv 可能包含当前未收盘 K 线，过滤后要仍满足策略最低已收盘根数。
 OPEN_CANDLE_FETCH_BUFFER = 1
+# 策略所需「已收盘」K 线根数的硬上限：OKX /market/candles 单次最多返回 300 根，
+# 扣除 1 根可能未收盘的当前 K 线。超过它的周期配置**永远**取不够数据、永远出不了
+# 信号（日检每天警告跳过，形同该策略静默停摆）——与 EMA 短≥长同标准 fail-loud
+# 拒绝，而不是留一个「配置合法却永不工作」的陷阱。若交易所提高供应，同步调整。
+MAX_REQUIRED_CLOSED_CANDLES = 299
 # 单笔风险度上限 50%：防止把 1 当 1% 输这类数量级笔误直接放大到全仓
 MAX_RISK_PER_TRADE = 0.5
 # 内部交易对名：大写字母/数字，以 USDT 结尾（U 本位永续）

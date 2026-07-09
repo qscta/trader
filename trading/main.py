@@ -252,6 +252,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if eff_short >= eff_long:
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
 
+        # 所需已收盘 K 线不得超过交易所单次供应上限：超限的周期永远取不够数据，
+        # 该策略会静默停摆（日检每天警告跳过）——fail-loud 拒启，与 API 入口同口径
+        for st in cfgv.STRATEGY_WHITELIST:
+            required = cfgv.required_closed_candles_for_strategy(st, strategy)
+            if required > cfgv.MAX_REQUIRED_CLOSED_CANDLES:
+                raise ValueError(
+                    f"config.strategy 使 {st} 策略需要 {required} 根已收盘K线，超过交易所单次"
+                    f"K线供应上限 {cfgv.MAX_REQUIRED_CLOSED_CANDLES}（OKX 单次最多 300 根），"
+                    f"该策略将永远无法出信号，请调小周期")
+
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
 

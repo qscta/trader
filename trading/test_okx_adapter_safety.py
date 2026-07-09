@@ -45,6 +45,7 @@ def _bare_api():
     api.exchange = Mock()
     api._contract_size_cache = {}
     api._amount_precision_cache = {}
+    api._price_tick_cache = {}
     api.CANCEL_VERIFY_RECHECK_DELAY = 0  # 测试不等待复查间隔
     return api
 
@@ -252,6 +253,14 @@ class FindStopOrderStateTest(unittest.TestCase):
         api.exchange.fetch_open_orders.return_value = []
         self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'missing')
 
+    def test_tick_rounded_trigger_is_intact_not_mismatch(self):
+        """触发价被交易所按 tick 取整（差一个 tick）：应判 intact，不得误报 mismatch 轰炸人工。"""
+        api = self._api()
+        api._price_tick_cache['BTC/USDT:USDT'] = 0.5
+        api.exchange.fetch_open_orders.return_value = [
+            {'id': 'stop-1', 'side': 'sell', 'amount': 10.0, 'stopLossPrice': 55000.5, 'info': {}}]
+        self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'intact')
+
     def test_contract_size_failure_propagates(self):
         """面值不可得：fail-closed 异常向上传播，调用方按 fail-safe 跳过本轮。"""
         api = _bare_api()
@@ -284,6 +293,22 @@ class StopOrderMatchTest(unittest.TestCase):
     def test_trigger_from_okx_info_field(self):
         o = {'side': 'sell', 'info': {'slTriggerPx': '98.5', 'sz': '25'}}
         self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
+
+    def test_tick_rounded_trigger_matches_with_price_tick(self):
+        """交易所把触发价按 tick 取整（差一个 tick）：提供 price_tick 时必须仍认作我方止损单，
+        否则超时重试路径会把「实际已落单」误判成未落单再建一张，留下双止损/孤儿单。"""
+        rounded = dict(self.GOOD, stopLossPrice=98.4)  # 差 0.1 = 恰好一个 tick
+        self.assertTrue(OkxApi._algo_order_matches(rounded, 'sell', 98.5, 25.0, price_tick=0.1))
+
+    def test_two_ticks_off_rejected_even_with_price_tick(self):
+        """差两个 tick 已超出取整可能：仍是残留旧单，不得误认。"""
+        far = dict(self.GOOD, stopLossPrice=98.3)
+        self.assertFalse(OkxApi._algo_order_matches(far, 'sell', 98.5, 25.0, price_tick=0.1))
+
+    def test_without_price_tick_keeps_strict_tolerance(self):
+        """tick 不可得（fail-safe 回退）：维持原 1ppm 严格容差，宁可重试创建也不误认。"""
+        rounded = dict(self.GOOD, stopLossPrice=98.4)
+        self.assertFalse(OkxApi._algo_order_matches(rounded, 'sell', 98.5, 25.0))
 
 
 if __name__ == '__main__':

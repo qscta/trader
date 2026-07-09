@@ -144,6 +144,10 @@ class StartupSmokeTest(unittest.TestCase):
             {'default_risk_per_trade': 0.6},          # 超 50% 上限
             {'ma_short_period': 28, 'ma_long_period': 28},  # 短 >= 长
             {'ma_short_period': 30, 'ma_long_period': 20},  # 短 > 长
+            # 所需已收盘K线超交易所单次供应上限（299）：该策略永远取不够数据，
+            # 形同静默停摆——启动即拒，而非留一个「合法却永不工作」的配置
+            {'channel_period': 298},                        # turtle 需 300 根
+            {'ma_short_period': 7, 'ma_long_period': 150},  # ma_cross 需 300 根
         ]
         for bad in bad_cases:
             with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +158,17 @@ class StartupSmokeTest(unittest.TestCase):
                 with patch.object(main, 'OkxApi', _FakeOkxApi):
                     with self.assertRaises(ValueError, msg=f"应拒绝非法配置: {bad}"):
                         TradingSystem(config_file=path)
+
+    def test_candle_supply_boundary_strategy_param_boots(self):
+        """所需已收盘K线恰等于供应上限（297+2=299）：必须正常启动，校验不许过紧。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            cfg = _jload(path)
+            cfg['strategy']['channel_period'] = 297
+            _jdump(cfg, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            self.assertEqual(system.config['strategy']['channel_period'], 297)
 
     def test_out_of_range_symbol_config_rejected(self):
         """手写 config.json 的品种池非法值：启动即拒（与增删品种的 API 入口同口径），

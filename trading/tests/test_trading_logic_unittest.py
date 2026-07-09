@@ -515,6 +515,17 @@ class SymbolInputValidationTests(unittest.TestCase):
             self.assertEqual(resp.status_code, 400, msg=f"default_risk={bad!r} 应 400")
             self.assertEqual(self.system.config["strategy"]["default_risk_per_trade"], 0.01)
 
+    def test_strategy_params_rejects_period_exceeding_candle_supply(self):
+        """所需已收盘K线超过交易所单次供应上限（299）：该策略永远取不够数据形同停摆，
+        API 与启动校验同口径拒绝（channel_period=350 → turtle 需 352 根）。"""
+        self.system.config = {"strategy": {"channel_period": 28}}
+        with patch.object(api_server, "trading_system", self.system), patch.object(
+            api_server, "send_dingtalk", Mock()
+        ):
+            resp = self.client.put("/api/strategy_params", json={"channel_period": 350})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.system.config["strategy"]["channel_period"], 28)  # 未写入
+
     def test_strategy_params_rejects_fractional_period(self):
         """API 与启动校验同源 strict_int：小数周期 28.9 拒绝而非截断为 28（三入口口径一致）。"""
         self.system.config = {"strategy": {"channel_period": 28}}
