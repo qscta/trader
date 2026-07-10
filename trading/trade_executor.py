@@ -123,6 +123,24 @@ class TradeExecutorMixin:
             self.notifier.notify_error(msg)
             return
 
+        # 孤儿仓阻断：本方法所有调用点都以「本地无持仓」为前提，此刻交易所端若有持仓，
+        # 必为本地无记录的孤儿仓（人工开仓/开仓超时后迟到成交）。单向(净)模式下新单会与
+        # 孤儿仓合并成一笔更大的净持仓——本地只记本次数量、止损也只覆盖本次数量，孤儿部分
+        # 继续裸奔且账目/风控全部错位。与止损残留同标准 fail-closed；巡检告警负责发现孤儿，
+        # 本阻断负责在人工处理前不让敞口继续叠加。查询失败按无孤儿继续（与适配层开仓前
+        # 查询失败的既有取向一致：不让读故障吞掉入场，孤儿检测主责在巡检告警）。
+        try:
+            unmanaged = self.exchange_api.get_position(ccxt_symbol)
+        except Exception as e:
+            unmanaged = None
+            logger.warning(f"{symbol} 开仓前孤儿仓核对查询失败({e})，按无孤儿继续")
+        if unmanaged is not None:
+            msg = (f"{symbol} 交易所端已存在本地无记录的持仓（孤儿仓），已阻断本次开仓："
+                   f"单向模式下新单会与孤儿仓合并，止损只覆盖新增部分。请人工处理该持仓后再开仓")
+            logger.error(msg)
+            self.notifier.notify_error(msg)
+            return
+
         # 基本方向校验：防止数据异常时开出危险仓位
         if side == 'long' and stop_loss_price >= entry_price:
             logger.error(f"{symbol} 开仓中止: 多单止损价({stop_loss_price})必须低于入场价({entry_price})")

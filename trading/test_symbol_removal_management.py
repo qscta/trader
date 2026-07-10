@@ -422,6 +422,24 @@ class StateOwnerGuardTest(unittest.TestCase):
                 system._guard_state_owner()
 
 
+class OrphanPreOpenGuardTest(unittest.TestCase):
+    """开仓前孤儿仓阻断：交易所端已有本地无记录的持仓时拒绝叠加开仓（真实 TradeState）。"""
+
+    def test_open_blocked_when_unmanaged_exchange_position_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, config_symbols=[])
+            alerts = []
+            system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)
+            system.exchange_api.get_position = lambda s: {'contracts': 3.0, 'side': 'long'}
+            system.exchange_api.open_position = lambda *a, **k: self.fail("孤儿仓存在时不得开仓")
+
+            system._execute_open('BTCUSDT', 'long', 100.0, 90.0, {'name': 'BTCUSDT'})
+
+            self.assertEqual(len(alerts), 1)
+            self.assertIn('孤儿仓', alerts[0])
+            self.assertIsNone(system.trade_state.get_open_position('BTCUSDT'))
+
+
 class StopResidueBlockTest(unittest.TestCase):
     def test_execute_open_blocked_while_residue_marked(self):
         """品种被标记止损残留时，_execute_open 直接拒绝开仓（不触达交易所）。"""

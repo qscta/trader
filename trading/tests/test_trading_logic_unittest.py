@@ -723,6 +723,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             exchange=exchange_stub,
             get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             get_balance=Mock(return_value={"total": {"USDT": 10000}}),
+            get_position=Mock(return_value=None),   # 开仓前孤儿仓核对：默认交易所端无仓
             round_quantity=Mock(return_value=2.5),
             get_quantity_precision=Mock(return_value=3),
             open_position=Mock(return_value={"average": 100}),
@@ -732,6 +733,32 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             close_position=Mock(return_value={"id": "close-1"}),
         )
         return system
+
+    def test_rejects_open_when_unmanaged_exchange_position_exists(self):
+        """孤儿仓阻断：交易所端已有本地无记录的持仓时拒绝开仓——单向模式下新单会与
+        孤儿仓合并成更大净持仓，止损只覆盖新增部分、账目错位（与止损残留同标准）。"""
+        system = self.make_system()
+        system.exchange_api.get_position.return_value = {"contracts": 3.0, "side": "long"}
+
+        system._execute_open(
+            "BTCUSDT", "long", 100, 80, {"name": "BTCUSDT", "risk_per_trade": 0.01},
+        )
+
+        system.exchange_api.open_position.assert_not_called()
+        system.trade_state.add_open_position.assert_not_called()
+        system.notifier.notify_error.assert_called_once()
+
+    def test_orphan_query_failure_does_not_block_open(self):
+        """孤儿核对查询失败：按无孤儿继续开仓（读故障不吞入场，孤儿检测主责在巡检告警）。"""
+        system = self.make_system()
+        system.exchange_api.get_position.side_effect = RuntimeError("查询失败")
+
+        system._execute_open(
+            "BTCUSDT", "long", 100, 80, {"name": "BTCUSDT", "risk_per_trade": 0.01},
+        )
+
+        system.exchange_api.open_position.assert_called_once()
+        system.trade_state.add_open_position.assert_called_once()
 
     def test_rejects_open_when_realtime_price_has_crossed_stop(self):
         system = self.make_system()
