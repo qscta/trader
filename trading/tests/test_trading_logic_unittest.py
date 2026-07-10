@@ -700,6 +700,8 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system.stop_loss_dates = {}
+        system._save_stop_loss_dates = Mock()
         system.config = {"strategy": {"default_risk_per_trade": 0.01}}
         system.notifier = SimpleNamespace(
             notify_error=Mock(),
@@ -747,6 +749,34 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system.exchange_api.open_position.assert_not_called()
         system.trade_state.add_open_position.assert_not_called()
         system.notifier.notify_error.assert_called_once()
+
+    def test_successful_open_clears_stale_tplus1_marker(self):
+        """开仓成功即入市：过期 T+1 标记必须随之清除——否则「止损→次日全新交叉直接开仓」
+        留下的陈旧标记，会在几周后人工平仓的下一个日检触发意外自动重入（把用户明确
+        退出的仓位悄悄补回来）。"""
+        system = self.make_system()
+        system.stop_loss_dates = {"BTCUSDT": "2000-01-01"}   # 陈旧标记
+
+        system._execute_open(
+            "BTCUSDT", "long", 100, 80, {"name": "BTCUSDT", "risk_per_trade": 0.01},
+        )
+
+        system.trade_state.add_open_position.assert_called_once()
+        self.assertNotIn("BTCUSDT", system.stop_loss_dates)  # 标记已随入市消亡
+        system._save_stop_loss_dates.assert_called_once()
+
+    def test_open_failure_keeps_tplus1_marker(self):
+        """开仓失败（止损单创建失败回滚）：标记保留，次日重入机制不受影响。"""
+        system = self.make_system()
+        system.stop_loss_dates = {"BTCUSDT": "2000-01-01"}
+        system.exchange_api.create_stop_loss_order.return_value = None   # 止损创建失败 → 回滚
+
+        system._execute_open(
+            "BTCUSDT", "long", 100, 80, {"name": "BTCUSDT", "risk_per_trade": 0.01},
+        )
+
+        system.trade_state.add_open_position.assert_not_called()
+        self.assertIn("BTCUSDT", system.stop_loss_dates)     # 失败不清标记
 
     def test_orphan_query_failure_does_not_block_open(self):
         """孤儿核对查询失败：按无孤儿继续开仓（读故障不吞入场，孤儿检测主责在巡检告警）。"""

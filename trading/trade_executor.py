@@ -8,7 +8,8 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / risk_manager / config /
-_pending_stop_loss_updates / record_stop_loss / _cancel_stop_order_confirmed /
+_pending_stop_loss_updates / stop_loss_dates / _save_stop_loss_dates /
+record_stop_loss / _cancel_stop_order_confirmed /
 _close_trade_state_with_runtime_fallback / _update_trade_state_stop_with_runtime_fallback /
 _buffer_trade_open_notification / _buffer_trade_close_notification /
 handle_open_signal_turtle。
@@ -282,6 +283,14 @@ class TradeExecutorMixin:
             strategy=symbol_config.get('strategy', 'turtle')
         ):
             return
+        # 开仓成功即已重新入市：统一清除该品种的 T+1 重入待定标记（若有）。标记的唯一使命
+        # 是「空仓时次日补回持仓」，入市即寿终——否则「止损→次日全新交叉直接开仓」等不经
+        # 重入路径的成功入市会留下过期标记，几周后人工平仓的下一个日检会因这枚陈旧标记
+        # 触发意外自动重入，把用户明确退出的仓位悄悄补回来。此处是所有开仓成功路径的
+        # 单一收口（fresh-cross/T+1 重入/翻转反手/即时开仓），重入路径的显式清除改为 pop 兜底。
+        if symbol in self.stop_loss_dates:
+            del self.stop_loss_dates[symbol]
+            self._save_stop_loss_dates()
         if buffer_notification:
             self._buffer_trade_open_notification(symbol, side, actual_price, position_size, stop_loss_price)
 

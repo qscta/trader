@@ -235,8 +235,9 @@ class SignalHandlersMixin:
                     logger.info(f"{symbol} [双均线] T+1重入: 方向={side}, EMA仍然{'看多' if side == 'long' else '看空'}")
                     self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
                     if self.trade_state.get_open_position(symbol):
-                        # 重入成功：解除 T+1 标记，回归常规「永远在市」
-                        del self.stop_loss_dates[symbol]
+                        # 重入成功：解除 T+1 标记，回归常规「永远在市」。标记通常已在
+                        # _execute_open 成功路径统一清除，此处 pop 幂等兜底（del 会 KeyError）
+                        self.stop_loss_dates.pop(symbol, None)
                         self._save_stop_loss_dates()
                     else:
                         # 重入开仓未成功（价格已穿止损/超时未确认/残留阻断等）：**保留** T+1 标记，
