@@ -37,6 +37,7 @@ sys.modules.pop('okx_api', None)
 
 OrderNotFound = _ccxt.OrderNotFound
 RequestTimeout = _ccxt.RequestTimeout
+NetworkError = _ccxt.NetworkError
 
 
 def _bare_api():
@@ -104,6 +105,71 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         api.exchange.market.return_value = {'contractSize': 0.01}
         self.assertEqual(api._get_contract_size('BTC/USDT:USDT'), 0.01)
         self.assertEqual(api._contract_size_cache['BTC/USDT:USDT'], 0.01)
+
+
+class CoinContractRoundTripTest(unittest.TestCase):
+    """币↔张往返浮点吸附：账本币数 = 整步长张数 × 面值，往返除法的浮点尘埃
+    （49×0.0001/0.0001 = 48.999…99）若直接截断会少一张——实际下单比账本记的
+    小一张，盈亏/风险校验/持仓汇总系统性偏差。截断前必须吸附回最近步长。"""
+
+    def _api(self, cs=0.0001, precision=None):
+        api = _bare_api()
+        api._contract_size_cache['X/USDT:USDT'] = cs
+        if precision is not None:
+            api._amount_precision_cache['X/USDT:USDT'] = precision
+        return api
+
+    def test_roundtrip_dust_snaps_back_to_whole_contracts(self):
+        api = self._api()
+        # 模拟 ccxt amount_to_precision 的 TRUNCATE 语义（整张步长）
+        api.exchange.amount_to_precision.side_effect = lambda s, a: str(int(a))
+        for n in (49, 59, 81, 98, 115):  # 实证均产生 48.999…99 级下侧尘埃的张数
+            self.assertEqual(api._coin_to_contracts('X/USDT:USDT', n * 0.0001), float(n),
+                             msg=f'n={n} 往返丢张')
+
+    def test_fallback_floor_path_also_snapped(self):
+        """ccxt 精度接口不可用走 floor 兜底：同样必须先吸附。"""
+        api = self._api()
+        api.exchange.amount_to_precision.side_effect = RuntimeError('markets 未加载')
+        self.assertEqual(api._coin_to_contracts('X/USDT:USDT', 49 * 0.0001), 49.0)
+
+    def test_genuine_fraction_still_truncates(self):
+        """真实的不足一张部分仍截断丢弃：吸附只救 1e-6 步以内的浮点尘埃，
+        不改变「向下取整到可交易步长」的既有语义。"""
+        api = self._api()
+        api.exchange.amount_to_precision.side_effect = lambda s, a: str(int(a))
+        # 0.00049 币 / 0.0001 面值 = 4.9 张（真实小数，非尘埃）→ 4 张
+        self.assertEqual(api._coin_to_contracts('X/USDT:USDT', 0.00049), 4.0)
+
+    def test_fractional_step_snap_uses_precision_cache(self):
+        """步长 0.1 张（precision=1）：尘埃吸附到最近 0.1 倍数，而非整数。
+        3.1 张 × 0.0001 币往返 = 3.0999999999999996，无吸附会被截成 3.0。"""
+        import math
+        api = self._api(precision=1)
+        api.exchange.amount_to_precision.side_effect = lambda s, a: str(math.floor(a * 10) / 10)
+        self.assertEqual(api._coin_to_contracts('X/USDT:USDT', 3.1 * 0.0001), 3.1)
+
+
+class PositionQuerySingleShotTest(unittest.TestCase):
+    """下单超时确认循环使用单次持仓查询：循环自带「3 次 × 2 秒」重试节奏，
+    内层不得再叠网络退避重试，否则最坏确认等待成倍拉长、确认窗口被动错过。"""
+
+    def test_position_contracts_does_not_retry(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.side_effect = NetworkError('查询失败')
+        with self.assertRaises(NetworkError):
+            api._position_contracts('BTC/USDT:USDT')
+        self.assertEqual(api.exchange.fetch_positions.call_count, 1)
+
+    def test_get_position_keeps_retry(self):
+        """常规读路径 get_position 保留 3 次退避重试（语义不变）。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.side_effect = NetworkError('查询失败')
+        # get_position 是 exchange_base 装饰器包装的函数，经 __globals__ 桩掉其 time.sleep
+        with patch.dict(OkxApi.get_position.__globals__, {'time': Mock(sleep=lambda s: None)}):
+            with self.assertRaises(NetworkError):
+                api.get_position('BTC/USDT:USDT')
+        self.assertEqual(api.exchange.fetch_positions.call_count, 3)
 
 
 class CancelAlgoVerifiedTest(unittest.TestCase):

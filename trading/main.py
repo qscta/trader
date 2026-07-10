@@ -262,6 +262,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if eff_short >= eff_long:
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
 
+        # K 线供应能力：周期组合所需已收盘根数必须是交易所单次能给到的，
+        # 否则该品种「每日 K 线不足警告、永不交易」——配置入口即拒绝（API 改参同口径）
+        cfgv.ensure_candle_supply(strategy)
+
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
 

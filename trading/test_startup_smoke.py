@@ -143,6 +143,8 @@ class StartupSmokeTest(unittest.TestCase):
             {'default_risk_per_trade': 0.6},          # 超 50% 上限
             {'ma_short_period': 28, 'ma_long_period': 28},  # 短 >= 长
             {'ma_short_period': 30, 'ma_long_period': 20},  # 短 > 长
+            {'channel_period': 298},                  # 超K线供应上限（298+2=300 > 299）
+            {'ma_long_period': 150},                  # 超K线供应上限（150×2=300 > 299）
         ]
         for bad in bad_cases:
             with tempfile.TemporaryDirectory() as tmp:

@@ -16,10 +16,15 @@ import re
 # 策略周期允许范围（整数，含端点）
 PERIOD_MIN = 2
 PERIOD_MAX = 500
-# 主循环默认至少拉取约一年日线；大周期策略按实际配置自动上调。
+# 主循环默认请求约一年日线（交易所按自身上限截断，多请求无害）。
 DEFAULT_OHLCV_FETCH_LIMIT = 365
 # fetch_ohlcv 可能包含当前未收盘 K 线，过滤后要仍满足策略最低已收盘根数。
 OPEN_CANDLE_FETCH_BUFFER = 1
+# 交易所单次 K 线供应上限：OKX /market/candles 一次最多 300 根（ccxt fetch_ohlcv
+# 不分页，请求再多也只返回这些）。策略所需已收盘根数必须在供应能力内，否则该
+# 品种会「每日 K 线不足警告、永不交易」——与其它参数同标准，在配置入口就拒绝。
+EXCHANGE_MAX_CANDLES = 300
+MAX_REQUIRED_CLOSED_CANDLES = EXCHANGE_MAX_CANDLES - OPEN_CANDLE_FETCH_BUFFER
 # 单笔风险度上限 50%：防止把 1 当 1% 输这类数量级笔误直接放大到全仓
 MAX_RISK_PER_TRADE = 0.5
 # 内部交易对名：大写字母/数字，以 USDT 结尾（U 本位永续）
@@ -53,6 +58,23 @@ def ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config=None):
     """返回主数据管线应请求的 K 线根数，与策略窗口配置同源。"""
     required = required_closed_candles_for_strategy(strategy_type, strategy_config)
     return max(DEFAULT_OHLCV_FETCH_LIMIT, required + OPEN_CANDLE_FETCH_BUFFER)
+
+
+def ensure_candle_supply(strategy_config):
+    """校验两策略按当前周期配置所需的已收盘 K 线根数不超过交易所单次供应上限。
+
+    PERIOD_MAX(500) 是泛化的参数健全性外界；本函数是数据供应能力的精确内界
+    （海龟 channel+2 ≤ 299 即 channel ≤ 297；双均线 max(long×2, stop+1) ≤ 299
+    即 long ≤ 149、stop ≤ 298）。不满足则该品种每天警告、永不交易——这类
+    「配了却永远不生效」的参数必须在配置入口 fail-loud。抛 ValueError。
+    """
+    for strategy_type in STRATEGY_WHITELIST:
+        required = required_closed_candles_for_strategy(strategy_type, strategy_config)
+        if required > MAX_REQUIRED_CLOSED_CANDLES:
+            raise ValueError(
+                f"{strategy_type} 策略按当前周期配置需要 {required} 根已收盘K线，"
+                f"超过交易所单次供应上限 {MAX_REQUIRED_CLOSED_CANDLES} 根"
+                f"（OKX 单次最多 {EXCHANGE_MAX_CANDLES} 根，扣 1 根未收盘缓冲），请调小周期")
 
 
 def strict_float_finite(value, field):

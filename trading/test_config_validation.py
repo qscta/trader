@@ -88,5 +88,25 @@ class StrategyOhlcvLimitTest(unittest.TestCase):
         self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 365)
 
 
+class CandleSupplyTest(unittest.TestCase):
+    """K 线供应能力校验：所需已收盘根数超过交易所单次上限（300−1 缓冲=299）的
+    周期组合必须在配置入口拒绝，否则品种「每日警告、永不交易」。"""
+
+    def test_defaults_pass(self):
+        cv.ensure_candle_supply({'channel_period': 28, 'ma_long_period': 28, 'ma_stop_period': 28})
+
+    def test_exact_boundaries_pass(self):
+        cv.ensure_candle_supply({'channel_period': 297})   # 297+2 = 299 恰好可供
+        cv.ensure_candle_supply({'ma_long_period': 149})   # 149×2 = 298
+        cv.ensure_candle_supply({'ma_stop_period': 298})   # 298+1 = 299
+
+    def test_over_capacity_rejected(self):
+        for bad in ({'channel_period': 298},               # 298+2 = 300 > 299
+                    {'ma_long_period': 150},               # 150×2 = 300 > 299
+                    {'ma_stop_period': 299}):              # 299+1 = 300 > 299
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                cv.ensure_candle_supply(bad)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -123,14 +123,24 @@ class OkxApi(ExchangeApi):
     # ===================== 张数换算 =====================
 
     def _coin_to_contracts(self, ccxt_symbol, coin_amount):
-        """币数 -> 张数（按交易所张数步长取整）。面值不可得时向上抛出（拒绝交易）。"""
+        """币数 -> 张数（按交易所张数步长取整）。面值不可得时向上抛出（拒绝交易）。
+
+        截断前先做浮点吸附：账本币数 = 「整步长张数 × 面值」，往返除法
+        (n × cs) / cs 会带出 48.999…99 级浮点尘埃，直接交给截断会少一张——
+        实际开出的仓比账本记的小一张，盈亏/风险校验/持仓汇总全部系统性偏差
+        （数值实证：cs ∈ {0.0001…100}、n ≤ 20000 的组合约 2.4% 中招）。
+        吸附容差 1e-6 步：尘埃只有 ~1e-9 步级，而真实仓位定价连续、不会
+        恰好贴近步长边界到 1e-6 以内，即便贴到，取边界值经济上等价。
+        """
         contract_size = self._get_contract_size(ccxt_symbol)
         raw_contracts = coin_amount / contract_size
+        factor = 10 ** self._amount_precision_cache.get(ccxt_symbol, 0)
+        nearest_step = round(raw_contracts * factor)
+        if nearest_step > 0 and abs(raw_contracts * factor - nearest_step) <= 1e-6:
+            raw_contracts = nearest_step / factor
         try:
             return float(self.exchange.amount_to_precision(ccxt_symbol, raw_contracts))
         except Exception:
-            precision = self._amount_precision_cache.get(ccxt_symbol, 0)
-            factor = 10 ** precision
             return math.floor(raw_contracts * factor) / factor
 
     def round_quantity(self, symbol, quantity):
@@ -189,13 +199,13 @@ class OkxApi(ExchangeApi):
 
     # ===================== 读操作 =====================
 
-    @retry_on_network_error(max_retries=3)
-    def get_position(self, symbol):
-        """获取特定交易对的持仓（单向模式下只有一条）。
+    def _get_position_once(self, symbol):
+        """get_position 的单次查询（无网络重试）。
 
-        无实仓时返回 None。OKX 可能返回 contracts=None/0 的空仓条目，
-        若原样外泄，上层（币安时代写下的）`contracts == 0` / `contracts > 0`
-        判断会因 None 误判甚至 TypeError——统一在适配层归一化掉。
+        供下单超时后的确认循环使用：循环自带「3 次尝试 × 2 秒间隔」的节奏，
+        若每次查询内部再叠 3 次退避重试（1+2+4 秒 × 每次 15 秒超时），最坏
+        等待会成倍拉长，确认窗口被动错过。错误语义不变：失败向上抛出，由
+        调用方按自己的节奏捕获重试。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
         positions = self.exchange.fetch_positions([ccxt_symbol])
@@ -204,9 +214,20 @@ class OkxApi(ExchangeApi):
                 return p
         return None
 
+    @retry_on_network_error(max_retries=3)
+    def get_position(self, symbol):
+        """获取特定交易对的持仓（单向模式下只有一条）。
+
+        无实仓时返回 None。OKX 可能返回 contracts=None/0 的空仓条目，
+        若原样外泄，上层（币安时代写下的）`contracts == 0` / `contracts > 0`
+        判断会因 None 误判甚至 TypeError——统一在适配层归一化掉。
+        """
+        return self._get_position_once(symbol)
+
     def _position_contracts(self, ccxt_symbol):
-        """查询当前持仓张数；查询失败时向上抛出（保留与币安一致的错误语义）。"""
-        position = self.get_position(ccxt_symbol)
+        """查询当前持仓张数（单次查询，不重试；确认循环自带重试节奏）。
+        查询失败时向上抛出（保留与币安一致的错误语义）。"""
+        position = self._get_position_once(ccxt_symbol)
         if position and position.get('contracts'):
             return abs(float(position['contracts']))
         return 0.0

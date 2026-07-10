@@ -95,7 +95,7 @@ FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 ws
 
 ## 七、测试
 
-无需第三方依赖、可本机运行并通过（共 176 用例，已验证同进程任意顺序全绿）：
+无需第三方依赖、可本机运行并通过（共 192 用例，已验证同进程任意顺序全绿）：
 
 ```bash
 python -m unittest test_startup_smoke               # 15 通过（启动装配全链冒烟：配置校验/迁移/护栏/装配）

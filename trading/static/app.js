@@ -203,10 +203,10 @@ async function loadAccountStats() {
         setText('potentialDetail', '最低权益 ' + fmt(d.worst_case_equity));
         setText('daysSincePeak', d.days_since_peak);
         setText('longestDrawdownDetail', '历史最长 ' + d.longest_drawdown_days + ' 天');
-        // 品种池构成
+        // 品种池构成（缺省策略按海龟计：与后端 get_strategy_for_symbol 的默认托管口径一致）
         if (window._symbolsData) {
             let t = 0, m = 0;
-            window._symbolsData.forEach(s => { if (s.strategy === 'turtle') t++; else m++; });
+            window._symbolsData.forEach(s => { if (s.strategy === 'ma_cross') m++; else t++; });
             setText('symbolPoolDetail', '海龟 ' + t + ' · 均线 ' + m);
         }
     } catch (e) { setEquityNA(); }
@@ -386,12 +386,13 @@ async function loadSymbols() {
         const symbols = await res.json();
         window._symbolsData = symbols;
         // 品种池构成直接在此更新，不依赖 loadAccountStats 的返回时序
+        // （缺省策略按海龟计：与后端 get_strategy_for_symbol 的默认托管口径一致）
         let _t = 0, _m = 0;
-        symbols.forEach(s => { if (s.strategy === 'turtle') _t++; else _m++; });
+        symbols.forEach(s => { if (s.strategy === 'ma_cross') _m++; else _t++; });
         setText('symbolPoolDetail', symbols.length ? ('海龟 ' + _t + ' · 均线 ' + _m) : '');
         if (!symbols.length) { box.innerHTML = '<div class="empty">品种池为空，添加一个交易对</div>'; return; }
         let rows = symbols.map(s => {
-            const stratBadge = s.strategy === 'turtle' ? '<span class="badge badge-turtle">海龟</span>' : '<span class="badge badge-ma">双均线</span>';
+            const stratBadge = s.strategy === 'ma_cross' ? '<span class="badge badge-ma">双均线</span>' : '<span class="badge badge-turtle">海龟</span>';
             const stateBadge = s.enabled ? '<span class="badge badge-on">启用</span>' : '<span class="badge badge-off">禁用</span>';
             const holding = s.has_open_position ? '<span class="badge badge-holding">持仓中</span>' : '';
             return `<tr>

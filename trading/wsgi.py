@@ -1,4 +1,3 @@
-import hashlib
 import os
 import threading
 import fcntl
@@ -6,10 +5,10 @@ import api_server as srv
 from api_server import app, logger, _bootstrap
 
 _lock_fp = None
-# 锁文件按项目目录派生：同一目录的多 worker 仍互斥（防重复初始化交易系统），
-# 而同机部署的另一套独立目录实例（如迁移期新旧并存）不会被误伤拒启
-_LOCK_FILE = '/tmp/trading_system_runner.{}.lock'.format(
-    hashlib.sha1(os.path.dirname(os.path.abspath(__file__)).encode('utf-8')).hexdigest()[:12])
+# 锁文件放项目目录内：同一目录的多 worker 仍互斥（防重复初始化交易系统），
+# 不同目录部署（如迁移期新旧并存）天然隔离。不落 /tmp——共享主机上可预测的
+# /tmp 路径可被其它本地用户抢占（sticky 位下 open 他人文件即失败），造成拒启。
+_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.trading_runner.lock')
 
 
 def _try_start_runner_once():

@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, send_from_directory, session
+from collections import deque
 from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
@@ -14,6 +15,7 @@ from trade_state import enrich_closed_trade_with_fees
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
 from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
+                               ensure_candle_supply,
                                ohlcv_fetch_limit_for_strategy,
                                required_closed_candles_for_strategy, strict_int,
                                strict_risk_per_trade, strict_bool,
@@ -93,6 +95,9 @@ _manual_check_guard = threading.Lock()
 # 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+# 字典封顶：来源 IP 可能被伪造（XFF 跳数配错时），不设上限会被刷成无界内存增长。
+# 触顶时只清「已不在锁定期」的条目，正在生效的锁定不受影响。
+LOGIN_FAILURES_MAX_ENTRIES = 10000
 _login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
 _login_guard = threading.Lock()
 
@@ -194,6 +199,9 @@ def api_login():
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
     with _login_guard:
+        if len(_login_failures) >= LOGIN_FAILURES_MAX_ENTRIES:
+            for stale_ip in [k for k, (_, lu) in _login_failures.items() if lu < now]:
+                del _login_failures[stale_ip]
         fails, _ = _login_failures.get(ip, (0, 0.0))
         fails += 1
         locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
@@ -225,10 +233,12 @@ def get_logs():
     try:
         lines = max(1, min(request.args.get('lines', 50, type=int), 1000))
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
+        # 流式过滤 + 定长 deque：只保留末尾 N 条，不把整个日志文件（上限 10MB）读进内存
         with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            all_lines = f.readlines()
-        filtered = [l for l in all_lines if not (' "' in l and 'HTTP/1.1' in l) and 'code 400, message Bad request' not in l]
-        result = filtered[-lines:]
+            result = list(deque(
+                (l for l in f
+                 if not (' "' in l and 'HTTP/1.1' in l) and 'code 400, message Bad request' not in l),
+                maxlen=lines))
         result.reverse()
         return jsonify({'logs': result})
     except Exception as e:
@@ -457,6 +467,12 @@ def delete_symbol(symbol):
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，删除已回滚')
             if err_resp:
                 return err_resp
+        # 品种已出池且无持仓：顺手清掉海龟信号状态（有持仓时保留——托管到平仓仍要用）
+        if not held:
+            try:
+                system.trade_state.clear_signal_state(symbol_u)
+            except Exception as e:
+                logger.warning(f"清理 {symbol_u} 信号状态失败（不影响删除）: {e}")
         send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
         return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
     except Exception as e:
@@ -520,7 +536,11 @@ def get_trades():
     if err:
         return err
     try:
-        trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
+        # 默认只回最近 500 条：史书只追加、永不清理，全量返回会随运行年限无界膨胀。
+        # 汇总统计（/api/trades_summary）仍基于全量历史，口径不受影响。
+        limit = max(1, min(request.args.get('limit', 500, type=int), 10000))
+        trades = [enrich_closed_trade_with_fees(t)
+                  for t in system.trade_state.get_closed_trades()[-limit:]]
         return jsonify(trades)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -707,6 +727,12 @@ def update_strategy_params():
         eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
         if eff_short >= eff_long:
             return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
+        # K 线供应能力（与启动校验同源）：按「生效值 = 本次提交覆盖当前配置」整体校验，
+        # 否则超供应能力的周期能从 API 写入，品种从此每日警告、永不交易
+        try:
+            ensure_candle_supply({**cur, **parsed})
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
 
         changed = []
         with system._config_lock:

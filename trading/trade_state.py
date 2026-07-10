@@ -33,6 +33,16 @@ def atomic_write_json(filepath, data):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, filepath)
+        # rename 自身也要落盘：fsync 目录项，否则掉电瞬间 rename 可能未持久化。
+        # 平台不支持（如 Windows 无 O_DIRECTORY）时静默跳过，退回原有持久性水平。
+        try:
+            dir_fd = os.open(dir_name, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
         return True
     except Exception as e:
         logger.error(f'原子写入失败 {filepath}: {e}')
@@ -145,12 +155,12 @@ class TradeState:
             return self.get_default_state()
         try:
             with open(self.state_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                return self._validated_state(json.load(f), self.state_file)
         except Exception as e:
             logger.error(f'读取交易状态失败({self.state_file}): {e}，尝试从备份恢复')
             try:
                 with open(backup, 'r', encoding='utf-8') as f:
-                    recovered = json.load(f)
+                    recovered = self._validated_state(json.load(f), backup)
                 logger.warning(f'交易状态已从备份恢复: {backup}')
                 return recovered
             except Exception as be:
@@ -158,6 +168,28 @@ class TradeState:
                     f'交易状态主文件损坏且备份不可恢复（主: {e}；备: {be}）。'
                     f'拒绝以空状态启动，请人工修复 {self.state_file} 或其 .bak 后重启'
                 ) from e
+
+    @staticmethod
+    def _validated_state(state, source):
+        """账本形状校验 + 缺省键补齐。
+
+        json.load 成功只证明「是合法 JSON」，不证明是账本：顶层被误改成数组、
+        或关键段类型错误的文件若放行，会在运行中以裸 KeyError/TypeError 崩溃——
+        绕过 fail-closed 精心准备的人工修复指引。形状非法与解析失败同等对待
+        （走备份恢复 → 仍失败则拒启）。缺键按默认补齐（兼容老版本账本）。
+        """
+        if not isinstance(state, dict):
+            raise ValueError(f'账本顶层不是对象({source}): {type(state).__name__}')
+        state.setdefault('open_positions', {})
+        state.setdefault('closed_trades', [])
+        state.setdefault('signal_states', {})
+        if not isinstance(state['open_positions'], dict):
+            raise ValueError(f'账本 open_positions 段不是对象({source})')
+        if not isinstance(state['closed_trades'], list):
+            raise ValueError(f'账本 closed_trades 段不是数组({source})')
+        if not isinstance(state['signal_states'], dict):
+            raise ValueError(f'账本 signal_states 段不是对象({source})')
+        return state
 
     def get_default_state(self):
         return {
@@ -346,6 +378,14 @@ class TradeState:
         with self.lock:
             self._set_signal_state_locked(symbol, mid_line_crossed)
             self.save_state()
+
+    def clear_signal_state(self, symbol):
+        """删除品种的信号状态（品种出池且无持仓时清理，防 signal_states 随历史品种无限增长）。"""
+        with self.lock:
+            states = self.state.get('signal_states') or {}
+            if symbol in states:
+                del states[symbol]
+                self.save_state()
 
     def get_signal_state(self, symbol):
         """获取品种的中轨穿越状态。"""

@@ -250,7 +250,9 @@ class SignalHandlersMixin:
                         )
                         logger.warning(f"{symbol} [双均线] T+1 重入开仓未成功，保留标记次日重试")
                 else:
-                    logger.info(f"{symbol} [双均线] 重入条件不满足（EMA方向已变），不重入")
+                    # 仅当两条 EMA 精确持平（方向不明）才会走到这里——重入永远跟随当前
+                    # EMA 方向（可能与被止损仓位相反），不存在「方向已变就不重入」的语义
+                    logger.info(f"{symbol} [双均线] 重入条件不满足（EMA 精确持平、方向不明），清除标记等待下一次交叉")
                     if symbol in self.stop_loss_dates:
                         del self.stop_loss_dates[symbol]
                         self._save_stop_loss_dates()

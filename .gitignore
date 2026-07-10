@@ -32,3 +32,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# ===== 运行时锁文件（wsgi 单实例互斥，属于部署机） =====
+trading/.trading_runner.lock
