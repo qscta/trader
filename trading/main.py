@@ -117,6 +117,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._trade_lock = threading.Lock()  # 防并发执行锁
         self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
         self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
+        self._known_orphans = set()  # 已告警的孤儿仓（新增才告警、消失即移除，与 _stop_anomalies 同一节流模式）
         self._last_failure_notify_ts = 0
         self._equity_tick_fail_streak = 0
         self._equity_tick_alert_sent = False
@@ -423,18 +424,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             else:
                 logger.info(f"{symbol} 持仓同步成功")
 
-        # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓）——
-        # 该仓不会被系统托管（不推止损、不检查平仓），静默存在比报错更危险，必须告警
+        # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓/开仓超时后迟到成交）——
+        # 该仓不会被系统托管（不推止损、不检查平仓），静默存在比报错更危险，必须告警。
+        # 同一核对在盘中巡检每轮执行（_check_orphan_positions），此处为启动首查
         try:
-            exchange_symbols = set(self.exchange_api.list_position_symbols())
-            local_symbols = set(self.trade_state.get_all_open_positions().keys())
-            orphans = sorted(exchange_symbols - local_symbols)
-            if orphans:
-                msg = (f"发现交易所端存在、但本地无记录的持仓: {', '.join(orphans)}。"
-                       f"系统不会自动接管（可能是人工仓位或本地状态丢失），也不会为其推进止损/平仓，"
-                       f"请立即人工确认处理！")
-                logger.critical(msg)
-                self.notifier.notify_error(msg)
+            self._check_orphan_positions('启动同步')
         except Exception as e:
             logger.warning(f"启动孤儿仓核对失败（不阻断启动）: {e}")
 

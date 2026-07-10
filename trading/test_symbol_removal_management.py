@@ -28,6 +28,7 @@ def _build_system(tmpdir, config_symbols):
                      'strategy': {'default_risk_per_trade': 0.01}}
     system._trade_lock = threading.Lock()
     system._stop_anomalies = {}
+    system._known_orphans = set()
     system._last_check_date = None
     system._last_failure_notify_ts = 0
     system._pending_trade_open_notifications = []
@@ -52,7 +53,8 @@ def _build_system(tmpdir, config_symbols):
     # K线返回空 → 循环对每个 symbol 走到 fetch 后 continue，不进入信号分支
     system.exchange_api = SimpleNamespace(
         to_ccxt_symbol=lambda s: s,
-        fetch_ohlcv=lambda *a, **k: [])
+        fetch_ohlcv=lambda *a, **k: [],
+        list_position_symbols=lambda: [])
     return system, checked
 
 
@@ -493,6 +495,78 @@ class IntradayPerSymbolIsolationTest(unittest.TestCase):
             system.reconcile_intraday_stop_losses()  # 不应向外抛异常
 
             self.assertEqual(ensured, ['BBBUSDT'])  # 后续品种照常巡检
+
+
+class IntradayOrphanCheckTest(unittest.TestCase):
+    """盘中巡检的孤儿仓核对：运行期出现「交易所有仓、本地无记录」（开仓超时后迟到成交/
+    人工开仓/状态丢失）时不再等到下次重启才可见——每轮巡检核对，新增告警一次（集合节流）、
+    消失即解除、再次出现再告警；核对失败不影响本轮对本地持仓的巡检。"""
+
+    def _system(self, tmp, exchange_side):
+        system, _ = _build_system(tmp, config_symbols=[])
+        alerts = []
+        system.notifier = SimpleNamespace(
+            notify_error=lambda m: alerts.append(m) or True,
+            send_message=lambda *a, **k: True,
+            notify_stop_loss_updates_summary=lambda *a, **k: True)
+        system.exchange_api.list_position_symbols = lambda: list(exchange_side)
+        return system, alerts
+
+    def test_orphan_detected_even_with_zero_local_positions(self):
+        """本地零持仓也必须核对（旧实现此时直接 return，孤儿裸仓完全不可见）；
+        同一孤儿持续存在不重复轰炸。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, alerts = self._system(tmp, exchange_side=['GHOSTUSDT'])
+
+            system.reconcile_intraday_stop_losses()
+
+            self.assertEqual(len(alerts), 1)
+            self.assertIn('GHOSTUSDT', alerts[0])
+            system.reconcile_intraday_stop_losses()  # 第二轮巡检：状态未变，不再告警
+            self.assertEqual(len(alerts), 1)
+
+    def test_orphan_cleared_then_realerts_on_reappearance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exchange_side = ['GHOSTUSDT']
+            system, alerts = self._system(tmp, exchange_side)
+            system.reconcile_intraday_stop_losses()
+            self.assertEqual(len(alerts), 1)
+
+            exchange_side.clear()                     # 人工处理完成，交易所端消失
+            system.reconcile_intraday_stop_losses()
+            self.assertEqual(system._known_orphans, set())
+
+            exchange_side.append('GHOSTUSDT')         # 再次出现：新状态进入，再次告警
+            system.reconcile_intraday_stop_losses()
+            self.assertEqual(len(alerts), 2)
+
+    def test_locally_managed_position_is_not_orphan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, alerts = self._system(tmp, exchange_side=['BTCUSDT'])
+            system.trade_state.add_open_position('BTCUSDT', 'long', 100.0, 1.0, 90.0, strategy='turtle')
+            system.exchange_api.get_position = lambda s: {'contracts': 1}
+            system._ensure_stop_order_alive = lambda *a, **k: None
+
+            system.reconcile_intraday_stop_losses()
+
+            self.assertEqual(alerts, [])
+
+    def test_orphan_query_failure_does_not_break_scan(self):
+        """核对查询失败：fail-safe 记日志，本轮对本地持仓的巡检照常进行。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _alerts = self._system(tmp, exchange_side=[])
+
+            def boom():
+                raise RuntimeError('查询失败')
+
+            system.exchange_api.list_position_symbols = boom
+            system.trade_state.add_open_position('BTCUSDT', 'long', 100.0, 1.0, 90.0, strategy='turtle')
+            reconciled = []
+            system._reconcile_symbol_intraday = lambda sym, pos, cfgs: reconciled.append(sym)
+
+            system.reconcile_intraday_stop_losses()
+
+            self.assertEqual(reconciled, ['BTCUSDT'])
 
 
 class ResidueAutoClearGuardTest(unittest.TestCase):

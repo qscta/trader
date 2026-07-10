@@ -392,36 +392,48 @@ def update_symbol(symbol):
         if not any(k in clean for k in ('risk_per_trade', 'strategy', 'enabled')):
             return jsonify({'error': '缺少可更新字段（risk_per_trade / strategy / enabled）'}), 400
         symbol_u = clean['name']
-        # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
-        if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
-            return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
-                                     '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
-        with system._config_lock:
-            backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
-            for s in system.config['trading']['symbols']:
-                if s['name'] == symbol_u:
-                    if 'enabled' in clean:
-                        s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
-                    if 'risk_per_trade' in clean:
-                        s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
-                    if 'strategy' in clean:
-                        s['strategy'] = clean['strategy']
+        # 改策略必须与交易执行互斥（非阻塞取锁，与 instant_open/close_position 同一标准）：
+        # 否则「查持仓→写配置」之间日检/即时开仓恰好为该品种建仓（TOCTOU），护栏被穿过——
+        # 仓位按旧策略建立、池子已是新策略，次日被错误策略接管。改 enabled/risk 无此风险，不加锁。
+        holds_trade_lock = False
+        if 'strategy' in clean:
+            if not system._trade_lock.acquire(blocking=False):
+                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改策略'}), 409
+            holds_trade_lock = True
+        try:
+            # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
+            if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
+                return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
+                                         '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
+            with system._config_lock:
+                backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+                for s in system.config['trading']['symbols']:
+                    if s['name'] == symbol_u:
+                        if 'enabled' in clean:
+                            s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
+                        if 'risk_per_trade' in clean:
+                            s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
+                        if 'strategy' in clean:
+                            s['strategy'] = clean['strategy']
 
-                    err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
-                    if err_resp:
-                        return err_resp
+                        err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
+                        if err_resp:
+                            return err_resp
 
-                    changes = []
-                    if 'enabled' in clean:
-                        changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
-                    if 'risk_per_trade' in clean:
-                        changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
-                    if 'strategy' in clean:
-                        strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
-                        changes.append(f'策略: {strategy_text}')
-                    send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
-                    return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已更新'})
-        return jsonify({'error': '交易对不存在'}), 404
+                        changes = []
+                        if 'enabled' in clean:
+                            changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
+                        if 'risk_per_trade' in clean:
+                            changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
+                        if 'strategy' in clean:
+                            strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
+                            changes.append(f'策略: {strategy_text}')
+                        send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
+                        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已更新'})
+            return jsonify({'error': '交易对不存在'}), 404
+        finally:
+            if holds_trade_lock:
+                system._trade_lock.release()
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

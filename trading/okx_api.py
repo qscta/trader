@@ -439,11 +439,20 @@ class OkxApi(ExchangeApi):
 
     @retry_on_network_error(max_retries=3)
     def list_position_symbols(self):
-        """交易所端当前有实际持仓的内部符号列表（启动时反向核对孤儿仓用）。"""
+        """交易所端当前有实际持仓的内部符号列表（孤儿仓核对用：启动同步 + 盘中巡检）。
+
+        只统计 U 本位永续（ccxt 符号以 :USDT 结尾）：OKX 的 SWAP 持仓查询会一并
+        返回币本位合约（如 BTC/USD:BTC），to_internal_symbol 会把它错映射成
+        BTCUSDT——人工持有的币本位仓会被误报成孤儿、或恰有同名 U 本位托管仓时
+        把币本位仓错当已接管。币本位不在本系统边界内，在数据源处过滤。
+        """
         symbols = []
         for p in self.exchange.fetch_positions() or []:
-            if p and p.get('contracts') and abs(float(p['contracts'])) > 0 and p.get('symbol'):
-                symbols.append(self.to_internal_symbol(p['symbol']))
+            if not p or not p.get('contracts'):
+                continue
+            ccxt_symbol = p.get('symbol') or ''
+            if abs(float(p['contracts'])) > 0 and ccxt_symbol.endswith(':USDT'):
+                symbols.append(self.to_internal_symbol(ccxt_symbol))
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):

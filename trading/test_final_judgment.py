@@ -178,6 +178,7 @@ class DisasterRecoveryTest(unittest.TestCase):
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))  # 空（模拟全毁后）
             system._stop_anomalies = {}
+            system._known_orphans = set()
             alerts = []
             system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)
             system.exchange_api = SimpleNamespace(
@@ -197,6 +198,7 @@ class DisasterRecoveryTest(unittest.TestCase):
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy='turtle')
             system._stop_anomalies = {}
+            system._known_orphans = set()
             alerts = []
             system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)
             system.exchange_api = SimpleNamespace(

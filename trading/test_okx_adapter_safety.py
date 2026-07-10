@@ -394,5 +394,28 @@ class StopOrderMatchTest(unittest.TestCase):
         self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
 
 
+class ListPositionSymbolsFilterTest(unittest.TestCase):
+    """孤儿仓核对的数据源必须只含 U 本位永续：OKX 的 SWAP 持仓查询会带出币本位
+    （BTC/USD:BTC），to_internal_symbol 会把它错映射成 BTCUSDT——人工币本位仓会被
+    误报成孤儿、或恰有同名 U 本位托管仓时把币本位仓错当已接管。"""
+
+    def test_only_usdt_settled_positions_are_listed(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 10, 'symbol': 'BTC/USDT:USDT'},
+            {'contracts': 5, 'symbol': 'BTC/USD:BTC'},     # 币本位：必须被过滤
+            {'contracts': 0, 'symbol': 'ETH/USDT:USDT'},   # 空仓条目：不计
+            {'contracts': 2, 'symbol': 'DOGE/USDT:USDT'},
+            {'contracts': 3},                              # 缺 symbol 字段：不计
+            None,                                          # 脏条目：不计
+        ]
+        self.assertEqual(sorted(api.list_position_symbols()), ['BTCUSDT', 'DOGEUSDT'])
+
+    def test_empty_positions_returns_empty(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = None
+        self.assertEqual(api.list_position_symbols(), [])
+
+
 if __name__ == '__main__':
     unittest.main()

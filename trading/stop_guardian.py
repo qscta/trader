@@ -6,7 +6,8 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_display_name。
+_stop_anomalies / _known_orphans / record_stop_loss / get_strategy_for_symbol /
+_get_strategy_display_name。
 """
 
 import logging
@@ -25,6 +26,15 @@ class StopGuardianMixin:
             return
 
         try:
+            # 孤儿仓核对：下方主循环只遍历本地持仓，交易所侧多出的仓（开仓请求超时且
+            # 确认查询在同一场网络故障中全部失败、订单其后迟到成交 / 人工开仓）不在
+            # 遍历范围——此前只在启动时核对一次，运行期出现的孤儿裸仓（无止损、无托管）
+            # 要等到下次重启才可见。每轮巡检顺带核对，新增才告警（集合节流，不轰炸）。
+            try:
+                self._check_orphan_positions('盘中巡检')
+            except Exception as e:
+                logger.warning(f"盘中巡检孤儿仓核对失败（不影响本轮对本地持仓的巡检）: {e}")
+
             open_positions = self.trade_state.get_all_open_positions()
             if not open_positions:
                 return
@@ -43,6 +53,35 @@ class StopGuardianMixin:
             logger.exception(f"盘中止损巡检异常: {e}")
         finally:
             self._trade_lock.release()
+
+    def _check_orphan_positions(self, context):
+        """孤儿仓核对：交易所有仓、本地无记录（启动同步与盘中巡检共用）。
+
+        孤儿仓不被系统托管（不推止损、不检查平仓），静默存在比报错更危险。产生路径
+        除人工开仓/本地状态丢失外，还有一条系统自身的窄窗口：开仓请求超时、且随后的
+        持仓确认查询在同一场网络故障中全部失败（故障相关联，并非独立小概率）→ 本地
+        按开仓失败处理不记账，订单其后在交易所迟到成交 → 无止损的裸仓。反向情形
+        （本地有、交易所无）巡检 5 分钟即记平，孤儿侧必须有对称防线。
+        告警按「集合新增」节流（与 _stop_anomalies 同一模式）：新孤儿出现告警一次，
+        消失即从已知集合移除（再次出现会再次告警）。查询失败向上抛出，
+        由调用方 fail-safe（不阻断启动/巡检）。
+        """
+        exchange_symbols = set(self.exchange_api.list_position_symbols())
+        local_symbols = set(self.trade_state.get_all_open_positions().keys())
+        orphans = exchange_symbols - local_symbols
+        vanished = self._known_orphans - orphans
+        if vanished:
+            self._known_orphans -= vanished
+            logger.info(f"[{context}] 此前的孤儿仓已消失（人工处理完成）: {', '.join(sorted(vanished))}")
+        new_orphans = orphans - self._known_orphans
+        if new_orphans:
+            self._known_orphans |= new_orphans
+            msg = (f"[{context}] 发现交易所端存在、但本地无记录的持仓: {', '.join(sorted(new_orphans))}。"
+                   f"系统不会自动接管（可能是人工仓位、开仓超时后的迟到成交或本地状态丢失），"
+                   f"也不会为其推进止损/平仓，请立即人工确认处理！")
+            logger.critical(msg)
+            self.notifier.notify_error(msg)
+        return orphans
 
     def _reconcile_symbol_intraday(self, symbol, position, symbol_configs):
         """单品种盘中巡检：持仓核对 + 止损自愈 + 交易所端已平的记账。异常由调用方按品种隔离。"""

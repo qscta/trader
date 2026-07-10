@@ -528,6 +528,28 @@ class SymbolInputValidationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "turtle")
 
+    def test_update_symbol_strategy_change_rejected_while_trading_lock_held(self):
+        """改策略与交易执行互斥：日检/巡检持锁期间返回 409——堵住「查持仓→写配置」
+        之间被日检开仓穿过护栏的 TOCTOU 窗口；改 enabled 无此风险，持锁期间照常放行。"""
+        self.system.config = {"trading": {"symbols": [
+            {"name": "BTCUSDT", "strategy": "turtle", "enabled": True}]}}
+        self.system.trade_state = SimpleNamespace(get_open_position=Mock(return_value=None))
+        self.system.reload_strategies = Mock()       # enabled 修改会走到配置提交（需要 reload）
+        self.system.label = "欧易"
+        self.system._trade_lock = threading.Lock()   # 生产同款非重入锁（_prep_system 的 RLock 同线程可重入，测不出互斥）
+        self.system._trade_lock.acquire()            # 模拟日检/巡检正在执行
+        try:
+            with patch.object(api_server, "trading_system", self.system), patch.object(
+                api_server, "send_dingtalk", Mock()
+            ):
+                resp = self.client.put("/api/symbols/BTCUSDT", json={"strategy": "ma_cross"})
+                self.assertEqual(resp.status_code, 409)
+                self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "turtle")
+                resp2 = self.client.put("/api/symbols/BTCUSDT", json={"enabled": False})
+                self.assertEqual(resp2.status_code, 200)
+        finally:
+            self.system._trade_lock.release()
+
     def test_strategy_params_rejects_short_not_less_than_long(self):
         self.system.config = {"strategy": {"ma_short_period": 6, "ma_long_period": 28}}
         with patch.object(api_server, "trading_system", self.system), patch.object(
@@ -1260,6 +1282,7 @@ class StartupSyncCompensationTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system._known_orphans = set()
         exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
