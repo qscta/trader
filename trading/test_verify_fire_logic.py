@@ -88,7 +88,8 @@ class FireTestDecisionLogicTest(unittest.TestCase):
         # 开的是 long：轮询先看到有仓 → 归零（触发）→ 复核时却报告一笔 short 持仓（反向）
         seq = [{'contracts': 10.0, 'side': 'long'}, None,
                {'contracts': 5.0, 'side': 'short'}]
-        api.get_position.side_effect = lambda _s: seq.pop(0) if seq else seq[-1]
+        last = seq[-1]  # 序列耗尽后沿用最后一个值（清理阶段可能追加查询，不得 IndexError）
+        api.get_position.side_effect = lambda _s: seq.pop(0) if seq else last
         result = run_fire_test(api, 'BTC/USDT:USDT', 0.1, 'long',
                                distance_pct=0.15, timeout_seconds=10, poll_interval=0)
         self.assertFalse(result)

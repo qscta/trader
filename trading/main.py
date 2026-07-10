@@ -130,10 +130,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             retention_days=self.config.get('equity_tick_retention_days'),
         )
 
-        # 启动时必须成功获取权益，重试3次
+        # 启动时必须成功获取权益，重试3次。get_balance 的网络异常（适配层重试耗尽后
+        # re-raise）与认证异常（立抛）都必须在此捕获——否则会绕过下方「钉钉告警+退出」
+        # 路径，进程裸 traceback 静默死亡，恰是本函数要消灭的最贵故障模式
         account_equity = None
         for _retry_i in range(3):
-            balance = self.exchange_api.get_balance()
+            try:
+                balance = self.exchange_api.get_balance()
+            except Exception as e:
+                balance = None
+                logger.warning(f'[{self.label}] 启动时获取账户权益异常: {e}')
             if balance and 'USDT' in balance.get('total', {}):
                 account_equity = balance['total']['USDT']
                 break

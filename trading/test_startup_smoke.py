@@ -298,6 +298,36 @@ class StartupSmokeTest(unittest.TestCase):
             self.assertEqual(system.config['equity_tick_retention_days'], 30)
             self.assertEqual(system.equity_tracker.EQUITY_TICK_RETENTION_DAYS, 30)
 
+    def test_balance_fetch_exception_exits_with_alert(self):
+        """启动权益获取抛异常（网络重试耗尽/密钥错误）：必须走「钉钉告警 + sys.exit(1)」
+        路径退出，不得裸 traceback 静默死亡（历轮审查确立的最贵故障模式红线）。"""
+        class _BoomApi(_FakeOkxApi):
+            def get_balance(self):
+                raise RuntimeError('模拟网络/认证异常')
+
+        alerts = []
+
+        class _RecordingNotifier:
+            def __init__(self, webhook):
+                pass
+
+            def notify_error(self, msg):
+                alerts.append(msg)
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            from types import SimpleNamespace
+            import time as _time
+            with patch.object(main, 'OkxApi', _BoomApi), \
+                 patch.object(main, 'DingTalkNotifier', _RecordingNotifier), \
+                 patch.object(main, 'time', SimpleNamespace(sleep=lambda s: None, time=_time.time)):
+                with self.assertRaises(SystemExit) as ctx:
+                    TradingSystem(config_file=path)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertTrue(any('无法获取初始账户权益' in m for m in alerts),
+                        f'退出前必须补发钉钉告警，实际: {alerts}')
+
     def test_large_scan_interval_passes_validation(self):
         """巡检间隔 ≥ 60 分钟必须通过启动校验（_validate_scheduler_config 放行 [1,1440]）。
 
