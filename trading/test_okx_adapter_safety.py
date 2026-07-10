@@ -394,6 +394,29 @@ class StopOrderMatchTest(unittest.TestCase):
         self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
 
 
+class MarginModeValidationTest(unittest.TestCase):
+    """margin_mode 启动即校验（fail-loud）：该值直接进入每一笔订单的 tdMode，
+    写错不会在启动时暴露，而是让全部下单在盘中被交易所逐笔拒绝。"""
+
+    @staticmethod
+    def _cfg(mode):
+        cfg = {'apiKey': 'k', 'secret': 's', 'password': 'p'}
+        if mode is not None:
+            cfg['margin_mode'] = mode
+        return cfg
+
+    def test_invalid_margin_mode_rejected_at_startup(self):
+        for bad in ('corss', 'both', 'margin', 5, ['cross']):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                OkxApi(self._cfg(bad))
+
+    def test_valid_and_default_modes_accepted(self):
+        for mode, expect in (('cross', 'cross'), ('isolated', 'isolated'),
+                             (' CROSS ', 'cross'), (None, 'cross'), ('', 'cross')):
+            api = OkxApi(self._cfg(mode))
+            self.assertEqual(api.margin_mode, expect, msg=repr(mode))
+
+
 class ListPositionSymbolsFilterTest(unittest.TestCase):
     """孤儿仓核对的数据源必须只含 U 本位永续：OKX 的 SWAP 持仓查询会带出币本位
     （BTC/USD:BTC），to_internal_symbol 会把它错映射成 BTCUSDT——人工币本位仓会被

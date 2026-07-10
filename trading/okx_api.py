@@ -53,9 +53,15 @@ class OkxApi(ExchangeApi):
         return ex
 
     def __init__(self, config):
+        # 保证金模式：cross（全仓）/ isolated（逐仓）。启动即校验（fail-loud）：该值直接
+        # 进入每一笔订单的 tdMode，写错（如手滑 "corss"）不会在启动时暴露，而是让全部
+        # 下单在盘中被交易所逐笔拒绝——与 strategy/scheduler 配置同标准，坏配置拒绝启动。
+        raw_margin_mode = config.get('margin_mode') or 'cross'
+        if not isinstance(raw_margin_mode, str) or raw_margin_mode.strip().lower() not in ('cross', 'isolated'):
+            raise ValueError(
+                f"okx.margin_mode 非法: {config.get('margin_mode')!r}（只支持 cross / isolated）")
         super().__init__(config)
-        # 保证金模式：cross（全仓）/ isolated（逐仓）
-        self.margin_mode = (config.get('margin_mode') or 'cross').lower()
+        self.margin_mode = raw_margin_mode.strip().lower()
         # 杠杆：默认值 + 可按内部符号覆盖，如 {"BTCUSDT": 10}
         self.default_leverage = config.get('leverage', 5)
         self.leverage_overrides = config.get('leverage_overrides', {}) or {}
