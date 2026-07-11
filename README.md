@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-373%20stdlib%20%2B%20105%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-375%20stdlib%20%2B%20105%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -31,7 +31,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **478 个测试**——373 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 105 个依赖版集成用例。
+- **480 个测试**——375 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 105 个依赖版集成用例。
 
 ## 🏗️ 架构
 
@@ -109,7 +109,7 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```bash
 cd trading
 
-# 373 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 375 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
 # 105 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
