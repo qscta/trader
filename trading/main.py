@@ -1,10 +1,13 @@
+import copy
+import hashlib
 import json
-import shutil
+import math
 import sys
 import time
 import logging
 import logging.handlers
 import os
+import stat
 from datetime import datetime, date, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 import threading
@@ -14,11 +17,15 @@ from turtle_strategy import TurtleStrategy
 from ma_cross_strategy import MaCrossStrategy
 from risk_manager import RiskManager
 from dingtalk_notifier import DingTalkNotifier
-from trade_state import TradeState, TradeStatePersistenceError, atomic_write_json
+from trade_state import (
+    TradeState, TradeStatePersistenceError, atomic_write_json,
+    open_private_text_file, private_file_exists,
+)
 from stop_guardian import StopGuardianMixin
 from reporting import ReportingMixin
 from signal_handlers import SignalHandlersMixin
 from trade_executor import TradeExecutorMixin
+from runtime_guard import acquire_runner_lock
 import config_validation as cfgv
 
 # 日志轮转（10MB自动切割，保留5个备份）。路径锚定项目目录，避免 systemd/cron 等不同 cwd 下日志写错位置。
@@ -39,6 +46,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+# OKX 的已撤未成交订单只保留 2 小时。pending 已进入“计划量已落盘”阶段后，
+# 超过这个窗口再得到 OrderNotFound，已不能证明当年的请求从未到达交易所。
+_PENDING_ORDER_ABSENCE_PROOF_WINDOW = timedelta(hours=2)
+_PENDING_TIMESTAMP_FUTURE_TOLERANCE = timedelta(minutes=5)
 
 
 class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, TradeExecutorMixin):
@@ -108,22 +120,27 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 pass
             raise
         self._guard_state_owner()  # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入
+
+        # 双均线 T+1 是交易状态而非展示数据，必须在启动仓位同步之前就可用，
+        # 并且与主账本共享事务性落盘。旧的独立 JSON 只用于一次性迁移。
+        self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
+        self.stop_loss_dates = self._load_stop_loss_dates()
+
         self.scheduler = BackgroundScheduler()
-        self._last_check_date = None  # 防重复执行
-        self._last_summary_date = None  # 每日持仓汇总去重
+        self._last_check_date = self.trade_state.get_last_daily_check_date()  # 跨重启防重复执行
+        self._last_summary_date = self.trade_state.get_last_daily_summary_date()
         self._pending_trade_open_notifications = []
         self._pending_trade_close_notifications = []
         self._pending_stop_loss_updates = []
         self._trade_lock = threading.Lock()  # 防并发执行锁
         self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
         self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
-        self._known_orphans = set()  # 已告警的孤儿仓（新增才告警、消失即移除，与 _stop_anomalies 同一节流模式）
         self._last_failure_notify_ts = 0
         self._equity_tick_fail_streak = 0
         self._equity_tick_alert_sent = False
-
-        self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
-        self.stop_loss_dates = self._load_stop_loss_dates()
+        self._stop_event = threading.Event()
+        self._heartbeat_lock = threading.Lock()
+        self._runner_heartbeat_ts = None
 
         self.equity_tracker = EquityTracker(
             self.data_dir, self,
@@ -166,7 +183,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def load_config(self, config_file):
         """加载欧易单所配置：{okx:{凭据...}, strategy, trading, scheduler, dingtalk}。
         兼容旧多所格式（exchanges.okx）自动展平；环境变量可覆盖凭据。"""
-        with open(config_file, 'r', encoding='utf-8') as f:
+        # 配置可能直接含 API 密钥；与命脉账本使用同一套 O_NOFOLLOW +
+        # fstat/inode/owner 校验，消除 lstat/chmod/open 之间的替换窗口。
+        with open_private_text_file(config_file) as f:
             config = json.load(f)
         # 兼容旧多所格式：从 exchanges.okx 展平到顶层
         if 'okx' not in config and isinstance(config.get('exchanges'), dict):
@@ -175,13 +194,22 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             config.setdefault('strategy', okx_block.get('strategy', {}))
             config.setdefault('trading', okx_block.get('trading', {'symbols': []}))
         okx = config.setdefault('okx', {})
+        # 记住磁盘上原始凭据。环境变量只是运行时覆盖，之后 API 持久化
+        # 策略配置时必须恢复这些原值，不能把 env-only 密钥扩散到文件/备份。
+        self._disk_okx_credentials = {
+            key: okx[key] for key in ('apiKey', 'secret', 'password') if key in okx
+        }
+        self._env_okx_credential_keys = set()
         if os.environ.get('OKX_API_KEY'):
             okx['apiKey'] = os.environ['OKX_API_KEY']
+            self._env_okx_credential_keys.add('apiKey')
         if os.environ.get('OKX_API_SECRET'):
             okx['secret'] = os.environ['OKX_API_SECRET']
+            self._env_okx_credential_keys.add('secret')
         _pass = os.environ.get('OKX_API_PASSPHRASE') or os.environ.get('OKX_PASSWORD')
         if _pass:
             okx['password'] = _pass
+            self._env_okx_credential_keys.add('password')
         if not okx.get('apiKey') or not okx.get('secret') or not okx.get('password'):
             raise ValueError('未配置 OKX API 凭据（apiKey/secret/passphrase），请在 config.json 或环境变量中提供')
         config.setdefault('strategy', {})
@@ -294,100 +322,279 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
                 raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 turtle / ma_cross）")
 
-    def _migrate_okx_legacy_state(self):
-        """旧多所版把欧易状态存在 data/okx/，收敛单所时迁回根目录。
+    @staticmethod
+    def _state_has_lifecycle_data(state):
+        """空仓不等于空状态：pending/历史/阻断标记同样带交易所归属。"""
+        if not isinstance(state, dict):
+            return True
+        for key in (
+                'open_positions', 'closed_trades', 'signal_states',
+                'open_intents', 'stop_residues', 'stop_loss_dates',
+                'position_quarantines'):
+            if state.get(key):
+                return True
+        return bool(state.get('last_daily_check_date'))
 
-        边界保护（本地持仓状态是命脉，不能被空文件覆盖或绕过）：
-        - 根目录无 trade_state.json：正常迁移；
-        - 根目录有但**空仓**、而 data/okx/ 旧文件**有持仓**：备份空文件后迁移旧持仓；
-        - 两边都有持仓：无法自动裁决，拒绝启动等人工；
-        - 任一文件读取失败：拒绝启动（不能在持仓不明的情况下继续）。
-        """
+    @staticmethod
+    def _states_equal_ignoring_owner(left, right):
+        left_copy = copy.deepcopy(left)
+        right_copy = copy.deepcopy(right)
+        left_copy.pop('exchange', None)
+        right_copy.pop('exchange', None)
+        return left_copy == right_copy
+
+    @staticmethod
+    def _validate_migrated_auxiliary(filename, payload):
+        expected = {
+            'stop_loss_dates.json': dict,
+            'peak_equity.json': dict,
+            'equity_history.json': dict,
+            'daily_equity.json': list,
+            'equity_ticks.json': list,
+            'qiusuo_index.json': dict,
+            'closed_trades_archive.json': list,
+        }[filename]
+        if not isinstance(payload, expected):
+            raise ValueError(
+                f'{filename} 顶层必须是 {expected.__name__}')
+        if filename == 'stop_loss_dates.json':
+            for symbol, day in payload.items():
+                if not isinstance(symbol, str) or not isinstance(day, str):
+                    raise ValueError('T+1 必须是 品种→YYYY-MM-DD')
+                datetime.strptime(day, '%Y-%m-%d')
+        if filename == 'closed_trades_archive.json' and any(
+                not isinstance(item, dict) for item in payload):
+            raise ValueError('平仓史书每项必须是对象')
+
+    def _read_private_json_for_startup(self, path, context):
+        try:
+            with open_private_text_file(path) as handle:
+                return json.load(
+                    handle,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f'不允许的 JSON 数值常量: {value}')))
+        except Exception as exc:
+            raise RuntimeError(
+                f'{context}读取 {path} 失败({exc})，状态不明拒绝启动。') from exc
+
+    def _migrate_okx_legacy_state(self):
+        """只执行一次的旧 data/okx 状态迁移；任一歧义都 fail-closed。"""
         legacy_dir = os.path.join(self.base_dir, 'data', 'okx')
-        if not os.path.isdir(legacy_dir):
+        if not os.path.lexists(legacy_dir):
             return
+        try:
+            info = os.lstat(legacy_dir)
+        except OSError as exc:
+            raise RuntimeError(f'无法检查旧状态目录 {legacy_dir}: {exc}') from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f'旧状态目录不是实际目录（拒绝符号链接）: {legacy_dir}')
+        current_uid = os.geteuid() if hasattr(os, 'geteuid') else os.getuid()
+        if info.st_uid != current_uid:
+            raise RuntimeError(f'旧状态目录不属于当前用户: {legacy_dir}')
+
+        marker = os.path.join(self.base_dir, '.okx_legacy_migration_complete.json')
+        if private_file_exists(marker):
+            payload = self._read_private_json_for_startup(marker, '迁移标记')
+            if not isinstance(payload, dict) or payload.get('exchange') != 'okx':
+                raise RuntimeError(f'旧状态迁移标记非法: {marker}')
+            return
+
         root_ts = os.path.join(self.base_dir, 'trade_state.json')
         legacy_ts = os.path.join(legacy_dir, 'trade_state.json')
+        aux_names = [
+            'stop_loss_dates.json', 'peak_equity.json', 'equity_history.json',
+            'daily_equity.json', 'equity_ticks.json', 'qiusuo_index.json',
+            'closed_trades_archive.json',
+        ]
+        legacy_has_any = private_file_exists(legacy_ts) or any(
+            private_file_exists(os.path.join(legacy_dir, name))
+            for name in aux_names)
+        if not legacy_has_any:
+            return
 
-        if os.path.exists(root_ts):
-            if not os.path.exists(legacy_ts):
-                return
+        if (not private_file_exists(root_ts) and
+                private_file_exists(root_ts + '.bak')):
+            raise RuntimeError(
+                '根主账本缺失但 .bak 尚在，拒绝用永久旧 legacy 快照覆盖；'
+                '请先按主账本恢复指引人工裁决')
+
+        legacy_state = TradeState.get_default_state()
+        if private_file_exists(legacy_ts):
+            legacy_state = self._read_private_json_for_startup(
+                legacy_ts, '旧账本迁移前')
             try:
-                with open(legacy_ts, encoding='utf-8') as f:
-                    legacy_positions = json.load(f).get('open_positions') or {}
-                with open(root_ts, encoding='utf-8') as f:
-                    root_positions = json.load(f).get('open_positions') or {}
-            except Exception as e:
+                TradeState.validate_state(legacy_state)
+            except Exception as exc:
                 raise RuntimeError(
-                    f"状态迁移前读取 trade_state.json 失败({e})，持仓不明拒绝启动。"
-                    f"请人工检查 {root_ts} 与 {legacy_ts}")
-            if not legacy_positions:
-                return  # 旧文件无持仓，根目录维持现状
-            if root_positions:
+                    f'旧账本 {legacy_ts} schema 非法({exc})，拒绝迁移/启动。') from exc
+            if legacy_state.get('exchange') not in (None, 'okx'):
                 raise RuntimeError(
-                    "根目录与 data/okx/ 的 trade_state.json 都含持仓，无法自动选择，已拒绝启动。"
-                    "请人工核对欧易实际持仓，保留正确的一份（把另一份移走）后再启动。")
-            backup = f"{root_ts}.bak.empty.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            shutil.copy2(root_ts, backup)
-            os.remove(root_ts)
-            logger.warning(f"根目录 trade_state.json 为空仓而 data/okx/ 有持仓：空文件已备份到 {backup}，开始迁移旧持仓状态")
+                    f'旧 data/okx 账本归属异常: {legacy_state.get("exchange")!r}')
+
+        root_exists = private_file_exists(root_ts)
+        root_state = None
+        if root_exists:
+            root_state = self._read_private_json_for_startup(
+                root_ts, '根账本迁移前')
+            try:
+                TradeState.validate_state(root_state)
+            except Exception as exc:
+                raise RuntimeError(
+                    f'根账本 {root_ts} schema 非法({exc})，拒绝迁移/启动。') from exc
+
+        root_nonempty = self._state_has_lifecycle_data(root_state or {})
+        legacy_nonempty = self._state_has_lifecycle_data(legacy_state)
+        lineage_confirmed = (
+            root_state is not None and
+            self._states_equal_ignoring_owner(root_state, legacy_state))
+        # 即便旧目录只有 T+1/权益/史书，也要同时建立带 okx owner 的根账本，
+        # 否则目录归属护栏会正确地把这些非空辅助状态判为来路不明。
+        replace_root = not root_exists
+        if root_exists and legacy_nonempty and not lineage_confirmed:
+            if root_nonempty:
+                raise RuntimeError(
+                    '根目录与 data/okx 均含生命周期状态，无法自动选择；'
+                    '请人工核对持仓、pending、残留和历史后再启动')
+            backup = (
+                f'{root_ts}.bak.empty.'
+                f'{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}')
+            if not atomic_write_json(backup, root_state):
+                raise RuntimeError(f'备份根目录空账本失败: {backup}')
+            replace_root = True
+            logger.warning(f'根空状态已备份到 {backup}，开始迁入旧 OKX 生命周期状态')
+
         moved = []
-        for fn in ['trade_state.json', 'stop_loss_dates.json', 'peak_equity.json',
-                   'equity_history.json', 'daily_equity.json', 'equity_ticks.json', 'qiusuo_index.json']:
-            src = os.path.join(legacy_dir, fn)
-            dst = os.path.join(self.base_dir, fn)
-            if os.path.exists(src) and not os.path.exists(dst):
-                try:
-                    shutil.copy2(src, dst)
-                    moved.append(fn)
-                except Exception as e:
-                    logger.error(f"迁移欧易状态 {fn} 失败: {e}")
-        if moved:
-            logger.warning(f"已把 data/okx/ 的欧易状态迁回根目录: {moved}（老文件保留作备份）")
-        if 'trade_state.json' in moved:
-            # 来源 data/okx 明确属欧易，固化归属标记，避免之后启动校验把它当来路不明状态拦下
-            ts_path = os.path.join(self.base_dir, 'trade_state.json')
+        if replace_root:
+            migrated = copy.deepcopy(legacy_state)
+            migrated['exchange'] = 'okx'
+            if not atomic_write_json(root_ts, migrated):
+                raise RuntimeError(
+                    f'迁移命脉账本 {legacy_ts} -> {root_ts} 原子写入失败')
+            written = self._read_private_json_for_startup(root_ts, '迁移后账本')
+            TradeState.validate_state(written)
+            moved.append('trade_state.json')
+            lineage_confirmed = True
+
+        source_aux = [
+            name for name in aux_names
+            if private_file_exists(os.path.join(legacy_dir, name))]
+        if root_nonempty and source_aux and not lineage_confirmed:
+            raise RuntimeError(
+                '根账本已有独立生命周期状态，无法安全合并旧 data/okx 辅助状态；'
+                '请人工确认数据归属')
+
+        for filename in source_aux:
+            src = os.path.join(legacy_dir, filename)
+            dst = os.path.join(self.base_dir, filename)
+            payload = self._read_private_json_for_startup(src, '旧辅助状态迁移前')
             try:
-                with open(ts_path, encoding='utf-8') as f:
-                    ts = json.load(f)
-                ts['exchange'] = 'okx'
-                atomic_write_json(ts_path, ts)
-            except Exception as e:
-                logger.error(f"标记迁移状态归属失败: {e}")
+                self._validate_migrated_auxiliary(filename, payload)
+            except Exception as exc:
+                raise RuntimeError(
+                    f'旧辅助状态 {src} schema 非法({exc})') from exc
+            if private_file_exists(dst):
+                existing = self._read_private_json_for_startup(dst, '根辅助状态')
+                if existing != payload:
+                    raise RuntimeError(
+                        f'根目录与旧目录的 {filename} 内容冲突，拒绝自动覆盖')
+                continue
+            if private_file_exists(dst + '.bak'):
+                raise RuntimeError(
+                    f'{dst} 缺失但备份仍在，拒绝用 legacy 绕过恢复裁决')
+            if not atomic_write_json(dst, payload):
+                raise RuntimeError(f'迁移欧易状态 {filename} 失败')
+            moved.append(filename)
+
+        if not atomic_write_json(marker, {
+                'exchange': 'okx', 'completed_at': datetime.now().isoformat(),
+                'moved': moved}):
+            raise RuntimeError('状态文件已迁移但无法写完成标记，拒绝启动')
+        logger.warning(
+            f'旧 data/okx 状态迁移已一次性收口: {moved}；原路径此后不再参与候选')
+
+    def _directory_has_unowned_state(self):
+        names = [
+            'closed_trades_archive.json', 'stop_loss_dates.json',
+            'peak_equity.json', 'equity_history.json', 'daily_equity.json',
+            'equity_ticks.json', 'qiusuo_index.json',
+            '.equity_sync_journal.json',
+        ]
+        for name in names:
+            for path in (
+                    os.path.join(self.base_dir, name),
+                    os.path.join(self.base_dir, name + '.bak')):
+                if not private_file_exists(path):
+                    continue
+                payload = self._read_private_json_for_startup(
+                    path, '目录归属校验')
+                if payload not in ({}, [], None):
+                    return True
+        backup = os.path.join(self.base_dir, 'trade_state.json.bak')
+        if private_file_exists(backup):
+            backup_state = self._read_private_json_for_startup(
+                backup, '账本备份归属校验')
+            TradeState.validate_state(backup_state)
+            if self._state_has_lifecycle_data(backup_state):
+                return True
+        return False
 
     def _guard_state_owner(self):
-        """启动前校验本地状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入。
-
-        - 已标记为本所(okx)：放行。
-        - 标记为其它交易所：拒绝启动。
-        - 未标记且无持仓：视为全新状态，安全地打上本所标记。
-        - 未标记但已有持仓：来路不明(可能是旧币安状态)，拒绝启动并要求人工确认。
-        """
+        """用目录级 owner manifest 在加载任何辅助状态前阻止跨所污染。"""
         owner = self.trade_state.get_owner_exchange()
-        has_positions = bool(self.trade_state.get_all_open_positions())
-        if owner == self.exchange_id:
-            return
-        if owner and owner != self.exchange_id:
+        manifest_path = os.path.join(self.base_dir, '.trading_data_owner.json')
+        manifest_owner = None
+        if private_file_exists(manifest_path):
+            manifest = self._read_private_json_for_startup(
+                manifest_path, '数据目录归属')
+            if not isinstance(manifest, dict) or not isinstance(
+                    manifest.get('exchange'), str):
+                raise RuntimeError(f'数据目录归属标记非法: {manifest_path}')
+            manifest_owner = manifest['exchange']
+
+        claimed_owners = {value for value in (owner, manifest_owner) if value}
+        if len(claimed_owners) > 1 or any(
+                value != self.exchange_id for value in claimed_owners):
             raise RuntimeError(
-                f"状态文件 trade_state.json 归属交易所为「{owner}」，与当前「{self.exchange_id}」不一致，"
-                "已拒绝启动以避免串仓。请改用独立目录部署，或人工确认后修正归属标记。"
-            )
-        # owner 为空：未标记
-        if not has_positions:
+                f'状态归属冲突：账本={owner!r}, 目录={manifest_owner!r}, '
+                f'当前={self.exchange_id!r}；拒绝启动')
+
+        if manifest_owner == self.exchange_id and owner is None:
             self.trade_state.claim_owner_exchange(self.exchange_id)
-            logger.info(f"[{self.label}] 全新本地状态，已标记归属交易所为 {self.exchange_id}")
-            return
-        raise RuntimeError(
-            "检测到根目录 trade_state.json 含持仓但无交易所归属标记，可能是旧币安单所版遗留状态。"
-            "为避免把币安持仓当作欧易仓位管理(错误止损/平仓)，已拒绝启动。请人工确认后二选一：\n"
-            "  1) 若该状态确属欧易：在 trade_state.json 顶层加 \"exchange\": \"okx\" 后重启；\n"
-            "  2) 若不确定或属币安：把欧易系统部署到独立目录(避免与旧状态混用)。"
-        )
+            owner = self.exchange_id
+        elif owner is None:
+            with self.trade_state.lock:
+                state = self.trade_state._snapshot_locked()
+            if (self._state_has_lifecycle_data(state) or
+                    self._directory_has_unowned_state()):
+                raise RuntimeError(
+                    '检测到无交易所归属的生命周期/历史/权益状态；空仓不足以证明安全。'
+                    '请人工确认全部文件确属 OKX 后写入 exchange="okx"，或使用独立目录')
+            self.trade_state.claim_owner_exchange(self.exchange_id)
+            owner = self.exchange_id
+
+        if manifest_owner is None:
+            if not atomic_write_json(manifest_path, {
+                    'exchange': self.exchange_id,
+                    'claimed_at': datetime.now().isoformat()}):
+                raise RuntimeError('无法持久化数据目录归属标记，拒绝启动')
+        logger.info(f'[{self.label}] 账本与数据目录归属均已确认: {owner}')
 
     def persist_config(self):
-        """把当前 config 原子写回磁盘（增删品种/改参数后调用）。"""
+        """把当前 config 原子写回磁盘（增删品种/改参数后调用）。
+
+        OKX_* 环境变量是运行时 secret overlay；持久化时恢复文件原值，
+        如原文件无该键则继续保持无键，绝不把环境密钥写入磁盘。
+        """
         with self._config_lock:
-            return atomic_write_json(self.config_file, self.config)
+            disk_config = copy.deepcopy(self.config)
+            disk_okx = disk_config.setdefault('okx', {})
+            for key in getattr(self, '_env_okx_credential_keys', set()):
+                originals = getattr(self, '_disk_okx_credentials', {})
+                if key in originals:
+                    disk_okx[key] = originals[key]
+                else:
+                    disk_okx.pop(key, None)
+            return atomic_write_json(self.config_file, disk_config)
 
     def reload_strategies(self):
         """重新加载策略参数"""
@@ -402,14 +609,140 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     f"EMA长期={self.config['strategy'].get('ma_long_period', 28)}, "
                     f"EMA止损周期={self.config['strategy'].get('ma_stop_period', 28)}")
 
+    @staticmethod
+    def _normalise_position_side(position):
+        if not position:
+            return None
+        side = str(position.get('side') or (position.get('info') or {}).get('posSide') or '').lower()
+        if side in ('long', 'short'):
+            return side
+        return None
+
+    def _position_reconciliation_details(self, symbol, local_position, exchange_position):
+        """生成本地/交易所仓位方向与张数对账结果。"""
+        ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+        local_side = self._normalise_position_side(local_position)
+        exchange_side = self._normalise_position_side(exchange_position)
+        exchange_contracts = abs(float((exchange_position or {}).get('contracts') or 0))
+        local_coin = float((local_position or {}).get('position_size') or 0)
+        local_contracts = 0.0
+        if local_position:
+            local_contracts = abs(float(
+                self.exchange_api._coin_to_contracts(ccxt_symbol, local_coin)))
+        side_match = local_side == exchange_side
+        quantity_match = math.isclose(
+            local_contracts, exchange_contracts, rel_tol=1e-10, abs_tol=1e-10)
+        return {
+            'local_side': local_side,
+            'exchange_side': exchange_side,
+            'local_contracts': local_contracts,
+            'exchange_contracts': exchange_contracts,
+            'side_match': side_match,
+            'quantity_match': quantity_match,
+            'matched': bool(side_match and quantity_match),
+        }
+
+    def _quarantine_position_mismatch(
+            self, symbol, reason, details=None, *, notify=True,
+            stop_residue_possible=False):
+        """隔离仓位不一致品种；磁盘故障时至少保住本进程阻断。"""
+        check = getattr(self.trade_state, 'is_position_quarantined', None)
+        mark = getattr(self.trade_state, 'mark_position_quarantine', None)
+        previous = bool(check(symbol)) if callable(check) else False
+        persist_error = None
+        if callable(mark):
+            try:
+                mark_kwargs = (
+                    {'stop_residue_possible': True}
+                    if stop_residue_possible else {})
+                mark(symbol, reason, details, **mark_kwargs)
+            except Exception as exc:
+                persist_error = exc
+                force_mark = getattr(
+                    self.trade_state, 'force_runtime_mark_position_quarantine', None)
+                if callable(force_mark):
+                    try:
+                        force_mark(symbol, reason, details, **mark_kwargs)
+                    except Exception:
+                        logger.exception(f'{symbol} 运行时隔离也失败')
+                logger.critical(
+                    f'{symbol} 隔离状态落盘失败，已尽力启用运行时隔离: {exc}')
+        if notify and not previous:
+            msg = f"{symbol} 已进入仓位对账隔离: {reason}"
+            if persist_error is not None:
+                msg += f'（隔离落盘失败，仅本进程生效: {persist_error}）'
+            logger.critical(msg)
+            try:
+                self.notifier.notify_error(msg)
+            except Exception:
+                logger.exception(f"{symbol} 发送仓位隔离告警失败")
+        return persist_error is None
+
+    def _clear_position_quarantine_after_reconcile(self, symbol):
+        # 方向/数量一致还不等于“可解除隔离”：应急余仓可能仍无止损，
+        # 或有未知算法单残留。等 guardian 验证/补挂保护后再清。
+        get_position = getattr(self.trade_state, 'get_open_position', None)
+        position = get_position(symbol) if callable(get_position) else None
+        if position and (
+                not position.get('stop_order_id') or
+                position.get('stop_resize_pending')):
+            return False
+        has_residue = getattr(self.trade_state, 'has_stop_residue', None)
+        if callable(has_residue) and has_residue(symbol):
+            return False
+        clear = getattr(self.trade_state, 'clear_position_quarantine', None)
+        if callable(clear) and clear(symbol):
+            logger.warning(f"{symbol} 本地/交易所仓位已重新一致，自动解除隔离")
+            return True
+        return False
+
+    def is_symbol_quarantined(self, symbol):
+        """API/executor 可调用的统一隔离查询入口。"""
+        check = getattr(self.trade_state, 'is_position_quarantined', None)
+        return bool(check(symbol)) if callable(check) else False
+
+    def _verify_existing_position_or_quarantine(
+            self, symbol, local_position, exchange_position, clear_on_match=True):
+        """两边都有仓时必须方向+张数完整一致。"""
+        try:
+            details = self._position_reconciliation_details(
+                symbol, local_position, exchange_position)
+        except Exception as exc:
+            self._quarantine_position_mismatch(
+                symbol, f'仓位数量换算失败: {exc}')
+            return False
+        if not details['matched']:
+            reason = (
+                f"本地 {details['local_side']} {details['local_contracts']} 张，"
+                f"交易所 {details['exchange_side']} {details['exchange_contracts']} 张")
+            self._quarantine_position_mismatch(symbol, reason, details)
+            return False
+        if clear_on_match:
+            self._clear_position_quarantine_after_reconcile(symbol)
+        return True
+
     def sync_positions_on_startup(self):
-        """启动时与交易所同步持仓状态"""
+        """启动时对账持仓现实：存在性、方向、张数三者必须同时一致。"""
         logger.info("开始同步持仓状态...")
         open_positions = self.trade_state.get_all_open_positions()
 
         for symbol in list(open_positions.keys()):
+            close_recovery = self._resume_persisted_close_intent(
+                symbol, open_positions[symbol], '启动对账')
+            if close_recovery in ('closed', 'unresolved'):
+                continue
+            if close_recovery == 'partial':
+                refreshed = self.trade_state.get_open_position(symbol)
+                if not refreshed:
+                    continue
+                open_positions[symbol] = refreshed
             ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
-            position = self.exchange_api.get_position(ccxt_symbol)
+            try:
+                position = self.exchange_api.get_position(ccxt_symbol)
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'启动对账查询交易所持仓失败: {exc}')
+                continue
 
             if position is None or position.get('contracts', 0) == 0:
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
@@ -418,19 +751,101 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 except Exception:
                     exit_price = open_positions[symbol]['entry_price']
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
-                    symbol, ccxt_symbol, open_positions[symbol], exit_price, "启动同步平仓")
+                    symbol, ccxt_symbol, open_positions[symbol], exit_price,
+                    "启动同步平仓",
+                    strategy_type=(open_positions[symbol].get('strategy') or 'turtle'))
                 if not closed_position:
                     logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
+                    self._quarantine_position_mismatch(
+                        symbol, '交易所已空仓但本地平仓补偿失败')
+                    continue
+                if not _state_saved:
+                    # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
+                    # 对同一磁盘故障重复通知。
+                    continue
+                # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
+                # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
+                if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
+                    pass
+                else:
+                    pending = self.trade_state.get_pending_signal_execution(symbol)
+                    if (pending and (pending.get('payload') or {}).get('side') ==
+                            open_positions[symbol].get('side')):
+                        self.trade_state.confirm_signal_execution(
+                            symbol, 'turtle', pending.get('signal_id'))
+                        candle = (pending.get('payload') or {}).get('candle_id')
+                        if candle:
+                            self.trade_state.mark_candle_processed(
+                                symbol, 'turtle', candle)
+                self._clear_position_quarantine_after_reconcile(symbol)
             else:
-                logger.info(f"{symbol} 持仓同步成功")
+                local_position = open_positions[symbol]
+                if self._verify_existing_position_or_quarantine(
+                        symbol, local_position, position, clear_on_match=False):
+                    strategy_type = local_position.get('strategy') or 'turtle'
+                    strategy_name = self._get_strategy_display_name(strategy_type)
+                    if not self._ensure_stop_order_alive(
+                            symbol, ccxt_symbol, local_position, strategy_name):
+                        self._quarantine_position_mismatch(
+                            symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
+                        continue
+                    self._clear_position_quarantine_after_reconcile(symbol)
+                    intent_getter = getattr(
+                        self.trade_state, 'get_open_intent', None)
+                    intent = (
+                        intent_getter(symbol) if callable(intent_getter) else None)
+                    if intent and intent.get('side') == local_position.get('side'):
+                        self.trade_state.resolve_open_intent(
+                            symbol, intent.get('client_order_id'))
+                    pending = self.trade_state.get_pending_signal_execution(symbol)
+                    if (pending and pending.get('strategy') == 'turtle' and
+                            (pending.get('payload') or {}).get('side') == open_positions[symbol].get('side')):
+                        # 崩溃可能发生在“成交+止损+账本已落盘”之后、confirmed
+                        # 标记之前。既然此刻本地/交易所方向张数已完整匹配，可安全补确认。
+                        self.trade_state.confirm_signal_execution(
+                            symbol, 'turtle', pending.get('signal_id'))
+                        candle = (pending.get('payload') or {}).get('candle_id')
+                        if candle:
+                            self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
+                    logger.info(f"{symbol} 持仓方向与张数同步成功")
 
-        # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓/开仓超时后迟到成交）——
-        # 该仓不会被系统托管（不推止损、不检查平仓），静默存在比报错更危险，必须告警。
-        # 同一核对在盘中巡检每轮执行（_check_orphan_positions），此处为启动首查
+        # 本地/交易所都空仓的 pending 也必须主动裁决：不能只在
+        # “交易所有孤儿仓”时才触发恢复。
+        self._reconcile_all_pending_turtle_executions('启动')
+        self._reconcile_all_open_intents('启动')
+
+        # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓）——
+        # 该仓不会被系统托管，必须持久化隔离，不能仅发一条告警后继续开仓。
         try:
-            self._check_orphan_positions('启动同步')
+            exchange_symbols = set(self.exchange_api.list_position_symbols())
+            local_symbols = set(self.trade_state.get_all_open_positions().keys())
+            orphans = sorted(exchange_symbols - local_symbols)
+            if orphans:
+                for orphan in orphans:
+                    pending_getter = getattr(
+                        self.trade_state, 'get_pending_signal_execution', None)
+                    pending = pending_getter(orphan) if callable(pending_getter) else None
+                    if (pending and pending.get('strategy') == 'turtle' and
+                            self._resume_pending_turtle_execution(orphan, pending)):
+                        continue
+                    self._quarantine_position_mismatch(
+                        orphan, '交易所有仓但本地无账本记录（孤儿仓）')
+            # 只有本轮完整反向查询成功才可解除已经实际双边空仓的旧隔离。
+            get_quarantines = getattr(self.trade_state, 'get_position_quarantines', None)
+            quarantined_symbols = (
+                list(get_quarantines().keys()) if callable(get_quarantines) else [])
+            for quarantined in quarantined_symbols:
+                if quarantined not in exchange_symbols and quarantined not in local_symbols:
+                    self._clear_position_quarantine_after_reconcile(quarantined)
         except Exception as e:
-            logger.warning(f"启动孤儿仓核对失败（不阻断启动）: {e}")
+            # 无法列出交易所全部持仓时，无法证明任一本地空仓品种真的安全。
+            # 将当前配置池的空仓品种全部隔离；后续成功对账时自动解除。
+            logger.critical(f"启动孤儿仓核对失败，对本地空仓品种 fail-closed: {e}")
+            for cfg in getattr(self, 'config', {}).get('trading', {}).get('symbols', []):
+                symbol = cfg.get('name')
+                if symbol and symbol not in open_positions:
+                    self._quarantine_position_mismatch(
+                        symbol, f'无法完成启动孤儿仓核对: {e}')
 
         logger.info("持仓状态同步完成")
 
@@ -443,21 +858,44 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return self.turtle_strategy, 'turtle'
 
     def _load_stop_loss_dates(self):
-        """从文件加载止损日期记录"""
-        if os.path.exists(self.stop_loss_file):
+        """从主账本加载 T+1；首次升级时严格迁移旧独立 JSON。"""
+        if self.trade_state.stop_loss_dates_migrated():
+            dates = self.trade_state.get_stop_loss_dates()
+            logger.info(f"已从主账本加载止损日期记录: {dates}")
+            return dates
+
+        legacy = {}
+        if private_file_exists(self.stop_loss_file):
             try:
-                with open(self.stop_loss_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                logger.info(f"已加载止损日期记录: {data}")
-                return data
-            except Exception as e:
-                logger.warning(f"加载止损日期文件失败: {e}")
-        return {}
+                with open_private_text_file(self.stop_loss_file) as f:
+                    legacy = json.load(
+                        f,
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(f'不允许的 JSON 数值常量: {value}')))
+                if not isinstance(legacy, dict):
+                    raise ValueError('顶层必须是对象')
+                for symbol, value in legacy.items():
+                    if not isinstance(symbol, str) or not isinstance(value, str):
+                        raise ValueError('键值必须都是字符串')
+                    datetime.strptime(value, '%Y-%m-%d')
+            except Exception as exc:
+                raise TradeStatePersistenceError(
+                    f'旧 T+1 文件 {self.stop_loss_file} 损坏({exc})，拒绝以空标记启动'
+                ) from exc
+        self.trade_state.replace_stop_loss_dates(legacy)
+        if legacy:
+            logger.warning(f"已把旧 stop_loss_dates.json 迁入主账本: {legacy}")
+        return self.trade_state.get_stop_loss_dates()
 
     def _save_stop_loss_dates(self):
-        """保存止损日期记录到文件（原子写入）"""
+        """保存 T+1：主账本落盘失败向上抛出，由交易调用链 fail-closed。"""
+        if hasattr(self, 'trade_state') and hasattr(self.trade_state, 'replace_stop_loss_dates'):
+            self.stop_loss_dates = self.trade_state.replace_stop_loss_dates(self.stop_loss_dates)
+            return True
+        # 仅为老单元测试的 __new__ 最小桩保留兼容；生产必走主账本。
         if not atomic_write_json(self.stop_loss_file, self.stop_loss_dates):
-            logger.error(f"保存止损日期文件失败: {self.stop_loss_file}")
+            raise TradeStatePersistenceError(f'保存 T+1 状态失败: {self.stop_loss_file}')
+        return True
 
     def is_stop_loss_today(self, symbol):
         """检查该交易对今天是否已经止损过（T+1限制）"""
@@ -468,11 +906,724 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return False
 
     def record_stop_loss(self, symbol):
-        """记录止损日期（持久化到文件）"""
+        """记录止损日期（与主账本事务性持久化）。"""
+        previous = dict(self.stop_loss_dates)
         self.stop_loss_dates[symbol] = date.today().strftime('%Y-%m-%d')
-        self._save_stop_loss_dates()
+        try:
+            self._save_stop_loss_dates()
+        except Exception:
+            self.stop_loss_dates = previous
+            raise
+        return True
 
-    def check_and_execute_trades(self, manual_run=False):
+    def clear_stop_loss(self, symbol):
+        """事务性清除某品种 T+1 标记。"""
+        if symbol not in self.stop_loss_dates:
+            return False
+        previous = dict(self.stop_loss_dates)
+        del self.stop_loss_dates[symbol]
+        try:
+            self._save_stop_loss_dates()
+        except Exception:
+            self.stop_loss_dates = previous
+            raise
+        return True
+
+    @staticmethod
+    def _closed_candle_id(df):
+        """返回最新已收盘 K 线的稳定 ID（带时区无关的 ISO 字符串）。"""
+        value = df.iloc[-1].get('timestamp') if len(df) else None
+        if value is None:
+            raise ValueError('K 线缺少 timestamp，无法建立幂等信号 ID')
+        try:
+            return value.isoformat()
+        except AttributeError:
+            return str(value)
+
+    @staticmethod
+    def _turtle_client_order_id(symbol, candle_id, side):
+        digest = hashlib.sha256(
+            f'turtle|{symbol}|{candle_id}|{side}'.encode('utf-8')).hexdigest()
+        # OKX clOrdId 上限 32，仅接受 ASCII 字母数字。
+        return f'T{digest[:31]}'
+
+    def _prepare_turtle_signal_execution(self, symbol, signal, candle_id):
+        """为海龟突破建立 pending + 确定性 clOrdId；已确认信号直接拒绝重放。"""
+        side = signal.get('action')
+        if side not in ('long', 'short'):
+            return None
+        signal_id = f'{candle_id}|{side}'
+        client_order_id = self._turtle_client_order_id(symbol, candle_id, side)
+        payload = {
+            'side': side,
+            'candle_id': candle_id,
+            'entry_price': float(signal['current_close']),
+            'stop_loss_price': float(
+                signal['lower_line'] if side == 'long' else signal['upper_line']),
+        }
+        execution = self.trade_state.prepare_signal_execution(
+            symbol, 'turtle', signal_id, client_order_id, payload=payload)
+        if execution.get('status') == 'confirmed':
+            logger.warning(
+                f"{symbol} [海龟] 忽略已消费的同 K 线突破 {signal_id}，防止止损后重放")
+            signal['action'] = None
+            return None
+        # pending 重试必须复用账本中原 clOrdId，不可重新生成。
+        signal['_client_order_id'] = execution['client_order_id']
+        signal['_signal_id'] = signal_id
+        return signal_id
+
+    def _confirm_turtle_signal_if_reconciled(self, symbol, signal_id, side):
+        """只有主账本已经反映目标持仓方向时才确认消费。"""
+        if not signal_id:
+            return False
+        position = self.trade_state.get_open_position(symbol)
+        if not position or position.get('side') != side:
+            return False
+        self.trade_state.confirm_signal_execution(symbol, 'turtle', signal_id)
+        return True
+
+    def _finalize_rolled_back_turtle_signal(self, symbol, execution, outcome):
+        """把“旧开仓已确认、补偿平仓也已全平”原子收口为成交史+已消费信号。"""
+        if not isinstance(outcome, dict) or outcome.get('status') != 'rolled_back':
+            return False
+        close_order = outcome.get('close_order') or {}
+        if close_order.get('fully_closed') is not True:
+            return False
+        payload = execution.get('payload') or {}
+        side = payload.get('side')
+        if side not in ('long', 'short'):
+            return False
+        recovered_entry = outcome.get('entry_price') or payload.get('entry_price')
+        recovered_exit = close_order.get('average')
+        if recovered_exit is None:
+            try:
+                recovered_exit = self.exchange_api.get_last_price(
+                    self.exchange_api.to_ccxt_symbol(symbol))
+            except Exception:
+                recovered_exit = recovered_entry
+        entry_fee, entry_fee_currency = self._extract_usdt_fee(
+            outcome.get('open_order'))
+        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
+        try:
+            self.trade_state.finalize_recovered_signal_round_trip(
+                symbol, 'turtle', execution.get('signal_id'), side,
+                recovered_entry, recovered_exit, outcome.get('position_size'),
+                payload.get('stop_loss_price'),
+                candle_id=payload.get('candle_id'),
+                entry_fee=entry_fee,
+                entry_fee_currency=entry_fee_currency,
+                entry_order_ids=self._order_ids(outcome.get('open_order')),
+                exit_fee=exit_fee,
+                exit_fee_currency=exit_fee_currency,
+                exit_order_ids=self._order_ids(close_order))
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 仓位已全平，但往返成交史/幂等状态无法原子落盘: {exc}')
+            return False
+        self._clear_position_quarantine_after_reconcile(symbol)
+        logger.critical(
+            f'{symbol} [海龟] 开仓后已补偿全平，往返成交与信号状态已原子收口')
+        return True
+
+    def _resume_pending_turtle_execution(self, symbol, execution):
+        """启动对账专用：用原 clOrdId 恢复“已成交、未挂止损/未记账”的中断交易。"""
+        payload = execution.get('payload') or {}
+        side = payload.get('side')
+        if side not in ('long', 'short'):
+            return False
+        try:
+            entry_price = float(payload['entry_price'])
+            stop_loss_price = float(payload['stop_loss_price'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        symbol_config = next(
+            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
+             if cfg.get('name') == symbol),
+            {
+                'name': symbol,
+                'enabled': True,
+                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                'strategy': 'turtle',
+            })
+        outcome = self._execute_open(
+            symbol, side, entry_price, stop_loss_price, symbol_config,
+            buffer_notification=False,
+            client_order_id=execution.get('client_order_id'),
+            recover_pending_position=True)
+        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
+            return self._finalize_rolled_back_turtle_signal(
+                symbol, execution, outcome)
+        if isinstance(outcome, dict) and outcome.get('status') == 'rollback_incomplete':
+            logger.critical(
+                f'{symbol} [海龟] pending 恢复回滚后仍有余仓，保留 pending 并隔离人工处理')
+            return False
+        if not self._confirm_turtle_signal_if_reconciled(
+                symbol, execution.get('signal_id'), side):
+            return False
+        self._clear_position_quarantine_after_reconcile(symbol)
+        logger.critical(
+            f"{symbol} [海龟] 已用原 clOrdId 恢复中断开仓，止损与账本已补齐")
+        return True
+
+    @staticmethod
+    def _finite_nonnegative(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+
+    def _pending_order_resolution(self, order):
+        """将只读查到的旧订单归一为 (terminal, filled_contracts)。"""
+        info = order.get('info') if isinstance(order.get('info'), dict) else {}
+        states = {
+            str(value).lower() for value in (
+                order.get('status'), info.get('state'), info.get('ordState'))
+            if value is not None
+        }
+        terminal_states = {
+            'closed', 'filled', 'canceled', 'cancelled', 'rejected',
+            'expired', 'mmp_canceled', 'mmp_cancelled',
+        }
+        terminal = bool(states & terminal_states)
+        filled = self._finite_nonnegative(order.get('filled'))
+        amount = self._finite_nonnegative(order.get('amount'))
+        remaining = self._finite_nonnegative(order.get('remaining'))
+        if filled is None and amount is not None and remaining is not None:
+            filled = max(0.0, amount - remaining)
+        if (filled is None and amount is not None and
+                states & {'closed', 'filled'} and (remaining is None or remaining == 0)):
+            filled = amount
+        return terminal, filled
+
+    def _consume_pending_without_trade(
+            self, symbol, execution, resolution, reason, order=None):
+        payload = execution.get('payload') or {}
+        self.trade_state.finalize_signal_without_trade(
+            symbol, 'turtle', execution.get('signal_id'),
+            candle_id=payload.get('candle_id'), resolution=resolution,
+            reason=reason, order=order)
+        self._clear_position_quarantine_after_reconcile(symbol)
+        logger.warning(f'{symbol} [海龟] pending 已无成交原子收口: {reason}')
+        return True
+
+    def _finalize_flat_filled_pending(self, symbol, execution, order, filled_contracts):
+        """旧单有成交但当前已空仓：按保守退出价补记完整往返。"""
+        payload = execution.get('payload') or {}
+        side = payload.get('side')
+        try:
+            stop_price = float(payload['stop_loss_price'])
+            entry_price = float(
+                order.get('average') or order.get('price') or payload['entry_price'])
+            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+            contract_size = float(self.exchange_api._get_contract_size(ccxt_symbol))
+            position_size = float(filled_contracts) * contract_size
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f'pending 旧成交的价格/数量无法安全还原: {exc}') from exc
+        if (side not in ('long', 'short') or
+                any(not math.isfinite(value) or value <= 0 for value in (
+                    stop_price, entry_price, position_size, contract_size))):
+            raise RuntimeError('pending 旧成交缺少有效方向/价格/数量')
+
+        close_evidence = None
+        try:
+            close_evidence = self._recover_flat_compensation_evidence(
+                ccxt_symbol, side, position_size,
+                execution.get('client_order_id'))
+        except Exception as exc:
+            logger.warning(
+                f'{symbol} pending 补偿平仓腿查询失败，退回保守退出价: {exc}')
+        if close_evidence and close_evidence.get('average') is not None:
+            exit_price = float(close_evidence['average'])
+            recovery_reason = 'pending 旧订单与确定性补偿腿均已找回'
+        else:
+            current_price = None
+            try:
+                current_price = float(self.exchange_api.get_last_price(ccxt_symbol))
+                if not math.isfinite(current_price) or current_price <= 0:
+                    current_price = None
+            except Exception:
+                current_price = None
+            # 真实退出价不可证明时：多单取止损/现价较低者，空单取较高者，
+            # 不用入场价伪造“无损退出”。
+            exit_candidates = [stop_price]
+            if current_price is not None:
+                exit_candidates.append(current_price)
+            exit_price = (
+                min(exit_candidates) if side == 'long'
+                else max(exit_candidates))
+            recovery_reason = 'pending 旧订单已成交但当前已空仓，按保守退出价补记'
+        entry_fee, entry_fee_currency = self._extract_usdt_fee(order)
+        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_evidence)
+        trade = self.trade_state.finalize_recovered_signal_round_trip(
+            symbol, 'turtle', execution.get('signal_id'), side,
+            entry_price, exit_price, position_size, stop_price,
+            candle_id=payload.get('candle_id'), entry_fee=entry_fee,
+            entry_fee_currency=entry_fee_currency,
+            entry_order_ids=self._order_ids(order),
+            exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
+            exit_order_ids=self._order_ids(close_evidence),
+            reason=recovery_reason)
+        self._clear_position_quarantine_after_reconcile(symbol)
+        msg = (
+            f'{symbol} [海龟] 发现 pending 旧订单已成交 {position_size}币，'
+            f'但交易所当前已空仓；已用'
+            f'{"确定性补偿腿真实" if close_evidence else "保守"}退出价 {exit_price} '
+            f'原子补记往返成交（PnL={trade.get("pnl")}）')
+        logger.critical(msg)
+        self.notifier.notify_error(msg)
+        return True
+
+    def _continue_unsubmitted_pending_turtle(self, symbol, execution):
+        """确认从未发单后，在原止损仍有效时复用原 clOrdId 开仓。"""
+        payload = execution.get('payload') or {}
+        side = payload.get('side')
+        try:
+            entry_price = float(payload['entry_price'])
+            stop_loss_price = float(payload['stop_loss_price'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        symbol_config = next(
+            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
+             if cfg.get('name') == symbol),
+            {
+                'name': symbol, 'enabled': True,
+                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                'strategy': 'turtle',
+            })
+        outcome = self._execute_open(
+            symbol, side, entry_price, stop_loss_price, symbol_config,
+            buffer_notification=False,
+            client_order_id=execution.get('client_order_id'))
+        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
+            return self._finalize_rolled_back_turtle_signal(symbol, execution, outcome)
+        if isinstance(outcome, dict) and outcome.get('status') == 'opened':
+            if not self._confirm_turtle_signal_if_reconciled(
+                    symbol, execution.get('signal_id'), side):
+                return False
+            candle = payload.get('candle_id')
+            if candle:
+                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
+            self._clear_position_quarantine_after_reconcile(symbol)
+            return True
+        return False
+
+    @staticmethod
+    def _pending_order_absence_is_conclusive(execution):
+        """判断 OrderNotFound 是否仍足以证明 pending 从未发单。"""
+        raw_updated_at = execution.get('updated_at')
+        if not isinstance(raw_updated_at, str) or not raw_updated_at.strip():
+            return False, 'pending 缺少下单阶段时间戳'
+        try:
+            updated_at = datetime.fromisoformat(raw_updated_at)
+            now = datetime.now(updated_at.tzinfo) if updated_at.tzinfo else datetime.now()
+            age = now - updated_at
+        except (TypeError, ValueError, OverflowError) as exc:
+            return False, f'pending 下单阶段时间戳非法: {exc}'
+        if age < -_PENDING_TIMESTAMP_FUTURE_TOLERANCE:
+            return False, f'pending 下单阶段时间戳位于未来（偏差 {-age}）'
+        if age > _PENDING_ORDER_ABSENCE_PROOF_WINDOW:
+            return False, f'pending 已超过交易所可证明未发单的 2 小时窗口（{age}）'
+        return True, None
+
+    def _adjudicate_flat_pending_turtle(self, symbol, execution):
+        """裁决“本地空仓 + 交易所空仓”的 pending。"""
+        payload = execution.get('payload') or {}
+        side = payload.get('side')
+        if side not in ('long', 'short'):
+            self._quarantine_position_mismatch(
+                symbol, f'pending payload 方向非法: {side!r}')
+            return False
+        planned = execution.get('planned_position_size')
+        order = None
+        if planned is not None:
+            try:
+                planned_value = float(planned)
+                if not math.isfinite(planned_value) or planned_value <= 0:
+                    raise ValueError(f'非法 planned_position_size={planned!r}')
+                finder = getattr(self.exchange_api, 'find_existing_open_order', None)
+                if not callable(finder):
+                    raise RuntimeError('交易所适配层缺少旧 clOrdId 只读查询')
+                order = finder(
+                    self.exchange_api.to_ccxt_symbol(symbol), side,
+                    planned_value, execution.get('client_order_id'))
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'pending 旧 clOrdId 查询不确定: {exc}',
+                    {'client_order_id': execution.get('client_order_id')})
+                return False
+
+        if order is not None:
+            terminal, filled_contracts = self._pending_order_resolution(order)
+            if not terminal or filled_contracts is None:
+                self._quarantine_position_mismatch(
+                    symbol, 'pending 旧订单尚未终态或成交量不确定',
+                    {'client_order_id': execution.get('client_order_id'),
+                     'order_id': order.get('id'), 'status': order.get('status')})
+                return False
+            if filled_contracts <= 1e-12:
+                return self._consume_pending_without_trade(
+                    symbol, execution, 'terminal_zero_fill',
+                    '旧 clOrdId 订单已终态且零成交', order=order)
+            try:
+                return self._finalize_flat_filled_pending(
+                    symbol, execution, order, filled_contracts)
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'pending 旧成交无法补记: {exc}',
+                    {'client_order_id': execution.get('client_order_id'),
+                     'order_id': order.get('id')})
+                return False
+
+        if planned is not None:
+            conclusive, reason = self._pending_order_absence_is_conclusive(execution)
+            if not conclusive:
+                self._quarantine_position_mismatch(
+                    symbol,
+                    f'{reason}；旧 clOrdId 查无订单不能再证明请求从未送达，禁止自动重开',
+                    {'client_order_id': execution.get('client_order_id'),
+                     'updated_at': execution.get('updated_at')})
+                return False
+
+        # planned 缺失，或按 clOrdId 明确 OrderNotFound：根据发单前事务顺序，
+        # 且仍在交易所可查询窗口内，才可确认这笔从未发出。只有当前止损仍能
+        # 保护新仓时才可继续。
+        try:
+            stop_price = float(payload['stop_loss_price'])
+            current_price = float(self.exchange_api.get_last_price(
+                self.exchange_api.to_ccxt_symbol(symbol)))
+            if any(not math.isfinite(value) or value <= 0 for value in (
+                    stop_price, current_price)):
+                raise ValueError('当前价/止损价非法')
+        except Exception as exc:
+            self._quarantine_position_mismatch(
+                symbol, f'pending 未发单的当前止损有效性无法确认: {exc}')
+            return False
+        stop_valid = (
+            (side == 'long' and stop_price < current_price) or
+            (side == 'short' and stop_price > current_price))
+        if not stop_valid:
+            return self._consume_pending_without_trade(
+                symbol, execution, 'unsubmitted_expired',
+                f'从未发单，且当前价 {current_price} 已越过原止损 {stop_price}')
+        if self._continue_unsubmitted_pending_turtle(symbol, execution):
+            return True
+        self._quarantine_position_mismatch(
+            symbol, 'pending 确认未发单，但复用原 clOrdId 开仓未能收口')
+        return False
+
+    def _reconcile_all_pending_turtle_executions(self, context):
+        """主动枚举所有 pending，返回仍未收口的品种集合。"""
+        getter = getattr(self.trade_state, 'get_pending_signal_executions', None)
+        pending_by_symbol = getter() if callable(getter) else {}
+        unresolved = set()
+        for symbol, execution in sorted(pending_by_symbol.items()):
+            if execution.get('strategy') != 'turtle':
+                self._quarantine_position_mismatch(
+                    symbol, f'{context} pending 策略非 turtle，无法自动裁决')
+                unresolved.add(symbol)
+                continue
+            local_position = self.trade_state.get_open_position(symbol)
+            try:
+                exchange_position = self.exchange_api.get_position(
+                    self.exchange_api.to_ccxt_symbol(symbol))
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'{context} pending 仓位查询不确定: {exc}')
+                unresolved.add(symbol)
+                continue
+            if local_position:
+                # 本地仓的常规对账/平仓链路负责收口，此处不抢跑外部动作。
+                continue
+            if exchange_position:
+                if not self._resume_pending_turtle_execution(symbol, execution):
+                    self._quarantine_position_mismatch(
+                        symbol, f'{context} pending 孤儿仓恢复未收口')
+                    unresolved.add(symbol)
+                continue
+            if not self._adjudicate_flat_pending_turtle(symbol, execution):
+                unresolved.add(symbol)
+        return unresolved
+
+    def _finalize_open_intent_rollback(self, symbol, intent, outcome):
+        close_order = (outcome or {}).get('close_order') or {}
+        if close_order.get('fully_closed') is not True:
+            return False
+        payload = intent.get('payload') or {}
+        entry_price = (outcome or {}).get('entry_price') or payload.get('entry_price')
+        exit_price = close_order.get('average')
+        if exit_price is None:
+            try:
+                exit_price = self.exchange_api.get_last_price(
+                    self.exchange_api.to_ccxt_symbol(symbol))
+            except Exception:
+                exit_price = payload.get('stop_loss_price') or entry_price
+        position_size = (outcome or {}).get('position_size') or intent.get(
+            'planned_position_size')
+        entry_fee, _entry_currency = self._extract_usdt_fee(
+            (outcome or {}).get('open_order'))
+        exit_fee, _exit_currency = self._extract_usdt_fee(close_order)
+        self.trade_state.finalize_open_intent_round_trip(
+            symbol, intent.get('client_order_id'), entry_price, exit_price,
+            position_size,
+            entry_order_ids=self._order_ids((outcome or {}).get('open_order')),
+            exit_order_ids=self._order_ids(close_order),
+            entry_fee=entry_fee, exit_fee=exit_fee,
+            reason='开仓意图执行后已完整回滚')
+        self._clear_position_quarantine_after_reconcile(symbol)
+        return True
+
+    def _resume_open_intent_position(self, symbol, intent):
+        payload = intent.get('payload') or {}
+        side = intent.get('side')
+        try:
+            entry_price = float(payload['entry_price'])
+            stop_price = float(payload['stop_loss_price'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        symbol_config = next((
+            cfg for cfg in self.config.get('trading', {}).get('symbols', [])
+            if cfg.get('name') == symbol), {
+                'name': symbol, 'enabled': True,
+                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                'strategy': intent.get('strategy') or 'turtle',
+            })
+        outcome = self._execute_open(
+            symbol, side, entry_price, stop_price, symbol_config,
+            buffer_notification=False,
+            client_order_id=intent.get('client_order_id'),
+            recover_pending_position=True)
+        if isinstance(outcome, dict) and outcome.get('status') == 'opened':
+            return True
+        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
+            if outcome.get('open_intent_finalized'):
+                return True
+            return self._finalize_open_intent_rollback(symbol, intent, outcome)
+        return False
+
+    def _finalize_flat_filled_open_intent(
+            self, symbol, intent, order, filled_contracts):
+        payload = intent.get('payload') or {}
+        side = intent.get('side')
+        ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+        contract_size = float(self.exchange_api._get_contract_size(ccxt_symbol))
+        position_size = float(filled_contracts) * contract_size
+        entry_price = float(
+            order.get('average') or order.get('price') or payload['entry_price'])
+        stop_price = float(payload['stop_loss_price'])
+        close_evidence = None
+        try:
+            close_evidence = self._recover_flat_compensation_evidence(
+                ccxt_symbol, side, position_size,
+                intent.get('client_order_id'))
+        except Exception as exc:
+            logger.warning(
+                f'{symbol} open intent 补偿平仓腿查询失败，退回保守退出价: {exc}')
+        if close_evidence and close_evidence.get('average') is not None:
+            exit_price = float(close_evidence['average'])
+            recovery_reason = '旧开仓意图与确定性补偿腿均已找回'
+        else:
+            try:
+                current_price = float(self.exchange_api.get_last_price(ccxt_symbol))
+            except Exception:
+                current_price = stop_price
+            exit_price = (
+                min(stop_price, current_price) if side == 'long'
+                else max(stop_price, current_price))
+            recovery_reason = (
+                '旧开仓意图订单有成交但交易所当前已空仓，保守补记往返')
+        entry_fee, _currency = self._extract_usdt_fee(order)
+        exit_fee, _exit_currency = self._extract_usdt_fee(close_evidence)
+        self.trade_state.finalize_open_intent_round_trip(
+            symbol, intent.get('client_order_id'), entry_price, exit_price,
+            position_size, entry_order_ids=self._order_ids(order),
+            exit_order_ids=self._order_ids(close_evidence),
+            entry_fee=entry_fee, exit_fee=exit_fee,
+            reason=recovery_reason)
+        self._clear_position_quarantine_after_reconcile(symbol)
+        self.notifier.notify_error(
+            f'{symbol} 旧 open intent 有成交但当前已空仓，已按'
+            f'{"确定性补偿腿真实" if close_evidence else "保守"}退出价补记往返')
+        return True
+
+    def _adjudicate_flat_open_intent(self, symbol, intent):
+        side = intent.get('side')
+        planned = intent.get('planned_position_size')
+        if planned is None:
+            # 旧两阶段实现可能崩在 prepare 与 set_amount 之间；POST 位于两次
+            # 成功落盘之后，因此缺计划量可严格证明从未发单，不得用当前风险重算。
+            self.trade_state.resolve_open_intent(
+                symbol, intent.get('client_order_id'))
+            self._clear_position_quarantine_after_reconcile(symbol)
+            logger.warning(
+                f'{symbol} 收口无计划量 open intent：确认属于发单前中间态，'
+                '已删除句柄并允许策略重新计算')
+            return True
+        try:
+            planned_value = float(planned)
+            if not math.isfinite(planned_value) or planned_value <= 0:
+                raise ValueError(f'非法计划量 {planned!r}')
+            order = self.exchange_api.find_existing_open_order(
+                self.exchange_api.to_ccxt_symbol(symbol), side,
+                planned_value, intent.get('client_order_id'))
+        except Exception as exc:
+            self._quarantine_position_mismatch(
+                symbol, f'open intent 旧订单查询不确定: {exc}')
+            return False
+        if order is not None:
+            terminal, filled = self._pending_order_resolution(order)
+            if not terminal or filled is None:
+                self._quarantine_position_mismatch(
+                    symbol, 'open intent 旧订单尚未终态或成交量不确定')
+                return False
+            if filled <= 1e-12:
+                self.trade_state.resolve_open_intent(
+                    symbol, intent.get('client_order_id'))
+                self._clear_position_quarantine_after_reconcile(symbol)
+                return True
+            try:
+                return self._finalize_flat_filled_open_intent(
+                    symbol, intent, order, filled)
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'open intent 旧成交无法补记: {exc}')
+                return False
+
+        conclusive, reason = self._pending_order_absence_is_conclusive(intent)
+        if not conclusive:
+            self._quarantine_position_mismatch(
+                symbol, f'{reason}；open intent 查无订单不能证明从未送达')
+            return False
+        payload = intent.get('payload') or {}
+        try:
+            stop_price = float(payload['stop_loss_price'])
+            current_price = float(self.exchange_api.get_last_price(
+                self.exchange_api.to_ccxt_symbol(symbol)))
+            if any(not math.isfinite(value) or value <= 0 for value in (
+                    stop_price, current_price)):
+                raise ValueError('当前价/止损价非法')
+        except Exception as exc:
+            self._quarantine_position_mismatch(
+                symbol, f'open intent 止损有效性无法确认: {exc}')
+            return False
+        stop_valid = (
+            side == 'long' and stop_price < current_price or
+            side == 'short' and stop_price > current_price)
+        if not stop_valid:
+            self.trade_state.resolve_open_intent(
+                symbol, intent.get('client_order_id'))
+            self._clear_position_quarantine_after_reconcile(symbol)
+            return True
+        outcome = self._execute_open(
+            symbol, side, float(payload['entry_price']), stop_price,
+            next((
+                cfg for cfg in self.config.get('trading', {}).get('symbols', [])
+                if cfg.get('name') == symbol), {
+                    'name': symbol, 'enabled': True,
+                    'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                    'strategy': intent.get('strategy') or 'turtle',
+                }),
+            buffer_notification=False,
+            client_order_id=intent.get('client_order_id'))
+        if isinstance(outcome, dict) and outcome.get('status') == 'opened':
+            return True
+        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
+            if outcome.get('open_intent_finalized'):
+                return True
+            return self._finalize_open_intent_rollback(symbol, intent, outcome)
+        return False
+
+    def _reconcile_all_open_intents(self, context):
+        getter = getattr(self.trade_state, 'get_open_intents', None)
+        intents = getter() if callable(getter) else {}
+        unresolved = set()
+        for symbol, intent in sorted(intents.items()):
+            if self.trade_state.get_open_position(symbol):
+                continue
+            try:
+                exchange_position = self.exchange_api.get_position(
+                    self.exchange_api.to_ccxt_symbol(symbol))
+            except Exception as exc:
+                self._quarantine_position_mismatch(
+                    symbol, f'{context} open intent 持仓查询不确定: {exc}')
+                unresolved.add(symbol)
+                continue
+            if exchange_position:
+                resolved = self._resume_open_intent_position(symbol, intent)
+            else:
+                resolved = self._adjudicate_flat_open_intent(symbol, intent)
+            if not resolved:
+                unresolved.add(symbol)
+        return unresolved
+
+    def _ma_signal_with_catchup(self, symbol, strategy, df):
+        """逐根回放上次成功处理之后的 EMA 交叉，只执行最终目标仓位。
+
+        停机期间可能发生多次交叉。逐根计算用于确认是否有遗漏事件，
+        但恢复时不会用历史价位连续买卖；仅按最新 EMA 状态执行一次收敛，
+        止损位也使用最新已收盘数据。
+        """
+        metadata = self.trade_state.get_signal_metadata(symbol)
+        last_id = metadata.get('last_processed_candle') if metadata.get('strategy') in (None, 'ma_cross') else None
+        candle_ids = [
+            (v.isoformat() if hasattr(v, 'isoformat') else str(v))
+            for v in df['timestamp'].tolist()
+        ]
+        current_id = candle_ids[-1]
+        current_state = strategy.check_current_state(df)
+        if current_state is None:
+            return None, current_id, 0
+        # action 是“本根需执行的交叉”，target_side 是“当前 EMA 应有持仓”。
+        # 即使 marker 曾被旧版本错误推进，后者仍可修正遗留的反向仓。
+        current_state['target_side'] = current_state.get('action')
+
+        if last_id == current_id:
+            # 已处理过这根 K 线：仍返回当前指标供 T+1/持仓检查，但不重放交叉。
+            current_state['action'] = None
+            return current_state, current_id, 0
+
+        min_required = max(strategy.long_period * 2, strategy.stop_loss_period + 1)
+        if last_id in candle_ids:
+            start_index = candle_ids.index(last_id) + 1
+        elif last_id:
+            # 标记已超出本轮可见历史：无法还原每一根，但必须向最终 EMA 方向收敛。
+            logger.warning(
+                f"{symbol} [双均线] 上次处理 K 线 {last_id} 已不在可见历史中，"
+                "按当前 EMA 最终状态恢复")
+            start_index = max(min_required - 1, 1)
+        else:
+            # 首次升级没有 marker：用可见窗口回放，并向当前状态收敛。
+            start_index = max(min_required - 1, 1)
+
+        missed = []
+        for end_index in range(start_index, len(df)):
+            frame = df.iloc[:end_index + 1]
+            replayed = strategy.check_signal(frame)
+            if replayed and replayed.get('action') in ('long', 'short'):
+                missed.append((candle_ids[end_index], replayed['action']))
+
+        # 无 marker 代表首次建立事实源，或 marker 不可见；即使可见窗口内
+        # 没有交叉，“永远在市”也要与当前 EMA 方向收敛。
+        needs_convergence = bool(missed) or not last_id or last_id not in candle_ids
+        if needs_convergence:
+            logger.warning(
+                f"{symbol} [双均线] 回放未处理 K 线发现 {len(missed)} 次交叉，"
+                f"最终目标方向={current_state.get('action')}")
+        else:
+            current_state['action'] = None
+        return current_state, current_id, len(missed)
+
+    def _mark_daily_check_complete(self, check_date):
+        """先持久化调度日，成功后再更新内存守卫。"""
+        setter = getattr(self.trade_state, 'set_last_daily_check_date', None)
+        if callable(setter):
+            setter(check_date)
+        self._last_check_date = check_date
+
+    def check_and_execute_trades(self, manual_run=False, scheduled_date=None):
         """检查并执行交易"""
         # 三重防护：线程锁 + 日期检查 + APScheduler max_instances
         if not self._trade_lock.acquire(blocking=False):
@@ -480,7 +1631,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return
         try:
             self.equity_tracker.record_daily_equity_snapshot()  # 记录每日权益快照
-            today = date.today().isoformat()
+            today = scheduled_date or date.today().isoformat()
             if self._last_check_date == today and not manual_run:
                 logger.warning(f"今日({today})已执行过交易检查，跳过重复执行")
                 return
@@ -489,13 +1640,26 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._pending_trade_close_notifications = []
             self._pending_stop_loss_updates = []
 
-            # 本轮监控集合 = 手动池启用品种 ∪ 有持仓品种。品种池取轮次开始时的
+            unresolved_pending = self._reconcile_all_pending_turtle_executions('日检')
+            unresolved_pending.update(self._reconcile_all_open_intents('日检'))
+
+            # 本轮监控集合 = 手动池启用品种 ∪ 有持仓品种 ∪ pending 品种。
+            # 品种即使已从配置删除，未收口 clOrdId 也不得被遗忘/剪枝。
             # 快照视图（与盘中巡检同一模式）：循环中途 API 增删品种不影响本轮的
             # 一致性，也免去逐品种重扫池子
             all_open_positions = self.trade_state.get_all_open_positions()
+            pending_getter = getattr(
+                self.trade_state, 'get_pending_signal_executions', None)
+            pending_after_reconcile = (
+                pending_getter() if callable(pending_getter) else {})
+            intent_getter = getattr(self.trade_state, 'get_open_intents', None)
+            intents_after_reconcile = (
+                intent_getter() if callable(intent_getter) else {})
             symbol_config_map = {s['name']: s for s in self.config['trading']['symbols']}
             symbols_to_check = {name for name, s in symbol_config_map.items() if s.get('enabled', True)}
             symbols_to_check.update(all_open_positions.keys())
+            symbols_to_check.update(pending_after_reconcile.keys())
+            symbols_to_check.update(intents_after_reconcile.keys())
 
             logger.info(f"本轮检查交易对数: {len(symbols_to_check)}")
 
@@ -509,7 +1673,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.warning(f"平仓历史归档失败（不影响交易，账本保留全部记录）: {e}")
 
             # 逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
-            failed_symbols = []
+            failed_symbols = sorted(unresolved_pending)
+            data_unready_symbols = []
             for symbol in sorted(symbols_to_check):
                 # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
                 try:
@@ -528,7 +1693,113 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
                     logger.info(f"检查 {symbol} (策略: {strategy_type})...")
 
+                    if symbol in unresolved_pending:
+                        logger.error(
+                            f'{symbol} 仍有未裁决 pending，本轮阻断新策略信号')
+                        continue
+
                     ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+                    # 每一轮正常调度都重新核对仓位现实，不把安全性只寄托在启动时。
+                    # 查询失败也必须持久化隔离：未知不等于空仓。
+                    local_position = self.trade_state.get_open_position(symbol)
+                    if local_position:
+                        close_recovery = self._resume_persisted_close_intent(
+                            symbol, local_position, '日检对账')
+                        if close_recovery == 'unresolved':
+                            failed_symbols.append(symbol)
+                            continue
+                        if close_recovery == 'closed':
+                            local_position = None
+                        elif close_recovery == 'partial':
+                            local_position = self.trade_state.get_open_position(symbol)
+                    try:
+                        exchange_position = self.exchange_api.get_position(ccxt_symbol)
+                    except Exception as exc:
+                        self._quarantine_position_mismatch(
+                            symbol, f'日检持仓对账查询失败: {exc}')
+                        failed_symbols.append(symbol)
+                        continue
+                    if local_position and exchange_position:
+                        if not self._verify_existing_position_or_quarantine(
+                                symbol, local_position, exchange_position,
+                                clear_on_match=False):
+                            failed_symbols.append(symbol)
+                            continue
+                        if not self._ensure_stop_order_alive(
+                                symbol, ccxt_symbol, local_position,
+                                self._get_strategy_display_name(strategy_type)):
+                            self._quarantine_position_mismatch(
+                                symbol, '日检仓位一致但止损保护未能严格确认')
+                            failed_symbols.append(symbol)
+                            continue
+                        self._clear_position_quarantine_after_reconcile(symbol)
+                        intent_getter = getattr(
+                            self.trade_state, 'get_open_intent', None)
+                        intent = (
+                            intent_getter(symbol)
+                            if callable(intent_getter) else None)
+                        if intent and intent.get('side') == local_position.get('side'):
+                            self.trade_state.resolve_open_intent(
+                                symbol, intent.get('client_order_id'))
+                        pending = self.trade_state.get_pending_signal_execution(symbol)
+                        if (pending and pending.get('strategy') == 'turtle' and
+                                (pending.get('payload') or {}).get('side') ==
+                                local_position.get('side')):
+                            self.trade_state.confirm_signal_execution(
+                                symbol, 'turtle', pending.get('signal_id'))
+                            pending_candle = (pending.get('payload') or {}).get('candle_id')
+                            if pending_candle:
+                                self.trade_state.mark_candle_processed(
+                                    symbol, 'turtle', pending_candle)
+                    elif local_position and not exchange_position:
+                        exit_price = (
+                            local_position.get('stop_loss_price') or
+                            local_position.get('entry_price'))
+                        closed, state_saved, _stop_cleared = self._handle_exchange_flat_close(
+                            symbol, ccxt_symbol, local_position, exit_price,
+                            f'{strategy_type} 日检仓位对账',
+                            strategy_type=strategy_type)
+                        if not closed:
+                            self._quarantine_position_mismatch(
+                                symbol, '交易所已空仓但本地日检平仓补偿失败')
+                            failed_symbols.append(symbol)
+                            continue
+                        if not state_saved:
+                            # _notify_trade_state_persistence_issue 已通知并建立
+                            # 运行时隔离，不重复轰炸。
+                            failed_symbols.append(symbol)
+                            continue
+                        if strategy_type == 'ma_cross':
+                            logger.info(
+                                f'{symbol} [双均线] 日检记平与 T+1 已同事务落盘')
+                        else:
+                            # 仅重置 armed 布尔，set_signal_state 会保留已处理 candle /
+                            # confirmed signal ID，同一根突破不可重放。
+                            self.trade_state.set_signal_state(symbol, False)
+                            pending = self.trade_state.get_pending_signal_execution(symbol)
+                            if (pending and (pending.get('payload') or {}).get('side') ==
+                                    local_position.get('side')):
+                                self.trade_state.confirm_signal_execution(
+                                    symbol, 'turtle', pending.get('signal_id'))
+                                pending_candle = (pending.get('payload') or {}).get('candle_id')
+                                if pending_candle:
+                                    self.trade_state.mark_candle_processed(
+                                        symbol, 'turtle', pending_candle)
+                        self._clear_position_quarantine_after_reconcile(symbol)
+                        local_position = None
+                    elif not local_position and exchange_position:
+                        pending = self.trade_state.get_pending_signal_execution(symbol)
+                        if (pending and pending.get('strategy') == 'turtle' and
+                                self._resume_pending_turtle_execution(symbol, pending)):
+                            local_position = self.trade_state.get_open_position(symbol)
+                        else:
+                            self._quarantine_position_mismatch(
+                                symbol, '交易所有仓但本地无记录（日检发现孤儿仓）')
+                            failed_symbols.append(symbol)
+                            continue
+                    elif not local_position and not exchange_position:
+                        self._clear_position_quarantine_after_reconcile(symbol)
+
                     required_closed_candles = cfgv.required_closed_candles_for_strategy(
                         strategy_type, self.config.get('strategy', {}))
                     fetch_limit = cfgv.ohlcv_fetch_limit_for_strategy(
@@ -537,41 +1808,70 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
                     if not ohlcv:
                         logger.warning(f"{symbol} 获取K线数据失败")
+                        failed_symbols.append(symbol)
                         continue
 
                     df = self.exchange_api.ohlcv_to_dataframe(ohlcv)
                     df = self.exchange_api.filter_closed_candles(df, timeframe='1d')
                     if len(df) == 0:
                         logger.warning(f"{symbol} 无已收盘K线，跳过本轮检查")
+                        failed_symbols.append(symbol)
                         continue
                     if len(df) < required_closed_candles:
                         logger.warning(
                             f"{symbol} K线数据不足：{strategy_type} 策略配置至少需要 "
                             f"{required_closed_candles} 根已收盘K线，本轮仅取得 {len(df)} 根"
                             f"（请求 {fetch_limit} 根），请检查周期配置或交易所历史K线供应")
+                        if local_position:
+                            # 有钱仓位不得以“新币历史不足”降级：退出/止损推进未完成。
+                            failed_symbols.append(symbol)
+                        else:
+                            # 双边已确认空仓且历史确实不足，属结构性 data-unready。
+                            # 保持日报可见，但不要拖累全品种每 30 分钟重跑一整天。
+                            data_unready_symbols.append(symbol)
                         continue
 
+                    turtle_signal_id = None
+                    turtle_signal_side = None
+                    candle_id = self._closed_candle_id(df)
                     if strategy_type == 'turtle':
+                        turtle_metadata = self.trade_state.get_signal_metadata(symbol)
                         mid_line_crossed = self.trade_state.get_signal_state(symbol)
+                        execution = turtle_metadata.get('signal_execution') or {}
+                        execution_same_candle = str(execution.get('signal_id') or '').startswith(
+                            f'{candle_id}|')
+                        already_processed = (
+                            turtle_metadata.get('strategy') == 'turtle' and
+                            turtle_metadata.get('last_processed_candle') == candle_id)
                         try:
                             # 这里只回填“截至上一根K线”的可开仓状态，不能把今天刚发生的
                             # 首次突破提前算成已消耗，否则会吞掉本轮本该执行的开仓信号。
-                            armed = self.turtle_strategy.is_first_breakout_armed(df, include_latest_bar=False)
-                            if armed != mid_line_crossed:
-                                self.trade_state.set_signal_state(symbol, armed)
-                                mid_line_crossed = armed
-                                if armed:
-                                    logger.info(f"{symbol} [海龟] 历史回溯判定为可开仓状态（中轨后尚未突破），已激活")
-                                else:
-                                    logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
+                            # 但仅“首次看到该 candle”时允许 include_latest=False。已处理或已建立
+                            # pending/confirmed 的同 candle 重跑必须信任持久化状态，不可再排除
+                            # latest 把已消费资格重新写成 True。
+                            if not already_processed and not execution_same_candle:
+                                armed = self.turtle_strategy.is_first_breakout_armed(
+                                    df, include_latest_bar=False)
+                                if armed != mid_line_crossed:
+                                    self.trade_state.set_signal_state(symbol, armed)
+                                    mid_line_crossed = armed
+                                    if armed:
+                                        logger.info(f"{symbol} [海龟] 历史回溯判定为可开仓状态（中轨后尚未突破），已激活")
+                                    else:
+                                        logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
                         except Exception as e:
                             logger.warning(f"{symbol} [海龟] 历史回溯开仓状态失败: {e}")
 
                         signal = strategy.check_signal(df, mid_line_crossed=mid_line_crossed)
                         if signal and signal.get('mid_line_crossed'):
                             self.trade_state.set_signal_state(symbol, True)
+                        if signal and signal.get('action') in ('long', 'short'):
+                            turtle_signal_side = signal['action']
+                            turtle_signal_id = self._prepare_turtle_signal_execution(
+                                symbol, signal, candle_id)
                     else:
-                        signal = strategy.check_signal(df)
+                        signal, candle_id, _missed_crosses = self._ma_signal_with_catchup(
+                            symbol, strategy, df)
 
                     if not signal:
                         logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
@@ -602,6 +1902,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
                     position = self.trade_state.get_open_position(symbol)
 
+                    if (strategy_type == 'ma_cross' and position and
+                            signal.get('action') not in ('long', 'short') and
+                            signal.get('target_side') in ('long', 'short') and
+                            position.get('side') != signal.get('target_side')):
+                        signal['action'] = signal['target_side']
+                        logger.critical(
+                            f"{symbol} [双均线] 本地仓位 {position.get('side')} 与"
+                            f"当前 EMA 目标 {signal['target_side']} 相反；"
+                            "即使历史 marker 已推进，仍执行一次收敛")
+
                     if position:
                         if strategy_type == 'turtle':
                             self.handle_open_position_turtle(symbol, signal, position, symbol_config)
@@ -613,9 +1923,67 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         elif strategy_type == 'ma_cross':
                             self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
 
+                    if strategy_type == 'turtle':
+                        if turtle_signal_id:
+                            outcome = signal.get('_execution_outcome')
+                            reconciled = False
+                            candle_already_marked = False
+                            if (isinstance(outcome, dict) and
+                                    outcome.get('status') == 'rolled_back'):
+                                pending = self.trade_state.get_pending_signal_execution(
+                                    symbol, signal.get('_client_order_id'))
+                                reconciled = bool(pending) and self._finalize_rolled_back_turtle_signal(
+                                    symbol, pending, outcome)
+                                candle_already_marked = reconciled
+                            elif (isinstance(outcome, dict) and
+                                  outcome.get('status') == 'rollback_incomplete'):
+                                reconciled = False
+                            else:
+                                reconciled = self._confirm_turtle_signal_if_reconciled(
+                                    symbol, turtle_signal_id, turtle_signal_side)
+                            if not reconciled:
+                                logger.error(
+                                    f'{symbol} [海龟] 信号交易尚未与账本/交易所收口；'
+                                    '不推进 K 线幂等标记，交由日内重试')
+                                failed_symbols.append(symbol)
+                                continue
+                            if not candle_already_marked:
+                                self.trade_state.mark_candle_processed(
+                                    symbol, 'turtle', candle_id)
+                        else:
+                            self.trade_state.mark_candle_processed(
+                                symbol, 'turtle', candle_id)
+                    else:
+                        # EMA 交叉只有在目标方向已经真实落到账本后才可消费。
+                        # 平仓失败/部分成交/反手开仓失败时保留旧 marker，让 08:01
+                        # 及 30 分钟兜底按同一根交叉再次收敛，而不是永久吞信号。
+                        target_side = signal.get('action')
+                        if target_side in ('long', 'short'):
+                            post_position = self.trade_state.get_open_position(symbol)
+                            if (not post_position or
+                                    post_position.get('side') != target_side):
+                                logger.error(
+                                    f'{symbol} [双均线] 目标仓位 {target_side} 尚未对齐；'
+                                    '不推进 K 线幂等标记，等待日内重试')
+                                failed_symbols.append(symbol)
+                                continue
+                        self.trade_state.mark_candle_processed(
+                            symbol, 'ma_cross', candle_id)
+
                 except Exception as sym_e:
                     logger.exception(f"{symbol} 本轮检查异常，跳过该品种继续: {sym_e}")
                     failed_symbols.append(symbol)
+
+            try:
+                pruner = getattr(self.trade_state, 'prune_inactive_symbol_metadata', None)
+                removed_metadata = (
+                    pruner(symbol_config_map.keys()) if callable(pruner) else [])
+                if removed_metadata:
+                    logger.info(
+                        f"已清理 {len(removed_metadata)} 个退池且无仓品种的信号元数据: "
+                        f"{', '.join(removed_metadata)}")
+            except Exception as e:
+                logger.warning(f"清理退池品种信号元数据失败（不影响本轮交易）: {e}")
 
             # 信号检查完成后按汇总顺序推送，避免 08:00 单条消息过多触发限流
             self._flush_pending_trade_notifications()
@@ -625,7 +1993,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.info("信号检查完毕，刷新账户统计状态...")
             self.equity_tracker.refresh_account_stats_state()
             logger.info("信号检查完毕，推送每日持仓汇总...")
-            self.send_daily_position_summary_if_due(mark_sent=not manual_run)
+            self.send_daily_position_summary_if_due(
+                mark_sent=not manual_run, summary_date=today)
+            if data_unready_symbols:
+                logger.warning(
+                    f"本轮 {len(data_unready_symbols)} 个空仓品种历史 K 线尚不足（结构性未就绪）: "
+                    f"{', '.join(sorted(data_unready_symbols))}；不触发日内全局重试")
             if failed_symbols:
                 # 不标记当日完成：让 +1 分钟的重试调度整轮重跑（开仓/止损/平仓均有幂等防护）
                 logger.error(f"本轮 {len(failed_symbols)} 个品种检查异常: {', '.join(sorted(failed_symbols))}，"
@@ -640,7 +2013,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             elif not manual_run:
                 # 手动检查不标记当日完成：00:00–08:00 间手动触发跑的是昨日已收盘数据，
                 # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失
-                self._last_check_date = today
+                self._mark_daily_check_complete(today)
         except Exception as e:
             logger.exception(f"交易检查异常: {e}")
             try:
@@ -659,34 +2032,71 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.info("交易检查锁已释放")
 
 
+    def _catchup_schedule_slot(self, now):
+        """计算当前时刻应归属的最近一次日检调度日。
+
+        常规配置在今日正点前不补昨日（保持原语义）；唯一例外是
+        23:58/23:59 的 2 分钟正常调度窗口跨过零点，此时必须仍归属前一调度日。
+        """
+        sched = self.config.get('scheduler', {})
+        check_hour = sched.get('check_hour', 8)
+        check_minute = sched.get('check_minute', 0)
+        scheduled_today = now.replace(
+            hour=check_hour, minute=check_minute, second=0, microsecond=0)
+        if now >= scheduled_today:
+            slot = scheduled_today
+        else:
+            previous = scheduled_today - timedelta(days=1)
+            if (previous + timedelta(minutes=2)).date() == previous.date():
+                return None
+            slot = previous
+        if now < slot + timedelta(minutes=2):
+            return None
+        return slot
+
     def _run_startup_catchup_check(self, now=None):
         """兜底补跑：已过今日检查时间而今日未执行过日检时，立即补跑一轮
         （启动时调用一次 + 每 30 分钟周期兜底，守卫幂等，已跑则空转）。
 
         场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
         新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
-        重启后 _last_check_date 必然为空，午后重启也会补跑一轮——幂等防护
-        （持仓检查/同价跳过/T+1/张数上限）保证重复执行无副作用，且顺带自校验一遍状态。
+        _last_check_date 已持久化到主账本：成功调度日跨重启仍去重，
+        未完成调度日才会补跑。持仓对账/信号 ID/T+1 继续作为业务幂等防护。
         缓冲 2 分钟：恰在调度窗口内启动时，让正常 cron（:05/:20/:40 与 +1 分钟重试）先走。
         """
         now = now or datetime.now()
+        slot = self._catchup_schedule_slot(now)
+        if slot is None:
+            return
+        schedule_date = slot.date().isoformat()
+        if self._last_check_date == schedule_date:
+            return
+        logger.warning(
+            f"[{self.label}] 调度日 {schedule_date} 日检未完成，兜底补跑一轮")
+        self.check_and_execute_trades(scheduled_date=schedule_date)
+
+    def _run_daily_check_retry(self, now=None):
+        """+1 分钟重试；23:59→00:00 时仍使用前一调度日的去重键。"""
+        now = now or datetime.now()
         sched = self.config.get('scheduler', {})
-        check_hour = sched.get('check_hour', 8)
-        check_minute = sched.get('check_minute', 0)
-        # 按当日绝对分钟数比较，避免 check_minute 接近 59 时 check_minute+2 溢出
-        # 让缓冲窗口错误地跨过整点（如 08:59 的缓冲应到 09:01，而非落在 (8,61) 的元组里）
-        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
-            return
-        if self._last_check_date == now.date().isoformat():
-            return
-        logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，兜底补跑一轮日检")
-        self.check_and_execute_trades()
+        total = sched.get('check_hour', 8) * 60 + sched.get('check_minute', 0)
+        rolled = total + 1 >= 24 * 60
+        schedule_date = (now.date() - timedelta(days=1) if rolled else now.date()).isoformat()
+        self.check_and_execute_trades(scheduled_date=schedule_date)
+
+    def _run_daily_summary_retry(self, now=None):
+        """持仓汇总 +1 分钟重试；跨零点时不把前一调度日错记成新日期。"""
+        now = now or datetime.now()
+        sched = self.config.get('scheduler', {})
+        total = sched.get('summary_hour', 8) * 60 + sched.get('summary_minute', 0)
+        rolled = total + 1 >= 24 * 60
+        summary_date = (now.date() - timedelta(days=1) if rolled else now.date()).isoformat()
+        self.send_daily_position_summary_if_due(summary_date=summary_date)
 
     def _apply_deploy_restart_skip_catchup(self, now=None):
         """部署重启专用护栏：显式要求时只跳过今天的启动兜底日检。
 
-        实盘晚间滚动代码时，重启会让内存级 _last_check_date 丢失；若已过 08:00，
-        启动兜底会立刻按上一根已收盘日线再跑一轮，可能管理当前实盘仓位。部署方可在
+        当调度日尚未成功、但部署方明确要放弃本日补跑时，可在
         本次重启的进程环境里设 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1，把今日标记为已
         日检，避免启动/30分钟兜底补跑；次日自然恢复正常 08:00 日检。
 
@@ -697,17 +2107,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
             return False
         now = now or datetime.now()
+        slot = self._catchup_schedule_slot(now)
         sched = self.config.get('scheduler', {})
         check_hour = sched.get('check_hour', 8)
         check_minute = sched.get('check_minute', 0)
-        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
+        if slot is None:
             logger.warning(
                 f"[{self.label}] TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 已忽略：尚未到今日 "
                 f"{check_hour:02d}:{check_minute:02d} 日检时间，无兜底补跑可跳过；"
                 "若此时标记会吞掉今天的正点日检")
             return False
-        today = now.date().isoformat()
-        self._last_check_date = today
+        today = slot.date().isoformat()
+        self._mark_daily_check_complete(today)
         logger.warning(
             f"[{self.label}] 已按 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 标记今日({today})已日检，"
             "本次部署重启跳过启动兜底补跑；次日正常恢复"
@@ -717,18 +2128,61 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def start(self):
         """启动交易系统：注册定时任务、启动调度、阻塞主循环。"""
         logger.info("启动交易系统...")
-        skip_startup_catchup = self._apply_deploy_restart_skip_catchup()
-        self.register_jobs(self.config.get('scheduler', {}))
-        self.scheduler.start()
-        logger.info(f"[{self.label}] 调度已启动，等待定时任务...")
-        if not skip_startup_catchup:
-            self._run_startup_catchup_check()
+        if self._stop_event.is_set():
+            logger.warning("启动前已收到停止请求，runner 不再启动")
+            return
         try:
-            while True:
-                time.sleep(60)
+            # 注册、启动与启动补跑也必须在 finally 保护内：任一阶段抛异常时都要
+            # 关闭已部分启动的 scheduler 并清空心跳，不能留下 Web 正常但后台残活。
+            skip_startup_catchup = self._apply_deploy_restart_skip_catchup()
+            self.register_jobs(self.config.get('scheduler', {}))
+            self.scheduler.start()
+            self._update_runner_heartbeat()
+            logger.info(f"[{self.label}] 调度已启动，等待定时任务...")
+            if not skip_startup_catchup and not self._stop_event.is_set():
+                self._run_startup_catchup_check()
+            elif self._stop_event.is_set():
+                logger.info(f"[{self.label}] runner 已收到停止请求，跳过启动补跑")
+            while not self._stop_event.wait(60):
+                self._update_runner_heartbeat()
         except KeyboardInterrupt:
             logger.info("收到中断信号，关闭交易系统...")
-            self.scheduler.shutdown()
+        finally:
+            try:
+                if getattr(self.scheduler, 'running', False):
+                    self.scheduler.shutdown(wait=True)
+            finally:
+                self._update_runner_heartbeat(stopped=True)
+
+    def stop(self):
+        """请求 runner 停止。不拿交易锁，避免 worker-exit 与长交易互锁。"""
+        self._stop_event.set()
+
+    def _update_runner_heartbeat(self, stopped=False):
+        with self._heartbeat_lock:
+            self._runner_heartbeat_ts = None if stopped else time.time()
+
+    def health_snapshot(self):
+        """Web 层可用的真实 runner/scheduler/心跳快照。"""
+        with self._heartbeat_lock:
+            heartbeat = self._runner_heartbeat_ts
+        scheduler_running = bool(getattr(self.scheduler, 'running', False))
+        scheduler_thread = getattr(self.scheduler, '_thread', None)
+        scheduler_thread_alive = (
+            bool(scheduler_thread.is_alive()) if scheduler_thread is not None else scheduler_running)
+        age = (time.time() - heartbeat) if heartbeat is not None else None
+        healthy = bool(
+            scheduler_running and scheduler_thread_alive and
+            heartbeat is not None and age <= 150 and
+            not self._stop_event.is_set())
+        return {
+            'healthy': healthy,
+            'scheduler_running': scheduler_running,
+            'scheduler_thread_alive': scheduler_thread_alive,
+            'runner_heartbeat_ts': heartbeat,
+            'heartbeat_age_seconds': age,
+            'stopping': self._stop_event.is_set(),
+        }
 
     def register_jobs(self, scheduler_config=None):
         """把定时任务注册到本系统的调度器。"""
@@ -742,6 +2196,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         weekly_minute = scheduler_config.get('weekly_minute', 1)
 
         # 日内权益采样（间隔与 EquityTracker 分桶常量同源）用于前端求索指数
+        self.scheduler.add_job(self._update_runner_heartbeat, 'interval',
+                              id=f'{ex}_runner_heartbeat', max_instances=1, coalesce=True,
+                              misfire_grace_time=120, minutes=1)
         equity_tick_interval = EquityTracker.EQUITY_TICK_INTERVAL_MINUTES
         self.scheduler.add_job(self._record_equity_tick_with_alert, 'cron',
                               id=f'{ex}_equity_tick', max_instances=1, coalesce=True, misfire_grace_time=120,
@@ -766,12 +2223,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.scheduler.add_job(self.check_and_execute_trades, 'cron',
                               id=f'{ex}_daily_check', max_instances=1, coalesce=True, misfire_grace_time=60,
                               hour=check_hour, minute=check_minute, second='5,20,40')
-        if check_minute < 59:
-            self.scheduler.add_job(self.check_and_execute_trades, 'cron',
-                                  id=f'{ex}_daily_check_retry', max_instances=1, coalesce=True, misfire_grace_time=60,
-                                  hour=check_hour, minute=check_minute + 1, second=0)
-        else:
-            logger.warning(f"[{self.label}] check_minute=59，跳过 +1 分钟重试任务")
+        retry_hour, retry_minute = divmod(
+            (check_hour * 60 + check_minute + 1) % (24 * 60), 60)
+        self.scheduler.add_job(self._run_daily_check_retry, 'cron',
+                              id=f'{ex}_daily_check_retry', max_instances=1, coalesce=True, misfire_grace_time=60,
+                              hour=retry_hour, minute=retry_minute, second=0)
         # 日检兜底：主执行与 +1 分钟重试整窗失败（如恰逢网络故障）后当日再无触发点——
         # 每 30 分钟由幂等守卫补跑（时间窗 + _last_check_date + 交易锁，已跑则空转）
         self.scheduler.add_job(self._run_startup_catchup_check, 'cron',
@@ -781,12 +2237,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.scheduler.add_job(self.send_daily_position_summary_if_due, 'cron',
                               id=f'{ex}_daily_summary', max_instances=1, coalesce=True, misfire_grace_time=120,
                               hour=summary_hour, minute=summary_minute, second=50)
-        if summary_minute < 59:
-            self.scheduler.add_job(self.send_daily_position_summary_if_due, 'cron',
-                                  id=f'{ex}_daily_summary_retry', max_instances=1, coalesce=True, misfire_grace_time=120,
-                                  hour=summary_hour, minute=summary_minute + 1, second=20)
-        else:
-            logger.warning(f"[{self.label}] summary_minute=59，跳过 +1 分钟持仓汇总重试任务")
+        summary_retry_hour, summary_retry_minute = divmod(
+            (summary_hour * 60 + summary_minute + 1) % (24 * 60), 60)
+        self.scheduler.add_job(self._run_daily_summary_retry, 'cron',
+                              id=f'{ex}_daily_summary_retry', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              hour=summary_retry_hour, minute=summary_retry_minute, second=20)
         self.scheduler.add_job(self.send_weekly_report, 'cron',
                               id=f'{ex}_weekly', day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
 
@@ -799,4 +2254,5 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
 
 if __name__ == '__main__':
+    acquire_runner_lock()
     TradingSystem().start()

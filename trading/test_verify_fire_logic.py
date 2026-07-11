@@ -2,8 +2,8 @@
 
 --fire 模式验证「止损触发瞬间是否只减仓、绝不反向」——本系统止损防线
 唯一从未被实测过的一环。这里只测决策逻辑本身（触发判定/归零判定/反向
-判定/超时判定/列表消失判定），真实触发行为由用户在实盘上用该脚本验证，
-两者互补：这里锁定「代码看到某种交易所响应时会不会下对结论」。
+    判定/超时判定/列表消失判定），真实触发行为由用户在实盘上用该脚本验证，
+    两者互补：这里锁定「代码看到某种交易所响应时会不会下对结论」。
 """
 import sys
 import types
@@ -68,7 +68,19 @@ class FireTestDecisionLogicTest(unittest.TestCase):
     只验证「看到某种交易所响应时会不会下对结论」，与真实等待时长无关。"""
 
     def setUp(self):
-        patcher = patch.object(verify_okx, 'time', Mock(sleep=lambda s: None, time=__import__('time').time))
+        # 使用会前进的虚拟时钟；sleep(0) 也推进 1ms，避免超时测试在真实
+        # 10ms 内忙等并向测试日志打印数千行。
+        clock = {'now': 0.0}
+
+        def fake_time():
+            clock['now'] += 0.001
+            return clock['now']
+
+        def fake_sleep(seconds):
+            clock['now'] += max(float(seconds), 0.001)
+
+        patcher = patch.object(
+            verify_okx, 'time', Mock(sleep=fake_sleep, time=fake_time))
         self._mock_time = patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -92,6 +104,36 @@ class FireTestDecisionLogicTest(unittest.TestCase):
         api.get_position.side_effect = lambda _s: seq.pop(0) if seq else last
         result = run_fire_test(api, 'BTC/USDT:USDT', 0.1, 'long',
                                distance_pct=0.15, timeout_seconds=10, poll_interval=0)
+        self.assertFalse(result)
+
+    def test_direct_long_to_short_between_polls_fails(self):
+        """轮询没看到空仓、直接看到反向仓，也必须立即判失败而不是超时不确定。"""
+        api = _fake_api(position_sequence=[])
+        seq = [
+            {'contracts': 10.0, 'side': 'long'},
+            {'contracts': 5.0, 'side': 'short'},
+        ]
+        last = seq[-1]
+        api.get_position.side_effect = lambda _s: seq.pop(0) if seq else last
+
+        result = run_fire_test(api, 'BTC/USDT:USDT', 0.1, 'long',
+                               distance_pct=0.15, timeout_seconds=10, poll_interval=0)
+
+        self.assertFalse(result)
+
+    def test_partial_stop_that_never_flattens_fails(self):
+        """止损已部分成交不是“行情未触发”，超时后必须判失败。"""
+        api = _fake_api(position_sequence=[])
+        seq = [
+            {'contracts': 10.0, 'side': 'long'},
+            {'contracts': 5.0, 'side': 'long'},
+        ]
+        last = seq[-1]
+        api.get_position.side_effect = lambda _s: seq.pop(0) if seq else last
+
+        result = run_fire_test(api, 'BTC/USDT:USDT', 0.1, 'long',
+                               distance_pct=0.15, timeout_seconds=0.01, poll_interval=0)
+
         self.assertFalse(result)
 
     def test_timeout_without_trigger_is_inconclusive(self):

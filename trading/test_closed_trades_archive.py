@@ -7,6 +7,8 @@
 - 「史书已写、账本落盘失败回滚」的窄窗口由内容级去重消除重复。
 """
 import os
+import copy
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -124,6 +126,24 @@ class ArchiveFailSafeTest(unittest.TestCase):
             self.assertEqual(_symbols(archive), ['C0USDT', 'C1USDT', 'C2USDT'])
             self.assertEqual(_symbols(ts.get_closed_trades()),
                              [f'C{i}USDT' for i in range(8)])
+
+    def test_ordered_overlap_preserves_two_identical_real_trades(self):
+        """史书已有第一笔、账本前两笔内容相同：只跳过有序重叠的一笔。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            duplicate = {'symbol': 'SAMEUSDT', 'pnl': 1, 'close_time': 'legacy'}
+            recent = {'symbol': 'RECENTUSDT', 'pnl': 2, 'close_time': 'new'}
+            ts.state['closed_trades'] = [
+                copy.deepcopy(duplicate), copy.deepcopy(duplicate), recent]
+            ts.save_state()
+            with open(ts.archive_file, 'w', encoding='utf-8') as handle:
+                json.dump([duplicate], handle)
+
+            self.assertEqual(2, ts.compact_closed_trades())
+
+            archive, ok = ts._read_archive()
+            self.assertTrue(ok)
+            self.assertEqual([duplicate, duplicate], archive)
 
 
 class DailyCheckCompactionWiringTest(unittest.TestCase):

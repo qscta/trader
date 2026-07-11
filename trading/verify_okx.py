@@ -126,16 +126,16 @@ def run_side(api, ccxt_symbol, coin, side):
                 print(f"[{side}] ⚠️ 没查到算法止损单！可能没挂上或查询路径异常。")
                 ok = False
 
-            # 三态判定全链路：原生查询 + 方向/触发价/张数严格匹配（止损自愈巡检同一路径）
+            # 四态裁决全链路：原生查询 + 方向/触发价/张数严格匹配（止损自愈巡检同一路径）
             try:
                 state = api.find_stop_order_state(
                     ccxt_symbol, side, coin, stop_px, (stop or {}).get('id'))
                 print(f"[{side}] find_stop_order_state = {state}（应为 intact）")
                 if state != 'intact':
-                    print(f"[{side}] ⚠️ 三态判定未返回 intact！严格匹配（触发价 tick 取整/张数）需人工核对。")
+                    print(f"[{side}] ⚠️ 四态裁决未返回 intact！严格匹配（触发价 tick 取整/张数）需人工核对。")
                     ok = False
             except Exception as e:
-                print(f"[{side}] ⚠️ 三态判定异常: {e}")
+                print(f"[{side}] ⚠️ 四态裁决异常: {e}")
                 ok = False
 
             print(f"[{side}] 撤止损 ...")
@@ -204,26 +204,49 @@ def run_fire_test(api, ccxt_symbol, coin, side, distance_pct=0.15, timeout_secon
         print(f"[fire-{side}] 等待自然行情触发...")
         start = time.time()
         triggered = False
+        reverse_observed = False
+        partial_fill_observed = False
+        initial_contracts = None
         while time.time() - start < timeout_seconds:
             pos = api.get_position(ccxt_symbol)
-            if pos is None:
+            contracts = abs(float((pos or {}).get('contracts') or 0))
+            observed_side = (pos or {}).get('side')
+            if pos is None or contracts == 0:
                 triggered = True
                 break
+            # 不要求必须先采样到“空仓”。如果错误的非 reduce-only 止损让仓位
+            # 在两个轮询点之间由 long 直接翻成 short（或反之），旧逻辑只会一路
+            # 等到超时并给出“不确定”，恰好漏掉最危险的证据。
+            if observed_side and observed_side != side:
+                reverse_observed = True
+                triggered = True
+                print(f"[fire-{side}] 🔴 轮询直接观察到反向仓: {contracts} 张 {observed_side}")
+                break
+            if initial_contracts is None:
+                initial_contracts = contracts
+            elif contracts < initial_contracts:
+                partial_fill_observed = True
             print(f"[fire-{side}] 未触发（已等待 {int(time.time() - start)}s，持仓仍在）...")
             time.sleep(poll_interval)
 
         if not triggered:
+            if partial_fill_observed:
+                print(f"[fire-{side}] ❌ 观察到止损部分成交但未在超时前归零，按失败处理。")
+                return False
             print(f"[fire-{side}] ⏱️ 超时未触发（{timeout_seconds}s 内价格未走到止损位），"
                   f"本次不构成证据，非失败。清理后可加大 --fire-distance 或 --fire-timeout 重试。")
             return None
 
-        print(f"[fire-{side}] ✓ 检测到持仓已归零，止损已触发")
+        if reverse_observed:
+            print(f"[fire-{side}] ❌ 检测到止损执行，但仓位直接反向")
+        else:
+            print(f"[fire-{side}] ✓ 检测到持仓已归零，止损已触发")
         time.sleep(2)  # 留出成交回报与列表更新的短暂窗口
         pos_after = api.get_position(ccxt_symbol)
         contracts_after = abs(float((pos_after or {}).get('contracts') or 0))
         side_after = (pos_after or {}).get('side')
 
-        ok = True
+        ok = not reverse_observed
         if pos_after is not None and contracts_after > 0:
             print(f"[fire-{side}] ⚠️⚠️ 触发后仍有持仓 {contracts_after} 张，方向={side_after}！")
             if side_after and side_after != side:
@@ -292,7 +315,10 @@ def main():
     cs = api._get_contract_size(ccxt_symbol)
     print(f"ccxt 符号: {ccxt_symbol} | 合约面值 contractSize: {cs}")
 
-    check_position_mode(api)
+    mode_ok = check_position_mode(api)
+    if mode_ok is not True:
+        print("❌ 无法确认账户处于 net_mode，验证脚本拒绝继续。请先修正/确认持仓模式。")
+        return
 
     bal = api.get_balance()
     print("USDT 总额:", (bal or {}).get('total', {}).get('USDT'))

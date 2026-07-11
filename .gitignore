@@ -1,6 +1,9 @@
 # ===== 凭据（绝不入库；用 trading/config.example.json 作为模板）=====
 trading/config.json
 *.save
+.env
+.env.*
+!.env.example
 
 # ===== 运行时状态（真实账本/权益数据，属于部署机，不属于代码库）=====
 trading/trade_state.json
@@ -12,12 +15,20 @@ trading/equity_history.json
 trading/equity_ticks.json
 trading/peak_equity.json
 trading/qiusuo_index.json
+trading/.trading_data_owner.json
+trading/.okx_legacy_migration_complete.json
+trading/.equity_sync_journal.json
 trading/data/
+trading/.runtime/
 
 # ===== 日志与备份 =====
 *.log
 *.log.*
 trading/backups/
+*.tgz
+*.tar
+*.tar.gz
+*.zip
 
 # ===== 编辑器/进程留下的副本 =====
 .DS_Store

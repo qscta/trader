@@ -3,9 +3,12 @@ import os
 import sys
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import equity_tracker as eqt
@@ -80,6 +83,75 @@ class DrawdownStatsTest(unittest.TestCase):
         d = t.build_account_stats(persist=True)             # 统计刷新时峰值已是新高
         self.assertEqual(d['days_since_peak'], 0)
         self.assertEqual(d['longest_drawdown_days'], 5)
+
+    def test_peak_does_not_advance_when_closed_streak_cannot_persist(self):
+        tmp, tracker = _make(equity=110, peak=100, peak_days_ago=5, longest=3)
+        tracker.save_equity_history = Mock(return_value=False)
+
+        with self.assertRaises(RuntimeError):
+            tracker.reconcile_peak_equity(
+                110, persist=True, now=datetime.now())
+
+        self.assertEqual(100, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+
+
+class TickCompactionConcurrencyTest(unittest.TestCase):
+    def test_compaction_cannot_overwrite_a_concurrent_new_tick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = SimpleNamespace(
+                exchange_api=SimpleNamespace(),
+                trade_state=SimpleNamespace(get_all_open_positions=lambda: {}),
+            )
+            tracker = eqt.EquityTracker(tmp, system)
+            old_tick = {
+                'timestamp': '2026-07-10T09:00',
+                'recorded_at': '2026-07-10T09:00:01',
+                'equity': 1000, 'qiusuo_index': 1853,
+            }
+            new_tick = {
+                'timestamp': '2026-07-11T09:00',
+                'recorded_at': '2026-07-11T09:00:01',
+                'equity': 1001, 'qiusuo_index': 1854,
+            }
+            self.assertTrue(tracker.save_equity_ticks([old_tick]))
+            loaded = threading.Event()
+            release = threading.Event()
+            writer_done = threading.Event()
+            original_load = tracker.load_equity_ticks
+
+            def paused_load():
+                result = original_load()
+                if threading.current_thread().name == 'compact':
+                    loaded.set()
+                    release.wait(2)
+                return result
+
+            tracker.load_equity_ticks = paused_load
+
+            def writer():
+                with tracker._lock:
+                    ticks = original_load()
+                    ticks.append(new_tick)
+                    tracker.save_equity_ticks(ticks)
+                writer_done.set()
+
+            compact = threading.Thread(
+                name='compact', target=tracker._compact_closed_ticks,
+                kwargs={'now': datetime(2026, 7, 11, 9, 5)})
+            compact.start()
+            self.assertTrue(loaded.wait(1))
+            write_thread = threading.Thread(target=writer)
+            write_thread.start()
+            time.sleep(0.05)
+            self.assertFalse(writer_done.is_set())  # compact 从首次读取起持锁
+            release.set()
+            compact.join(2)
+            write_thread.join(2)
+
+            self.assertTrue(writer_done.is_set())
+            self.assertEqual(
+                ['2026-07-11T09:00'],
+                [item['timestamp'] for item in original_load()])
 
 
 class EquitySyncFlowTest(unittest.TestCase):

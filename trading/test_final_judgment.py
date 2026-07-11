@@ -173,12 +173,11 @@ class DisasterRecoveryTest(unittest.TestCase):
 
     def test_orphan_position_alert_on_total_loss(self):
         """账本丢失（文件不存在）或存在人工仓时：启动同步的反向核对告警
-        「交易所有仓本地无记录」，只告警不拒启（保留人工开仓自由）。"""
+        「交易所有仓本地无记录」，并逐品种持久化隔离阻断后续开仓。"""
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))  # 空（模拟全毁后）
             system._stop_anomalies = {}
-            system._known_orphans = set()
             alerts = []
             system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)
             system.exchange_api = SimpleNamespace(
@@ -188,9 +187,10 @@ class DisasterRecoveryTest(unittest.TestCase):
 
             system.sync_positions_on_startup()
 
-            self.assertEqual(len(alerts), 1)
-            self.assertIn('BTCUSDT', alerts[0])
-            self.assertIn('ETHUSDT', alerts[0])
+            self.assertEqual(len(alerts), 2)
+            self.assertEqual(
+                set(system.trade_state.get_position_quarantines()),
+                {'BTCUSDT', 'ETHUSDT'})
 
     def test_no_orphan_no_alert(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,12 +198,13 @@ class DisasterRecoveryTest(unittest.TestCase):
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy='turtle')
             system._stop_anomalies = {}
-            system._known_orphans = set()
             alerts = []
             system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)
             system.exchange_api = SimpleNamespace(
                 to_ccxt_symbol=lambda s: s,
-                get_position=lambda s: {'contracts': 10.0},
+                _coin_to_contracts=lambda s, amount: 10.0,
+                get_position=lambda s: {'contracts': 10.0, 'side': 'long'},
+                find_stop_order_state=lambda *args, **kwargs: 'intact',
                 list_position_symbols=lambda: ['BTCUSDT'])  # 两边一致
 
             system.sync_positions_on_startup()

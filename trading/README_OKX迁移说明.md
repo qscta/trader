@@ -1,19 +1,21 @@
 # 欧易（OKX）程序化交易系统 — 架构与上线说明
 
 本系统由币安版迁移而来，现已收敛为「**欧易单所版**」：只对接欧易，状态、配置、前端均按单所组织。
-**核心交易逻辑（海龟通道突破 / 双均线、以损定量、开仓后建止损、止损推进、平仓、平仓后状态记录、风控校验、每日 08:00 调度）与原币安已跑通版本保持等价**，本次迁移只替换交易所适配层、收敛交易所范围、调整统计展示与默认参数。
+两套策略的**信号语义**保持不变；但当前版本不是“只换适配层”：已同时加固下单幂等、订单终态归因、补偿回滚、原子账本、崩溃恢复、止损残留隔离与三入口配置校验。
 
 ## 一、整体架构
 
 ```
         TradingSystem (main.py)               ← 单实例：加载配置、调度、执行
           ├── OkxApi      (适配器, okx_api.py)  ← 继承 ExchangeApi (exchange_base.py)
-          ├── TradeState   trade_state.json     ← 本地持仓/止损/信号状态（恒定大小；平仓历史归档在 closed_trades_archive.json）
+          ├── TradeState   trade_state.json     ← 本地持仓/止损/信号状态（保留最近 200 笔平仓）
+          │                                      旧平仓历史追加到 closed_trades_archive.json
           └── EquityTracker *.json              ← 权益历史/峰值/日快照/求索指数
 ```
 
 - **内部符号**统一 `BTCUSDT`，由 `to_ccxt_symbol()` 映射为欧易 `BTC/USDT:USDT`。
 - **仓位单位**：上层与本地状态始终用「币的数量」；欧易「张数」换算只在 `okx_api.py` 下单边界内部发生，不外泄，保证风控/盈亏口径与原版一致。
+- **双向事务句柄**：开仓用 `open_intent`，已有仓位的主动平仓用持仓内 `close_intent`；两者都在首次 POST 前固化基础 `clOrdId` 和计划量。平仓恢复会查询基础腿及确定性 `r1/r2`，把真实 VWAP、手续费和订单 ID 与完整/部分账本更新一次性收口。
 - 状态文件直接存在**项目根目录**（不再有 `data/<交易所>/` 子目录）。
 
 ## 二、配置（config.json）
@@ -44,7 +46,7 @@
 - 顶部状态条直接显示「运行中 · 欧易」，无交易所切换、无汇总总览页。
 - 完整管理区：KPI、求索指数图、品种池、持仓、即时开仓、策略参数、资金同步、系统日志、历史交易。
 - **求索指数图**用 TradingView 官方开源库 **lightweight-charts**：蜡烛图、拖动平移、滚轮缩放、十字光标悬停显示**开/高/低/收/涨跌/涨幅/振幅**；区间可选 30/60/120/365/**全部**。库已下载到本地 `static/lwc.js`，**不依赖外网 CDN**。
-- **求索指数数据存储**：每天切日时把当天的 5 分钟采样压缩成一根日线 OHLC 永久存入 `daily_equity.json`，并清空当天之前的原始采样——`equity_ticks.json` 永远只存当天，历史十年也仅几百 KB，「全部」是完整历史的真蜡烛。`equity_tick_retention_days`（默认 30）仅作压缩失效时的兜底。
+- **求索指数数据存储**：切日压缩事务成功后，才把旧 5 分钟采样从 `equity_ticks.json` 裁掉，平常只保留当天；任一主文件/备份写入失败时整个交易回滚，原始 ticks 继续保留等下轮恢复。`daily_equity.json` 保留日线 OHLC，`equity_tick_retention_days` 是压缩失效时的兜底上限。
 - 排行榜（交易对动态池）已彻底删除。样式内联在 `index.html`。
 
 ### 删除交易对的语义
@@ -57,7 +59,7 @@
 - **历史最长未创新高**（`longest_drawdown_days`）= 历史上两次创新高之间的最长间隔；**若当前正处于未创新高中，会把当前这段进行中的天数一起纳入比较**（`max(历史已记录, 当前未创新高天数)`）。创新高当天会先用「旧峰值时间→本次新高」结算刚结束的那段、更新历史最长，再把未创新高天数归零。
 - 前端、`/api/account_stats`、钉钉周报**统一复用** `EquityTracker.build_account_stats()` 的结果，口径完全一致。
 
-## 四、HTTP API（单所，无 exchange 参数）
+## 四、主要 HTTP API（单所，无 exchange 参数）
 
 `/api/login`、`/api/logout`、`/api/check_auth`、`/api/logs`、`/api/status`、`/api/positions`、
 `/api/symbols`、`/api/account_stats`、`/api/equity_ohlc`(=`/api/qiusuo_index_ohlc`)、`/api/instant_open`、
@@ -69,51 +71,55 @@
 
 ```bash
 pip install -r requirements.txt   # ccxt, pandas, flask, apscheduler, requests, gunicorn
-python main.py                  # 直接运行（仅交易调度，无 Web）
+python main.py                  # 直接运行（仅交易调度，无 Web；与 Web 共用单实例锁）
 # 或 Web + 交易一体（推荐，gunicorn 走 wsgi）
-FLASK_SECRET_KEY=xxx TRADING_LOGIN_PASSWORD=xxx gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
+export FLASK_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 ```
 
 - **时区**：每日 08:00 检查等 cron 任务按**服务器系统本地时区**触发。部署前确认时区符合预期（如 `timedatectl set-timezone Asia/Shanghai`），否则 UTC 服务器上 08:00 实际是北京时间 16:00。
-- 务必用 **1 个 worker**（`-w 1`）：交易线程与状态需单实例，`wsgi.py` 已用文件锁防重复启动（抢不到锁直接退出）。
-- **从多所版升级（自动迁移，带边界保护）**：若状态还在 `data/okx/` 下——根目录无 `trade_state.json` 时自动迁回（顺带打 `"exchange": "okx"` 归属标记）；根目录已有但**空仓**而旧文件**有持仓**时，备份空文件后迁移旧持仓（不会被空文件绕过）；**两边都有持仓时拒绝启动**等人工裁决；任一文件读取失败也拒绝启动。首次启动后请在日志确认迁移信息并**核对持仓数量无误**再继续运行。
-- **止损自愈（防裸奔红线）**：盘中巡检（默认 5 分钟）在「本地与交易所都有仓」时，会确认本地记录的止损单仍挂在交易所（方向+触发价+张数严格匹配，三态判定：intact 不动 / mismatch 告警人工 / missing 补挂）。异常状态（mismatch/补挂失败）在前端顶栏常驻红色警示，钉钉告警只在状态首次进入时发（防巡检轰炸）；**丢失则按本地止损价自动补挂**并通知——覆盖建新止损失败、人工误撤、交易所端丢单等任何原因的止损缺失。fail-safe：查询失败、残留阻断、状态不明时一律不动，只告警。前端顶栏会常驻显示止损残留阻断警示。
-- **止损残留护栏（防错杀红线）**：撤旧止损采用**验证式撤销**（撤完必须在算法单列表确认目标 id 不存在）。不可确认时：标记该品种「止损残留」（持久化在 trade_state.json）、严重告警、**阻断该品种新开仓/反手/止损更新**；每日检查前自动重试清理（仅对已无持仓的品种盲撤兜底），确认清干净后解除阻断并通知。
+- 务必使用仓库的 `gunicorn.conf.py`：单 worker + gthread + 120 秒请求超时 + 900 秒优雅退出；`wsgi.py` 与
+  `main.py`/`api_server.py` 共用项目内文件锁防重复 runner（抢不到锁直接退出）。默认仅监听
+  `127.0.0.1:5000`，公网必须经 HTTPS 反代；一层可信反代需显式设置 `TRADING_PROXYFIX_X_FOR=1`。
+- `FLASK_SECRET_KEY` 少于 32 字节会拒绝启动；不要使用文档占位符、密码或可猜字符串。
+  若用 `TRADING_RUNNER_LOCK_FILE` 改锁路径，锁必须位于当前用户所有的专用 0700 目录，
+  不能直接放在 `/tmp` 等共享目录。
+- **一次性 legacy 迁移**：`data/okx/` 只在无 `.okx_legacy_migration_complete.json` 时参与裁决；迁移成功后原子写 marker，后续重启绝不再用永久旧快照复活主账本。根主账本/.bak 缺失冲突、两边存在不同生命周期数据、任一 schema/权限/符号链接异常均拒启；只在内容同源或安全空状态下迁移。
+- **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
+- **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。止损更新/缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
+- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手/止损推进。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
+- **OKX 原生止损单**：直调 `POST /api/v5/trade/order-algo`，发送 `ordType=conditional`、`slTriggerPx`、`slOrdPx=-1`、`reduceOnly=true` 和确定性 `algoClOrdId`；每个意图最多一次 POST，ACK 或超时都只按同 ID 查询，绝不盲重发。
 - **状态归属护栏（防串仓红线）**：启动时校验 `trade_state.json` 顶层 `exchange` 标记——
   - 标记为 `okx`：放行；标记为其它交易所（如旧币安）：**拒绝启动**；
-  - 无标记且无持仓：视为全新状态，自动打上 `okx` 标记；
-  - 无标记但**已有持仓**（可能是旧币安单所版遗留状态）：**拒绝启动**，要求人工确认——确属欧易则在文件顶层加 `"exchange": "okx"` 后重启，不确定则把欧易系统部署到独立目录。绝不静默把旧币安持仓当欧易仓位管理。
+  - 无标记且**整个目录无任何持仓/意图/历史/权益生命周期数据**：视为全新，自动打 `okx` 标记；
+  - 无标记但存在任何生命周期数据：**拒绝启动**。人工核对全部文件确属 OKX 后再同时建立目录 owner manifest/账本归属，否则使用独立目录。
 
 ## 六、⚠️ 欧易上线前务必小额 / 模拟盘验证
 
-我无法在本机连欧易实盘联调，以下几处不同 ccxt 版本行为可能有差异，**先用最小金额或模拟盘（`sandbox: true`）实测确认再放大资金**。可用 `python verify_okx.py`（带 `--side long/short/both`）做开/平/止损全链路验证：
+代码审查与历史验证日志都不能替代**当前提交 + 当前 ccxt + 当前 OKX 账户**的重跑。模拟盘至少执行：
+
+```bash
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+```
+
+`--fire` 超时未触发是“未获得证据”，不是通过；调整距离/超时后重跑。需确认：
 
 1. **合约张数换算（最关键）**：欧易按「张」下单，每张 = `contractSize` 个币。开一小单，核对欧易实际持仓数量与日志「≈X币」是否一致——不一致会导致仓位成倍偏差。
-2. **止损算法单**：系统用 ccxt 统一参数 `stopLossPrice` + `reduceOnly` 创建条件单；确认它确实挂上、是 reduce-only、触发后市价平仓。
+2. **止损算法单**：确认原生 conditional 单确实挂上、是 reduce-only、触发后市价平仓且不反向开仓。
 3. **撤止损 / 撤全部**：确认 `cancel_all_orders` 能把算法止损单一并撤掉，无残留。
 4. **杠杆与单向模式**：账户须为**单向（净）持仓模式**；系统每品种首次开仓前 `set_leverage`，确认杠杆/保证金模式生效（风控以损定量，仓位价值常数倍于本金，杠杆必须够）。
 
 ## 七、测试
 
-无需第三方依赖、可本机运行并通过（共 176 用例，已验证同进程任意顺序全绿）：
+当前聚合测试矩阵：362 个纯标准库用例 + 105 个依赖版用例。以聚合命令为准，避免模块新增后文档逐项计数漂移：
 
 ```bash
-python -m unittest test_startup_smoke               # 15 通过（启动装配全链冒烟：配置校验/迁移/护栏/装配）
-python -m unittest test_final_judgment              # 16 通过（时间边界/并发混沌/灾难恢复/风控性质/孤儿仓告警）
-python -m unittest test_equity_drawdown             # 9 通过（未创新高统计/权益采样/资金同步）
-python -m unittest test_daily_summary_delivery      # 10 通过（钉钉汇总/缓冲/去重）
-python -m unittest test_symbol_removal_management   # 53 通过（删除后托管 + 异常隔离 + 各护栏 + 撤单确认 + 状态事务回滚 + 止损自愈 + 调度兜底）
-python -m unittest test_okx_adapter_safety          # 33 通过（面值 fail-closed + 原生端点查询/撤销/复验 + 止损严格匹配/三态判定 + tick 对齐）
-python -m unittest test_closed_trades_archive       # 8 通过（账本/史书分离：归档/降级/去重/日检接线）
-python -m unittest test_config_validation           # 14 通过（三入口共享校验原语边界）
-python -m unittest test_trade_state_fees            # 3 通过（手续费/盈亏）
-python -m unittest test_turtle_strategy_regression  # 8 通过（海龟信号回归）
-python -m unittest test_verify_fire_logic            # 7 通过（--fire 实弹触发验证：决策逻辑离线测试）
+python3 -m unittest discover -s . -p 'test_*.py'
+python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
 测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。
 
-> `tests/test_trading_logic_unittest.py` 需要 pandas/ccxt/flask 才能运行（本机未装）。它已**适配单所结构**：api_server 路由测试直接 patch `api_server.trading_system`（用 `_prep_system` 补 `_config_lock`/`persist_config`/`config_file`），`filter_closed_candles` 测试改用基类 `exchange_base.ExchangeApi`，并新增 `DeleteSymbolApiTests`（4 用例：删除只动配置不平仓不撤单 / 缺 strategy 从配置补写 / 无从知晓策略时拒删）。请在依赖齐全的环境运行验证：
-> ```bash
-> python -m unittest tests.test_trading_logic_unittest
-> ```
+> 依赖版需要 requirements.txt 中的 pandas/ccxt/flask/apscheduler。

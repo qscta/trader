@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, send_from_directory, session
+from contextlib import contextmanager
 from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
@@ -58,11 +59,22 @@ def _parse_proxyfix_hops(value):
     return hops
 
 
+def _validate_flask_secret_key(value):
+    """校验 Flask 签名密钥。所有 Session 认证都依赖它，「非空」不够：
+    短密钥可被离线猜中并伪造 authenticated=True 绕过全部写接口。
+    """
+    if not value:
+        raise RuntimeError('未配置 FLASK_SECRET_KEY，拒绝启动')
+    if len(str(value).encode('utf-8')) < 32:
+        raise RuntimeError('FLASK_SECRET_KEY 至少需要 32 字节的随机值，拒绝弱密钥启动')
+    return str(value)
+
+
 # 反代跳数由部署方声明（代码无法安全地自动探测——盲信 X-Forwarded-For 本身就是漏洞）：
-# 0 = 无反代直连（完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（默认，真实客户端 IP
+# 0 = 无反代直连（默认，完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（真实客户端 IP
 # 在链尾）；2 = CDN→nginx 双层。登录防爆破按还原后的 remote_addr 计数——跳数配错时
 # 计数键要么可被伪造（绕过锁定）、要么全体访客共享（互相连坐锁定）。
-_PROXYFIX_HOPS = _parse_proxyfix_hops(os.environ.get('TRADING_PROXYFIX_X_FOR', '1'))
+_PROXYFIX_HOPS = _parse_proxyfix_hops(os.environ.get('TRADING_PROXYFIX_X_FOR', '0'))
 if _PROXYFIX_HOPS > 0:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_PROXYFIX_HOPS, x_proto=1)
 app.config['JSON_AS_ASCII'] = False   # Flask < 2.3
@@ -70,9 +82,7 @@ try:
     app.json.ensure_ascii = False     # Flask >= 2.2（JSON_AS_ASCII 已废弃）
 except AttributeError:
     pass
-app.secret_key = os.environ.get('FLASK_SECRET_KEY')
-if not app.secret_key:
-    raise RuntimeError('未配置 FLASK_SECRET_KEY，拒绝启动')
+app.secret_key = _validate_flask_secret_key(os.environ.get('FLASK_SECRET_KEY'))
 
 # 会话 Cookie 加固：SameSite 显式 Lax；Secure 由部署方按是否走 HTTPS 决定——
 # 设 TRADING_COOKIE_SECURE=1 开启，不无条件写死（内网纯 HTTP 部署会被弄坏）
@@ -88,15 +98,194 @@ logger = logging.getLogger(__name__)
 
 # 手动检查防重入标记
 _manual_check_running = False
+_manual_check_thread = None
 _manual_check_guard = threading.Lock()
 
 # 登录防爆破：内存级按 IP 退避（连续 5 次失败锁 60 秒，成功即清零；进程重启即重置，无需持久化）
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
+LOGIN_FAILURE_CACHE_MAX = 4096
 _login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
 _login_guard = threading.Lock()
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
+
+# 由 wsgi / __main__ 保存真实 runner 线程状态。不能仅凭 trading_system 非空就宣称
+# “运行中”：调度线程若在 register_jobs/start 中异常退出，Web 仍可能完全正常。
+_runner_thread = None
+_runner_started_at = None
+_runner_failure = None
+_runner_guard = threading.Lock()
+
+
+def _prune_login_failures(now):
+    """清除过期项并对攻击者可控的 IP 字典设置硬上限。必须在 _login_guard 内调用。"""
+    expired = [ip for ip, (_fails, locked_until) in _login_failures.items()
+               if locked_until and locked_until <= now]
+    for ip in expired:
+        _login_failures.pop(ip, None)
+    while len(_login_failures) >= LOGIN_FAILURE_CACHE_MAX:
+        _login_failures.pop(next(iter(_login_failures)), None)
+
+
+def start_runner_thread(system):
+    """启动并登记交易 runner；异常被记录，供 /api/status fail-loud。"""
+    global _runner_thread, _runner_started_at, _runner_failure
+
+    def run():
+        global _runner_failure
+        try:
+            system.start()
+        except BaseException as exc:
+            with _runner_guard:
+                _runner_failure = f'{type(exc).__name__}: {exc}'
+            logger.critical('交易 runner 已退出', exc_info=True)
+
+    with _runner_guard:
+        if _runner_thread is not None and _runner_thread.is_alive():
+            return _runner_thread
+        stop_event = getattr(system, '_stop_event', None)
+        if stop_event is not None:
+            # 必须在线程启动前清；若让 main.start 在线程内清，紧随 start 的 stop()
+            # 可能先 set、后被后台线程 clear，丢失退出请求并卡住 worker shutdown。
+            stop_event.clear()
+        _runner_failure = None
+        _runner_started_at = datetime.now().isoformat()
+        _runner_thread = threading.Thread(
+            target=run, name='trading-system-runner', daemon=True)
+        _runner_thread.start()
+        return _runner_thread
+
+
+def stop_runner_thread(timeout=895):
+    """请求 runner 优雅停止并等待交易 job/调度器收尾；供 Gunicorn hooks 调用。"""
+    deadline = time.monotonic() + max(0, timeout)
+    with _runner_guard:
+        thread = _runner_thread
+    system = trading_system
+    if system is not None and hasattr(system, 'stop'):
+        try:
+            system.stop()
+        except Exception:
+            logger.exception('请求交易 runner 停止失败')
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+    runner_alive = bool(thread and thread.is_alive())
+    with _manual_check_guard:
+        manual_thread = _manual_check_thread
+    if manual_thread is not None and manual_thread.is_alive():
+        manual_thread.join(timeout=max(0, deadline - time.monotonic()))
+    manual_alive = bool(manual_thread and manual_thread.is_alive())
+    if runner_alive or manual_alive:
+        logger.critical(f'后台交易线程在 {timeout}s 内未能优雅停止；worker 不应强制退出')
+    return not runner_alive and not manual_alive
+
+
+def _runner_health(system):
+    """返回 runner/scheduler/heartbeat 的真实健康快照。"""
+    with _runner_guard:
+        thread = _runner_thread
+        started_at = _runner_started_at
+        failure = _runner_failure
+    issues = []
+    if thread is None:
+        issues.append('runner_thread_unregistered')
+        thread_alive = False
+    else:
+        thread_alive = thread.is_alive()
+        if not thread_alive:
+            issues.append('runner_thread_stopped')
+
+    # TradingSystem.health_snapshot 同时检查 APScheduler 内部线程。单看
+    # scheduler.running 会在调度线程异常退出后仍保留 RUNNING 状态；
+    # runner 主循环又会继续更新 heartbeat，从而把「所有 job 都停了」
+    # 误报为健康。测试桩没有 health_snapshot 时才走兼容回退。
+    system_health = {}
+    snapshot_reader = getattr(system, 'health_snapshot', None)
+    if callable(snapshot_reader):
+        try:
+            system_health = snapshot_reader()
+            if not isinstance(system_health, dict):
+                raise TypeError('health_snapshot 必须返回对象')
+        except Exception as exc:
+            logger.error(f'读取交易 runner 健康快照失败: {exc}')
+            issues.append('system_health_unavailable')
+            system_health = {}
+
+    scheduler = getattr(system, 'scheduler', None)
+    scheduler_running = bool(system_health.get(
+        'scheduler_running', getattr(scheduler, 'running', False)))
+    scheduler_thread_alive = system_health.get('scheduler_thread_alive')
+    if scheduler_thread_alive is None:
+        scheduler_thread = getattr(scheduler, '_thread', None)
+        if scheduler_thread is None:
+            scheduler_thread_alive = scheduler_running
+        else:
+            try:
+                scheduler_thread_alive = bool(scheduler_thread.is_alive())
+            except Exception:
+                scheduler_thread_alive = False
+    if not scheduler_running:
+        issues.append('scheduler_not_running')
+    elif not scheduler_thread_alive:
+        issues.append('scheduler_thread_stopped')
+
+    # main.start 会更新该 epoch；兼容尚未带 heartbeat 的测试桩，但真实部署一旦存在
+    # 心跳，超过阈值就明确降级。阈值需覆盖主循环 60 秒睡眠及短暂调度抖动。
+    heartbeat = system_health.get(
+        'runner_heartbeat_ts', getattr(system, '_runner_heartbeat_ts', None))
+    heartbeat_age = None
+    if heartbeat is not None:
+        try:
+            heartbeat_age = max(0.0, time.time() - float(heartbeat))
+            if heartbeat_age > 150:
+                issues.append('runner_heartbeat_stale')
+        except (TypeError, ValueError):
+            issues.append('runner_heartbeat_invalid')
+    elif hasattr(system, '_runner_heartbeat_ts'):
+        issues.append('runner_heartbeat_missing')
+    stop_event = getattr(system, '_stop_event', None)
+    stopping = system_health.get('stopping')
+    if stopping is None and stop_event is not None:
+        stopping = stop_event.is_set()
+    if stopping:
+        issues.append('runner_stopping')
+    if failure:
+        issues.append('runner_failed')
+    return {
+        'healthy': not issues,
+        'runner_thread_alive': thread_alive,
+        'scheduler_running': scheduler_running,
+        'scheduler_thread_alive': bool(scheduler_thread_alive),
+        'runner_started_at': started_at,
+        'heartbeat_age_seconds': round(heartbeat_age, 1) if heartbeat_age is not None else None,
+        'failure': failure,
+        'issues': issues,
+    }
+
+
+@contextmanager
+def _trade_then_config(system):
+    """所有影响交易的配置提交统一按 trade→config 顺序加锁。
+
+    非阻塞获取可避免 HTTP 请求在一次长交易重试后方继续提交用户早已放弃的修改。
+    """
+    acquired = system._trade_lock.acquire(blocking=False)
+    if not acquired:
+        yield False
+        return
+    try:
+        with system._config_lock:
+            yield True
+    finally:
+        system._trade_lock.release()
+
+
+def _explicit_null_error(data, fields):
+    for field in fields:
+        if field in data and data[field] is None:
+            return f'{field} 不允许为 null；请提供有效值或省略该字段'
+    return None
 
 
 def require_auth(f):
@@ -154,7 +343,8 @@ def _persist_config():
 def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_message):
     """配置提交：持久化整份 config；写盘失败把 config[section][sub]（sub 为 None 则整段）
     回滚为 backup，并返回 500 错误响应；成功则 reload 策略并返回 None。
-    必须在 system._config_lock 内调用（写路由的统一收口，替代五处重复样板）。"""
+    必须在固定顺序的 system._trade_lock → system._config_lock 内调用
+    （写路由的统一收口，替代五处重复样板）。"""
     if not _persist_config():
         if sub_key is None:
             system.config[section_key] = backup
@@ -179,11 +369,14 @@ def api_login():
     ip = request.remote_addr or 'unknown'
     now = time.time()
     with _login_guard:
+        _prune_login_failures(now)
         _fails, locked_until = _login_failures.get(ip, (0, 0.0))
         if now < locked_until:
             return jsonify({'success': False,
                             'message': f'登录失败次数过多，请 {int(locked_until - now) + 1} 秒后再试'}), 429
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
     # 恒定时间比较，消除密码校验的计时侧信道（与 API Token 的 compare_digest 口径一致）。
     # 必须编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，含中文等非 ASCII 密码
     # 会抛 TypeError 令登录彻底失效；bytes 无此限制。str() 兜底防 password 传非字符串。
@@ -194,6 +387,8 @@ def api_login():
         session['authenticated'] = True
         return jsonify({'success': True, 'message': '登录成功'})
     with _login_guard:
+        if ip not in _login_failures:
+            _prune_login_failures(now)
         fails, _ = _login_failures.get(ip, (0, 0.0))
         fails += 1
         locked_until = now + LOGIN_LOCKOUT_SECONDS if fails >= LOGIN_MAX_FAILURES else 0.0
@@ -225,12 +420,29 @@ def get_logs():
     try:
         lines = max(1, min(request.args.get('lines', 50, type=int), 1000))
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
-        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-            all_lines = f.readlines()
-        filtered = [l for l in all_lines if not (' "' in l and 'HTTP/1.1' in l) and 'code 400, message Bad request' not in l]
-        result = filtered[-lines:]
+        # 从文件尾向前按块读取；正常请求不再为 80 行日志整读整个 10MB 文件。
+        chunks = b''
+        result = []
+        with open(log_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            while pos > 0 and len(result) < lines:
+                size = min(8192, pos)
+                pos -= size
+                f.seek(pos)
+                chunks = f.read(size) + chunks
+                raw_lines = chunks.splitlines(keepends=True)
+                # 仍未读到文件头时，首段可能只是某一行的后半截，不能返回乱码半行。
+                candidates = raw_lines if pos == 0 else raw_lines[1:]
+                decoded = [line.decode('utf-8', errors='replace') for line in candidates]
+                result = [line for line in decoded
+                          if not (' "' in line and 'HTTP/1.1' in line)
+                          and 'code 400, message Bad request' not in line]
+        result = result[-lines:]
         result.reverse()
         return jsonify({'logs': result})
+    except FileNotFoundError:
+        return jsonify({'logs': []})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -256,9 +468,15 @@ def get_status():
             stop_residues = list(system.trade_state.get_stop_residues().keys())
         except Exception:
             stop_residues = []
+        try:
+            position_quarantines = system.trade_state.get_position_quarantines()
+        except Exception:
+            position_quarantines = {}
         stop_anomalies = dict(getattr(system, '_stop_anomalies', {}) or {})
-        return jsonify({
-            'status': 'running',
+        health = _runner_health(system)
+        payload = {
+            'status': 'running' if health['healthy'] else 'degraded',
+            'health': health,
             'exchange': system.exchange_id,
             'label': system.label,
             'open_positions_count': len(open_positions),
@@ -267,8 +485,10 @@ def get_status():
             'manual_pool_count': len(manual_symbols),
             'stop_residues': stop_residues,
             'stop_anomalies': stop_anomalies,
+            'position_quarantines': position_quarantines,
             'last_symbol_update': last_symbol_update
-        })
+        }
+        return jsonify(payload), (200 if health['healthy'] else 503)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -297,19 +517,18 @@ def add_symbol():
         return err
     try:
         data = request.get_json(silent=True)
-        if not data or 'name' not in data:
+        if not isinstance(data, dict) or 'name' not in data:
             return jsonify({'error': '缺少必要参数'}), 400
+        null_error = _explicit_null_error(
+            data, ('name', 'risk_per_trade', 'strategy', 'enabled'))
+        if null_error:
+            return jsonify({'error': null_error}), 400
 
-        # 显式 null 与缺省同义：.get 的默认值只覆盖「键不存在」，覆盖不了 "risk_per_trade": null——
-        # None 会穿过校验（视为未提供），随后 clean[键] 抛 KeyError 变 500 而非干净 400/默认值
-        risk_in = data.get('risk_per_trade')
-        strategy_in = data.get('strategy')
-        enabled_in = data.get('enabled')
         clean, invalid = _validate_symbol_input(
             data.get('name'),
-            0.01 if risk_in is None else risk_in,
-            'turtle' if strategy_in is None else strategy_in,
-            True if enabled_in is None else enabled_in)
+            data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
+            data['strategy'] if 'strategy' in data else 'turtle',
+            data['enabled'] if 'enabled' in data else True)
         if invalid:
             return jsonify({'error': invalid}), 400
         new_symbol = {  # 全部用规范化值：name 大写、risk float、enabled 真 bool
@@ -329,9 +548,14 @@ def add_symbol():
         except Exception:
             return jsonify({'error': f"交易所验证失败: {new_symbol['name']} 不是有效的永续合约交易对"}), 400
 
-        with system._config_lock:
+        with _trade_then_config(system) as locked:
+            if not locked:
+                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对已存在'}), 400
+            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
+            if callable(pending_getter) and pending_getter(new_symbol['name']):
+                return jsonify({'error': f"{new_symbol['name']} 存在未收口订单，禁止重新加入/改配"}), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'].append(new_symbol)
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，交易对未添加')
@@ -381,59 +605,58 @@ def update_symbol(symbol):
         return err
     try:
         data = request.get_json(silent=True)
-        if not data:
+        if not isinstance(data, dict) or not data:
             return jsonify({'error': '缺少参数'}), 400
+        null_error = _explicit_null_error(data, ('risk_per_trade', 'strategy', 'enabled'))
+        if null_error:
+            return jsonify({'error': null_error}), 400
         clean, invalid = _validate_symbol_input(
             symbol, data.get('risk_per_trade'), data.get('strategy'), data.get('enabled'))
         if invalid:
             return jsonify({'error': invalid}), 400
-        # 以 clean 为准判断「提供了哪些字段」：显式 null 会穿过校验（视为未提供），
-        # 按 data 判断会在 clean[键] 处抛 KeyError 变 500；null 与缺省统一按未提供处理
         if not any(k in clean for k in ('risk_per_trade', 'strategy', 'enabled')):
             return jsonify({'error': '缺少可更新字段（risk_per_trade / strategy / enabled）'}), 400
         symbol_u = clean['name']
-        # 改策略必须与交易执行互斥（非阻塞取锁，与 instant_open/close_position 同一标准）：
-        # 否则「查持仓→写配置」之间日检/即时开仓恰好为该品种建仓（TOCTOU），护栏被穿过——
-        # 仓位按旧策略建立、池子已是新策略，次日被错误策略接管。改 enabled/risk 无此风险，不加锁。
-        holds_trade_lock = False
-        if 'strategy' in clean:
-            if not system._trade_lock.acquire(blocking=False):
-                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改策略'}), 409
-            holds_trade_lock = True
-        try:
-            # 有持仓时禁止改策略：主循环对在池品种按配置策略托管，改了会让现有仓位换策略出场
+        changes = None
+        with _trade_then_config(system) as locked:
+            if not locked:
+                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
+            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
+            if callable(pending_getter) and pending_getter(symbol_u):
+                return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止修改配置'}), 409
+            # 检查与提交必须同在 trade lock 内；否则检查后日检可开仓，随后策略仍被改掉。
             if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
                 return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
                                          '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
-            with system._config_lock:
-                backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
-                for s in system.config['trading']['symbols']:
-                    if s['name'] == symbol_u:
-                        if 'enabled' in clean:
-                            s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
-                        if 'risk_per_trade' in clean:
-                            s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
-                        if 'strategy' in clean:
-                            s['strategy'] = clean['strategy']
+            backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
+            for s in system.config['trading']['symbols']:
+                if s['name'] == symbol_u:
+                    if 'enabled' in clean:
+                        s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
+                    if 'risk_per_trade' in clean:
+                        s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
+                    if 'strategy' in clean:
+                        s['strategy'] = clean['strategy']
 
-                        err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
-                        if err_resp:
-                            return err_resp
+                    err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
+                    if err_resp:
+                        return err_resp
 
-                        changes = []
-                        if 'enabled' in clean:
-                            changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
-                        if 'risk_per_trade' in clean:
-                            changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
-                        if 'strategy' in clean:
-                            strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
-                            changes.append(f'策略: {strategy_text}')
-                        send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
-                        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已更新'})
+                    changes = []
+                    if 'enabled' in clean:
+                        changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
+                    if 'risk_per_trade' in clean:
+                        changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
+                    if 'strategy' in clean:
+                        strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
+                        changes.append(f'策略: {strategy_text}')
+                    break
+        if changes is None:
             return jsonify({'error': '交易对不存在'}), 404
-        finally:
-            if holds_trade_lock:
-                system._trade_lock.release()
+        # 外部网络通知不得占用 trade→config 双锁：失败重试最长可阻塞
+        # 数十秒，会延迟日检/盘中巡检。
+        send_dingtalk(f'[{system.label}] 更新交易对: {symbol_u}, {", ".join(changes)}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已更新'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -445,12 +668,21 @@ def delete_symbol(symbol):
     if err:
         return err
     try:
-        symbol_u = symbol.upper()
-        with system._config_lock:
+        try:
+            symbol_u = normalize_symbol_name(symbol)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        held = None
+        with _trade_then_config(system) as locked:
+            if not locked:
+                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             # 品种不在池中：直接 404，与 update_symbol 的语义一致。否则「删不存在的品种」
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
             if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对不存在'}), 404
+            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
+            if callable(pending_getter) and pending_getter(symbol_u):
+                return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止删除配置'}), 409
             # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，必须先把策略固化进持仓，
             # 否则删除后 check_and_execute 会按默认 turtle 托管，双均线仓位会被错误管理。
             held = system.trade_state.get_open_position(symbol_u)
@@ -469,6 +701,21 @@ def delete_symbol(symbol):
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，删除已回滚')
             if err_resp:
                 return err_resp
+            # 清理也必须留在同一 trade lock 内；否则锁释放后即时开仓可插入，清理线程
+            # 还拿旧的 exchange-flat 结论删除新仓的信号/T+1 元数据。
+            if not held and hasattr(system.trade_state, 'remove_symbol_metadata'):
+                try:
+                    clear_quarantine = False
+                    if hasattr(system.exchange_api, 'get_position'):
+                        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
+                        exchange_position = system.exchange_api.get_position(ccxt_symbol)
+                        clear_quarantine = not exchange_position or float(
+                            exchange_position.get('contracts') or 0) == 0
+                    system.trade_state.remove_symbol_metadata(
+                        symbol_u, clear_quarantine=clear_quarantine)
+                except Exception as e:
+                    # 查询失败时 fail-closed：不清 quarantine；配置删除本身已成功。
+                    logger.warning(f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')
         send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
         return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
     except Exception as e:
@@ -532,8 +779,31 @@ def get_trades():
     if err:
         return err
     try:
-        trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
-        return jsonify(trades)
+        try:
+            page = int(request.args.get('page', 1))
+            page_size = int(request.args.get('page_size', 100))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'page/page_size 必须是整数'}), 400
+        if page < 1 or not (1 <= page_size <= 200):
+            return jsonify({'error': 'page 必须 >= 1，page_size 必须在 1-200'}), 400
+        page_reader = getattr(system.trade_state, 'get_closed_trades_page', None)
+        if callable(page_reader):
+            selected, total = page_reader(page, page_size)
+        else:
+            all_trades = system.trade_state.get_closed_trades()
+            total = len(all_trades)
+            start = (page - 1) * page_size
+            selected = list(reversed(all_trades))[start:start + page_size]
+        # 接口按最新在前分页，响应和常态内存工作量都限制在 page_size。
+        trades = [enrich_closed_trade_with_fees(t) for t in selected]
+        total_pages = (total + page_size - 1) // page_size
+        return jsonify({
+            'trades': trades,
+            'page': page,
+            'page_size': page_size,
+            'total': total,
+            'total_pages': total_pages,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -545,9 +815,17 @@ def get_trades_summary():
     if err:
         return err
     try:
+        revision_fn = getattr(system.trade_state, 'get_closed_trades_revision', None)
+        revision = revision_fn() if callable(revision_fn) else None
+        cached = getattr(system, '_trades_summary_cache', None)
+        if revision is not None and cached and cached.get('revision') == revision:
+            return jsonify(cached['payload'])
         trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
         if not trades:
-            return jsonify({'total': 0})
+            payload = {'total': 0}
+            if revision is not None:
+                system._trades_summary_cache = {'revision': revision, 'payload': payload}
+            return jsonify(payload)
         total = len(trades)
         wins = [t for t in trades if t.get('pnl', 0) > 0]
         losses = [t for t in trades if t.get('pnl', 0) <= 0]
@@ -563,14 +841,17 @@ def get_trades_summary():
         avg_pnl_pct = sum(t.get('pnl_percent', 0) for t in trades) / total
         max_win = max((t.get('pnl', 0) for t in trades), default=0)
         max_loss = min((t.get('pnl', 0) for t in trades), default=0)
-        return jsonify({
+        payload = {
             'total': total, 'win_count': win_count, 'loss_count': loss_count,
             'win_rate': round(win_rate, 1), 'total_pnl': round(total_pnl, 2),
             'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2),
             'profit_factor': round(profit_factor, 2) if profit_factor else None,
             'avg_pnl_pct': round(avg_pnl_pct, 2),
             'max_win': round(max_win, 2), 'max_loss': round(max_loss, 2)
-        })
+        }
+        if revision is not None:
+            system._trades_summary_cache = {'revision': revision, 'payload': payload}
+        return jsonify(payload)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -611,7 +892,16 @@ def equity_sync():
     if err:
         return err
     try:
-        data = request.get_json(silent=True) or {}
+        # 即使无 flow_amount 也必须发送 JSON 对象 {}：阻断跨站表单 POST，且不把
+        # text/plain / HTML 错误请求静默解释为一次真实的资金基准重置。
+        data = request.get_json(silent=True)
+        if not request.is_json or not isinstance(data, dict):
+            return jsonify({'error': '请求必须是 JSON 对象（无参数时发送 {}）'}), 400
+        unknown = sorted(set(data) - {'flow_amount'})
+        if unknown:
+            return jsonify({'error': f'未知字段: {unknown}；只允许 flow_amount'}), 400
+        if 'flow_amount' in data and data['flow_amount'] is None:
+            return jsonify({'error': 'flow_amount 不允许为 null；请提供有效值或省略该字段'}), 400
         flow_amount = data.get('flow_amount')
         if flow_amount is not None:
             try:
@@ -696,8 +986,20 @@ def update_strategy_params():
         return err
     try:
         data = request.get_json(silent=True)
-        if not data:
+        if not isinstance(data, dict) or not data:
             return jsonify({'error': '缺少参数'}), 400
+        allowed_fields = {
+            'channel_period', 'ma_short_period', 'ma_long_period',
+            'ma_stop_period', 'default_risk_per_trade',
+        }
+        unknown = sorted(set(data) - allowed_fields)
+        if unknown:
+            return jsonify({'error': f'未知策略参数: {unknown}'}), 400
+        null_error = _explicit_null_error(
+            data, ('channel_period', 'ma_short_period', 'ma_long_period',
+                   'ma_stop_period', 'default_risk_per_trade'))
+        if null_error:
+            return jsonify({'error': null_error}), 400
         # 范围硬校验：非法值 400，不写配置、不 reload（周期严格整数；短期必须小于长期；风险度限幅）
         # strict_int 与启动校验同源：28.9 拒绝而非截断，三入口口径完全一致
         try:
@@ -714,14 +1016,18 @@ def update_strategy_params():
                 )
         except (TypeError, ValueError) as e:
             return jsonify({'error': f'参数不是有效数字: {e}'}), 400
-        cur = system.config.get('strategy', {})
-        eff_short = parsed.get('ma_short_period', cur.get('ma_short_period', 7))
-        eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
-        if eff_short >= eff_long:
-            return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
-
+        if not parsed:
+            return jsonify({'error': '缺少可更新策略参数'}), 400
         changed = []
-        with system._config_lock:
+        params_snapshot = None
+        with _trade_then_config(system) as locked:
+            if not locked:
+                return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
+            cur = system.config.get('strategy', {})
+            eff_short = parsed.get('ma_short_period', cur.get('ma_short_period', 7))
+            eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
+            if eff_short >= eff_long:
+                return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
             backup = json.loads(json.dumps(system.config.get('strategy', {})))
             sp = system.config.setdefault('strategy', {})
 
@@ -737,8 +1043,9 @@ def update_strategy_params():
             err_resp = _commit_config_or_rollback(system, 'strategy', None, backup, '配置写入失败，策略参数更新已回滚')
             if err_resp:
                 return err_resp
-            send_dingtalk(f'[{system.label}] 策略参数更新: {", ".join(changed)}')
-            return jsonify({'status': 'success', 'message': '策略参数已更新', 'params': system.config['strategy']})
+            params_snapshot = json.loads(json.dumps(system.config['strategy']))
+        send_dingtalk(f'[{system.label}] 策略参数更新: {", ".join(changed)}')
+        return jsonify({'status': 'success', 'message': '策略参数已更新', 'params': params_snapshot})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -756,16 +1063,15 @@ def instant_open():
             return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
         try:
             data = request.get_json(silent=True)
-            if not data or 'name' not in data:
+            if not isinstance(data, dict) or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
-
-            # 显式 null 与缺省同义（同 add_symbol：防 None 穿过校验后 clean[键] KeyError → 500）
-            risk_in = data.get('risk_per_trade')
-            strategy_in = data.get('strategy')
+            null_error = _explicit_null_error(data, ('name', 'risk_per_trade', 'strategy'))
+            if null_error:
+                return jsonify({'error': null_error}), 400
             clean, invalid = _validate_symbol_input(
                 data.get('name'),
-                0.01 if risk_in is None else risk_in,
-                'turtle' if strategy_in is None else strategy_in)
+                data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
+                data['strategy'] if 'strategy' in data else 'turtle')
             if invalid:
                 return jsonify({'error': invalid}), 400
             symbol_name = clean['name']
@@ -839,23 +1145,56 @@ def instant_open():
             symbol_config = {'name': symbol_name, 'enabled': True,
                              'risk_per_trade': risk_per_trade, 'strategy': strategy_type}
             # buffer_notification=False：本路由下方自发专属钉钉，不进日检汇总缓冲
-            system._execute_open(symbol_name, signal_side, current_price, stop_loss_price, symbol_config,
-                                 buffer_notification=False)
+            outcome = system._execute_open(
+                symbol_name, signal_side, current_price, stop_loss_price,
+                symbol_config, buffer_notification=False)
 
             new_position = system.trade_state.get_open_position(symbol_name)
-            if not new_position:
-                return jsonify({'error': f'{symbol_name} 开仓执行失败，请查看日志'}), 500
+            outcome_status = outcome.get('status') if isinstance(outcome, dict) else None
 
-            with system._config_lock:
-                exists = any(s['name'] == symbol_name for s in system.config['trading']['symbols'])
-                if not exists:
-                    backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
-                    system.config['trading']['symbols'].append(symbol_config)
-                    err_resp = _commit_config_or_rollback(
-                        system, 'trading', 'symbols', backup_symbols,
-                        f'{symbol_name} 已开仓，但写入交易对配置失败，请检查磁盘和配置文件')
-                    if err_resp:
-                        return err_resp
+            # rollback_incomplete 也会建立 quarantined 余仓账本。它不是“开仓成功”，
+            # 但仍须加入配置托管，不能因 HTTP 失败响应让真钱余仓退出日常管理。
+            if new_position:
+                with system._config_lock:
+                    exists = any(
+                        s['name'] == symbol_name
+                        for s in system.config['trading']['symbols'])
+                    if not exists:
+                        backup_symbols = json.loads(json.dumps(
+                            system.config['trading']['symbols']))
+                        system.config['trading']['symbols'].append(symbol_config)
+                        err_resp = _commit_config_or_rollback(
+                            system, 'trading', 'symbols', backup_symbols,
+                            f'{symbol_name} 已产生交易所余仓，但写入交易对配置失败，'
+                            '请立即检查磁盘和配置文件')
+                        if err_resp:
+                            return err_resp
+
+            if outcome_status != 'opened':
+                if new_position:
+                    return jsonify({
+                        'status': 'quarantined',
+                        'error': (f'{symbol_name} 开仓未能完整收口，交易所余仓已建账并'
+                                  '隔离托管；这不是开仓成功，请立即人工核对持仓与止损'),
+                        'outcome_status': outcome_status or 'unknown',
+                        'position': {
+                            'symbol': symbol_name,
+                            'side': new_position.get('side'),
+                            'position_size': new_position.get('position_size'),
+                            'stop_order_id': new_position.get('stop_order_id'),
+                        },
+                    }), 409
+                status_code = 409 if outcome_status in {
+                    'rolled_back', 'order_unresolved', 'attribution_unresolved'} else 500
+                return jsonify({
+                    'error': f'{symbol_name} 开仓未成功，请查看日志',
+                    'outcome_status': outcome_status or 'unknown',
+                }), status_code
+
+            if not new_position:
+                return jsonify({
+                    'error': f'{symbol_name} 返回 opened 但本地无持仓，状态不一致',
+                }), 500
 
             direction_text = '做多' if signal_side == 'long' else '做空'
             strategy_text = '海龟通道' if strategy_type == 'turtle' else '双均线EMA'
@@ -892,7 +1231,7 @@ def close_position():
             return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
         try:
             data = request.get_json(silent=True)
-            if not data or 'name' not in data:
+            if not isinstance(data, dict) or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
 
             try:
@@ -904,11 +1243,45 @@ def close_position():
                 return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-            close_order = system.exchange_api.close_position(ccxt_symbol, position['side'], position['position_size'])
+            submit_close = getattr(system, '_submit_persisted_close', None)
+            if callable(submit_close):
+                close_order = submit_close(
+                    symbol_name, ccxt_symbol, position, 'API 手动平仓')
+            else:
+                # 兼容旧测试桩；真实 TradingSystem 必须走持久化 close intent。
+                close_order = system.exchange_api.close_position(
+                    ccxt_symbol, position['side'], position['position_size'])
             if not close_order:
                 return jsonify({'error': f'{symbol_name} 平仓失败'}), 500
 
-            actual_price = close_order.get('average', None)
+            reject_partial = getattr(system, '_reject_partial_close', None)
+            if close_order.get('fully_closed') is False:
+                handle_partial = getattr(system, '_handle_partial_close', None)
+                safely_reconciled = False
+                if callable(handle_partial):
+                    safely_reconciled = bool(handle_partial(
+                        symbol_name, close_order, position, '手动平仓'))
+                elif callable(reject_partial):
+                    reject_partial(symbol_name, close_order, '手动平仓')
+                else:
+                    logger.critical(f'{symbol_name} 手动平仓仅部分成交，保留账本和止损')
+                # 绝不能继续撤掉保护余仓的止损或删除完整本地账本。
+                return jsonify({
+                    'status': 'partial',
+                    'error': (f'{symbol_name} 仅部分平仓，交易所仍有余仓；'
+                              f'{"账本已按余仓缩减且止损已收口" if safely_reconciled else "安全收口失败，请立即人工复核"}'),
+                    'closed_amount': close_order.get('amount'),
+                    'remaining_amount': close_order.get('remaining_amount'),
+                    'safely_reconciled': safely_reconciled,
+                }), 409
+
+            warn_ambiguous = getattr(system, '_warn_ambiguous_close_execution', None)
+            if callable(warn_ambiguous):
+                warn_ambiguous(symbol_name, close_order, '手动平仓')
+
+            # 仓位变化与订单成交量不一致时，订单 VWAP 不能代表完整平仓，使用保守行情回退。
+            actual_price = None if close_order.get('execution_ambiguous') \
+                else close_order.get('average', None)
             if actual_price and isinstance(actual_price, str):
                 actual_price = float(actual_price)
             if not actual_price:
@@ -916,13 +1289,27 @@ def close_position():
                     actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
                 except Exception:
                     actual_price = position['entry_price']
+            if close_order.get('fee') is not None or close_order.get('fees'):
+                logger.info(
+                    f"{symbol_name} 手动平仓真实手续费: fee={close_order.get('fee')}, "
+                    f"fees={close_order.get('fees')}")
 
             if not system._cancel_stop_order_confirmed(symbol_name, ccxt_symbol, position.get('stop_order_id')):
                 logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
 
             # 记平 + 落盘失败的运行时补偿 + 告警 + 止损异常警示清理，统一复用主系统的收口方法
+            extract_fee = getattr(system, '_extract_usdt_fee', None)
+            exit_fee, exit_fee_currency = (
+                extract_fee(close_order) if callable(extract_fee) else (None, None))
+            order_ids_getter = getattr(system, '_order_ids', None)
+            exit_order_ids = (
+                order_ids_getter(close_order) if callable(order_ids_getter) else [])
             closed_position, state_saved = system._close_trade_state_with_runtime_fallback(
-                symbol_name, actual_price, "手动平仓")
+                symbol_name, actual_price, "手动平仓",
+                exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
+                exit_order_ids=exit_order_ids,
+                close_intent_client_id=close_order.get(
+                    'close_intent_client_id'))
             if not state_saved:
                 return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
 
@@ -1017,12 +1404,13 @@ def _set_manual_check_running(value):
 @require_auth
 def manual_check():
     """手动触发交易信号检查（后台线程执行，防重入）。"""
+    global _manual_check_thread
     system, err = _require_system()
     if err:
         return err
     # 要求 JSON body（空 {} 即可）：其余写接口因解析 JSON 天然免疫跨站表单，
     # 本接口原本无参数，补上同等门槛（防 CSRF 触发手动检查）
-    if request.get_json(silent=True) is None:
+    if not isinstance(request.get_json(silent=True), dict):
         return jsonify({'error': '请求须携带 JSON body（空对象 {} 即可），'
                                  '例如: curl -X POST -H "Content-Type: application/json" -d "{}"'}), 400
     if not _set_manual_check_running(True):
@@ -1031,15 +1419,21 @@ def manual_check():
         logger.info(f"[{system.label}] 手动触发交易检查")
 
         def run_check():
+            global _manual_check_thread, _manual_check_running
             try:
                 system.check_and_execute_trades(manual_run=True)
                 logger.info(f"[{system.label}] 手动触发的交易检查执行完毕")
             except Exception as e:
                 logger.error(f"[{system.label}] 手动触发的交易检查失败: {e}")
             finally:
-                _set_manual_check_running(False)
+                with _manual_check_guard:
+                    _manual_check_running = False
+                    _manual_check_thread = None
 
-        threading.Thread(target=run_check, daemon=True).start()
+        thread = threading.Thread(target=run_check, name='manual-trade-check', daemon=True)
+        with _manual_check_guard:
+            _manual_check_thread = thread
+        thread.start()
         return jsonify({'status': 'running', 'message': '交易检查已触发，正在后台执行...'})
     except Exception as e:
         _set_manual_check_running(False)
@@ -1058,7 +1452,12 @@ def _bootstrap():
 
 
 if __name__ == '__main__':
+    from runtime_guard import acquire_runner_lock
+    acquire_runner_lock()
     _bootstrap()
-    threading.Thread(target=trading_system.start, daemon=True).start()
-    logger.info("HTTP API 服务器启动在 0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    start_runner_thread(trading_system)
+    logger.info("HTTP API 服务器启动在 127.0.0.1:5000")
+    try:
+        app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
+    finally:
+        stop_runner_thread()

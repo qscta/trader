@@ -145,7 +145,8 @@ class MaCrossStrategy:
     def check_reentry_condition(self, df):
         """
         检查止损后重入条件
-        重入前提：EMA短期仍高于EMA长期（多头环境）
+        重入方向跟随当前 EMA 环境：短期高于长期做多，低于长期做空。
+        只有两线精确相等、暂无明确方向时不重入。
 
         返回: (should_reenter, side, signal)
         """

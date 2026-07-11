@@ -132,8 +132,12 @@ async function refreshStatus() {
     try {
         const res = await authFetch('/api/status');
         const data = await res.json();
-        el('statusDot').className = 'status-dot';
-        setText('statusText', '运行中 · ' + (data.label || '欧易'));
+        const healthy = res.ok && data.status === 'running';
+        el('statusDot').className = healthy ? 'status-dot' : 'status-dot offline';
+        const healthIssues = (data.health && data.health.issues) || [];
+        setText('statusText', healthy
+            ? '运行中 · ' + (data.label || '欧易')
+            : '异常 · ' + (healthIssues.join(', ') || data.error || 'runner 不健康'));
         setText('symbolCount', data.enabled_symbols ? data.enabled_symbols.length : 0);
 
         // 止损残留阻断 / 止损状态异常：高风险状态在顶栏常驻显示，不能只靠一条钉钉
@@ -148,10 +152,14 @@ async function refreshStatus() {
             }
         }
         const anomalies = Object.keys(data.stop_anomalies || {});
+        const quarantines = Object.keys(data.position_quarantines || {});
         const aPill = el('anomalyPill');
         if (aPill) {
-            if (anomalies.length) {
-                setText('anomalyText', '⚠ 止损异常待人工: ' + anomalies.join(', '));
+            if (anomalies.length || quarantines.length) {
+                const warnings = [];
+                if (anomalies.length) warnings.push('止损异常: ' + anomalies.join(', '));
+                if (quarantines.length) warnings.push('仓位隔离: ' + quarantines.join(', '));
+                setText('anomalyText', '⚠ ' + warnings.join(' · '));
                 aPill.classList.remove('hidden');
             } else {
                 aPill.classList.add('hidden');
@@ -387,11 +395,11 @@ async function loadSymbols() {
         window._symbolsData = symbols;
         // 品种池构成直接在此更新，不依赖 loadAccountStats 的返回时序
         let _t = 0, _m = 0;
-        symbols.forEach(s => { if (s.strategy === 'turtle') _t++; else _m++; });
+        symbols.forEach(s => { if ((s.strategy || 'turtle') === 'turtle') _t++; else _m++; });
         setText('symbolPoolDetail', symbols.length ? ('海龟 ' + _t + ' · 均线 ' + _m) : '');
         if (!symbols.length) { box.innerHTML = '<div class="empty">品种池为空，添加一个交易对</div>'; return; }
         let rows = symbols.map(s => {
-            const stratBadge = s.strategy === 'turtle' ? '<span class="badge badge-turtle">海龟</span>' : '<span class="badge badge-ma">双均线</span>';
+            const stratBadge = (s.strategy || 'turtle') === 'turtle' ? '<span class="badge badge-turtle">海龟</span>' : '<span class="badge badge-ma">双均线</span>';
             const stateBadge = s.enabled ? '<span class="badge badge-on">启用</span>' : '<span class="badge badge-off">禁用</span>';
             const holding = s.has_open_position ? '<span class="badge badge-holding">持仓中</span>' : '';
             return `<tr>
@@ -412,7 +420,8 @@ async function loadSymbols() {
 async function addSymbol() {
     const name = el('symbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
-    const risk = parseFloat(el('riskPerTrade').value) / 100;
+    const risk = Number(el('riskPerTrade').value) / 100;
+    if (!Number.isFinite(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
     const strategy = el('symbolStrategy').value;
     try {
         const res = await postJSON('/api/symbols', { name, risk_per_trade: risk, strategy });
@@ -442,8 +451,8 @@ async function toggleSymbol(symbol, enabled) {
 async function updateSymbolRisk(symbol, currentRisk) {
     const v = prompt('输入新的风险度 (%)', (currentRisk * 100).toFixed(1));
     if (v == null) return;
-    const risk = parseFloat(v) / 100;
-    if (isNaN(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
+    const risk = Number(v) / 100;
+    if (!Number.isFinite(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
     try {
         const res = await authFetch('/api/symbols/' + symbol, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ risk_per_trade: risk }) });
         if (res.ok) { showAlert('已更新', 'success'); loadSymbols(); } else showAlert('更新失败', 'error');
@@ -454,7 +463,8 @@ async function updateSymbolRisk(symbol, currentRisk) {
 async function instantOpen() {
     const name = el('instantSymbolName').value.trim().toUpperCase();
     if (!name) { showAlert('请输入交易对', 'error'); return; }
-    const risk = parseFloat(el('instantRiskPerTrade').value) / 100;
+    const risk = Number(el('instantRiskPerTrade').value) / 100;
+    if (!Number.isFinite(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
     const strategy = el('instantStrategy').value;
     const out = el('instantResult');
     out.className = 'result-line'; out.textContent = '检测信号并开仓中...';
@@ -481,7 +491,10 @@ async function closePosition(symbol, side, size) {
         const res = await postJSON('/api/close_position', { name: symbol });
         const data = await res.json();
         if (res.ok) { showAlert(symbol + ' 平仓成功', 'success'); loadPositions(); refreshStatus(); }
-        else showAlert(data.error || '平仓失败', 'error');
+        else {
+            showAlert(data.error || '平仓失败', 'error');
+            if (data.status === 'partial') { loadPositions(); refreshStatus(); }
+        }
     } catch (e) { showAlert('网络错误', 'error'); }
 }
 
@@ -500,12 +513,24 @@ async function loadStrategyParams() {
 
 async function saveStrategyParams() {
     const out = el('strategyParamResult');
+    const periods = [
+        Number(el('paramChannelPeriod').value),
+        Number(el('paramMaShort').value),
+        Number(el('paramMaLong').value),
+        Number(el('paramMaStop').value),
+    ];
+    const defaultRisk = Number(el('paramDefaultRisk').value) / 100;
+    if (!periods.every(Number.isInteger) || !Number.isFinite(defaultRisk) || defaultRisk <= 0) {
+        out.className = 'result-line err';
+        out.textContent = '策略周期必须是整数，默认风险度必须是正数';
+        return;
+    }
     const body = {
-        channel_period: parseInt(el('paramChannelPeriod').value),
-        ma_short_period: parseInt(el('paramMaShort').value),
-        ma_long_period: parseInt(el('paramMaLong').value),
-        ma_stop_period: parseInt(el('paramMaStop').value),
-        default_risk_per_trade: parseFloat(el('paramDefaultRisk').value) / 100,
+        channel_period: periods[0],
+        ma_short_period: periods[1],
+        ma_long_period: periods[2],
+        ma_stop_period: periods[3],
+        default_risk_per_trade: defaultRisk,
     };
     try {
         const res = await authFetch('/api/strategy_params', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -521,8 +546,8 @@ async function syncEquity() {
     const body = {};
     let tip = '锚定方式：最近指数值（须在入金/出金后 5 分钟内点击才准确）';
     if (raw !== '') {
-        const v = parseFloat(raw);
-        if (isNaN(v)) { showAlert('净变动金额无效', 'error'); return; }
+        const v = Number(raw);
+        if (!Number.isFinite(v)) { showAlert('净变动金额无效', 'error'); return; }
         body.flow_amount = v;
         tip = `净变动 ${v >= 0 ? '+' : ''}${v} USDT，按变动前权益精确锚定（不受点击时间影响）`;
     }
@@ -546,16 +571,17 @@ async function loadTrades() {
     const box = el('tradesList');
     try {
         const [tr, sr] = await Promise.all([
-            authFetch('/api/trades'),
+            authFetch('/api/trades?page=1&page_size=200'),
             authFetch('/api/trades_summary'),
         ]);
-        const trades = await tr.json();
+        const tradePage = await tr.json();
+        const trades = tradePage.trades || [];
         const summary = await sr.json();
         if (summary && summary.total) {
             setText('tradesSummary', `共 ${summary.total} 笔 · 胜率 ${summary.win_rate}% · 净盈亏 ${fmt(summary.total_pnl)}U · 盈亏比 ${summary.profit_factor ?? '-'}`);
         } else setText('tradesSummary', '暂无成交');
         if (!trades || !trades.length) { box.innerHTML = '<div class="empty">暂无历史交易</div>'; return; }
-        const rows = trades.slice().reverse().map(t => {
+        const rows = trades.map(t => {
             const side = t.side === 'long' ? '<span class="badge badge-long">多</span>' : '<span class="badge badge-short">空</span>';
             const closeTime = (t.close_time || '').replace('T', ' ').slice(0, 16);
             const pnl = `<span class="${pnlClass(t.pnl)}">${t.pnl>=0?'+':''}${fmt(t.pnl)}</span>`;

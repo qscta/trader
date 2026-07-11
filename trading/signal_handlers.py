@@ -6,7 +6,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
-stop_loss_dates / is_stop_loss_today / record_stop_loss / _save_stop_loss_dates /
+stop_loss_dates / is_stop_loss_today / record_stop_loss / clear_stop_loss /
 _handle_exchange_flat_close / _get_strategy_display_name /
 _notify_missing_position_after_signal / _execute_open / _update_stop_order /
 handle_close_signal / _flip_position。
@@ -21,15 +21,11 @@ logger = logging.getLogger(__name__)
 class SignalHandlersMixin:
 
     def _mark_ma_cross_reentry_pending(self, symbol, side, signal, reason):
-        """双均线开仓腿失败后统一收口：记 T+1「重入待定」标记 + 告警。
+        """双均线开仓腿失败后统一告警；K 线不推进，由日内调度幂等重试。
 
-        双均线「永远在市」：任一开仓腿失败（初始金叉/死叉开仓、翻转反手、T+1 重入）若不留
-        恢复线索，该品种会一直空到下一次全新 EMA 交叉。记 T+1 让次日 handle_no_position_ma_cross
-        的重入逻辑按当时 EMA 方向自动补回持仓——与止损后 T+1 重入同一套机制。
-        （标记记为当天：当日不再抢开，交由次日重入；同日 08:01 整轮重试对孤立失败本不触发，
-        故不抑制既有恢复。）
+        T+1 只属于真实止损事件。把网络/下单失败伪装成“今天已止损”会阻断
+        08:01/30 分钟重试，并在主调度错误推进 candle 后永久吞掉交叉。
         """
-        self.record_stop_loss(symbol)
         self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
 
     def handle_no_position_turtle(self, symbol, signal, symbol_config, df):
@@ -69,7 +65,8 @@ class SignalHandlersMixin:
                 logger.warning(f"{symbol} [海龟] 检测到交易所端已无持仓，止损单可能已触发")
                 exit_price = position.get('stop_loss_price', signal['current_close'])
                 closed_position, state_saved, stop_cleared = self._handle_exchange_flat_close(
-                    symbol, ccxt_symbol, position, exit_price, "海龟止损确认")
+                    symbol, ccxt_symbol, position, exit_price, "海龟止损确认",
+                    strategy_type='turtle')
                 if not closed_position:
                     return
                 if not state_saved:
@@ -161,7 +158,13 @@ class SignalHandlersMixin:
         entry_price = signal['current_close']
         stop_loss_price = signal['lower_line'] if side == 'long' else signal['upper_line']
 
-        self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
+        outcome = self._execute_open(
+            symbol, side, entry_price, stop_loss_price, symbol_config,
+            client_order_id=signal.get('_client_order_id'))
+        # 主调度在统一出口据此决定 confirmed/重试；嵌套的“平旧再开新”路径也
+        # 不会丢失成功回滚或部分回滚终态。
+        signal['_execution_outcome'] = outcome
+        return outcome
 
     def check_and_update_stop_loss_turtle(self, symbol, signal, position):
         """海龟策略：检查并更新止损单（含方向保护）"""
@@ -204,7 +207,7 @@ class SignalHandlersMixin:
                     symbol,
                     'long',
                     signal,
-                    '双均线做多信号已出现，但本轮检查结束后仍无持仓，已记 T+1 次日按 EMA 方向重入'
+                    '双均线做多信号已出现，但本轮检查结束后仍无持仓；保留本根 K 线等待日内重试'
                 )
         elif signal['action'] == 'short':
             logger.info(f"{symbol} [双均线] 死叉信号，准备做空...")
@@ -216,7 +219,7 @@ class SignalHandlersMixin:
                     symbol,
                     'short',
                     signal,
-                    '双均线做空信号已出现，但本轮检查结束后仍无持仓，已记 T+1 次日按 EMA 方向重入'
+                    '双均线做空信号已出现，但本轮检查结束后仍无持仓；保留本根 K 线等待日内重试'
                 )
         else:
             yesterday_str = None
@@ -235,10 +238,8 @@ class SignalHandlersMixin:
                     logger.info(f"{symbol} [双均线] T+1重入: 方向={side}, EMA仍然{'看多' if side == 'long' else '看空'}")
                     self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
                     if self.trade_state.get_open_position(symbol):
-                        # 重入成功：解除 T+1 标记，回归常规「永远在市」。标记通常已在
-                        # _execute_open 成功路径统一清除，此处 pop 幂等兜底（del 会 KeyError）
-                        self.stop_loss_dates.pop(symbol, None)
-                        self._save_stop_loss_dates()
+                        # 重入成功：解除 T+1 标记，回归常规「永远在市」
+                        self.clear_stop_loss(symbol)
                     else:
                         # 重入开仓未成功（价格已穿止损/超时未确认/残留阻断等）：**保留** T+1 标记，
                         # 次日 EMA 方向仍成立则再重试重入，不放弃「永远在市」（此前无条件删除会永久放弃）
@@ -251,10 +252,9 @@ class SignalHandlersMixin:
                         )
                         logger.warning(f"{symbol} [双均线] T+1 重入开仓未成功，保留标记次日重试")
                 else:
-                    logger.info(f"{symbol} [双均线] 重入条件不满足（EMA方向已变），不重入")
-                    if symbol in self.stop_loss_dates:
-                        del self.stop_loss_dates[symbol]
-                        self._save_stop_loss_dates()
+                    # 只有两条 EMA 精确相等时才会进入此分支；方向并未“改变”。
+                    # 保留 T+1 标记，下一根已收盘 K 线再按明确 EMA 方向重试。
+                    logger.info(f"{symbol} [双均线] EMA 短长线暂时相等，无明确方向，保留 T+1 标记")
 
     def handle_open_position_ma_cross(self, symbol, signal, position, symbol_config, df):
         """双均线策略：处理已开仓头寸"""
@@ -268,13 +268,13 @@ class SignalHandlersMixin:
                 logger.warning(f"{symbol} [双均线] 检测到交易所端已无持仓，止损单可能已触发")
                 exit_price = position.get('stop_loss_price', signal['current_close'])
                 closed_position, state_saved, _stop_cleared = self._handle_exchange_flat_close(
-                    symbol, ccxt_symbol, position, exit_price, "双均线止损确认")
+                    symbol, ccxt_symbol, position, exit_price, "双均线止损确认",
+                    strategy_type='ma_cross')
                 if not closed_position:
                     return
                 if not state_saved:
                     logger.warning(f"{symbol} [双均线] 止损确认已执行，但本地状态落盘失败，本轮不记录 T+1")
                     return
-                self.record_stop_loss(symbol)
                 # 出场价传原始数值（与盘中巡检同口径），不做 .4f 假精度格式化
                 self.notifier.notify_stop_loss_triggered(
                     symbol,
