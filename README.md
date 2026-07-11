@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-186%20stdlib%20%2B%2079%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-373%20stdlib%20%2B%20105%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -20,17 +20,18 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 > 作者不对任何盈亏承担责任。程序化合约交易可能导致本金全部损失。任何人在投入真实资金前，
 > 必须先用 OKX 模拟盘（sandbox）跑通 `verify_okx.py` 全链路，并自行完整审计代码与风控。
 >
-> **本仓库只存放代码。** 凭据（`config.json`）、交易账本（`trade_state.json`）、权益数据、
+> **当前代码树只应存放代码。** 凭据（`config.json`）、交易账本（`trade_state.json`）、权益数据、
 > 日志与备份都属于部署机，已被 `.gitignore` 排除，任何时候不得提交。
+> 早期 Git 历史曾包含运行时文件；当前工作树干净不等于历史已净化，详见 [`SECURITY.md`](SECURITY.md)。
 
 ## ✨ 设计要点
 
 - **以损定量**——无论标的波动大小，单笔止损打掉的都是账户的固定比例（默认 1%）。开仓用实时市价而非信号收盘价计算仓位，成交后二次风险校验。
-- **止损即交易所侧算法单**——reduce-only 条件单，触发后市价平仓；进程宕机期间止损依然生效。
-- **三条防线保证「止损永远在、账本永远真」**——账本 fail-closed（损坏/误删拒绝启动，绝不失忆运行）、验证式撤单（以「查不到该单」为撤销成功标准）、止损自愈巡检（每 5 分钟三态校验，缺失自动补挂）。
+- **止损即交易所侧算法单**——reduce-only 条件单，触发后市价平仓；已经 OKX 清单查询确认存在的止损，在本进程宕机期间仍由交易所托管。
+- **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **265 个测试**——186 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 79 个依赖版集成用例。
+- **478 个测试**——373 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 105 个依赖版集成用例。
 
 ## 🏗️ 架构
 
@@ -75,8 +76,10 @@ cd trading
 pip install -r requirements.txt
 cp config.example.json config.json        # 填入 OKX 凭据与钉钉 webhook（或用环境变量）
 
-python verify_okx.py BTCUSDT               # 只读检查；上实盘前必须用模拟盘跑完整验证
-gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```
 
 凭据也可用环境变量注入（优先于 config.json）：
@@ -87,11 +90,16 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 | 要求 | 原因 |
 |---|---|
 | 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC）；系统启动时校验 UTC+8，不符告警 |
-| `gunicorn -w 1`（单 worker） | 多 worker 会重复初始化交易系统；`wsgi.py` 文件锁兜底，多余 worker 直接拒启 |
-| 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；缺 `FLASK_SECRET_KEY` 拒绝启动 |
+| `gunicorn -c gunicorn.conf.py` | 固定单 worker + gthread；120 秒请求超时、900 秒优雅退出窗口，避免在 OKX 长重试/交易收尾中误杀 runner |
+| 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；`FLASK_SECRET_KEY` 必须是至少 32 字节的随机值，缺失或过短均拒绝启动 |
+| 自定义 `TRADING_RUNNER_LOCK_FILE` 时使用专用 0700 目录 | 不得直接指向 `/tmp/runner.lock` 等共享目录；例如 `/run/user/$UID/trader/runner.lock` |
+| 反代部署显式设置 `TRADING_PROXYFIX_X_FOR=1` | 默认 0（不信任任何 XFF）；仅在确有一层可信反代时设 1，双层设 2 |
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
 | 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
-| 上实盘前跑通 `python verify_okx.py`（sandbox） | 张数换算 / 止损算法单 / 撤单 / 单向模式只能真连交易所自证，代码审查不能替代 |
+| 当前提交在模拟盘跑通上述普通全链路 + long/short 两个 `--fire` | 张数换算 / 止损触发 / 撤单 / 单向模式只能真连交易所自证；超时未触发属“不确定”，必须调参重试 |
+
+`FLASK_SECRET_KEY` 可用 `python3 -c 'import secrets; print(secrets.token_hex(32))'`
+生成；生成后仅放在部署环境的 secret manager / 环境变量中。
 
 > **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——
 > 锁文件必须来自实际运行环境（ccxt 行为随版本漂移，正是适配层反复警示的风险），不要在 CI/开发机生成。
@@ -101,10 +109,10 @@ gunicorn -w 1 -b 0.0.0.0:5000 wsgi:application
 ```bash
 cd trading
 
-# 186 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 373 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
-# 79 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
+# 105 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
 pip install -r requirements.txt
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```

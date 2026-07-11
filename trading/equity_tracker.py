@@ -9,17 +9,28 @@
 锁实例化、以及持久化失败/消息推送改为回调。
 """
 
+import copy
 import json
 import logging
+import math
 import os
 import threading
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
-from trade_state import atomic_write_json
+from trade_state import (atomic_write_json, open_private_text_file,
+                         private_file_exists)
 import config_validation as cfgv
 
 logger = logging.getLogger(__name__)
+
+
+class EquityStatePersistenceError(RuntimeError):
+    """权益/指数辅助状态无法被可信读取或保存。"""
+
+
+def _reject_nonfinite_json(value):
+    raise ValueError(f'JSON 不允许非有限数字常量: {value}')
 
 
 def _coerce_positive_float(value):
@@ -32,7 +43,13 @@ def _coerce_positive_float(value):
 
 def _parse_equity_tick_timestamp(ts):
     try:
-        return datetime.fromisoformat(ts)
+        parsed = datetime.fromisoformat(ts)
+        if parsed.tzinfo is not None:
+            # 内部调度/日界统一使用北京时间 naive datetime；把带 offset 的
+            # 合法 ISO 先换算到 UTC+8，再去掉 tzinfo，避免 aware/naive 比较崩溃。
+            parsed = parsed.astimezone(
+                timezone(timedelta(hours=8))).replace(tzinfo=None)
+        return parsed
     except Exception:
         return None
 
@@ -70,45 +87,278 @@ class EquityTracker:
         self.DAILY_EQUITY_FILE = os.path.join(data_dir, 'daily_equity.json')
         self.EQUITY_TICKS_FILE = os.path.join(data_dir, 'equity_ticks.json')
         self.QIUSUO_INDEX_FILE = os.path.join(data_dir, 'qiusuo_index.json')
+        self.EQUITY_SYNC_JOURNAL_FILE = os.path.join(
+            data_dir, '.equity_sync_journal.json')
+        self._recover_equity_sync_journal()
+
+    def _equity_sync_targets(self):
+        return {
+            'peak': (self.PEAK_EQUITY_FILE, dict),
+            'history': (self.EQUITY_HISTORY_FILE, dict),
+            'qiusuo': (self.QIUSUO_INDEX_FILE, dict),
+        }
+
+    def _remove_sync_journal(self):
+        if not private_file_exists(self.EQUITY_SYNC_JOURNAL_FILE):
+            return
+        os.unlink(self.EQUITY_SYNC_JOURNAL_FILE)
+        directory_fd = None
+        try:
+            directory_fd = os.open(
+                self.data_dir,
+                os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            os.fsync(directory_fd)
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _validate_sync_generation(self, generation, field):
+        if not isinstance(generation, dict):
+            raise ValueError(f'权益同步 journal.{field} 必须是对象')
+        for key, (path, expected) in self._equity_sync_targets().items():
+            if key not in generation:
+                raise ValueError(f'权益同步 journal.{field} 缺少 {key}')
+            self._validate_json_shape(generation[key], expected, path)
+
+    def _recover_equity_sync_journal(self):
+        """崩溃后按 journal 整代前滚，绝不加载半旧半新的权益基准。"""
+        if not private_file_exists(self.EQUITY_SYNC_JOURNAL_FILE):
+            return
+        try:
+            with open_private_text_file(self.EQUITY_SYNC_JOURNAL_FILE) as handle:
+                journal = json.load(
+                    handle, parse_constant=_reject_nonfinite_json)
+            if not isinstance(journal, dict) or journal.get('version') != 1:
+                raise ValueError('权益同步 journal 版本非法')
+            old_generation = journal.get('old')
+            new_generation = journal.get('new')
+            self._validate_sync_generation(old_generation, 'old')
+            self._validate_sync_generation(new_generation, 'new')
+            for key, (path, _expected) in self._equity_sync_targets().items():
+                if not atomic_write_json(path + '.bak', old_generation[key]):
+                    raise OSError(f'恢复权益同步时写备份失败: {path}.bak')
+                if not atomic_write_json(path, new_generation[key]):
+                    raise OSError(f'恢复权益同步时写新一代失败: {path}')
+            # journal 删除后，单文件损坏会走普通 .bak 恢复；备份也必须属于
+            # 同一新世代，否则会把三文件重新拆成半旧半新。
+            for key, (path, _expected) in self._equity_sync_targets().items():
+                if not atomic_write_json(path + '.bak', new_generation[key]):
+                    raise OSError(f'恢复权益同步时刷新新世代备份失败: {path}.bak')
+            self._remove_sync_journal()
+            logger.warning('检测到中断的权益同步，已按 journal 完整前滚同一代状态')
+        except Exception as exc:
+            raise EquityStatePersistenceError(
+                f'权益同步 journal 无法恢复，拒绝加载半事务状态: {exc}') from exc
+
+    def _commit_equity_sync_generation(self, old_generation, new_generation):
+        """跨 peak/history/qiusuo 的可恢复多文件事务。"""
+        self._validate_sync_generation(old_generation, 'old')
+        self._validate_sync_generation(new_generation, 'new')
+        journal = {
+            'version': 1, 'created_at': datetime.now().isoformat(),
+            'old': old_generation, 'new': new_generation,
+        }
+        if not atomic_write_json(self.EQUITY_SYNC_JOURNAL_FILE, journal):
+            raise EquityStatePersistenceError('无法写权益同步预提交 journal')
+        try:
+            for key, (path, _expected) in self._equity_sync_targets().items():
+                if not atomic_write_json(path + '.bak', old_generation[key]):
+                    raise OSError(f'写权益同步备份失败: {path}.bak')
+                if not atomic_write_json(path, new_generation[key]):
+                    raise OSError(f'写权益同步新状态失败: {path}')
+            for key, (path, _expected) in self._equity_sync_targets().items():
+                if not atomic_write_json(path + '.bak', new_generation[key]):
+                    raise OSError(f'刷新权益同步新世代备份失败: {path}.bak')
+            self._remove_sync_journal()
+            return True
+        except Exception as commit_error:
+            rollback_ok = True
+            for key, (path, _expected) in self._equity_sync_targets().items():
+                if not atomic_write_json(path, old_generation[key]):
+                    rollback_ok = False
+                if not atomic_write_json(path + '.bak', old_generation[key]):
+                    rollback_ok = False
+            if rollback_ok:
+                try:
+                    self._remove_sync_journal()
+                except Exception:
+                    rollback_ok = False
+            if rollback_ok:
+                raise EquityStatePersistenceError(
+                    f'权益同步提交失败，旧一代已完整恢复: {commit_error}') from commit_error
+            raise EquityStatePersistenceError(
+                f'权益同步提交且同步回滚均失败；journal 已保留，'
+                f'下次启动将前滚恢复: {commit_error}') from commit_error
+
+    @staticmethod
+    def _validate_json_shape(data, expected_type, filepath):
+        if not isinstance(data, expected_type):
+            raise ValueError(
+                f'{filepath} 顶层应为 {expected_type.__name__}，实际为 {type(data).__name__}'
+            )
+        filename = os.path.basename(filepath)
+        if filename.endswith('.bak'):
+            filename = filename[:-4]
+
+        def finite(value, field, *, positive=False, nonnegative=False,
+                   allow_none=False):
+            if value is None and allow_none:
+                return
+            if isinstance(value, bool):
+                raise ValueError(f'{filepath}:{field} 不能是 bool')
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'{filepath}:{field} 必须是有限数') from exc
+            if not math.isfinite(parsed):
+                raise ValueError(f'{filepath}:{field} 必须是有限数')
+            if positive and parsed <= 0:
+                raise ValueError(f'{filepath}:{field} 必须为正')
+            if nonnegative and parsed < 0:
+                raise ValueError(f'{filepath}:{field} 不能为负')
+
+        def iso_time(value, field, *, allow_none=True):
+            if value is None and allow_none:
+                return
+            if not isinstance(value, str) or _parse_equity_tick_timestamp(value) is None:
+                raise ValueError(f'{filepath}:{field} 必须是 ISO 时间或 null')
+
+        if filename == 'peak_equity.json':
+            finite(data.get('peak_equity', 0), 'peak_equity', nonnegative=True)
+            iso_time(data.get('peak_time'), 'peak_time')
+        elif filename == 'equity_history.json':
+            for field in ('max_drawdown', 'longest_drawdown_days'):
+                finite(data.get(field, 0), field, nonnegative=True)
+            for field in ('initial_equity', 'year_start_equity'):
+                finite(data.get(field), field, positive=True, allow_none=True)
+            for field in ('max_dd_time', 'initial_time', 'year_start_time'):
+                iso_time(data.get(field), field)
+        elif filename == 'daily_equity.json':
+            for index, item in enumerate(data):
+                if not isinstance(item, dict):
+                    raise ValueError(f'{filepath}[{index}] 必须是对象')
+                day = item.get('date')
+                if not isinstance(day, str):
+                    raise ValueError(f'{filepath}[{index}].date 必须是 YYYY-MM-DD')
+                datetime.strptime(day, '%Y-%m-%d')
+                for field in ('equity', 'qiusuo_index', 'open', 'high', 'low', 'close'):
+                    if field in item:
+                        finite(item[field], f'[{index}].{field}', positive=True)
+                if 'samples' in item:
+                    finite(item['samples'], f'[{index}].samples', nonnegative=True)
+        elif filename == 'equity_ticks.json':
+            for index, item in enumerate(data):
+                if not isinstance(item, dict):
+                    raise ValueError(f'{filepath}[{index}] 必须是对象')
+                iso_time(item.get('timestamp'), f'[{index}].timestamp', allow_none=False)
+                iso_time(item.get('recorded_at'), f'[{index}].recorded_at')
+                finite(item.get('equity'), f'[{index}].equity', positive=True)
+                if 'qiusuo_index' in item or 'index' in item:
+                    finite(
+                        item.get('qiusuo_index', item.get('index')),
+                        f'[{index}].qiusuo_index', positive=True)
+        elif filename == 'qiusuo_index.json':
+            for field in ('base_index', 'current_divisor', 'anchor_equity', 'anchor_index'):
+                if field in data:
+                    finite(data.get(field), field, positive=True, allow_none=True)
+            iso_time(data.get('anchor_time'), 'anchor_time')
+            history = data.get('history', [])
+            if not isinstance(history, list):
+                raise ValueError(f'{filepath}:history 必须是数组')
+            for index, item in enumerate(history):
+                if not isinstance(item, dict):
+                    raise ValueError(f'{filepath}:history[{index}] 必须是对象')
+                iso_time(
+                    item.get('effective_from'),
+                    f'history[{index}].effective_from', allow_none=False)
+                finite(item.get('divisor'), f'history[{index}].divisor', positive=True)
+                for field in ('anchor_equity', 'anchor_index'):
+                    if field in item:
+                        finite(
+                            item.get(field), f'history[{index}].{field}',
+                            positive=True, allow_none=True)
+        return data
+
+    def _load_json_state(self, filepath, expected_type, default):
+        """读取辅助状态；主文件损坏时仅从合法备份恢复，绝不静默清空。"""
+        backup = filepath + '.bak'
+        if not private_file_exists(filepath):
+            if not private_file_exists(backup):
+                return default() if callable(default) else default.copy()
+            # 主文件被误删但备份仍在，不能当成全新部署。权益基准/
+            # 求索除数若静默回默认，下一两次保存还会覆盖唯一好备份。
+            try:
+                with open_private_text_file(backup) as f:
+                    recovered = self._validate_json_shape(
+                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, backup)
+                if not atomic_write_json(filepath, recovered):
+                    raise OSError('备份可读但无法恢复主文件')
+                logger.warning('辅助状态主文件缺失，已从备份恢复: %s', backup)
+                return recovered
+            except Exception as backup_error:
+                raise EquityStatePersistenceError(
+                    f'辅助状态主文件缺失且备份不可恢复: {filepath} '
+                    f'（备: {backup_error}）'
+                ) from backup_error
+
+        try:
+            with open_private_text_file(filepath) as f:
+                return self._validate_json_shape(
+                    json.load(f, parse_constant=_reject_nonfinite_json), expected_type, filepath)
+        except Exception as main_error:
+            try:
+                with open_private_text_file(backup) as f:
+                    recovered = self._validate_json_shape(
+                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, backup)
+                if not atomic_write_json(filepath, recovered):
+                    raise OSError('恢复后的状态无法写回主文件')
+                logger.warning('辅助状态已从备份恢复: %s', backup)
+                return recovered
+            except Exception as backup_error:
+                raise EquityStatePersistenceError(
+                    f'辅助状态损坏且无可用备份，拒绝按空状态覆盖：{filepath} '
+                    f'（主: {main_error}；备: {backup_error}）'
+                ) from main_error
+
+    def _save_json_state(self, filepath, data, expected_type, label):
+        """保存辅助状态并保留最后一个已验证版本；现有文件损坏时拒绝覆盖。"""
+        try:
+            self._validate_json_shape(data, expected_type, filepath)
+            if private_file_exists(filepath):
+                with open_private_text_file(filepath) as f:
+                    current = self._validate_json_shape(
+                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, filepath)
+                if not atomic_write_json(filepath + '.bak', current):
+                    raise OSError('无法写入状态备份')
+            if not atomic_write_json(filepath, data):
+                raise OSError('原子写入失败')
+            return True
+        except Exception as e:
+            logger.error('%s: %s: %s', label, filepath, e)
+            self.notify_failure(label, filepath)
+            return False
 
     # ====== 权益历史 / 峰值 ======
 
     def load_equity_history(self):
-        if os.path.exists(self.EQUITY_HISTORY_FILE):
-            try:
-                with open(self.EQUITY_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"读取权益历史失败，按默认值处理: {self.EQUITY_HISTORY_FILE}: {e}")
-        return {
+        return self._load_json_state(self.EQUITY_HISTORY_FILE, dict, lambda: {
             'max_drawdown': 0, 'max_dd_time': None,
             'initial_equity': None, 'initial_time': None,
             'year_start_equity': None, 'year_start_time': None,
             'longest_drawdown_days': 0
-        }
+        })
 
     def save_equity_history(self, data):
-        if not atomic_write_json(self.EQUITY_HISTORY_FILE, data):
-            logger.error(f"保存权益历史失败: {self.EQUITY_HISTORY_FILE}")
-            self.notify_failure("保存权益历史失败", self.EQUITY_HISTORY_FILE)
-            return False
-        return True
+        return self._save_json_state(
+            self.EQUITY_HISTORY_FILE, data, dict, '保存权益历史失败')
 
     def load_peak_equity(self):
-        if os.path.exists(self.PEAK_EQUITY_FILE):
-            try:
-                with open(self.PEAK_EQUITY_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"读取峰值权益失败，按默认值处理: {self.PEAK_EQUITY_FILE}: {e}")
-        return {'peak_equity': 0, 'peak_time': None}
+        return self._load_json_state(
+            self.PEAK_EQUITY_FILE, dict, lambda: {'peak_equity': 0, 'peak_time': None})
 
     def save_peak_equity(self, peak_data):
-        if not atomic_write_json(self.PEAK_EQUITY_FILE, peak_data):
-            logger.error(f"保存峰值权益失败: {self.PEAK_EQUITY_FILE}")
-            self.notify_failure("保存峰值权益失败", self.PEAK_EQUITY_FILE)
-            return False
-        return True
+        return self._save_json_state(
+            self.PEAK_EQUITY_FILE, peak_data, dict, '保存峰值权益失败')
 
     def reconcile_peak_equity(self, current_equity, persist=False, now=None):
         now = now or datetime.now()
@@ -147,7 +397,8 @@ class EquityTracker:
             eq_hist = self.load_equity_history()
             if closed_gap > (eq_hist.get('longest_drawdown_days', 0) or 0):
                 eq_hist['longest_drawdown_days'] = closed_gap
-                self.save_equity_history(eq_hist)
+                if not self.save_equity_history(eq_hist):
+                    raise RuntimeError('保存刚结束的最长未创新高周期失败')
 
     def build_account_stats(self, persist=False):
         # 只读调用短缓存直出（persist=True 的统计刷新必须完整执行，且会刷新缓存）
@@ -290,59 +541,32 @@ class EquityTracker:
     # ====== 每日快照 / 日内采样 / 求索指数 ======
 
     def load_daily_equity(self):
-        try:
-            if os.path.exists(self.DAILY_EQUITY_FILE):
-                with open(self.DAILY_EQUITY_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"读取每日权益快照失败，按空处理: {self.DAILY_EQUITY_FILE}: {e}")
-        return []
+        return self._load_json_state(self.DAILY_EQUITY_FILE, list, list)
 
     def save_daily_equity(self, data):
-        if not atomic_write_json(self.DAILY_EQUITY_FILE, data):
-            logger.error(f"保存每日权益快照失败: {self.DAILY_EQUITY_FILE}")
-            self.notify_failure("保存每日权益快照失败", self.DAILY_EQUITY_FILE)
-            return False
-        return True
+        return self._save_json_state(
+            self.DAILY_EQUITY_FILE, data, list, '保存每日权益快照失败')
 
     def load_equity_ticks(self):
-        try:
-            if os.path.exists(self.EQUITY_TICKS_FILE):
-                with open(self.EQUITY_TICKS_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"读取权益采样失败，按空处理: {self.EQUITY_TICKS_FILE}: {e}")
-        return []
+        return self._load_json_state(self.EQUITY_TICKS_FILE, list, list)
 
     def save_equity_ticks(self, data):
-        if not atomic_write_json(self.EQUITY_TICKS_FILE, data):
-            logger.error(f"保存权益采样失败: {self.EQUITY_TICKS_FILE}")
-            self.notify_failure("保存权益采样失败", self.EQUITY_TICKS_FILE)
-            return False
-        return True
+        return self._save_json_state(
+            self.EQUITY_TICKS_FILE, data, list, '保存权益采样失败')
 
     def load_qiusuo_index_state(self):
-        try:
-            if os.path.exists(self.QIUSUO_INDEX_FILE):
-                with open(self.QIUSUO_INDEX_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"读取求索指数状态失败，按默认值处理: {self.QIUSUO_INDEX_FILE}: {e}")
-        return {
+        return self._load_json_state(self.QIUSUO_INDEX_FILE, dict, lambda: {
             'base_index': self.QIUSUO_INDEX_BASE,
             'current_divisor': None,
             'anchor_equity': None,
             'anchor_index': self.QIUSUO_INDEX_BASE,
             'anchor_time': None,
             'history': []
-        }
+        })
 
     def save_qiusuo_index_state(self, data):
-        if not atomic_write_json(self.QIUSUO_INDEX_FILE, data):
-            logger.error(f"保存求索指数状态失败: {self.QIUSUO_INDEX_FILE}")
-            self.notify_failure("保存求索指数状态失败", self.QIUSUO_INDEX_FILE)
-            return False
-        return True
+        return self._save_json_state(
+            self.QIUSUO_INDEX_FILE, data, dict, '保存求索指数状态失败')
 
     def _equity_tick_bucket(self, now=None):
         now = now or datetime.now()
@@ -694,22 +918,24 @@ class EquityTracker:
         try:
             now = now or datetime.now()
             current_day = self._qiusuo_trading_day(now)
-            ticks = self.load_equity_ticks()
-            if not ticks:
-                return
-
-            by_day = {}
-            for item in ticks:
-                ts = _parse_equity_tick_timestamp(item.get('timestamp'))
-                if ts is None:
-                    continue
-                by_day.setdefault(self._qiusuo_trading_day(ts), []).append(item)
-
-            closed_days = [d for d in by_day if d < current_day]
-            if not closed_days:
-                return
-
             with self._lock:
+                # 锁必须覆盖“首次读取 ticks → 两个文件提交”。否则并行的 5 分钟
+                # 采样可在旧快照读取后追加，随后被 kept_ticks 的旧列表覆盖删除。
+                ticks = self.load_equity_ticks()
+                if not ticks:
+                    return
+
+                by_day = {}
+                for item in ticks:
+                    ts = _parse_equity_tick_timestamp(item.get('timestamp'))
+                    if ts is None:
+                        continue
+                    by_day.setdefault(self._qiusuo_trading_day(ts), []).append(item)
+
+                closed_days = [d for d in by_day if d < current_day]
+                if not closed_days:
+                    return
+
                 daily = self.load_daily_equity()
                 daily_by_date = {s['date']: s for s in daily if s.get('date')}
                 for d in sorted(closed_days):
@@ -759,7 +985,11 @@ class EquityTracker:
 
         now = datetime.now()
         with self._lock:
-            qiusuo_state = self.ensure_qiusuo_index_state(current_equity=current_equity, now=now, persist=True)
+            old_peak = self.load_peak_equity()
+            old_history = self.load_equity_history()
+            old_qiusuo = self.load_qiusuo_index_state()
+            qiusuo_state = self.ensure_qiusuo_index_state(
+                current_equity=current_equity, now=now, persist=False)
             old_divisor = qiusuo_state.get('current_divisor') or (current_equity / (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE))
             if flow_amount is not None:
                 # 状态边界 fail-closed：nan/inf 会写出 nan/0.0 的除数污染求索指数，
@@ -778,10 +1008,8 @@ class EquityTracker:
             new_divisor = current_equity / qiusuo_anchor
 
             peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
-            if not self.save_peak_equity(peak_data):
-                raise RuntimeError('保存峰值权益失败')
 
-            eq_hist = self.load_equity_history()
+            eq_hist = copy.deepcopy(old_history)
             # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），
             # 原实现在下方 :.2f 格式化处直接抛 TypeError → 路由 500
             old_initial = eq_hist.get('initial_equity') or 0
@@ -793,9 +1021,6 @@ class EquityTracker:
             eq_hist['max_dd_time'] = None
             eq_hist['longest_drawdown_days'] = 0
             eq_hist.pop('current_drawdown_start', None)  # 旧版遗留字段，顺带清掉
-            if not self.save_equity_history(eq_hist):
-                raise RuntimeError('保存权益历史失败')
-
             qiusuo_history = list(qiusuo_state.get('history', []))
             qiusuo_history.append({
                 'effective_from': now.isoformat(timespec='seconds'),
@@ -812,8 +1037,17 @@ class EquityTracker:
                 'history': qiusuo_history
             })
             qiusuo_state = self._normalize_qiusuo_index_state(qiusuo_state)
-            if not self.save_qiusuo_index_state(qiusuo_state):
-                raise RuntimeError('保存求索指数状态失败')
+            self._commit_equity_sync_generation(
+                {
+                    'peak': old_peak,
+                    'history': old_history,
+                    'qiusuo': old_qiusuo,
+                },
+                {
+                    'peak': peak_data,
+                    'history': eq_hist,
+                    'qiusuo': qiusuo_state,
+                })
 
             self.record_equity_tick(equity=current_equity, now=now)
 

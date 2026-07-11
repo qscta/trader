@@ -1,3 +1,5 @@
+import os
+import tempfile
 import threading
 import unittest
 from datetime import date
@@ -6,6 +8,7 @@ from types import SimpleNamespace
 import _test_stubs
 
 TradingSystem = _test_stubs.import_main().TradingSystem
+from trade_state import TradeState
 
 
 class _FakeNotifier:
@@ -56,12 +59,19 @@ class _FakeExchangeApi:
         self.cancel_calls += 1
         return True
 
+    def cancel_stop_order_only(self, symbol, order_id):
+        self.cancel_calls += 1
+        return True
+
     def cancel_all_orders(self, symbol):
         return True
 
     def create_stop_loss_order(self, symbol, side, amount, stop_price):
         self.stop_order_calls += 1
         return {'id': 'stop-123'}
+
+    def get_position(self, symbol):
+        return {'contracts': 1.5, 'side': 'long'}
 
 
 class DailySummaryDeliveryTest(unittest.TestCase):
@@ -86,6 +96,21 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         self.assertFalse(system.send_daily_position_summary_if_due())
         self.assertEqual(today, system._last_summary_date)
         self.assertEqual(1, system.notifier.calls)
+
+    def test_daily_summary_dedup_date_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trade_state.json')
+            system = self._build_system(notify_result=True)
+            system.trade_state = TradeState(path)
+
+            self.assertTrue(system.send_daily_position_summary_if_due())
+
+            restarted = self._build_system(notify_result=True)
+            restarted.trade_state = TradeState(path)
+            restarted._last_summary_date = (
+                restarted.trade_state.get_last_daily_summary_date())
+            self.assertFalse(restarted.send_daily_position_summary_if_due())
+            self.assertEqual(0, restarted.notifier.calls)
 
     def test_daily_summary_failure_does_not_mark_day_as_sent(self):
         system = self._build_system(notify_result=False)
@@ -122,7 +147,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = (
-            lambda force=False, mark_sent=True: summary_calls.append((force, mark_sent)) or True
+            lambda force=False, mark_sent=True, **kwargs: summary_calls.append((force, mark_sent)) or True
         )
 
         system.check_and_execute_trades(manual_run=True)
@@ -152,13 +177,14 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         }
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda symbol: symbol,
+            get_position=lambda symbol: None,
             fetch_ohlcv=lambda symbol, timeframe='1d', limit=100: requested_limits.append(limit) or [],
         )
         system.turtle_strategy = SimpleNamespace()
         system.ma_cross_strategy = SimpleNamespace()
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
-        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: True
+        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True, **kwargs: True
 
         system.check_and_execute_trades()
 
@@ -169,12 +195,14 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.exchange_api = _FakeExchangeApi()
         system.notifier = _FakeNotifier(result=True)
         system.trade_state = SimpleNamespace(
+            has_stop_residue=lambda symbol: False,
             clear_stop_residue=lambda symbol: None,
             mark_stop_residue=lambda symbol: None,
         )
         system._pending_stop_loss_updates = []
         system._update_trade_state_stop_with_runtime_fallback = (
-            lambda symbol, stop_price, order_id, context: ({'symbol': symbol}, True)
+            lambda symbol, stop_price, order_id, context, **kwargs: (
+                {'symbol': symbol}, True)
         )
 
         position = {
@@ -210,7 +238,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         )
         system.config = {'trading': {'symbols': []}}
         system.exchange_api = SimpleNamespace(fetch_ohlcv=lambda *args, **kwargs: [], get_balance=lambda: {'total': {'USDT': 1000}})
-        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True: False
+        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True, **kwargs: False
 
         system.notifier.notify_stop_loss_updates_summary(system._pending_stop_loss_updates)
 

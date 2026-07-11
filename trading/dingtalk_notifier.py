@@ -35,12 +35,16 @@ class DingTalkNotifier:
                 resp = requests.post(self.webhook_url, json=msg, timeout=10)
                 try:
                     payload = resp.json()
-                except ValueError:
-                    payload = {}
-                if resp.status_code == 200 and payload.get('errcode', 0) == 0:
+                except (TypeError, ValueError):
+                    payload = None
+                # 钉钉成功响应必须是对象且显式携带 errcode=0。HTTP 200 的 HTML
+                # 网关页、空正文或任意 JSON 数组都不是“已送达”，不得靠默认 0 误判。
+                if (resp.status_code == 200 and isinstance(payload, dict) \
+                        and payload.get('errcode') == 0):
                     logger.info(f"钉钉推送: {title} -> {resp.status_code}")
                     return True
-                last_err = f"http={resp.status_code}, body={payload or resp.text[:200]}"
+                body = payload if payload is not None else resp.text[:200]
+                last_err = _redact_secrets(f"http={resp.status_code}, body={body}")
             except Exception as e:
                 # 抹掉可能随异常带出的 access_token（requests 连接异常常含完整 URL）
                 last_err = _redact_secrets(e)

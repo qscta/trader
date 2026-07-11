@@ -80,19 +80,6 @@ class TurtleStrategy:
 
         return True
 
-    def calculate_channels(self, df):
-        """计算通道线"""
-        if len(df) < self.channel_period + 1:
-            return None, None, None
-
-        # 通道使用历史N根（不含当前K线），避免“当前价参与阈值”导致突破被抵消
-        close_prices = df.iloc[-(self.channel_period+1):-1]['close']
-        upper_line = close_prices.max()
-        lower_line = close_prices.min()
-        mid_line = (upper_line + lower_line) / 2
-
-        return upper_line, lower_line, mid_line
-
     def check_signal(self, df, mid_line_crossed=True):
         """
         检查交易信号

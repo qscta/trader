@@ -89,7 +89,7 @@ class ExchangeApi:
         """市价开仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
-    def close_position(self, symbol, side, amount):
+    def close_position(self, symbol, side, amount, client_order_id=None):
         """市价平仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
@@ -98,6 +98,10 @@ class ExchangeApi:
         raise NotImplementedError
 
     def cancel_order(self, symbol, order_id):
+        raise NotImplementedError
+
+    def cancel_stop_order_only(self, symbol, order_id):
+        """持仓仍在时仅撤指定保护单；不得退化为 cancel-all。"""
         raise NotImplementedError
 
     def cancel_all_orders(self, symbol):
@@ -116,7 +120,7 @@ class ExchangeApi:
         return None
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
-        """检查与本地持仓记录对应的止损单状态，返回 'intact' / 'mismatch' / 'missing'。"""
+        """检查止损：intact/adoptable/mismatch/missing 四种结果。"""
         raise NotImplementedError
 
     def list_position_symbols(self):
@@ -176,7 +180,78 @@ class ExchangeApi:
 
     @retry_on_network_error(max_retries=3)
     def fetch_ohlcv(self, symbol, timeframe='1d', limit=100):
-        return self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        """读取最近 ``limit`` 根 K 线，必要时显式分页。
+
+        OKX 的单次 candles 请求最多返回 300 根；ccxt 会把更大的 ``limit``
+        静默压到交易所上限。策略层允许的长周期需要超过 300 根历史数据，若
+        直接把期望数量交给 ccxt，配置虽然通过校验，却会永久处于“数据不足”。
+
+        小请求保持原来的单次调用。大请求从足够早的时间点向前分页，用时间戳
+        去重并严格限制返回最近 ``limit`` 根。若交易所提前耗尽历史数据，返回
+        实际可取得的数量，由上层把它作为未完成/配置不足处理，绝不伪造 K 线。
+        """
+        requested = int(limit)
+        if requested <= 0:
+            return []
+
+        # OKX public market candles endpoint 的硬上限。放在适配基类是为了让所有
+        # 调用入口（每日任务、管理台预览、即时开仓）获得完全相同的数据语义。
+        page_size = 300
+        if requested <= page_size:
+            return self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested)
+
+        try:
+            timeframe_ms = int(self.exchange.parse_timeframe(timeframe) * 1000)
+        except Exception:
+            timeframe_ms = {
+                '1m': 60_000, '3m': 180_000, '5m': 300_000,
+                '15m': 900_000, '30m': 1_800_000,
+                '1h': 3_600_000, '2h': 7_200_000, '4h': 14_400_000,
+                '6h': 21_600_000, '8h': 28_800_000, '12h': 43_200_000,
+                '1d': 86_400_000, '3d': 259_200_000, '1w': 604_800_000,
+            }.get(timeframe)
+        if not timeframe_ms:
+            raise ValueError(f'无法分页未知 K 线周期: {timeframe!r}')
+
+        now_ms = int(self.exchange.milliseconds()) if hasattr(self.exchange, 'milliseconds') else int(time.time() * 1000)
+        # 多取两根作为时间边界余量：不同交易所对 since 是包含还是排除并不完全
+        # 一致，最终会按 timestamp 去重和裁剪。
+        since = max(0, now_ms - (requested + 2) * timeframe_ms)
+        rows_by_timestamp = {}
+        max_pages = math.ceil((requested + 2) / page_size) + 2
+
+        for _ in range(max_pages):
+            page = self.exchange.fetch_ohlcv(
+                symbol,
+                timeframe,
+                since=since,
+                limit=page_size,
+            )
+            if not page:
+                break
+
+            newest_timestamp = None
+            for row in page:
+                if not row:
+                    continue
+                timestamp = int(row[0])
+                rows_by_timestamp[timestamp] = row
+                if newest_timestamp is None or timestamp > newest_timestamp:
+                    newest_timestamp = timestamp
+
+            if newest_timestamp is None:
+                break
+            next_since = newest_timestamp + timeframe_ms
+            if next_since <= since:
+                logger.warning('K 线分页未向前推进，停止读取: %s %s since=%s', symbol, timeframe, since)
+                break
+            since = next_since
+
+            if len(page) < page_size or since > now_ms + timeframe_ms:
+                break
+
+        rows = [rows_by_timestamp[key] for key in sorted(rows_by_timestamp)]
+        return rows[-requested:]
 
     @retry_on_network_error(max_retries=3)
     def get_balance(self):
