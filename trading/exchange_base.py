@@ -218,20 +218,20 @@ class ExchangeApi:
         # 一致，最终会按 timestamp 去重和裁剪。
         since = max(0, now_ms - (requested + 2) * timeframe_ms)
         rows_by_timestamp = {}
-        max_pages = math.ceil((requested + 2) / page_size) + 2
+        # 每次迭代把窗口至少推进一根（有数据推进到最新一根之后，空页按整窗跳过），
+        # 上限按窗口数留富余即可保证终止；到达上限仍未越过当下属异常，如实告警。
+        max_pages = math.ceil((requested + 2) / page_size) + 6
 
-        for _ in range(max_pages):
+        for _page_index in range(max_pages):
             page = self.exchange.fetch_ohlcv(
                 symbol,
                 timeframe,
                 since=since,
                 limit=page_size,
             )
-            if not page:
-                break
 
             newest_timestamp = None
-            for row in page:
+            for row in page or []:
                 if not row:
                     continue
                 timestamp = int(row[0])
@@ -239,16 +239,28 @@ class ExchangeApi:
                 if newest_timestamp is None or timestamp > newest_timestamp:
                     newest_timestamp = timestamp
 
-            if newest_timestamp is None:
-                break
-            next_since = newest_timestamp + timeframe_ms
-            if next_since <= since:
-                logger.warning('K 线分页未向前推进，停止读取: %s %s since=%s', symbol, timeframe, since)
-                break
-            since = next_since
+            if newest_timestamp is not None:
+                next_since = newest_timestamp + timeframe_ms
+                if next_since <= since:
+                    logger.warning('K 线分页未向前推进，停止读取: %s %s since=%s', symbol, timeframe, since)
+                    break
+                since = next_since
+            else:
+                # 空页 ≠ 历史终点：OKX 会把带 since 的请求限定在
+                # [since, since + limit×timeframe] 的固定时间窗内——上市前的
+                # 窗口、数据缺口的窗口都会返回空页。同理，短页只说明该窗口内
+                # 数据不满，绝不能当「已取完」终止（旧实现在此对上市不满一年
+                # 的品种静默返回截至 now-67 天的陈旧历史，指标全部失真）。
+                # 空页按整窗推进；唯一的终止条件是窗口越过当下。
+                since += page_size * timeframe_ms
 
-            if len(page) < page_size or since > now_ms + timeframe_ms:
+            # K 线时间戳是周期起点，恒 ≤ 当前时刻；窗口起点越过当下即取无可取。
+            if since > now_ms:
                 break
+        else:
+            logger.warning(
+                'K 线分页在 %s 页内未覆盖到当前时间（%s %s），返回数据可能不完整',
+                max_pages, symbol, timeframe)
 
         rows = [rows_by_timestamp[key] for key in sorted(rows_by_timestamp)]
         return rows[-requested:]

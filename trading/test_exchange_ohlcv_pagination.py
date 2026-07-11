@@ -1,4 +1,11 @@
-"""交易所 K 线分页回归测试。"""
+"""交易所 K 线分页回归测试。
+
+测试桩必须模拟 OKX 的真实窗口语义：带 ``since`` 的请求只返回
+``[since, since + limit×timeframe)`` 时间窗内的数据——上市前的窗口返回空页、
+数据不满的窗口返回短页。2026-07-11 生产事故（上市不满一年的品种拿到截至
+now-67 天的陈旧历史，指标全部失真）正是旧桩用「since 起全部数据」的简化语义
+掩盖的：短页被误判为「历史已取完」。本文件的回归用例按事故形态命名锁定。
+"""
 
 import sys
 import types
@@ -30,8 +37,15 @@ DAY_MS = 86_400_000
 
 
 class _FakeExchange:
-    def __init__(self, total=1200):
-        self.rows = [[i * DAY_MS, i, i, i, i, i] for i in range(total)]
+    """OKX 窗口语义的假交易所。
+
+    行情从 ``first_day`` 开始（模拟上市日），到 ``total - 1`` 天为止（当下）。
+    带 since 的请求只返回 [since, since + limit×tf) 窗口内的数据；
+    不带 since 的请求返回最近 limit 根。两者单页都不超过 300。
+    """
+
+    def __init__(self, total=1200, first_day=0):
+        self.rows = [[i * DAY_MS, i, i, i, i, i] for i in range(first_day, total)]
         self.now = (total - 1) * DAY_MS
         self.calls = []
 
@@ -45,8 +59,11 @@ class _FakeExchange:
 
     def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
         self.calls.append((symbol, timeframe, since, limit))
-        candidates = self.rows if since is None else [row for row in self.rows if row[0] >= since]
-        return candidates[:min(limit, 300)]
+        limit = min(limit or 300, 300)
+        if since is None:
+            return self.rows[-limit:]
+        window_end = since + limit * DAY_MS
+        return [row for row in self.rows if since <= row[0] < window_end][:limit]
 
 
 class _Api(ExchangeApi):
@@ -84,6 +101,36 @@ class OhlcvPaginationTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 120)
         self.assertEqual(len({row[0] for row in rows}), 120)
+
+    def test_recent_listing_short_first_window_must_reach_now(self):
+        """CL/ASTER 事故形态：上市 226 天的品种，首窗只有 158 根（短页）。
+
+        旧实现把短页当「历史已取完」终止，返回的历史停在 now-68 天——
+        指标计算随之整体陈旧。修复后必须继续推进窗口直到覆盖当下。
+        """
+        exchange = _FakeExchange(total=1200, first_day=974)
+        api = _Api({'exchange': exchange})
+
+        rows = api.fetch_ohlcv('CL/USDT:USDT', '1d', limit=365)
+
+        self.assertEqual(len(rows), 226)              # 上市以来全部 K 线
+        self.assertEqual(rows[0][0], 974 * DAY_MS)    # 从上市日开始
+        self.assertEqual(rows[-1][0], 1199 * DAY_MS)  # 必须到达当下，绝不陈旧
+
+    def test_infant_listing_empty_first_window_must_not_fail(self):
+        """GRAM/VVV 事故形态：上市 24 天的品种，首窗完全落在上市前（空页）。
+
+        旧实现把空页当「没有数据」直接返回空列表——上层报「获取K线数据失败」
+        并阻断当日完成标记。修复后空页必须按整窗推进，取到真实的 24 根。
+        """
+        exchange = _FakeExchange(total=1200, first_day=1176)
+        api = _Api({'exchange': exchange})
+
+        rows = api.fetch_ohlcv('GRAM/USDT:USDT', '1d', limit=365)
+
+        self.assertEqual(len(rows), 24)
+        self.assertEqual(rows[0][0], 1176 * DAY_MS)
+        self.assertEqual(rows[-1][0], 1199 * DAY_MS)
 
 
 if __name__ == '__main__':
