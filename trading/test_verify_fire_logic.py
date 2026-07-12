@@ -171,6 +171,26 @@ class FireTestDecisionLogicTest(unittest.TestCase):
         ], api.close_position.call_args_list)
         self.assertEqual(3, api.cancel_all_orders.call_count)
 
+    def test_cleanup_survives_contract_conversion_runtime_failure(self):
+        """合约面值获取异常也不得在 finally 真正平仓之前中断清理。"""
+        api = Mock()
+        api.cancel_all_orders.return_value = True
+        api._contracts_to_coins.side_effect = RuntimeError(
+            'contract size unavailable')
+        positions = [
+            {'contracts': 5.0, 'side': 'short'},
+            None,
+        ]
+        api.get_position.side_effect = lambda _symbol: positions.pop(0)
+        api.close_position.return_value = {'id': 'fallback-close'}
+
+        result = verify_okx.cleanup_live_position(
+            api, 'BTC/USDT:USDT', 'long', 0.1, 'conversion')
+
+        self.assertTrue(result)
+        api.close_position.assert_called_once_with(
+            'BTC/USDT:USDT', 'short', 0.1)
+
     def test_partial_stop_that_never_flattens_fails(self):
         """止损已部分成交不是“行情未触发”，超时后必须判失败。"""
         api = _fake_api(position_sequence=[])

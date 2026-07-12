@@ -111,8 +111,11 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
                 converted = float(converter(ccxt_symbol, contracts))
                 if math.isfinite(converted) and converted > 0:
                     return converted
-            except (TypeError, ValueError, OverflowError):
-                pass
+            except Exception as e:
+                # 验证脚本的首要目标是尽力把实弹测试仓清干净。合约面值缓存
+                # 异常（ContractSizeUnavailable 是 RuntimeError）也不能在进入
+                # reduce-only 平仓前打断 finally；回退调用者原始币数继续尝试。
+                print(f"[{tag}] ⚠️ 真实张数换算币数失败，回退原数量清理:", e)
         return fallback
 
     try:
