@@ -337,6 +337,67 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
             self.assertEqual([], seen_client_ids)
 
+    def test_flat_unsubmitted_intent_is_consumed_when_symbol_retired(self):
+        """删除/禁用发生在 intent 落盘后时，不得把恢复事务变成一笔新开仓。"""
+        retired_configs = (
+            [],
+            [{'name': 'BTCUSDT', 'enabled': False,
+              'strategy': 'ma_cross', 'risk_per_trade': 0.01}],
+        )
+        for symbols in retired_configs:
+            with self.subTest(symbols=symbols), tempfile.TemporaryDirectory() as tmp:
+                system, seen_client_ids = self._system(
+                    tmp, exchange_position=None)
+                system.exchange_api.find_existing_open_order = Mock(
+                    return_value=None)
+                system.trade_state.prepare_open_intent(
+                    'BTCUSDT', 'ma_cross', 'long', 'IRETIRED123',
+                    {'side': 'long', 'entry_price': 100.0,
+                     'stop_loss_price': 90.0},
+                    planned_position_size=1.0)
+                system.config['trading']['symbols'] = symbols
+
+                self.assertEqual(
+                    set(), system._reconcile_all_open_intents('test'))
+
+                self.assertEqual([], seen_client_ids)
+                self.assertIsNone(
+                    system.trade_state.get_open_intent('BTCUSDT'))
+                self.assertIsNone(
+                    system.trade_state.get_open_position('BTCUSDT'))
+
+    def test_disabled_symbol_still_recovers_already_existing_exchange_position(self):
+        """只平不开不能吞掉真钱孤儿仓：交易所有仓时仍须补账和止损。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, seen_client_ids = self._system(
+                tmp, exchange_position={'side': 'long', 'contracts': 1})
+            system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IRECOVERRETIRED',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
+            system.config['trading']['symbols'][0]['enabled'] = False
+
+            self.assertEqual(
+                set(), system._reconcile_all_open_intents('test'))
+
+            self.assertEqual(['IRECOVERRETIRED'], seen_client_ids)
+            self.assertEqual(
+                'long', system.trade_state.get_open_position('BTCUSDT')['side'])
+
+    def test_generic_executor_blocks_non_recovery_open_for_disabled_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, seen_client_ids = self._system(tmp)
+
+            outcome = system._execute_open(
+                'BTCUSDT', 'long', 100.0, 90.0,
+                {'name': 'BTCUSDT', 'enabled': False,
+                 'strategy': 'ma_cross', 'risk_per_trade': 0.01})
+
+            self.assertEqual('retired_blocked', outcome['status'])
+            self.assertEqual([], seen_client_ids)
+            self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
+
     def test_generic_full_rollback_immediately_books_real_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, _seen_client_ids = self._system(tmp)
@@ -484,6 +545,35 @@ class FlatPendingAdjudicationTest(unittest.TestCase):
             self.assertIsNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
             self.assertEqual('candle-1',
                              system.trade_state.get_signal_metadata('BTCUSDT')['last_processed_candle'])
+
+    def test_unsubmitted_pending_is_consumed_when_symbol_retired(self):
+        retired_configs = (
+            [],
+            [{'name': 'BTCUSDT', 'enabled': False,
+              'strategy': 'turtle', 'risk_per_trade': 0.01}],
+        )
+        for symbols in retired_configs:
+            with self.subTest(symbols=symbols), tempfile.TemporaryDirectory() as tmp:
+                system, finder = self._system(
+                    tmp, current_price=110.0, finder_result=None)
+                execution = self._prepare(system, planned=1.0, stop=90.0)
+                system.config['trading']['symbols'] = symbols
+                system._execute_open = Mock(
+                    side_effect=AssertionError('退池品种不得恢复开仓'))
+
+                self.assertTrue(system._adjudicate_flat_pending_turtle(
+                    'BTCUSDT', execution))
+
+                finder.assert_called_once_with(
+                    'BTCUSDT', 'long', 1.0, 'TPENDING1')
+                system._execute_open.assert_not_called()
+                system.exchange_api.get_last_price.assert_not_called()
+                self.assertIsNone(
+                    system.trade_state.get_pending_signal_execution('BTCUSDT'))
+                metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+                self.assertEqual(
+                    'unsubmitted_retired',
+                    metadata['signal_execution']['resolution'])
 
     def test_stale_order_not_found_never_reopens_an_ambiguous_old_signal(self):
         with tempfile.TemporaryDirectory() as tmp:

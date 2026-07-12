@@ -1057,6 +1057,30 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             f'{symbol} [海龟] 开仓后已补偿全平，往返成交与信号状态已原子收口')
         return True
 
+    def _recovery_symbol_config(self, symbol, strategy):
+        """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
+
+        恢复已有交易所仓位时，即使品种已经退池也必须补账、补止损；但在
+        “本地与交易所都空仓、确认旧请求从未送达”时，退池状态必须阻断任何
+        新 POST。统一在这里构造标记，避免各恢复分支把缺失配置兜成 enabled=True。
+        """
+        configured = next(
+            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
+             if cfg.get('name') == symbol), None)
+        if configured is None:
+            return {
+                'name': symbol,
+                'enabled': False,
+                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                'strategy': strategy,
+                '_retired_from_pool': True,
+            }, True
+        symbol_config = dict(configured)
+        retired = not symbol_config.get('enabled', True)
+        if retired:
+            symbol_config['_retired_from_pool'] = True
+        return symbol_config, retired
+
     def _resume_pending_turtle_execution(self, symbol, execution):
         """启动对账专用：用原 clOrdId 恢复“已成交、未挂止损/未记账”的中断交易。"""
         payload = execution.get('payload') or {}
@@ -1068,15 +1092,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             stop_loss_price = float(payload['stop_loss_price'])
         except (KeyError, TypeError, ValueError):
             return False
-        symbol_config = next(
-            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
-             if cfg.get('name') == symbol),
-            {
-                'name': symbol,
-                'enabled': True,
-                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                'strategy': 'turtle',
-            })
+        symbol_config, _retired = self._recovery_symbol_config(
+            symbol, 'turtle')
         outcome = self._execute_open(
             symbol, side, entry_price, stop_loss_price, symbol_config,
             buffer_notification=False,
@@ -1212,19 +1229,17 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         """确认从未发单后，在原止损仍有效时复用原 clOrdId 开仓。"""
         payload = execution.get('payload') or {}
         side = payload.get('side')
+        symbol_config, retired = self._recovery_symbol_config(
+            symbol, 'turtle')
+        if retired:
+            return self._consume_pending_without_trade(
+                symbol, execution, 'unsubmitted_retired',
+                '确认从未发单，且品种已删除或禁用；只平不开，取消恢复开仓')
         try:
             entry_price = float(payload['entry_price'])
             stop_loss_price = float(payload['stop_loss_price'])
         except (KeyError, TypeError, ValueError):
             return False
-        symbol_config = next(
-            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
-             if cfg.get('name') == symbol),
-            {
-                'name': symbol, 'enabled': True,
-                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                'strategy': 'turtle',
-            })
         outcome = self._execute_open(
             symbol, side, entry_price, stop_loss_price, symbol_config,
             buffer_notification=False,
@@ -1318,6 +1333,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     {'client_order_id': execution.get('client_order_id'),
                      'updated_at': execution.get('updated_at')})
                 return False
+
+        _symbol_config, retired = self._recovery_symbol_config(
+            symbol, 'turtle')
+        if retired:
+            return self._consume_pending_without_trade(
+                symbol, execution, 'unsubmitted_retired',
+                '确认从未发单，且品种已删除或禁用；只平不开，取消恢复开仓')
 
         # planned 缺失，或按 clOrdId 明确 OrderNotFound：根据发单前事务顺序，
         # 且仍在交易所可查询窗口内，才可确认这笔从未发出。只有当前止损仍能
@@ -1415,13 +1437,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             stop_price = float(payload['stop_loss_price'])
         except (KeyError, TypeError, ValueError):
             return False
-        symbol_config = next((
-            cfg for cfg in self.config.get('trading', {}).get('symbols', [])
-            if cfg.get('name') == symbol), {
-                'name': symbol, 'enabled': True,
-                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                'strategy': intent.get('strategy') or 'turtle',
-            })
+        symbol_config, _retired = self._recovery_symbol_config(
+            symbol, intent.get('strategy') or 'turtle')
         outcome = self._execute_open(
             symbol, side, entry_price, stop_price, symbol_config,
             buffer_notification=False,
@@ -1528,6 +1545,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._quarantine_position_mismatch(
                 symbol, f'{reason}；open intent 查无订单不能证明从未送达')
             return False
+        symbol_config, retired = self._recovery_symbol_config(
+            symbol, intent.get('strategy') or 'turtle')
+        if retired:
+            self.trade_state.resolve_open_intent(
+                symbol, intent.get('client_order_id'))
+            self._clear_position_quarantine_after_reconcile(symbol)
+            logger.warning(
+                f'{symbol} open intent 确认从未发单，但品种已删除或禁用；'
+                '已收口句柄，严格执行只平不开')
+            return True
         payload = intent.get('payload') or {}
         try:
             stop_price = float(payload['stop_loss_price'])
@@ -1550,13 +1577,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return True
         outcome = self._execute_open(
             symbol, side, float(payload['entry_price']), stop_price,
-            next((
-                cfg for cfg in self.config.get('trading', {}).get('symbols', [])
-                if cfg.get('name') == symbol), {
-                    'name': symbol, 'enabled': True,
-                    'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                    'strategy': intent.get('strategy') or 'turtle',
-                }),
+            symbol_config,
             buffer_notification=False,
             client_order_id=intent.get('client_order_id'))
         if isinstance(outcome, dict) and outcome.get('status') == 'opened':

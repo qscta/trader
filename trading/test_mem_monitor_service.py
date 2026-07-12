@@ -18,6 +18,9 @@ import mem_monitor
 
 
 class ResourceMonitorStartupTest(unittest.TestCase):
+    def test_log_override_requires_absolute_path(self):
+        self.assertTrue(mem_monitor.os.path.isabs(mem_monitor.LOG_FILE))
+
     def test_service_mode_missing_webhook_fails_loudly(self):
         with patch.object(mem_monitor.sys, 'argv', ['mem_monitor.py']), \
                 patch.object(mem_monitor, 'load_webhook', return_value=None):

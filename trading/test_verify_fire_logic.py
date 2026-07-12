@@ -105,6 +105,7 @@ class FireTestDecisionLogicTest(unittest.TestCase):
         result = run_fire_test(api, 'BTC/USDT:USDT', 0.1, 'long',
                                distance_pct=0.15, timeout_seconds=10, poll_interval=0)
         self.assertFalse(result)
+        self.assertEqual('short', api.close_position.call_args.args[1])
 
     def test_direct_long_to_short_between_polls_fails(self):
         """轮询没看到空仓、直接看到反向仓，也必须立即判失败而不是超时不确定。"""
@@ -120,6 +121,29 @@ class FireTestDecisionLogicTest(unittest.TestCase):
                                distance_pct=0.15, timeout_seconds=10, poll_interval=0)
 
         self.assertFalse(result)
+        self.assertEqual('short', api.close_position.call_args.args[1])
+
+    def test_reverse_cleanup_uses_actual_size_and_survives_cancel_failure(self):
+        """撤单报错不能跳过平仓；反向仓按交易所真实方向和张数清理。"""
+        api = _fake_api(position_sequence=[])
+        seq = [
+            {'contracts': 10.0, 'side': 'long'},
+            {'contracts': 5.0, 'side': 'short'},
+        ]
+        last = seq[-1]
+        api.get_position.side_effect = lambda _s: seq.pop(0) if seq else last
+        api.cancel_all_orders.side_effect = [
+            RuntimeError('cancel unavailable'), True]
+        api._contracts_to_coins = Mock(return_value=0.05)
+
+        result = run_fire_test(
+            api, 'BTC/USDT:USDT', 0.1, 'long',
+            distance_pct=0.15, timeout_seconds=10, poll_interval=0)
+
+        self.assertFalse(result)
+        api.close_position.assert_called_once_with(
+            'BTC/USDT:USDT', 'short', 0.05)
+        self.assertEqual(2, api.cancel_all_orders.call_count)
 
     def test_partial_stop_that_never_flattens_fails(self):
         """止损已部分成交不是“行情未触发”，超时后必须判失败。"""

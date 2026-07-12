@@ -42,13 +42,18 @@ class RepositoryHygieneTest(unittest.TestCase):
         unit = (root / 'trading' / 'systemd' /
                 'trading-mem-monitor.service').read_text(encoding='utf-8')
         for required in (
-                'User=ubuntu',
+                'DynamicUser=true',
+                'SupplementaryGroups=ubuntu',
                 '/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py',
-                'EnvironmentFile=-/etc/trading-mem-monitor.env',
+                'EnvironmentFile=/etc/trading-mem-monitor.env',
+                'TRADING_MEM_MONITOR_LOG=/var/log/trading-mem-monitor/mem_monitor.log',
+                'LogsDirectory=trading-mem-monitor',
+                'ProtectSystem=strict', 'ProtectHome=read-only',
+                'InaccessiblePaths=-/home/ubuntu/trader/trading/config.json',
                 'Restart=on-failure', 'StartLimitBurst=3', 'UMask=0077'):
             self.assertIn(required, unit)
-        # 最小权限：监控进程只需 webhook（从 config.json 回退取得），绝不通过
-        # EnvironmentFile 加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY 的整份 trading.env。
+        # 最小权限：监控进程只接收专用 webhook，既不加载整份 trading.env，
+        # 也由 systemd 沙箱明确禁止读取可能含交易密钥的 config.json。
         # 只检查生效指令行（忽略注释），注释里出于说明目的提及该路径是允许的。
         directives = [
             line.strip() for line in unit.splitlines()

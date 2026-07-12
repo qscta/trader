@@ -557,6 +557,9 @@ def add_symbol():
             pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
             if callable(pending_getter) and pending_getter(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口订单，禁止重新加入/改配"}), 409
+            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
+            if callable(intent_getter) and intent_getter(new_symbol['name']):
+                return jsonify({'error': f"{new_symbol['name']} 存在未收口开仓意图，禁止重新加入/改配"}), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'].append(new_symbol)
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，交易对未添加')
@@ -622,9 +625,23 @@ def update_symbol(symbol):
         with _trade_then_config(system) as locked:
             if not locked:
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
+            # 未收口生命周期存在时，只允许“单独禁用”这一紧急收口动作；风险/
+            # 策略修改或重新启用可能让旧意图被另一套配置接管。海龟 pending 与
+            # 通用 open intent 用同一口径，避免先被 pending 分支挡掉紧急禁用。
+            disabling_only = (
+                clean.get('enabled') is False and
+                not any(key in clean for key in ('risk_per_trade', 'strategy')))
             pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if callable(pending_getter) and pending_getter(symbol_u):
+            if (callable(pending_getter) and pending_getter(symbol_u) and
+                    not disabling_only):
                 return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止修改配置'}), 409
+            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
+            open_intent = intent_getter(symbol_u) if callable(intent_getter) else None
+            if open_intent and not disabling_only:
+                # 紧急“禁用”必须允许：恢复裁决会在确认从未发单后消费意图；
+                # 若交易所已有真钱仓则仍补账/补止损，并按退池仓只平不开托管。
+                return jsonify({'error': f'{symbol_u} 存在未收口开仓意图，'
+                                         '仅允许紧急禁用，禁止改风险/策略或重新启用'}), 409
             # 检查与提交必须同在 trade lock 内；否则检查后日检可开仓，随后策略仍被改掉。
             if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
                 return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'

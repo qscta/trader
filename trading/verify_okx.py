@@ -44,6 +44,7 @@
 import os
 import time
 import argparse
+import math
 
 from okx_api import OkxApi
 
@@ -92,6 +93,76 @@ def check_position_mode(api):
         print(f"  ⚠️ 无法自动确认持仓模式: {e}")
         print("  ⚠️ 上线前必须人工到欧易确认账户为「单向(净)持仓模式」——这是硬条件。")
         return None
+
+
+def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
+    """按交易所当前真实方向/数量清理验证仓位；撤单失败也必须继续平仓。"""
+    cleanup_ok = True
+    try:
+        if api.cancel_all_orders(ccxt_symbol) is False:
+            cleanup_ok = False
+            print(f"[{tag}] ⚠️ 清理撤单返回失败，仍继续尝试平仓")
+    except Exception as e:
+        cleanup_ok = False
+        print(f"[{tag}] ⚠️ 清理撤单失败，仍继续尝试平仓:", e)
+
+    actual_position = None
+    try:
+        actual_position = api.get_position(ccxt_symbol)
+    except Exception as e:
+        cleanup_ok = False
+        print(f"[{tag}] ⚠️ 清理前无法读取真实仓位，回退原方向/数量尝试平仓:", e)
+
+    actual_side = (actual_position or {}).get('side') or expected_side
+    if actual_side not in ('long', 'short'):
+        cleanup_ok = False
+        actual_side = expected_side
+    contracts = abs(float((actual_position or {}).get('contracts') or 0))
+    close_coin = expected_coin
+    if contracts > 0:
+        converter = getattr(api, '_contracts_to_coins', None)
+        if callable(converter):
+            try:
+                converted = float(converter(ccxt_symbol, contracts))
+                if math.isfinite(converted) and converted > 0:
+                    close_coin = converted
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if actual_side != expected_side:
+        print(f"[{tag}] 🔴 清理检测到方向已变化: {expected_side} → {actual_side}，"
+              "改按交易所真实方向 reduce-only 平仓")
+
+    try:
+        close_order = api.close_position(
+            ccxt_symbol, actual_side, close_coin)
+        if close_order:
+            print(f"[{tag}] 清理平仓返回:", close_order.get('id'))
+    except Exception as e:
+        cleanup_ok = False
+        print(f"[{tag}] ❌ 清理平仓请求失败:", e)
+
+    # 平仓后再撤一次：首次撤单可能只是瞬时失败；若残留 reduce-only 止损
+    # 一直挂着，未来同品种新仓仍可能被旧单干扰。
+    try:
+        if api.cancel_all_orders(ccxt_symbol) is False:
+            cleanup_ok = False
+            print(f"[{tag}] ⚠️ 平仓后残留撤单返回失败")
+    except Exception as e:
+        cleanup_ok = False
+        print(f"[{tag}] ⚠️ 平仓后残留撤单仍失败:", e)
+
+    time.sleep(2)
+    try:
+        after = api.get_position(ccxt_symbol)
+        remaining = abs(float((after or {}).get('contracts') or 0))
+        print(f"[{tag}] 清理后剩余持仓（应 0）: {remaining}")
+        if remaining:
+            cleanup_ok = False
+            print(f"[{tag}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
+    except Exception as e:
+        cleanup_ok = False
+        print(f"[{tag}] ❌ 清理后仓位无法确认，请立即人工核查:", e)
+    return cleanup_ok
 
 
 def run_side(api, ccxt_symbol, coin, side):
@@ -164,18 +235,8 @@ def run_side(api, ccxt_symbol, coin, side):
                 ok = False
     finally:
         print(f"[{side}] --- 平仓 / 清理（保证执行）---")
-        try:
-            api.cancel_all_orders(ccxt_symbol)
-            print(f"[{side}] 平仓返回:", (api.close_position(ccxt_symbol, side, coin) or {}).get('id'))
-            time.sleep(2)
-            after = api.get_position(ccxt_symbol)
-            rem = abs(float((after or {}).get('contracts') or 0))
-            print(f"[{side}] 平仓后剩余持仓（应 0）: {rem}")
-            if rem:
-                print(f"[{side}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
-                ok = False
-        except Exception as e:
-            print(f"[{side}] ❌ 清理失败，请立即手动到欧易检查并平仓！", e)
+        if not cleanup_live_position(
+                api, ccxt_symbol, side, coin, side):
             ok = False
     return ok
 
@@ -282,19 +343,8 @@ def run_fire_test(api, ccxt_symbol, coin, side, distance_pct=0.15, timeout_secon
         return ok
     finally:
         print(f"[fire-{side}] --- 清理（保证执行）---")
-        try:
-            api.cancel_all_orders(ccxt_symbol)
-            close_order = api.close_position(ccxt_symbol, side, coin)
-            if close_order:
-                print(f"[fire-{side}] 清理平仓返回:", close_order.get('id'))
-            time.sleep(2)
-            after = api.get_position(ccxt_symbol)
-            rem = abs(float((after or {}).get('contracts') or 0))
-            print(f"[fire-{side}] 清理后剩余持仓（应 0）: {rem}")
-            if rem:
-                print(f"[fire-{side}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
-        except Exception as e:
-            print(f"[fire-{side}] ❌ 清理失败，请立即手动到欧易检查并平仓！", e)
+        cleanup_live_position(
+            api, ccxt_symbol, side, coin, f'fire-{side}')
 
 
 def run_stop_id_reuse_test(api, ccxt_symbol, coin, side):
@@ -378,19 +428,8 @@ def run_stop_id_reuse_test(api, ccxt_symbol, coin, side):
         return False
     finally:
         print(f"[reuse-{side}] --- 清理（保证执行）---")
-        try:
-            api.cancel_all_orders(ccxt_symbol)
-            close_order = api.close_position(ccxt_symbol, side, coin)
-            if close_order:
-                print(f"[reuse-{side}] 清理平仓返回:", close_order.get('id'))
-            time.sleep(2)
-            after = api.get_position(ccxt_symbol)
-            rem = abs(float((after or {}).get('contracts') or 0))
-            print(f"[reuse-{side}] 清理后剩余持仓（应 0）: {rem}")
-            if rem:
-                print(f"[reuse-{side}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
-        except Exception as e:
-            print(f"[reuse-{side}] ❌ 清理失败，请立即手动到欧易检查并平仓！", e)
+        cleanup_live_position(
+            api, ccxt_symbol, side, coin, f'reuse-{side}')
 
 
 def main():

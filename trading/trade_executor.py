@@ -971,6 +971,14 @@ class TradeExecutorMixin:
         且存在匹配 pending clOrdId 的崩溃恢复。它允许先查询旧订单，再按当前价
         决定补止损或立即 reduce-only 回滚；绝不表示可用过期信号新开仓。
         """
+        retired = bool(
+            symbol_config.get('_retired_from_pool') or
+            symbol_config.get('enabled') is False)
+        if retired and not recover_pending_position:
+            logger.warning(
+                f'{symbol} 已删除或禁用，通用开仓执行器按只平不开阻断新开仓')
+            return {'status': 'retired_blocked'}
+
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
         pending_getter = getattr(self.trade_state, 'get_pending_signal_execution', None)

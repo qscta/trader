@@ -8,18 +8,33 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-User=ubuntu
+# 独立动态用户：即使监控进程被利用，也没有 ubuntu 用户对 config/账本的读取权限。
+DynamicUser=true
+# /home/ubuntu 是 0750；仅借 ubuntu 组的目录遍历/只读运行权限进入代码目录。
+# config/账本均为 0600，且 config.json 另由 InaccessiblePaths 强制封锁。
+SupplementaryGroups=ubuntu
 WorkingDirectory=/home/ubuntu/trader/trading
-# 最小权限：专用文件只能包含 DINGTALK_WEBHOOK，绝不能换成含 OKX 密钥、
-# 登录口令和 FLASK_SECRET_KEY 的 /etc/trading.env。前缀 '-' 允许 config.json
-# 已配置 dingtalk.webhook_url 的部署不创建该文件。
-EnvironmentFile=-/etc/trading-mem-monitor.env
+# 专用文件只能包含 DINGTALK_WEBHOOK，绝不能换成含 OKX 密钥、登录口令和
+# FLASK_SECRET_KEY 的 /etc/trading.env。服务沙箱同时明确禁止读取 config.json，
+# 因此该文件缺失/无 webhook 时会 fail-loud，而不是回退接触交易凭据。
+EnvironmentFile=/etc/trading-mem-monitor.env
+Environment=TRADING_MEM_MONITOR_LOG=/var/log/trading-mem-monitor/mem_monitor.log
 ExecStart=/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py
 Restart=on-failure
 RestartSec=10
 UMask=0077
+LogsDirectory=trading-mem-monitor
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+InaccessiblePaths=-/home/ubuntu/trader/trading/config.json
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

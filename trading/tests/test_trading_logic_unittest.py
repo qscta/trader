@@ -769,6 +769,67 @@ class SymbolInputValidationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertEqual(self.system.config["trading"]["symbols"][0]["risk_per_trade"], 0.01)
 
+    def test_add_symbol_rejects_unresolved_open_intent(self):
+        self.system.config = {'trading': {'symbols': []}}
+        self.system.label = '欧易'
+        self.system.exchange_api = SimpleNamespace(
+            to_ccxt_symbol=lambda symbol: symbol,
+            fetch_ohlcv=Mock(return_value=[[1, 1, 1, 1, 1, 1]]))
+        self.system.trade_state = SimpleNamespace(
+            get_pending_signal_execution=Mock(return_value=None),
+            get_open_intent=Mock(return_value={
+                'status': 'pending', 'client_order_id': 'IOLD'}))
+        with patch.object(api_server, 'trading_system', self.system), patch.object(
+                api_server, 'send_dingtalk', Mock()):
+            resp = self.client.post('/api/symbols', json={
+                'name': 'BTCUSDT', 'risk_per_trade': 0.01,
+                'strategy': 'ma_cross'})
+        self.assertEqual(409, resp.status_code)
+        self.assertEqual([], self.system.config['trading']['symbols'])
+
+    def test_open_intent_allows_only_emergency_disable(self):
+        self.system.config = {'trading': {'symbols': [{
+            'name': 'BTCUSDT', 'enabled': True,
+            'risk_per_trade': 0.01, 'strategy': 'ma_cross'}]}}
+        self.system.label = '欧易'
+        self.system.reload_strategies = Mock()
+        self.system.trade_state = SimpleNamespace(
+            get_pending_signal_execution=Mock(return_value=None),
+            get_open_intent=Mock(return_value={
+                'status': 'pending', 'client_order_id': 'IOLD'}),
+            get_open_position=Mock(return_value=None))
+        with patch.object(api_server, 'trading_system', self.system), patch.object(
+                api_server, 'send_dingtalk', Mock()):
+            rejected = self.client.put(
+                '/api/symbols/BTCUSDT', json={'risk_per_trade': 0.02})
+            disabled = self.client.put(
+                '/api/symbols/BTCUSDT', json={'enabled': False})
+
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual(200, disabled.status_code)
+        self.assertIs(
+            False, self.system.config['trading']['symbols'][0]['enabled'])
+
+    def test_turtle_pending_also_allows_emergency_disable(self):
+        self.system.config = {'trading': {'symbols': [{
+            'name': 'BTCUSDT', 'enabled': True,
+            'risk_per_trade': 0.01, 'strategy': 'turtle'}]}}
+        self.system.label = '欧易'
+        self.system.reload_strategies = Mock()
+        self.system.trade_state = SimpleNamespace(
+            get_pending_signal_execution=Mock(return_value={
+                'status': 'pending', 'client_order_id': 'TOLD'}),
+            get_open_intent=Mock(return_value=None),
+            get_open_position=Mock(return_value=None))
+        with patch.object(api_server, 'trading_system', self.system), patch.object(
+                api_server, 'send_dingtalk', Mock()):
+            disabled = self.client.put(
+                '/api/symbols/BTCUSDT', json={'enabled': False})
+
+        self.assertEqual(200, disabled.status_code)
+        self.assertIs(
+            False, self.system.config['trading']['symbols'][0]['enabled'])
+
 
 class DeleteSymbolApiTests(unittest.TestCase):
     """删除交易对语义：只移出品种池，不平仓不撤单；老仓缺 strategy 须兜底。"""
