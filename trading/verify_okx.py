@@ -96,8 +96,25 @@ def check_position_mode(api):
 
 
 def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
-    """按交易所当前真实方向/数量清理验证仓位；撤单失败也必须继续平仓。"""
+    """按交易所当前真实方向/数量清理验证仓位；撤单失败也必须继续平仓。
+
+    清理期间止损仍可能成交并让仓位状态发生变化。因此首次平仓后若仍有仓位，
+    必须重新读取交易所方向/数量并限次补平，不能沿用清理开始时的快照。
+    """
     cleanup_ok = True
+
+    def coin_for_contracts(contracts, fallback):
+        """尽量按最新真实张数换算币数；换算失败时仍保留原清理机会。"""
+        converter = getattr(api, '_contracts_to_coins', None)
+        if contracts > 0 and callable(converter):
+            try:
+                converted = float(converter(ccxt_symbol, contracts))
+                if math.isfinite(converted) and converted > 0:
+                    return converted
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return fallback
+
     try:
         if api.cancel_all_orders(ccxt_symbol) is False:
             cleanup_ok = False
@@ -118,16 +135,7 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
         cleanup_ok = False
         actual_side = expected_side
     contracts = abs(float((actual_position or {}).get('contracts') or 0))
-    close_coin = expected_coin
-    if contracts > 0:
-        converter = getattr(api, '_contracts_to_coins', None)
-        if callable(converter):
-            try:
-                converted = float(converter(ccxt_symbol, contracts))
-                if math.isfinite(converted) and converted > 0:
-                    close_coin = converted
-            except (TypeError, ValueError, OverflowError):
-                pass
+    close_coin = coin_for_contracts(contracts, expected_coin)
     if actual_side != expected_side:
         print(f"[{tag}] 🔴 清理检测到方向已变化: {expected_side} → {actual_side}，"
               "改按交易所真实方向 reduce-only 平仓")
@@ -157,8 +165,40 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
         remaining = abs(float((after or {}).get('contracts') or 0))
         print(f"[{tag}] 清理后剩余持仓（应 0）: {remaining}")
         if remaining:
-            cleanup_ok = False
-            print(f"[{tag}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
+            # 极窄但真实的竞态：首次撤单失败后，原止损可能在首次平仓调用前
+            # 触发，使适配层因方向快照已过期而拒绝平仓。只按旧方向重试会继续
+            # 失败，所以必须以此刻交易所返回的方向/数量补做一次有界清理。
+            retry_side = (after or {}).get('side')
+            if retry_side in ('long', 'short'):
+                retry_coin = coin_for_contracts(remaining, expected_coin)
+                print(f"[{tag}] ⚠️ 检测到清理竞态，按最新仓位补平: "
+                      f"{remaining} 张 {retry_side}")
+                try:
+                    retry_order = api.close_position(
+                        ccxt_symbol, retry_side, retry_coin)
+                    if retry_order:
+                        print(f"[{tag}] 补平返回:", retry_order.get('id'))
+                except Exception as e:
+                    cleanup_ok = False
+                    print(f"[{tag}] ❌ 补平请求失败:", e)
+
+                # 补平后再清一次算法单，防止第二次快照期间又出现已失效残单。
+                try:
+                    if api.cancel_all_orders(ccxt_symbol) is False:
+                        cleanup_ok = False
+                        print(f"[{tag}] ⚠️ 补平后残留撤单返回失败")
+                except Exception as e:
+                    cleanup_ok = False
+                    print(f"[{tag}] ⚠️ 补平后残留撤单失败:", e)
+
+                time.sleep(2)
+                after = api.get_position(ccxt_symbol)
+                remaining = abs(float((after or {}).get('contracts') or 0))
+                print(f"[{tag}] 补平后剩余持仓（应 0）: {remaining}")
+
+            if remaining:
+                cleanup_ok = False
+                print(f"[{tag}] ⚠️⚠️ 仍有残留持仓，请立即手动到欧易平掉！")
     except Exception as e:
         cleanup_ok = False
         print(f"[{tag}] ❌ 清理后仓位无法确认，请立即人工核查:", e)

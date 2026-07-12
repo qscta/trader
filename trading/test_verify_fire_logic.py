@@ -8,7 +8,7 @@
 import sys
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 # 桩 ccxt / pandas 后导入 verify_okx（它顶部 import okx_api → import ccxt），
 # 导入完立即恢复（同 test_okx_adapter_safety.py 思路）
@@ -141,9 +141,35 @@ class FireTestDecisionLogicTest(unittest.TestCase):
             distance_pct=0.15, timeout_seconds=10, poll_interval=0)
 
         self.assertFalse(result)
-        api.close_position.assert_called_once_with(
+        api.close_position.assert_any_call(
             'BTC/USDT:USDT', 'short', 0.05)
-        self.assertEqual(2, api.cancel_all_orders.call_count)
+        self.assertGreaterEqual(api.cancel_all_orders.call_count, 2)
+
+    def test_cleanup_retries_with_fresh_side_after_stop_race(self):
+        """首次平仓遇到止损并发变向时，须按最新方向/数量再补平一次。"""
+        api = Mock()
+        api.cancel_all_orders.return_value = True
+        api._contracts_to_coins.side_effect = lambda _symbol, contracts: contracts / 100
+        api.close_position.side_effect = [
+            None,  # 首次调用时适配层复读仓位，发现方向已由 long 变 short
+            {'id': 'retry-close'},
+        ]
+        positions = [
+            {'contracts': 10.0, 'side': 'long'},
+            {'contracts': 5.0, 'side': 'short'},
+            None,
+        ]
+        api.get_position.side_effect = lambda _symbol: positions.pop(0)
+
+        result = verify_okx.cleanup_live_position(
+            api, 'BTC/USDT:USDT', 'long', 0.1, 'race')
+
+        self.assertTrue(result)
+        self.assertEqual([
+            call('BTC/USDT:USDT', 'long', 0.1),
+            call('BTC/USDT:USDT', 'short', 0.05),
+        ], api.close_position.call_args_list)
+        self.assertEqual(3, api.cancel_all_orders.call_count)
 
     def test_partial_stop_that_never_flattens_fails(self):
         """止损已部分成交不是“行情未触发”，超时后必须判失败。"""
