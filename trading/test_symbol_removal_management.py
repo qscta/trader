@@ -430,6 +430,52 @@ class RetiredExternalFlatTest(unittest.TestCase):
             self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
             self.assertEqual(system.stop_loss_dates, {})
 
+    def test_disabled_in_pool_ma_flat_close_does_not_create_t1(self):
+        """在池但已禁用的持仓品种：外部平仓（止损）按只平不开处理，不得记 T+1，
+        否则次日会按 EMA 方向自动重入——与「删除品种」同规则。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.config = {'trading': {'symbols': [
+                {'name': 'ETHUSDT', 'enabled': False, 'strategy': 'ma_cross'}]}}
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
+                'stop-1', strategy='ma_cross')
+            system.stop_loss_dates = {}
+            system._stop_anomalies = {}
+            system._cancel_stop_order_confirmed = Mock(return_value=True)
+
+            position = system.trade_state.get_open_position('ETHUSDT')
+            closed, saved, _cleared = system._handle_exchange_flat_close(
+                'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
+                '禁用仓外部平仓', strategy_type='ma_cross')
+
+            self.assertIsNotNone(closed)
+            self.assertTrue(saved)
+            self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
+            self.assertEqual(system.stop_loss_dates, {})
+
+    def test_enabled_in_pool_ma_flat_close_still_records_t1(self):
+        """对照：在池且启用的正常品种，外部平仓仍记 T+1；禁用收口不得误伤正常品种。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.config = {'trading': {'symbols': [
+                {'name': 'ETHUSDT', 'enabled': True, 'strategy': 'ma_cross'}]}}
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
+                'stop-1', strategy='ma_cross')
+            system.stop_loss_dates = {}
+            system._stop_anomalies = {}
+            system._cancel_stop_order_confirmed = Mock(return_value=True)
+
+            position = system.trade_state.get_open_position('ETHUSDT')
+            system._handle_exchange_flat_close(
+                'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
+                'ma_cross 日检平仓', strategy_type='ma_cross')
+
+            self.assertIn('ETHUSDT', system.trade_state.get_stop_loss_dates())
+
 
 class StopUpdateGapGuardTest(unittest.TestCase):
     """撤旧确认与挂新止损之间的缝隙：交易所已无持仓时不得再挂新止损（防孤儿 reduce-only 单）。"""

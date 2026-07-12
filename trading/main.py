@@ -1780,6 +1780,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             # 删除品种只托管当前仓位到下一次平仓；禁止反手或再开新腿。
                             '_retired_from_pool': True,
                         }
+                    elif not symbol_config.get('enabled', True):
+                        # 在池但已禁用且仍有持仓：与删除品种同规则——只托管现有仓位平仓
+                        # 退出，禁止反手/再开新腿。复制一份再打标记，避免污染共享配置。
+                        symbol_config = dict(symbol_config)
+                        symbol_config['_retired_from_pool'] = True
 
                     strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
                     logger.info(f"检查 {symbol} (策略: {strategy_type})...")
