@@ -20,6 +20,9 @@ SENSITIVE_RUNTIME_PATHS = {
 
 def _is_forbidden_tracked_path(path):
     name = Path(path).name
+    if (path.startswith('trading/closed_trades_archive_') and
+            (path.endswith('.json') or '.json.bak' in path)):
+        return True
     if path in SENSITIVE_RUNTIME_PATHS:
         return True
     # 原子状态保留 .bak / .bak.*；它们与主文件同样包含真实
@@ -34,11 +37,33 @@ def _is_forbidden_tracked_path(path):
 
 
 class RepositoryHygieneTest(unittest.TestCase):
+    def test_resource_monitor_unit_uses_production_runtime(self):
+        root = Path(__file__).resolve().parents[1]
+        unit = (root / 'trading' / 'systemd' /
+                'trading-mem-monitor.service').read_text(encoding='utf-8')
+        for required in (
+                'User=ubuntu',
+                '/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py',
+                'Restart=always', 'UMask=0077'):
+            self.assertIn(required, unit)
+        # 最小权限：监控进程只需 webhook（从 config.json 回退取得），绝不通过
+        # EnvironmentFile 加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY 的整份 trading.env。
+        # 只检查生效指令行（忽略注释），注释里出于说明目的提及该路径是允许的。
+        directives = [
+            line.strip() for line in unit.splitlines()
+            if line.strip() and not line.strip().startswith('#')]
+        self.assertFalse(
+            any(line.startswith('EnvironmentFile=') and 'trading.env' in line
+                for line in directives),
+            '监控单元不得通过 EnvironmentFile 加载整份 trading.env')
+
     def test_classifier_covers_runtime_backups_and_daily_equity(self):
         for path in (
                 'trading/daily_equity.json',
                 'trading/config.json.bak',
                 'trading/trade_state.json.bak.empty.20260711',
+                'trading/closed_trades_archive_2026.json',
+                'trading/closed_trades_archive_2026.json.bak',
                 'trading/qiusuo_index.json.bak'):
             self.assertTrue(_is_forbidden_tracked_path(path), path)
         self.assertFalse(_is_forbidden_tracked_path('trading/config.example.json'))

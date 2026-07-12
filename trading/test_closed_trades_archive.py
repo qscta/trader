@@ -1,7 +1,7 @@
 """账本/史书分离单测（纯标准库）。
 
 命脉账本 trade_state.json 只保留最近 KEEP_RECENT_CLOSED 条平仓记录，
-超出部分由 compact_closed_trades 搬进只追加的史书 closed_trades_archive.json：
+超出部分由 compact_closed_trades 按年份搬进 closed_trades_archive_YYYY.json：
 - 账本从此恒定大小，每次落盘不再全量重写逐年增长的历史；
 - 史书损坏只降级（展示近期、归档暂停），绝不阻断启动、绝不丢账本数据；
 - 「史书已写、账本落盘失败回滚」的窄窗口由内容级去重消除重复。
@@ -36,13 +36,18 @@ def _symbols(trades):
     return [t['symbol'] for t in trades]
 
 
+def _year_archive(ts, year=None):
+    year = year or str(__import__('datetime').datetime.now().year)
+    return os.path.join(ts.archive_dir, f'{ts.archive_prefix}{year}.json')
+
+
 class CompactionTest(unittest.TestCase):
     def test_no_compact_below_threshold(self):
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=5)
             _close_n(ts, 3)
             self.assertEqual(ts.compact_closed_trades(), 0)
-            self.assertFalse(os.path.exists(ts.archive_file))
+            self.assertFalse(os.path.exists(_year_archive(ts)))
             self.assertEqual(len(ts.get_closed_trades()), 3)
 
     def test_compact_moves_oldest_overflow_in_order(self):
@@ -78,13 +83,48 @@ class CompactionTest(unittest.TestCase):
             self.assertEqual(_symbols(ts.get_closed_trades()),
                              [f'C{i}USDT' for i in range(12)])
 
+    def test_compact_splits_records_by_close_year(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            ts.state['closed_trades'] = [
+                {'symbol': 'OLDUSDT', 'close_time': '2025-12-31T23:59:00'},
+                {'symbol': 'NEWUSDT', 'close_time': '2026-01-01T00:01:00'},
+                {'symbol': 'RECENTUSDT', 'close_time': '2026-02-01T00:00:00'},
+            ]
+            ts.save_state()
+
+            self.assertEqual(ts.compact_closed_trades(), 2)
+            with open(_year_archive(ts, '2025'), encoding='utf-8') as handle:
+                self.assertEqual(_symbols(json.load(handle)), ['OLDUSDT'])
+            with open(_year_archive(ts, '2026'), encoding='utf-8') as handle:
+                self.assertEqual(_symbols(json.load(handle)), ['NEWUSDT'])
+            self.assertEqual(
+                _symbols(ts.get_closed_trades()),
+                ['OLDUSDT', 'NEWUSDT', 'RECENTUSDT'])
+
+    def test_legacy_archive_remains_readable_with_year_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            with open(ts.archive_file, 'w', encoding='utf-8') as handle:
+                json.dump([{'symbol': 'LEGACYUSDT',
+                            'close_time': '2024-01-01T00:00:00'}], handle)
+            with open(_year_archive(ts, '2025'), 'w', encoding='utf-8') as handle:
+                json.dump([{'symbol': 'YEARUSDT',
+                            'close_time': '2025-01-01T00:00:00'}], handle)
+            ts.state['closed_trades'] = [
+                {'symbol': 'RECENTUSDT', 'close_time': '2026-01-01T00:00:00'}]
+
+            self.assertEqual(
+                _symbols(ts.get_closed_trades()),
+                ['LEGACYUSDT', 'YEARUSDT', 'RECENTUSDT'])
+
 
 class ArchiveFailSafeTest(unittest.TestCase):
     def test_corrupt_archive_keeps_ledger_and_skips_compaction(self):
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=5)
             _close_n(ts, 8)
-            with open(ts.archive_file, 'w', encoding='utf-8') as f:
+            with open(_year_archive(ts), 'w', encoding='utf-8') as f:
                 f.write('{"corrupt": tru')  # 半截 JSON
             self.assertEqual(ts.compact_closed_trades(), 0)
             self.assertEqual(len(ts.state['closed_trades']), 8)  # 账本一条不丢
@@ -98,7 +138,7 @@ class ArchiveFailSafeTest(unittest.TestCase):
             real_write = trade_state_module.atomic_write_json
 
             def fail_archive_only(filepath, data):
-                if filepath == ts.archive_file:
+                if filepath == _year_archive(ts):
                     return False
                 return real_write(filepath, data)
 
@@ -136,7 +176,7 @@ class ArchiveFailSafeTest(unittest.TestCase):
             ts.state['closed_trades'] = [
                 copy.deepcopy(duplicate), copy.deepcopy(duplicate), recent]
             ts.save_state()
-            with open(ts.archive_file, 'w', encoding='utf-8') as handle:
+            with open(_year_archive(ts), 'w', encoding='utf-8') as handle:
                 json.dump([duplicate], handle)
 
             self.assertEqual(2, ts.compact_closed_trades())
@@ -144,6 +184,31 @@ class ArchiveFailSafeTest(unittest.TestCase):
             archive, ok = ts._read_archive()
             self.assertTrue(ok)
             self.assertEqual([duplicate, duplicate], archive)
+
+    def test_partial_multi_year_write_retries_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            ts.state['closed_trades'] = [
+                {'symbol': 'OLDUSDT', 'close_time': '2025-12-31T00:00:00'},
+                {'symbol': 'NEWUSDT', 'close_time': '2026-01-01T00:00:00'},
+                {'symbol': 'RECENTUSDT', 'close_time': '2026-02-01T00:00:00'},
+            ]
+            ts.save_state()
+            real_write = trade_state_module.atomic_write_json
+
+            def fail_second_year(filepath, data):
+                if filepath == _year_archive(ts, '2026'):
+                    return False
+                return real_write(filepath, data)
+
+            with patch.object(
+                    trade_state_module, 'atomic_write_json', fail_second_year):
+                self.assertEqual(ts.compact_closed_trades(), 0)
+            self.assertEqual(len(ts.state['closed_trades']), 3)
+            self.assertEqual(ts.compact_closed_trades(), 2)
+            self.assertEqual(
+                _symbols(ts.get_closed_trades()),
+                ['OLDUSDT', 'NEWUSDT', 'RECENTUSDT'])
 
 
 class DailyCheckCompactionWiringTest(unittest.TestCase):
@@ -155,7 +220,7 @@ class DailyCheckCompactionWiringTest(unittest.TestCase):
             system.trade_state.keep_recent_closed = 5
             _close_n(system.trade_state, 8)
             system.check_and_execute_trades()
-            self.assertTrue(os.path.exists(system.trade_state.archive_file))
+            self.assertTrue(os.path.exists(_year_archive(system.trade_state)))
             self.assertEqual(len(system.trade_state.state['closed_trades']), 5)
             self.assertEqual(len(system.trade_state.get_closed_trades()), 8)
 

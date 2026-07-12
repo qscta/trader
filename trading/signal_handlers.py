@@ -112,6 +112,10 @@ class SignalHandlersMixin:
                     return
                 # 止损确认后，检查当前信号是否需要开新仓
                 logger.info(f"{symbol} [海龟] 止损已确认，继续检查当前信号...")
+                if symbol_config.get('_retired_from_pool'):
+                    logger.info(
+                        f"{symbol} [海龟] 退池仓止损已确认；结束托管，不再开仓")
+                    return
                 mid_line_crossed = self.trade_state.get_signal_state(symbol)
                 if signal['action'] in ('long', 'short') and mid_line_crossed:
                     logger.info(f"{symbol} [海龟] 止损后检测到标准开仓信号 {signal['action']}，执行反手开仓")
@@ -132,8 +136,11 @@ class SignalHandlersMixin:
                (signal['action'] == 'short' and position['side'] == 'long'):
                 logger.info(f"{symbol} [海龟] 穿越中轨+突破轨道，先平{position['side']}仓再开{signal['action']}仓")
                 close_ok = self.handle_close_signal(symbol, signal, position, symbol_config, skip_reopen=True)
-                if close_ok:
+                if close_ok and not symbol_config.get('_retired_from_pool'):
                     self.handle_open_signal_turtle(symbol, signal['action'], signal, symbol_config)
+                elif close_ok:
+                    logger.info(
+                        f"{symbol} [海龟] 退池仓已平；禁止突破反手新腿，结束托管")
                 else:
                     logger.warning(f"{symbol} [海龟] 平仓未成功，取消开仓")
             else:
@@ -170,6 +177,9 @@ class SignalHandlersMixin:
 
     def handle_open_signal_turtle(self, symbol, side, signal, symbol_config):
         """海龟策略：处理开仓信号"""
+        if symbol_config.get('_retired_from_pool'):
+            logger.info(f"{symbol} [海龟] 品种已退池，禁止开新腿")
+            return {'status': 'retired_no_reopen'}
         if signal.get('bootstrap_direct_entry'):
             logger.info(f"{symbol} [海龟] 触发新币启动期直通 {side} 信号，准备开仓...")
         else:

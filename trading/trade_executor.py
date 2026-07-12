@@ -378,6 +378,7 @@ class TradeExecutorMixin:
 
     def _flip_position(self, symbol, signal, old_position, new_side, symbol_config):
         """双均线策略：翻转仓位（平旧开新）"""
+        retired_from_pool = bool(symbol_config.get('_retired_from_pool'))
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
         # 获取实时市价用于记录平仓价
@@ -429,8 +430,19 @@ class TradeExecutorMixin:
         if not stop_cleared:
             # 记入 T+1：次日日检开头会自动重试清理残留，清理确认后由 T+1 重入按当时
             # EMA 方向重新入场，恢复「永远在市」；清理仍失败则维持开仓阻断（已有告警）。
-            self.record_stop_loss(symbol)
-            logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已记录 T+1，残留清理确认后次日按 EMA 方向重入")
+            if not retired_from_pool:
+                self.record_stop_loss(symbol)
+                logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已记录 T+1，残留清理确认后次日按 EMA 方向重入")
+            else:
+                logger.error(
+                    f"{symbol} [双均线] 退池仓已平，但旧止损撤销不可确认；"
+                    "保留残留阻断，不记录 T+1、不再开仓")
+            return
+
+        if retired_from_pool:
+            logger.info(
+                f"{symbol} [双均线] 退池仓已按反向交叉平仓；"
+                "按退池只平不开规则结束托管，不开反向新腿")
             return
 
         # 开仓价由 _execute_open 内部获取实时价格，这里传信号价作为参考
@@ -1589,8 +1601,12 @@ class TradeExecutorMixin:
             return False
 
         # 检查是否有新的开仓机会
-        if skip_reopen:
-            logger.info(f"{symbol} 平仓完成（调用方将负责开仓）")
+        if skip_reopen or symbol_config.get('_retired_from_pool'):
+            if symbol_config.get('_retired_from_pool'):
+                logger.info(
+                    f"{symbol} 退池仓平仓完成；按只平不开规则结束托管")
+            else:
+                logger.info(f"{symbol} 平仓完成（调用方将负责开仓）")
             return True
         logger.info(f"{symbol} 仍在品种池内，检查当前信号是否需要开新仓...")
         if signal['action'] in ('long', 'short'):

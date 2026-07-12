@@ -482,6 +482,16 @@ class StopGuardianMixin:
         返回 (closed_position, state_saved, stop_cleared)；closed 为 None 时调用方直接放弃。
         """
         effective_strategy = strategy_type or position.get('strategy') or 'turtle'
+        config = getattr(self, 'config', None)
+        pool = (config.get('trading', {}).get('symbols', [])
+                if isinstance(config, dict) else [])
+        matched = next(
+            (cfg for cfg in pool if cfg.get('name') == symbol), None)
+        # 已从池删除（不在池）或在池但已禁用：均按「只平不开」处理——退出时不记 T+1，
+        # 避免次日按 EMA 方向自动重入。
+        retired_from_pool = bool(
+            isinstance(config, dict) and
+            (matched is None or not matched.get('enabled', True)))
         # 区分“平仓事务刚建的 crash-cleanup marker”与“之前已有的
         # 未知 POST 残留”。前者经 cancel-all 连续验空即可清；后者还要等满
         # 可见性窗，防止迟到算法单在释放新开仓后才浮现。
@@ -491,7 +501,7 @@ class StopGuardianMixin:
             residue_preexisting = True
         stop_loss_date = (
             date.today().strftime('%Y-%m-%d')
-            if effective_strategy == 'ma_cross' else None)
+            if effective_strategy == 'ma_cross' and not retired_from_pool else None)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, exit_price, context, stop_loss_date=stop_loss_date,
             stop_cleanup_pending=True,
