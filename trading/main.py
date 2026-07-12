@@ -296,6 +296,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         eff_long = strategy.get('ma_long_period', 28)
         if eff_short >= eff_long:
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
+        cfgv.validate_strategy_ohlcv_capacity(strategy)
 
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
@@ -930,6 +931,23 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return True
 
     @staticmethod
+    def _format_indicator_price(value):
+        """按价格量级保留足够小数，避免低价品种在日志中显示为 0.00。"""
+        number = float(value)
+        magnitude = abs(number)
+        if magnitude >= 100:
+            decimals = 2
+        elif magnitude >= 1:
+            decimals = 4
+        elif magnitude >= 0.01:
+            decimals = 6
+        elif magnitude >= 0.0001:
+            decimals = 8
+        else:
+            decimals = 10
+        return f'{number:.{decimals}f}'
+
+    @staticmethod
     def _closed_candle_id(df):
         """返回最新已收盘 K 线的稳定 ID（带时区无关的 ISO 字符串）。"""
         value = df.iloc[-1].get('timestamp') if len(df) else None
@@ -1560,11 +1578,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return unresolved
 
     def _ma_signal_with_catchup(self, symbol, strategy, df):
-        """逐根回放上次成功处理之后的 EMA 交叉，只执行最终目标仓位。
+        """只检查最新已收盘 K 线是否刚发生 EMA 交叉。
 
-        停机期间可能发生多次交叉。逐根计算用于确认是否有遗漏事件，
-        但恢复时不会用历史价位连续买卖；仅按最新 EMA 状态执行一次收敛，
-        止损位也使用最新已收盘数据。
+        last_processed_candle 仅用于同一根 K 线的消费幂等。即使停机或
+        行情故障造成历史间隔，也不回放旧交叉、不按当前 EMA 位置补仓；
+        只比较最新两根已收盘 K 线，避免恢复后补做历史交易。
         """
         metadata = self.trade_state.get_signal_metadata(symbol)
         last_id = metadata.get('last_processed_candle') if metadata.get('strategy') in (None, 'ma_cross') else None
@@ -1576,45 +1594,87 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         current_state = strategy.check_current_state(df)
         if current_state is None:
             return None, current_id, 0
-        # action 是“本根需执行的交叉”，target_side 是“当前 EMA 应有持仓”。
-        # 即使 marker 曾被旧版本错误推进，后者仍可修正遗留的反向仓。
-        current_state['target_side'] = current_state.get('action')
 
         if last_id == current_id:
             # 已处理过这根 K 线：仍返回当前指标供 T+1/持仓检查，但不重放交叉。
             current_state['action'] = None
             return current_state, current_id, 0
 
-        min_required = max(strategy.long_period * 2, strategy.stop_loss_period + 1)
-        if last_id in candle_ids:
-            start_index = candle_ids.index(last_id) + 1
-        elif last_id:
-            # 标记已超出本轮可见历史：无法还原每一根，但必须向最终 EMA 方向收敛。
-            logger.warning(
-                f"{symbol} [双均线] 上次处理 K 线 {last_id} 已不在可见历史中，"
-                "按当前 EMA 最终状态恢复")
-            start_index = max(min_required - 1, 1)
-        else:
-            # 首次升级没有 marker：用可见窗口回放，并向当前状态收敛。
-            start_index = max(min_required - 1, 1)
+        rebaseline, _, _, gap = self._history_requires_rebaseline(
+            symbol, 'ma_cross', df)
+        latest_signal = strategy.check_signal(df)
+        latest_action = (
+            latest_signal.get('action') if isinstance(latest_signal, dict) else None)
+        current_state['action'] = (
+            latest_action if latest_action in ('long', 'short') else None)
 
-        missed = []
-        for end_index in range(start_index, len(df)):
-            frame = df.iloc[:end_index + 1]
-            replayed = strategy.check_signal(frame)
-            if replayed and replayed.get('action') in ('long', 'short'):
-                missed.append((candle_ids[end_index], replayed['action']))
-
-        # 无 marker 代表首次建立事实源，或 marker 不可见；即使可见窗口内
-        # 没有交叉，“永远在市”也要与当前 EMA 方向收敛。
-        needs_convergence = bool(missed) or not last_id or last_id not in candle_ids
-        if needs_convergence:
+        if rebaseline:
+            current_state['_history_discontinuity'] = True
+            current_state['_history_gap_candles'] = gap
             logger.warning(
-                f"{symbol} [双均线] 回放未处理 K 线发现 {len(missed)} 次交叉，"
-                f"最终目标方向={current_state.get('action')}")
-        else:
-            current_state['action'] = None
-        return current_state, current_id, len(missed)
+                f"{symbol} [双均线] 信号历史不可安全连续：上次处理={last_id}，"
+                f"当前={current_id}，间隔={gap}；忽略间隔内的历史交叉，"
+                f"仅检查最新一根，信号={current_state['action']}")
+
+        return current_state, current_id, int(current_state['action'] is not None)
+
+    def _history_requires_rebaseline(self, symbol, strategy_type, df,
+                                     max_gap_candles=3):
+        """判断信号 marker 与当前可见历史是否存在不可安全回放的断层。"""
+        metadata = self.trade_state.get_signal_metadata(symbol)
+        last_id = (
+            metadata.get('last_processed_candle')
+            if metadata.get('strategy') in (None, strategy_type) else None)
+        candle_ids = [
+            (value.isoformat() if hasattr(value, 'isoformat') else str(value))
+            for value in df['timestamp'].tolist()
+        ]
+        current_id = candle_ids[-1]
+        if last_id == current_id:
+            return False, last_id, current_id, 0
+        if not last_id:
+            return True, None, current_id, None
+        if last_id not in candle_ids:
+            return True, last_id, current_id, None
+        unseen = len(candle_ids) - candle_ids.index(last_id) - 1
+        # 行数连续不等于时间连续：若行情源中间缺月但只返回两根稀疏 K 线，
+        # 仅按 unseen 会误判为安全。生产 candle ID 是 ISO 时间，同时比较日历跨度。
+        gap = unseen
+        try:
+            calendar_days = (
+                date.fromisoformat(current_id[:10]) -
+                date.fromisoformat(str(last_id)[:10])).days
+            gap = max(gap, calendar_days)
+        except (TypeError, ValueError):
+            # 测试桩/兼容旧 marker 可能不是 ISO；仍保留行数防线。
+            pass
+        return gap > max_gap_candles, last_id, current_id, gap
+
+    @staticmethod
+    def _daily_candle_is_fresh(df, scheduled_date, max_lag_days=1):
+        """验证最新日 K 足以代表本次调度日，拒绝陈旧行情进入真钱策略。
+
+        北京时间 08:00 对应 UTC 日线刚收盘；调度日 D 正常应至少拿到时间戳
+        为 D-1 的日 K。允许额外落后 1 天，兼容周末/节假日不连续的传统资产
+        映射合约；超过该窗口一律 fail-closed。
+        """
+        try:
+            values = df['timestamp'].tolist()
+            latest = values[-1]
+            if hasattr(latest, 'to_pydatetime'):
+                latest = latest.to_pydatetime()
+            elif not isinstance(latest, (datetime, date)):
+                latest = datetime.fromisoformat(str(latest).replace('Z', '+00:00'))
+            latest_date = latest.date() if isinstance(latest, datetime) else latest
+            check_date = (
+                scheduled_date.date() if isinstance(scheduled_date, datetime)
+                else scheduled_date if isinstance(scheduled_date, date)
+                else date.fromisoformat(str(scheduled_date)))
+            minimum_date = check_date - timedelta(days=1 + int(max_lag_days))
+            return latest_date >= minimum_date, latest_date, minimum_date
+        except Exception as exc:
+            logger.error(f'无法验证最新日 K 时间戳，按陈旧数据拒绝交易: {exc}')
+            return False, None, None
 
     def _mark_daily_check_complete(self, check_date):
         """先持久化调度日，成功后再更新内存守卫。"""
@@ -1831,6 +1891,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             data_unready_symbols.append(symbol)
                         continue
 
+                    fresh, latest_candle_date, minimum_candle_date = (
+                        self._daily_candle_is_fresh(df, today))
+                    if not fresh:
+                        logger.critical(
+                            f"{symbol} 最新已收盘日 K 陈旧：latest={latest_candle_date}，"
+                            f"本次调度日={today}，最低允许={minimum_candle_date}；"
+                            "禁止本品种开仓、平仓、反手及策略止损推进")
+                        failed_symbols.append(symbol)
+                        continue
+
                     turtle_signal_id = None
                     turtle_signal_side = None
                     candle_id = self._closed_candle_id(df)
@@ -1843,12 +1913,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         already_processed = (
                             turtle_metadata.get('strategy') == 'turtle' and
                             turtle_metadata.get('last_processed_candle') == candle_id)
+                        rebaseline, previous_candle, _, gap_candles = (
+                            self._history_requires_rebaseline(
+                                symbol, 'turtle', df))
+                        armed_state_ready = True
                         try:
                             # 这里只回填“截至上一根K线”的可开仓状态，不能把今天刚发生的
                             # 首次突破提前算成已消耗，否则会吞掉本轮本该执行的开仓信号。
-                            # 但仅“首次看到该 candle”时允许 include_latest=False。已处理或已建立
-                            # pending/confirmed 的同 candle 重跑必须信任持久化状态，不可再排除
-                            # latest 把已消费资格重新写成 True。
+                            # 断档时同样只重算资格状态、绝不回放旧交易；随后仍应检查
+                            # 最新两根 K 线本身是否刚产生突破/中轨穿越。
                             if not already_processed and not execution_same_candle:
                                 armed = self.turtle_strategy.is_first_breakout_armed(
                                     df, include_latest_bar=False)
@@ -1860,9 +1933,28 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                     else:
                                         logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
                         except Exception as e:
+                            armed_state_ready = False
                             logger.warning(f"{symbol} [海龟] 历史回溯开仓状态失败: {e}")
 
-                        signal = strategy.check_signal(df, mid_line_crossed=mid_line_crossed)
+                        signal = strategy.check_signal(
+                            df, mid_line_crossed=mid_line_crossed)
+                        if rebaseline and not execution_same_candle and signal:
+                            signal['_history_discontinuity'] = True
+                            signal['_history_gap_candles'] = gap_candles
+                            if armed_state_ready:
+                                logger.warning(
+                                    f"{symbol} [海龟] 信号历史不可安全连续："
+                                    f"上次处理={previous_candle}，当前={candle_id}，"
+                                    f"间隔={gap_candles}；忽略间隔内历史事件，"
+                                    f"仅检查最新一根，信号={signal.get('action')}")
+                            else:
+                                # 无法证明截至上一根的“首次突破资格”，开仓信号不能执行；
+                                # close_long/close_short 只依赖最新中轨穿越，仍可安全保留。
+                                if signal.get('action') in ('long', 'short'):
+                                    signal['action'] = None
+                                logger.critical(
+                                    f"{symbol} [海龟] 断档且开仓资格重建失败；"
+                                    "禁止最新突破开仓，最新中轨平仓信号仍按事实处理")
                         if signal and signal.get('mid_line_crossed'):
                             self.trade_state.set_signal_state(symbol, True)
                         if signal and signal.get('action') in ('long', 'short'):
@@ -1878,6 +1970,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         continue
 
                     current_close = float(df['close'].iloc[-1])
+                    fmt_price = self._format_indicator_price
                     if strategy_type == 'turtle':
                         upper = signal.get('upper_line')
                         lower = signal.get('lower_line')
@@ -1886,31 +1979,24 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             dist_upper = (upper - current_close) / current_close * 100
                             dist_lower = (current_close - lower) / current_close * 100
                             signal_label = self._get_turtle_signal_label(signal)
-                            logger.info(f"{symbol} [海龟指标] 收盘价={current_close:.2f}, "
-                                       f"上轨={upper:.2f}(距{dist_upper:+.2f}%), "
-                                       f"下轨={lower:.2f}(距{dist_lower:+.2f}%), "
-                                       f"中轨={mid:.2f}, 信号={signal_label}")
+                            logger.info(
+                                f"{symbol} [海龟指标] 收盘价={fmt_price(current_close)}, "
+                                f"上轨={fmt_price(upper)}(距{dist_upper:+.2f}%), "
+                                f"下轨={fmt_price(lower)}(距{dist_lower:+.2f}%), "
+                                f"中轨={fmt_price(mid)}, 信号={signal_label}")
                     elif strategy_type == 'ma_cross':
                         ema_s = signal.get('ema_short')
                         ema_l = signal.get('ema_long')
                         upper_stop = signal.get('upper_stop')
                         lower_stop = signal.get('lower_stop')
-                        logger.info(f"{symbol} [双均线指标] 收盘价={current_close:.2f}, "
-                                   f"EMA短={ema_s:.2f}, EMA长={ema_l:.2f}, "
-                                   f"N日高={upper_stop:.2f}, N日低={lower_stop:.2f}, "
-                                   f"信号={signal.get('action', '无')}")
+                        logger.info(
+                            f"{symbol} [双均线指标] 收盘价={fmt_price(current_close)}, "
+                            f"EMA短={fmt_price(ema_s)}, EMA长={fmt_price(ema_l)}, "
+                            f"N日高={fmt_price(upper_stop)}, "
+                            f"N日低={fmt_price(lower_stop)}, "
+                            f"信号={signal.get('action', '无')}")
 
                     position = self.trade_state.get_open_position(symbol)
-
-                    if (strategy_type == 'ma_cross' and position and
-                            signal.get('action') not in ('long', 'short') and
-                            signal.get('target_side') in ('long', 'short') and
-                            position.get('side') != signal.get('target_side')):
-                        signal['action'] = signal['target_side']
-                        logger.critical(
-                            f"{symbol} [双均线] 本地仓位 {position.get('side')} 与"
-                            f"当前 EMA 目标 {signal['target_side']} 相反；"
-                            "即使历史 marker 已推进，仍执行一次收敛")
 
                     if position:
                         if strategy_type == 'turtle':

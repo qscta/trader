@@ -16,8 +16,8 @@ import re
 # 策略周期允许范围（整数，含端点）
 PERIOD_MIN = 2
 PERIOD_MAX = 500
-# 主循环默认至少拉取约一年日线；大周期策略按实际配置自动上调。
-DEFAULT_OHLCV_FETCH_LIMIT = 365
+# OKX /market/candles 单次可靠上限为 300；策略日检固定只取最新一页。
+STRATEGY_OHLCV_FETCH_LIMIT = 300
 # fetch_ohlcv 可能包含当前未收盘 K 线，过滤后要仍满足策略最低已收盘根数。
 OPEN_CANDLE_FETCH_BUFFER = 1
 # 单笔风险度上限 50%：防止把 1 当 1% 输这类数量级笔误直接放大到全仓
@@ -50,9 +50,20 @@ def required_closed_candles_for_strategy(strategy_type, strategy_config=None):
 
 
 def ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config=None):
-    """返回主数据管线应请求的 K 线根数，与策略窗口配置同源。"""
+    """策略日检固定请求 OKX 单页上限；超容量配置由入口拒绝。"""
     required = required_closed_candles_for_strategy(strategy_type, strategy_config)
-    return max(DEFAULT_OHLCV_FETCH_LIMIT, required + OPEN_CANDLE_FETCH_BUFFER)
+    if required + OPEN_CANDLE_FETCH_BUFFER > STRATEGY_OHLCV_FETCH_LIMIT:
+        raise ValueError(
+            f'{strategy_type} 策略最低需要 {required} 根已收盘 K 线，'
+            f'加未收盘缓冲后超过单次 {STRATEGY_OHLCV_FETCH_LIMIT} 根上限')
+    return STRATEGY_OHLCV_FETCH_LIMIT
+
+
+def validate_strategy_ohlcv_capacity(strategy_config=None):
+    """确保两套策略均可由一次 300 根请求完整计算。"""
+    for strategy_type in STRATEGY_WHITELIST:
+        ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config)
+    return True
 
 
 def strict_float_finite(value, field):

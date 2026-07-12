@@ -18,7 +18,8 @@ from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
                                ohlcv_fetch_limit_for_strategy,
                                required_closed_candles_for_strategy, strict_int,
                                strict_risk_per_trade, strict_bool,
-                               normalize_symbol_name, strict_float_finite)
+                               normalize_symbol_name, strict_float_finite,
+                               validate_strategy_ohlcv_capacity)
 
 
 def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
@@ -1028,6 +1029,12 @@ def update_strategy_params():
             eff_long = parsed.get('ma_long_period', cur.get('ma_long_period', 28))
             if eff_short >= eff_long:
                 return jsonify({'error': f'EMA 短期({eff_short})必须小于长期({eff_long})'}), 400
+            proposed = dict(cur)
+            proposed.update(parsed)
+            try:
+                validate_strategy_ohlcv_capacity(proposed)
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 400
             backup = json.loads(json.dumps(system.config.get('strategy', {})))
             sp = system.config.setdefault('strategy', {})
 
@@ -1103,11 +1110,24 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} K线数据不足：{strategy_type} 策略至少需要 '
                                          f'{required_closed} 根已收盘K线，当前仅 {len(df)} 根'}), 400
 
+            fresh, latest_candle_date, minimum_candle_date = (
+                system._daily_candle_is_fresh(
+                    df, datetime.now().date().isoformat()))
+            if not fresh:
+                logger.critical(
+                    f'{symbol_name} 即时开仓拒绝陈旧日 K: latest={latest_candle_date}, '
+                    f'minimum={minimum_candle_date}')
+                return jsonify({
+                    'error': f'{symbol_name} 最新已收盘日K陈旧，禁止即时开仓',
+                    'latest_candle_date': str(latest_candle_date),
+                    'minimum_candle_date': str(minimum_candle_date),
+                }), 409
+
             try:
                 current_price = system.exchange_api.get_last_price(ccxt_symbol)
             except Exception as e:
-                current_price = float(df['close'].iloc[-1])
-                logger.warning(f"{symbol_name} 获取实时市价失败({e})，回退收盘价: {current_price}")
+                logger.error(f"{symbol_name} 获取实时市价失败，拒绝即时开仓: {e}")
+                return jsonify({'error': f'{symbol_name} 无法取得实时市价，禁止即时开仓'}), 503
 
             signal_side = None
             stop_loss_price = None
@@ -1120,14 +1140,14 @@ def instant_open():
                 signal_side = signal.get('action')
                 if signal_side not in ('long', 'short'):
                     return jsonify({'error': f'{symbol_name} 当前EMA无明确方向（短期EMA≈长期EMA）',
-                                    'info': {'ema_short': round(signal.get('ema_short', 0), 2),
-                                             'ema_long': round(signal.get('ema_long', 0), 2),
+                                    'info': {'ema_short': float(signal.get('ema_short', 0)),
+                                             'ema_long': float(signal.get('ema_long', 0)),
                                              'current_price': current_price}}), 400
                 stop_loss_price = signal['lower_stop'] if signal_side == 'long' else signal['upper_stop']
-                signal_info = {'ema_short': round(signal.get('ema_short', 0), 2),
-                               'ema_long': round(signal.get('ema_long', 0), 2),
-                               'upper_stop': round(signal.get('upper_stop', 0), 2),
-                               'lower_stop': round(signal.get('lower_stop', 0), 2),
+                signal_info = {'ema_short': float(signal.get('ema_short', 0)),
+                               'ema_long': float(signal.get('ema_long', 0)),
+                               'upper_stop': float(signal.get('upper_stop', 0)),
+                               'lower_stop': float(signal.get('lower_stop', 0)),
                                'strategy': 'ma_cross'}
             else:
                 signal = system.turtle_strategy.check_current_state(df)

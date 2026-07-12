@@ -27,7 +27,19 @@ async function postJSON(path, body) {
 
 function el(id) { return document.getElementById(id); }
 function setText(id, txt) { const e = el(id); if (e) e.textContent = txt; }
+function escapeHtml(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[ch]);
+}
 function fmt(n, d = 2) { if (n == null || isNaN(n)) return '-'; return Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d }); }
+function fmtPrice(n) {
+    if (n == null || !Number.isFinite(Number(n))) return '-';
+    const value = Number(n);
+    const magnitude = Math.abs(value);
+    const digits = magnitude >= 100 ? 2 : magnitude >= 1 ? 4 : magnitude >= 0.01 ? 6 : magnitude >= 0.0001 ? 8 : 10;
+    return value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
 function fmtPct(n) { if (n == null || isNaN(n)) return '-'; return (n >= 0 ? '+' : '') + Number(n).toFixed(2) + '%'; }
 function pnlClass(n) { return n >= 0 ? 'price-up' : 'price-down'; }
 
@@ -349,8 +361,9 @@ async function loadPositions() {
         let totalNotional = 0;
         let totalStopRisk = 0;
         let rows = entries.map(([symbol, p]) => {
+            const safeSymbol = escapeHtml(symbol);
             const sideBadge = p.side === 'long' ? '<span class="badge badge-long">多</span>' : '<span class="badge badge-short">空</span>';
-            const cur = p.current_price != null ? fmt(p.current_price, 4) : '-';
+            const cur = fmtPrice(p.current_price);
             const pnl = p.unrealized_pnl != null ? `<span class="${pnlClass(p.unrealized_pnl)}">${p.unrealized_pnl>=0?'+':''}${fmt(p.unrealized_pnl)}</span>` : '-';
             const days = p.holding_days != null ? p.holding_days + ' 天' : '-';
             const entry = Number(p.entry_price);
@@ -363,13 +376,13 @@ async function loadPositions() {
                 totalStopRisk += Math.max(0, (p.side === 'long' ? entry - stop : stop - entry) * size);
             }
             return `<tr>
-                <td><span class="symbol-name">${symbol}</span></td>
+                <td><span class="symbol-name">${safeSymbol}</span></td>
                 <td>${sideBadge}</td>
-                <td class="number-cell">${fmt(p.entry_price, 4)}</td>
+                <td class="number-cell">${fmtPrice(p.entry_price)}</td>
                 <td class="number-cell">${cur}</td>
                 <td class="number-cell">${pnl}</td>
                 <td>${days}</td>
-                <td class="center-cell"><button class="btn-close-pos" data-action="close" data-symbol="${symbol}" data-side="${p.side}" data-size="${p.position_size}">平仓</button></td>
+                <td class="center-cell"><button class="btn-close-pos" data-action="close" data-symbol="${safeSymbol}" data-side="${p.side}" data-size="${p.position_size}">平仓</button></td>
             </tr>`;
         }).join('');
         const pnlSign = totalPnl >= 0 ? '+' : '';
@@ -399,15 +412,16 @@ async function loadSymbols() {
         setText('symbolPoolDetail', symbols.length ? ('海龟 ' + _t + ' · 均线 ' + _m) : '');
         if (!symbols.length) { box.innerHTML = '<div class="empty">品种池为空，添加一个交易对</div>'; return; }
         let rows = symbols.map(s => {
+            const safeName = escapeHtml(s.name);
             const stratBadge = (s.strategy || 'turtle') === 'turtle' ? '<span class="badge badge-turtle">海龟</span>' : '<span class="badge badge-ma">双均线</span>';
             const stateBadge = s.enabled ? '<span class="badge badge-on">启用</span>' : '<span class="badge badge-off">禁用</span>';
             const holding = s.has_open_position ? '<span class="badge badge-holding">持仓中</span>' : '';
             return `<tr>
-                <td><span class="symbol-name">${s.name}</span>${holding}</td>
+                <td><span class="symbol-name">${safeName}</span>${holding}</td>
                 <td>${stratBadge}</td>
-                <td class="number-cell" data-action="risk" data-symbol="${s.name}" data-risk="${s.risk_per_trade}" style="cursor:pointer">${(s.risk_per_trade*100).toFixed(1)}%</td>
-                <td><span style="cursor:pointer" data-action="toggle" data-symbol="${s.name}" data-enabled="${s.enabled?1:0}">${stateBadge}</span></td>
-                <td class="center-cell"><button class="btn btn-sm btn-danger" data-action="del" data-symbol="${s.name}">删除</button></td>
+                <td class="number-cell" data-action="risk" data-symbol="${safeName}" data-risk="${s.risk_per_trade}" style="cursor:pointer">${(s.risk_per_trade*100).toFixed(1)}%</td>
+                <td><span style="cursor:pointer" data-action="toggle" data-symbol="${safeName}" data-enabled="${s.enabled?1:0}">${stateBadge}</span></td>
+                <td class="center-cell"><button class="btn btn-sm btn-danger" data-action="del" data-symbol="${safeName}">删除</button></td>
             </tr>`;
         }).join('');
         box.innerHTML = `<div class="table-wrap"><table class="data"><thead><tr>
@@ -583,14 +597,15 @@ async function loadTrades() {
         if (!trades || !trades.length) { box.innerHTML = '<div class="empty">暂无历史交易</div>'; return; }
         const rows = trades.map(t => {
             const side = t.side === 'long' ? '<span class="badge badge-long">多</span>' : '<span class="badge badge-short">空</span>';
-            const closeTime = (t.close_time || '').replace('T', ' ').slice(0, 16);
+            const closeTime = escapeHtml((t.close_time || '').replace('T', ' ').slice(0, 16));
+            const safeSymbol = escapeHtml(t.symbol);
             const pnl = `<span class="${pnlClass(t.pnl)}">${t.pnl>=0?'+':''}${fmt(t.pnl)}</span>`;
             return `<tr>
                 <td>${closeTime}</td>
-                <td><span class="symbol-name">${t.symbol}</span></td>
+                <td><span class="symbol-name">${safeSymbol}</span></td>
                 <td>${side}</td>
-                <td class="number-cell">${fmt(t.entry_price, 4)}</td>
-                <td class="number-cell">${fmt(t.exit_price, 4)}</td>
+                <td class="number-cell">${fmtPrice(t.entry_price)}</td>
+                <td class="number-cell">${fmtPrice(t.exit_price)}</td>
                 <td class="number-cell">${pnl}</td>
                 <td class="number-cell">${fmtPct(t.pnl_percent)}</td>
             </tr>`;

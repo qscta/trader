@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-375%20stdlib%20%2B%20105%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-384%20stdlib%20%2B%20107%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -31,7 +31,8 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **480 个测试**——375 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 105 个依赖版集成用例。
+- **491 个测试**——384 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 107 个依赖版集成用例。
+- **行情 fail-closed**——策略日检固定读取 OKX 最新单页 300 根，不为指标计算分页；最新已收盘日 K 陈旧、数据量不足或历史出现大跨度断层时，禁止该品种开仓、平仓、反手及策略止损推进。
 
 ## 🏗️ 架构
 
@@ -64,7 +65,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 | 策略 | 开仓 | 止损 | 出场 |
 |---|---|---|---|
 | **海龟通道突破** `turtle` | 收盘价穿越中轨「武装」后，该方向**首次**轨道突破（默认 28 日通道） | 反向轨道，随通道单向推进（多单只上移） | 价格反向穿越中轨 |
-| **双均线 EMA** `ma_cross` | EMA 短(默认 7)上穿/下穿长(默认 28)金叉做多/死叉做空，永远在市 | 前 N 日收盘价高低点（默认 N=28） | 反向交叉时先平旧仓再反手 |
+| **双均线 EMA** `ma_cross` | 只在最新已收盘日线刚发生 EMA 短(默认 7)上穿/下穿长(默认 28)时开仓；池内既有历史方向不自动补仓 | 前 N 日收盘价高低点（默认 N=28） | 最新反向交叉时先平旧仓再反手 |
 
 双均线含 **T+1 限制**：当天止损过的品种当天不重入，次日 EMA 方向仍成立则按当时方向重入。
 海龟含**新币启动期直通**：K 线不足以形成通道的新标的，首次能算出通道时允许直接突破开仓。
@@ -109,10 +110,10 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```bash
 cd trading
 
-# 375 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 384 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
-# 105 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
+# 107 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
 pip install -r requirements.txt
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
