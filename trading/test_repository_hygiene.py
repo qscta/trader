@@ -20,6 +20,9 @@ SENSITIVE_RUNTIME_PATHS = {
 
 def _is_forbidden_tracked_path(path):
     name = Path(path).name
+    if (path.startswith('trading/closed_trades_archive_') and
+            (path.endswith('.json') or '.json.bak' in path)):
+        return True
     if path in SENSITIVE_RUNTIME_PATHS:
         return True
     # 原子状态保留 .bak / .bak.*；它们与主文件同样包含真实
@@ -34,11 +37,23 @@ def _is_forbidden_tracked_path(path):
 
 
 class RepositoryHygieneTest(unittest.TestCase):
+    def test_resource_monitor_unit_uses_production_runtime(self):
+        root = Path(__file__).resolve().parents[1]
+        unit = (root / 'trading' / 'systemd' /
+                'trading-mem-monitor.service').read_text(encoding='utf-8')
+        for required in (
+                'User=ubuntu', 'EnvironmentFile=/etc/trading.env',
+                '/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py',
+                'Restart=always', 'UMask=0077'):
+            self.assertIn(required, unit)
+
     def test_classifier_covers_runtime_backups_and_daily_equity(self):
         for path in (
                 'trading/daily_equity.json',
                 'trading/config.json.bak',
                 'trading/trade_state.json.bak.empty.20260711',
+                'trading/closed_trades_archive_2026.json',
+                'trading/closed_trades_archive_2026.json.bak',
                 'trading/qiusuo_index.json.bak'):
             self.assertTrue(_is_forbidden_tracked_path(path), path)
         self.assertFalse(_is_forbidden_tracked_path('trading/config.example.json'))

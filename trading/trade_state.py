@@ -206,8 +206,11 @@ class TradeState:
 
     def __init__(self, state_file='trade_state.json', keep_recent_closed=None):
         self.state_file = state_file
+        self.archive_dir = os.path.dirname(os.path.abspath(state_file))
+        # 旧版单文件只读兼容；新归档按 close_time 年份写入独立史书。
         self.archive_file = os.path.join(
-            os.path.dirname(os.path.abspath(state_file)), 'closed_trades_archive.json')
+            self.archive_dir, 'closed_trades_archive.json')
+        self.archive_prefix = 'closed_trades_archive_'
         self.keep_recent_closed = keep_recent_closed or self.KEEP_RECENT_CLOSED
         self.lock = _file_lock
         self._archive_cache_key = None
@@ -1153,26 +1156,62 @@ class TradeState:
         with self.lock:
             return self._snapshot_locked()['open_positions']
 
+    def _archive_paths(self):
+        """按旧史书在前、年度史书按年份升序返回全部归档路径。"""
+        paths = []
+        if private_file_exists(self.archive_file):
+            paths.append(self.archive_file)
+        try:
+            names = sorted(
+                name for name in os.listdir(self.archive_dir)
+                if name.startswith(self.archive_prefix) and name.endswith('.json'))
+        except OSError as exc:
+            raise TradeStatePersistenceError(
+                f'无法枚举平仓历史史书目录 {self.archive_dir}: {exc}') from exc
+        paths.extend(os.path.join(self.archive_dir, name) for name in names)
+        return paths
+
+    @staticmethod
+    def _archive_sort_key(record):
+        value = record.get('close_time') if isinstance(record, dict) else None
+        return str(value or '')
+
+    def _read_archive_file(self, path):
+        with open_private_text_file(path) as handle:
+            records = json.load(handle, parse_constant=_reject_nonfinite_json)
+        if not isinstance(records, list) or any(
+                not isinstance(record, dict) for record in records):
+            raise ValueError('史书必须是交易对象数组')
+        return records
+
     def _read_archive(self, copy_records=True):
-        """读平仓历史史书。返回 (records, ok)：文件不存在视为空史书（ok=True）；
-        损坏时 ok=False——调用方 fail-safe（展示只出近期、归档跳过本轮），绝不静默清空。"""
+        """合并读取旧史书与年度史书。任一分卷损坏时整体降级并暂停归档。"""
         with self.lock:
-            if not private_file_exists(self.archive_file):
+            try:
+                paths = self._archive_paths()
+            except Exception as exc:
+                self._archive_cache_key = None
+                self._archive_cache_records = None
+                logger.error(f'枚举平仓历史史书失败（归档暂停）: {exc}')
+                return [], False
+            if not paths:
                 self._archive_cache_key = None
                 self._archive_cache_records = []
                 return [], True
             try:
-                info = private_file_stat(self.archive_file)
-                cache_key = (info.st_mtime_ns, info.st_size)
+                cache_key = tuple(
+                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
+                     private_file_stat(path).st_size)
+                    for path in paths)
                 if (self._archive_cache_key == cache_key
                         and self._archive_cache_records is not None):
                     records = self._archive_cache_records
                     return (copy.deepcopy(records) if copy_records else records), True
-                with open_private_text_file(self.archive_file) as f:
-                    records = json.load(f, parse_constant=_reject_nonfinite_json)
-                if not isinstance(records, list) or any(
-                        not isinstance(record, dict) for record in records):
-                    raise ValueError('史书必须是交易对象数组')
+                records = []
+                for path in paths:
+                    records.extend(self._read_archive_file(path))
+                # 旧单文件可能与新年度文件覆盖同一年；统一按平仓时间稳定排序。
+                records.sort(key=self._archive_sort_key)
                 self._archive_cache_key = cache_key
                 self._archive_cache_records = copy.deepcopy(records)
                 cached = self._archive_cache_records
@@ -1181,7 +1220,7 @@ class TradeState:
                 # 损坏后不能继续返回旧缓存，避免面板伪装成仍在展示最新史书。
                 self._archive_cache_key = None
                 self._archive_cache_records = None
-                logger.error(f'读取平仓历史史书失败（历史展示降级为近期记录，归档暂停）: {self.archive_file}: {e}')
+                logger.error(f'读取平仓历史史书失败（历史展示降级为近期记录，归档暂停）: {e}')
                 return [], False
 
     def get_closed_trades(self):
@@ -1230,9 +1269,11 @@ class TradeState:
         """供只读统计缓存使用；不解析史书内容即可识别归档/近期记录变化。"""
         with self.lock:
             try:
-                info = private_file_stat(self.archive_file)
-                archive_key = (info.st_mtime_ns, info.st_size)
-            except FileNotFoundError:
+                archive_key = tuple(
+                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
+                     private_file_stat(path).st_size)
+                    for path in self._archive_paths())
+            except (OSError, TradeStatePersistenceError):
                 archive_key = None
             recent = self.state['closed_trades']
             last = recent[-1] if recent else {}
@@ -1242,7 +1283,7 @@ class TradeState:
         return archive_key, recent_key
 
     def compact_closed_trades(self):
-        """把账本中超出保留窗口的最旧平仓记录搬进只追加的史书文件，返回搬移条数。
+        """把账本中超出保留窗口的最旧记录按平仓年份搬进独立史书。
 
         fail-safe 顺序：先写史书、成功后才收缩账本（任一失败都不动账本，绝不丢史料）。
         账本落盘失败走既有回滚——此时史书里可能多出一批「已写入但账本未收缩」的记录，
@@ -1262,14 +1303,46 @@ class TradeState:
             # 会把两笔内容恰好相同的真实成交误删掉。
             overlap = self._ordered_archive_overlap(archive, overflow)
             to_append = overflow[overlap:]
-            if to_append and not atomic_write_json(self.archive_file, archive + to_append):
-                logger.error(f'平仓历史归档写入失败，本轮跳过（账本保留全部记录）: {self.archive_file}')
-                return 0
+            grouped = {}
+            for record in to_append:
+                grouped.setdefault(self._archive_year(record), []).append(record)
+            for year, records in sorted(grouped.items()):
+                path = os.path.join(
+                    self.archive_dir, f'{self.archive_prefix}{year}.json')
+                try:
+                    existing = (
+                        self._read_archive_file(path)
+                        if private_file_exists(path) else [])
+                except Exception as exc:
+                    logger.error(
+                        f'读取年度平仓史书失败，本轮跳过（账本保留全部记录）: '
+                        f'{path}: {exc}')
+                    return 0
+                if not atomic_write_json(path, existing + records):
+                    logger.error(
+                        f'年度平仓史书写入失败，本轮跳过（账本保留全部记录）: {path}')
+                    return 0
+                # 多年度写入可能在后续分卷失败；立即失效缓存，使重试能看到已写分卷并去重。
+                self._archive_cache_key = None
+                self._archive_cache_records = None
             snapshot = self._snapshot_locked()
             self.state['closed_trades'] = closed[overflow_count:]
             self._save_or_rollback_locked(snapshot)
-            logger.info(f'已把 {overflow_count} 条最旧平仓记录归档到史书（账本保留最近 {self.keep_recent_closed} 条）')
+            logger.info(
+                f'已把 {overflow_count} 条最旧平仓记录按年度归档'
+                f'（账本保留最近 {self.keep_recent_closed} 条）')
             return overflow_count
+
+    @staticmethod
+    def _archive_year(record):
+        """从 close_time 提取四位年份；无法识别的旧记录进入 undated 分卷。"""
+        value = record.get('close_time') if isinstance(record, dict) else None
+        if isinstance(value, str):
+            try:
+                return f'{datetime.fromisoformat(value.replace("Z", "+00:00")).year:04d}'
+            except ValueError:
+                pass
+        return 'undated'
 
     @staticmethod
     def _ordered_archive_overlap(archive, overflow):

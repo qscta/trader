@@ -325,6 +325,111 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             self.assertEqual(system.stop_loss_dates, {})  # 不记 T+1
             self.assertFalse(system.trade_state.has_stop_residue('ETHUSDT'))
 
+    def test_retired_symbol_closes_without_reopening_or_t1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, opened = self._build(tmp, cancel_ok=True)
+            position = system.trade_state.get_open_position('ETHUSDT')
+            signal = {'current_close': 2900.0, 'lower_stop': 2800.0,
+                      'upper_stop': 3100.0}
+
+            system._flip_position(
+                'ETHUSDT', signal, position, 'long',
+                {'name': 'ETHUSDT', '_retired_from_pool': True})
+
+            self.assertEqual(opened, [])
+            self.assertIsNone(system.trade_state.get_open_position('ETHUSDT'))
+            self.assertEqual(system.stop_loss_dates, {})
+
+    def test_retired_symbol_cancel_uncertain_never_creates_t1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, opened = self._build(tmp, cancel_ok=False)
+            position = system.trade_state.get_open_position('ETHUSDT')
+            signal = {'current_close': 2900.0, 'lower_stop': 2800.0,
+                      'upper_stop': 3100.0}
+
+            system._flip_position(
+                'ETHUSDT', signal, position, 'long',
+                {'name': 'ETHUSDT', '_retired_from_pool': True})
+
+            self.assertEqual(opened, [])
+            self.assertEqual(system.stop_loss_dates, {})
+            self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))
+
+
+class RetiredTurtleExitOnlyTest(unittest.TestCase):
+    def test_open_helper_refuses_retired_symbol(self):
+        system = TradingSystem.__new__(TradingSystem)
+        system._execute_open = lambda *a, **k: self.fail(
+            '退池品种不得调用开仓执行器')
+        outcome = system.handle_open_signal_turtle(
+            'BTCUSDT', 'long',
+            {'current_close': 100.0, 'lower_line': 90.0,
+             'upper_line': 110.0},
+            {'name': 'BTCUSDT', '_retired_from_pool': True})
+        self.assertEqual(outcome, {'status': 'retired_no_reopen'})
+
+    def test_cross_break_closes_retired_position_without_reverse(self):
+        system = TradingSystem.__new__(TradingSystem)
+        system.exchange_api = SimpleNamespace(
+            to_ccxt_symbol=lambda value: value,
+            get_position=lambda value: {'contracts': 1})
+        system.handle_close_signal = Mock(return_value=True)
+        system.handle_open_signal_turtle = Mock()
+        position = {'side': 'short', 'stop_loss_price': 110.0}
+        signal = {
+            'action': 'long', 'mid_line_crossed': True,
+            'current_close': 120.0, 'mid_line': 100.0,
+            'upper_line': 115.0, 'lower_line': 85.0,
+        }
+
+        system.handle_open_position_turtle(
+            'BTCUSDT', signal, position,
+            {'name': 'BTCUSDT', '_retired_from_pool': True})
+
+        system.handle_close_signal.assert_called_once()
+        system.handle_open_signal_turtle.assert_not_called()
+
+    def test_partial_explicit_exit_remains_pending(self):
+        before = {'side': 'long', 'position_size': 10}
+        partial = {'side': 'long', 'position_size': 4}
+        self.assertTrue(TradingSystem._turtle_exit_still_pending(
+            {'action': 'close_long'}, before, partial))
+        self.assertFalse(TradingSystem._turtle_exit_still_pending(
+            {'action': 'close_long'}, before, None))
+
+    def test_partial_retired_reverse_exit_remains_pending(self):
+        before = {'side': 'short', 'position_size': 10}
+        partial = {'side': 'short', 'position_size': 3}
+        self.assertTrue(TradingSystem._turtle_exit_still_pending(
+            {'action': 'long'}, before, partial, retired_from_pool=True))
+        self.assertFalse(TradingSystem._turtle_exit_still_pending(
+            {'action': 'long'}, before, partial, retired_from_pool=False))
+
+
+class RetiredExternalFlatTest(unittest.TestCase):
+    def test_retired_ma_flat_close_does_not_create_t1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.config = {'trading': {'symbols': []}}
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
+                'stop-1', strategy='ma_cross')
+            system.stop_loss_dates = {}
+            system._stop_anomalies = {}
+            system._cancel_stop_order_confirmed = Mock(return_value=True)
+
+            position = system.trade_state.get_open_position('ETHUSDT')
+            closed, saved, cleared = system._handle_exchange_flat_close(
+                'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
+                '退池外部平仓', strategy_type='ma_cross')
+
+            self.assertIsNotNone(closed)
+            self.assertTrue(saved)
+            self.assertTrue(cleared)
+            self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
+            self.assertEqual(system.stop_loss_dates, {})
+
 
 class StopUpdateGapGuardTest(unittest.TestCase):
     """撤旧确认与挂新止损之间的缝隙：交易所已无持仓时不得再挂新止损（防孤儿 reduce-only 单）。"""
@@ -455,6 +560,16 @@ class StateOwnerGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)
             with open(os.path.join(tmp, 'closed_trades_archive.json'),
+                      'w', encoding='utf-8') as handle:
+                json.dump([{'symbol': 'BTCUSDT'}], handle)
+
+            with self.assertRaises(RuntimeError):
+                system._guard_state_owner()
+
+    def test_unmarked_annual_history_blocks_directory_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            with open(os.path.join(tmp, 'closed_trades_archive_2026.json'),
                       'w', encoding='utf-8') as handle:
                 json.dump([{'symbol': 'BTCUSDT'}], handle)
 

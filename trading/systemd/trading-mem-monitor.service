@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading System Memory and Disk Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trader/trading
+EnvironmentFile=/etc/trading.env
+ExecStart=/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

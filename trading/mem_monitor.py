@@ -4,6 +4,7 @@
 - 每5分钟检查一次内存和磁盘使用率
 - 内存超过85%或磁盘超过90%时，通过钉钉推送告警
 - 同一类告警30分钟内只推送一次，避免消息轰炸
+- 日志按 5MB 轮转，保留 3 个备份（总量约 20MB）
 - 支持 --test 参数发送测试消息
 """
 
@@ -15,6 +16,7 @@ import time
 import subprocess
 import requests
 import logging
+import logging.handlers
 
 # 抹掉错误串里可能随 requests 连接异常带出的 webhook access_token，避免泄露到 mem_monitor.log
 _ACCESS_TOKEN_RE = re.compile(r'(access_token=)[^&\s\'"]+', re.IGNORECASE)
@@ -36,7 +38,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3,
+            encoding='utf-8', delay=True),
         logging.StreamHandler()
     ]
 )

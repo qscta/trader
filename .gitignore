@@ -8,7 +8,7 @@ trading/config.json
 # ===== 运行时状态（真实账本/权益数据，属于部署机，不属于代码库）=====
 trading/trade_state.json
 trading/trade_state.json.bak
-trading/closed_trades_archive.json
+trading/closed_trades_archive*.json
 trading/stop_loss_dates.json
 trading/daily_equity.json
 trading/equity_history.json

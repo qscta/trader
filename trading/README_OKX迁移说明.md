@@ -9,7 +9,7 @@
         TradingSystem (main.py)               ← 单实例：加载配置、调度、执行
           ├── OkxApi      (适配器, okx_api.py)  ← 继承 ExchangeApi (exchange_base.py)
           ├── TradeState   trade_state.json     ← 本地持仓/止损/信号状态（保留最近 200 笔平仓）
-          │                                      旧平仓历史追加到 closed_trades_archive.json
+          │                                      旧平仓历史按年归档到 closed_trades_archive_YYYY.json
           └── EquityTracker *.json              ← 权益历史/峰值/日快照/求索指数
 ```
 
@@ -50,7 +50,7 @@
 - 排行榜（交易对动态池）已彻底删除。样式内联在 `index.html`。
 
 ### 删除交易对的语义
-- 删除 ≠ 平仓、≠ 停止托管。正确语义：**从品种池移除，之后不再为该交易对开新仓**；`DELETE /api/symbols/<symbol>` 只改 `config.trading.symbols`，**不动** `trade_state` 持仓、不撤止损单、不平仓。
+- 删除 ≠ 立即平仓、≠ 立即停止保护。正确语义：**从品种池移除，只托管当前仓位到下一次平仓**；`DELETE /api/symbols/<symbol>` 不动当前持仓、不撤保护止损，但退池后禁止反手、止损后重入或任何新腿；当前仓一旦结束即彻底停止监控和交易。
 - 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（turtle / ma_cross）继续跟踪、推进止损、处理平仓，直到仓位自然结束。
 - 老仓兜底：若删除时发现该持仓缺 `strategy` 字段，会先从当前配置补写进持仓再删；配置里也没有时**拒绝删除**，提示先明确策略。
 

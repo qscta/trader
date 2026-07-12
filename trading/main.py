@@ -520,6 +520,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             'equity_ticks.json', 'qiusuo_index.json',
             '.equity_sync_journal.json',
         ]
+        try:
+            annual_names = set()
+            for name in os.listdir(self.base_dir):
+                if not name.startswith('closed_trades_archive_'):
+                    continue
+                if name.endswith('.json'):
+                    annual_names.add(name)
+                elif name.endswith('.json.bak'):
+                    annual_names.add(name[:-4])
+            names.extend(sorted(annual_names))
+        except OSError as exc:
+            raise RuntimeError(
+                f'无法枚举数据目录中的年度平仓史书: {exc}') from exc
         for name in names:
             for path in (
                     os.path.join(self.base_dir, name),
@@ -1618,6 +1631,22 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         return current_state, current_id, int(current_state['action'] is not None)
 
+    @staticmethod
+    def _turtle_exit_still_pending(
+            signal, position_before, position_after, retired_from_pool=False):
+        """退出/退池反手信号只有在旧方向仓位确实归零后才能消费。"""
+        if not position_before or not position_after:
+            return False
+        action = signal.get('action') if isinstance(signal, dict) else None
+        old_side = position_before.get('side')
+        explicit_close = (
+            (action == 'close_long' and old_side == 'long') or
+            (action == 'close_short' and old_side == 'short'))
+        retired_reverse_exit = bool(
+            retired_from_pool and action in ('long', 'short') and
+            old_side != action)
+        return bool(explicit_close or retired_reverse_exit)
+
     def _history_requires_rebaseline(self, symbol, strategy_type, df,
                                      max_gap_candles=3):
         """判断信号 marker 与当前可见历史是否存在不可安全回放的断层。"""
@@ -1747,7 +1776,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             'name': symbol,
                             'enabled': True,
                             'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                            'strategy': held_strategy
+                            'strategy': held_strategy,
+                            # 删除品种只托管当前仓位到下一次平仓；禁止反手或再开新腿。
+                            '_retired_from_pool': True,
                         }
 
                     strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
@@ -1957,7 +1988,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                     "禁止最新突破开仓，最新中轨平仓信号仍按事实处理")
                         if signal and signal.get('mid_line_crossed'):
                             self.trade_state.set_signal_state(symbol, True)
-                        if signal and signal.get('action') in ('long', 'short'):
+                        if (signal and signal.get('action') in ('long', 'short') and
+                                not symbol_config.get('_retired_from_pool')):
                             turtle_signal_side = signal['action']
                             turtle_signal_id = self._prepare_turtle_signal_execution(
                                 symbol, signal, candle_id)
@@ -2004,7 +2036,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         elif strategy_type == 'ma_cross':
                             self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
                     else:
-                        if strategy_type == 'turtle':
+                        if symbol_config.get('_retired_from_pool'):
+                            logger.info(
+                                f"{symbol} 已退池且当前仓位已结束；禁止新开仓并完成生命周期清理")
+                        elif strategy_type == 'turtle':
                             self.handle_no_position_turtle(symbol, signal, symbol_config, df)
                         elif strategy_type == 'ma_cross':
                             self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
@@ -2037,6 +2072,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 self.trade_state.mark_candle_processed(
                                     symbol, 'turtle', candle_id)
                         else:
+                            post_position = self.trade_state.get_open_position(symbol)
+                            if self._turtle_exit_still_pending(
+                                    signal, position, post_position,
+                                    retired_from_pool=bool(
+                                        symbol_config.get('_retired_from_pool'))):
+                                logger.error(
+                                    f'{symbol} [海龟] 退出目标尚未归零；'
+                                    '不推进 K 线幂等标记，等待日内重试')
+                                failed_symbols.append(symbol)
+                                continue
                             self.trade_state.mark_candle_processed(
                                 symbol, 'turtle', candle_id)
                     else:
@@ -2046,8 +2091,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         target_side = signal.get('action')
                         if target_side in ('long', 'short'):
                             post_position = self.trade_state.get_open_position(symbol)
-                            if (not post_position or
-                                    post_position.get('side') != target_side):
+                            retired_exit_complete = bool(
+                                symbol_config.get('_retired_from_pool') and
+                                position and position.get('side') != target_side and
+                                not post_position)
+                            if (not retired_exit_complete and
+                                    (not post_position or
+                                     post_position.get('side') != target_side)):
                                 logger.error(
                                     f'{symbol} [双均线] 目标仓位 {target_side} 尚未对齐；'
                                     '不推进 K 线幂等标记，等待日内重试')
