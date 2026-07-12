@@ -69,23 +69,28 @@ class NormalizeSymbolTest(unittest.TestCase):
 
 
 class StrategyOhlcvLimitTest(unittest.TestCase):
-    def test_turtle_limit_tracks_channel_period_and_open_candle_buffer(self):
-        config = {'channel_period': 500}
-
-        self.assertEqual(cv.required_closed_candles_for_strategy('turtle', config), 502)
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 503)
-
-    def test_ma_cross_limit_tracks_longest_required_window(self):
-        config = {'ma_long_period': 250, 'ma_stop_period': 400}
-
-        self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 500)
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 501)
-
-    def test_default_periods_keep_existing_fetch_floor(self):
+    def test_default_periods_always_request_one_full_okx_page(self):
         config = {'channel_period': 28, 'ma_long_period': 28, 'ma_stop_period': 28}
 
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 365)
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 365)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 300)
+        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 300)
+
+    def test_capacity_boundary_leaves_one_open_candle_buffer(self):
+        config = {'channel_period': 297, 'ma_long_period': 149, 'ma_stop_period': 298}
+
+        self.assertTrue(cv.validate_strategy_ohlcv_capacity(config))
+        self.assertEqual(cv.required_closed_candles_for_strategy('turtle', config), 299)
+        self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 299)
+
+    def test_turtle_period_over_single_page_capacity_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, '超过单次 300 根上限'):
+            cv.validate_strategy_ohlcv_capacity({'channel_period': 298})
+
+    def test_ma_period_over_single_page_capacity_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, '超过单次 300 根上限'):
+            cv.validate_strategy_ohlcv_capacity({
+                'channel_period': 28, 'ma_long_period': 150,
+                'ma_stop_period': 28})
 
 
 if __name__ == '__main__':

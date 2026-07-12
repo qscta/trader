@@ -85,11 +85,17 @@ class SignalHandlersMixin:
                     if side == 'short' and current_close < mid_line:
                         # 开空被止损，价格回落到中轨下方，保持允许开仓
                         self.trade_state.set_signal_state(symbol, True)
-                        logger.info(f"{symbol} [海龟] 空单止损，价格仍在中轨下方({current_close:.4f}<{mid_line:.4f})，保持允许开仓")
+                        logger.info(
+                            f"{symbol} [海龟] 空单止损，价格仍在中轨下方"
+                            f"({self._format_indicator_price(current_close)}<"
+                            f"{self._format_indicator_price(mid_line)})，保持允许开仓")
                     elif side == 'long' and current_close > mid_line:
                         # 开多被止损，价格回落到中轨上方，保持允许开仓
                         self.trade_state.set_signal_state(symbol, True)
-                        logger.info(f"{symbol} [海龟] 多单止损，价格仍在中轨上方({current_close:.4f}>{mid_line:.4f})，保持允许开仓")
+                        logger.info(
+                            f"{symbol} [海龟] 多单止损，价格仍在中轨上方"
+                            f"({self._format_indicator_price(current_close)}>"
+                            f"{self._format_indicator_price(mid_line)})，保持允许开仓")
                     else:
                         self.trade_state.set_signal_state(symbol, False)
                         logger.info(f"{symbol} [海龟] 止损平仓，价格已穿越到另一侧，等待重新穿越中轨")
@@ -133,16 +139,30 @@ class SignalHandlersMixin:
             else:
                 self.check_and_update_stop_loss_turtle(symbol, signal, position)
         else:
+            if signal.get('_history_discontinuity'):
+                # 断档只允许最新一根明确产生的事件进入上方分支；不能仅凭
+                # “当前价格已经在中轨另一侧”推断历史期间漏过平仓并补做旧交易。
+                logger.warning(
+                    f"{symbol} [海龟] 历史断档且最新一根无明确退出/反手信号；"
+                    "不执行历史状态补偿平仓，仅按当前通道维护保护止损")
+                self.check_and_update_stop_loss_turtle(symbol, signal, position)
+                return
             # 补偿平仓：如果错过了穿越中轨的平仓信号（如之前因bug崩溃），
             # 检查价格是否已在中轨的反向一侧，若是则补偿平仓
             current_close = signal.get('current_close', 0)
             mid_line = signal.get('mid_line', 0)
             if position['side'] == 'short' and current_close > mid_line:
-                logger.info(f"{symbol} [海龟] 补偿平仓：空单价格({current_close:.4f})已在中轨({mid_line:.4f})上方，执行平仓")
+                logger.info(
+                    f"{symbol} [海龟] 补偿平仓：空单价格"
+                    f"({self._format_indicator_price(current_close)})已在中轨"
+                    f"({self._format_indicator_price(mid_line)})上方，执行平仓")
                 signal['action'] = 'close_short'
                 self.handle_close_signal(symbol, signal, position, symbol_config)
             elif position['side'] == 'long' and current_close < mid_line:
-                logger.info(f"{symbol} [海龟] 补偿平仓：多单价格({current_close:.4f})已在中轨({mid_line:.4f})下方，执行平仓")
+                logger.info(
+                    f"{symbol} [海龟] 补偿平仓：多单价格"
+                    f"({self._format_indicator_price(current_close)})已在中轨"
+                    f"({self._format_indicator_price(mid_line)})下方，执行平仓")
                 signal['action'] = 'close_long'
                 self.handle_close_signal(symbol, signal, position, symbol_config)
             else:

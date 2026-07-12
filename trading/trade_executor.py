@@ -443,9 +443,9 @@ class TradeExecutorMixin:
         logger.info(f"{symbol} [双均线] 翻转开仓: 方向={new_side}, 信号价={entry_price}, 止损={stop_loss_price}")
         self._execute_open(symbol, new_side, entry_price, stop_loss_price, symbol_config)
         if not self.trade_state.get_open_position(symbol):
-            # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：记 T+1，
-            # 次日 handle_no_position_ma_cross 按当时 EMA 方向自动重入，恢复「永远在市」——
-            # 与 stop_cleared=False 分支同一恢复机制（_execute_open 内部已发失败告警）
+            # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：
+            # 不把执行故障伪装成止损 T+1；保留本根 candle marker，交给当日
+            # 08:01/30 分钟兜底按同一个最新交叉重试。跨日后不追补旧信号。
             self._mark_ma_cross_reentry_pending(
                 symbol, new_side, signal,
                 '双均线翻转反手开仓未成功；保留本根交叉等待日内重试，请复核交易所与日志')

@@ -155,7 +155,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         self.assertEqual([(False, False)], summary_calls)
         self.assertIsNone(system._last_check_date)
 
-    def test_daily_check_fetch_limit_tracks_large_turtle_config(self):
+    def test_daily_check_uses_single_300_candle_page(self):
         system = self._build_system(notify_result=True)
         requested_limits = []
         system._trade_lock = SimpleNamespace(acquire=lambda blocking=False: True, release=lambda: None)
@@ -172,7 +172,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
             set_signal_state=lambda symbol, value: None,
         )
         system.config = {
-            'strategy': {'channel_period': 500},
+            'strategy': {'channel_period': 297},
             'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'turtle'}]},
         }
         system.exchange_api = SimpleNamespace(
@@ -188,7 +188,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
 
         system.check_and_execute_trades()
 
-        self.assertEqual([503], requested_limits)
+        self.assertEqual([300], requested_limits)
 
     def test_stop_loss_update_is_buffered_for_summary_notification(self):
         system = TradingSystem.__new__(TradingSystem)

@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -697,7 +697,11 @@ class MaCatchupStateTest(unittest.TestCase):
             action = {4: 'short', 5: 'long'}.get(len(df))
             return {'action': action} if action else {'action': None}
 
-    def test_replays_all_missing_bars_but_converges_once_to_current_state(self):
+    class _OldCrossOnlyStrategy(_Strategy):
+        def check_signal(self, df):
+            return {'action': 'short' if len(df) == 4 else None}
+
+    def test_only_checks_latest_cross_instead_of_replaying_missing_bars(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
@@ -706,7 +710,7 @@ class MaCatchupStateTest(unittest.TestCase):
 
             signal, candle_id, missed = system._ma_signal_with_catchup(
                 'BTCUSDT', self._Strategy(), frame)
-            self.assertEqual(2, missed)
+            self.assertEqual(1, missed)
             self.assertEqual('long', signal['action'])
             self.assertEqual('t5', candle_id)
 
@@ -715,7 +719,175 @@ class MaCatchupStateTest(unittest.TestCase):
                 'BTCUSDT', self._Strategy(), frame)
             self.assertEqual(0, missed)
             self.assertIsNone(signal['action'])
-            self.assertEqual('long', signal['target_side'])
+
+    def test_large_history_gap_ignores_old_bars_but_keeps_latest_cross(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+
+            signal, candle_id, missed = system._ma_signal_with_catchup(
+                'BTCUSDT', self._Strategy(), frame)
+
+            self.assertEqual('t5', candle_id)
+            self.assertEqual(1, missed)
+            self.assertEqual('long', signal['action'])
+            self.assertTrue(signal['_history_discontinuity'])
+            self.assertEqual(4, signal['_history_gap_candles'])
+
+    def test_large_history_gap_does_not_replay_an_old_cross(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+
+            signal, candle_id, count = system._ma_signal_with_catchup(
+                'BTCUSDT', self._OldCrossOnlyStrategy(), frame)
+
+            self.assertEqual('t5', candle_id)
+            self.assertEqual(0, count)
+            self.assertIsNone(signal['action'])
+            self.assertTrue(signal['_history_discontinuity'])
+
+    def test_invisible_previous_marker_still_checks_latest_cross(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.mark_candle_processed(
+                'BTCUSDT', 'ma_cross', 'outside-visible-window')
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+
+            signal, candle_id, missed = system._ma_signal_with_catchup(
+                'BTCUSDT', self._Strategy(), frame)
+
+            self.assertEqual('t5', candle_id)
+            self.assertEqual(1, missed)
+            self.assertEqual('long', signal['action'])
+            self.assertTrue(signal['_history_discontinuity'])
+
+    def test_missing_marker_checks_latest_without_replaying_visible_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+
+            signal, candle_id, missed = system._ma_signal_with_catchup(
+                'BTCUSDT', self._Strategy(), frame)
+
+            self.assertEqual('t5', candle_id)
+            self.assertEqual(1, missed)
+            self.assertEqual('long', signal['action'])
+            self.assertTrue(signal['_history_discontinuity'])
+
+    def test_turtle_missing_marker_requires_rebaseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+
+            rebaseline, previous, current, gap = (
+                system._history_requires_rebaseline('BTCUSDT', 'turtle', frame))
+
+            self.assertTrue(rebaseline)
+            self.assertIsNone(previous)
+            self.assertEqual('t5', current)
+            self.assertIsNone(gap)
+
+    def test_turtle_large_gap_requires_rebaseline_but_short_gap_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
+            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't1')
+
+            rebaseline, _, _, gap = system._history_requires_rebaseline(
+                'BTCUSDT', 'turtle', frame)
+            self.assertTrue(rebaseline)
+            self.assertEqual(4, gap)
+
+            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't2')
+            rebaseline, _, _, gap = system._history_requires_rebaseline(
+                'BTCUSDT', 'turtle', frame)
+            self.assertFalse(rebaseline)
+            self.assertEqual(3, gap)
+
+    def test_sparse_rows_with_large_calendar_gap_require_rebaseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.mark_candle_processed(
+                'BTCUSDT', 'ma_cross', '2026-05-05T00:00:00')
+            frame = self._Frame([
+                '2026-05-05T00:00:00',
+                '2026-07-09T00:00:00',
+                '2026-07-10T00:00:00',
+            ])
+
+            rebaseline, _, _, gap = system._history_requires_rebaseline(
+                'BTCUSDT', 'ma_cross', frame)
+
+            self.assertTrue(rebaseline)
+            self.assertEqual(66, gap)
+
+
+class DailyCandleFreshnessTest(unittest.TestCase):
+    class _TimestampSeries:
+        def __init__(self, values):
+            self._values = values
+
+        def tolist(self):
+            return list(self._values)
+
+    class _Frame:
+        def __init__(self, values):
+            self._timestamps = DailyCandleFreshnessTest._TimestampSeries(values)
+
+        def __getitem__(self, key):
+            if key == 'timestamp':
+                return self._timestamps
+            raise KeyError(key)
+
+    def test_expected_previous_day_is_fresh(self):
+        frame = self._Frame([datetime(2026, 7, 10)])
+        fresh, latest, minimum = TradingSystem._daily_candle_is_fresh(
+            frame, '2026-07-11')
+        self.assertTrue(fresh)
+        self.assertEqual(date(2026, 7, 10), latest)
+        self.assertEqual(date(2026, 7, 9), minimum)
+
+    def test_one_extra_missing_day_is_tolerated_for_market_holidays(self):
+        frame = self._Frame([datetime(2026, 7, 9)])
+        fresh, _, _ = TradingSystem._daily_candle_is_fresh(
+            frame, '2026-07-11')
+        self.assertTrue(fresh)
+
+    def test_multiweek_stale_candle_is_rejected(self):
+        frame = self._Frame([datetime(2026, 5, 5)])
+        fresh, latest, minimum = TradingSystem._daily_candle_is_fresh(
+            frame, '2026-07-11')
+        self.assertFalse(fresh)
+        self.assertEqual(date(2026, 5, 5), latest)
+        self.assertEqual(date(2026, 7, 9), minimum)
+
+    def test_unparseable_timestamp_fails_closed(self):
+        frame = self._Frame(['not-a-timestamp'])
+        fresh, latest, minimum = TradingSystem._daily_candle_is_fresh(
+            frame, '2026-07-11')
+        self.assertFalse(fresh)
+        self.assertIsNone(latest)
+        self.assertIsNone(minimum)
+
+
+class IndicatorPriceFormattingTest(unittest.TestCase):
+    def test_preserves_meaningful_digits_for_each_price_scale(self):
+        fmt = TradingSystem._format_indicator_price
+        self.assertEqual('4113.60', fmt(4113.6))
+        self.assertEqual('7.9100', fmt(7.91))
+        self.assertEqual('0.169064', fmt(0.169063860497983))
+        self.assertEqual('0.00147774', fmt(0.00147774092545))
+        self.assertEqual('0.0000051234', fmt(0.0000051234))
 
 
 class MaMarkerIntegrationTest(unittest.TestCase):
@@ -791,6 +963,8 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = lambda **kwargs: True
         system._closed_candle_id = lambda _df: 't5'
+        system._daily_candle_is_fresh = (
+            lambda _df, _scheduled_date: (True, date(2026, 7, 10), date(2026, 7, 9)))
         return system
 
     @staticmethod
@@ -816,7 +990,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             self.assertIsNone(system._last_check_date)
             system.notifier.notify_signal_missed.assert_called_once()
 
-    def test_opposite_held_position_converges_even_when_action_was_suppressed(self):
+    def test_opposite_held_position_does_not_flip_without_latest_cross(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp, held_side='short')
             system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't5')
@@ -824,19 +998,15 @@ class MaMarkerIntegrationTest(unittest.TestCase):
                 lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
             seen_actions = []
 
-            def converge(symbol, signal, position, _config, _df):
+            def observe(symbol, signal, position, _config, _df):
                 seen_actions.append(signal.get('action'))
-                system.trade_state.close_position(symbol, 11.0)
-                system.trade_state.add_open_position(
-                    symbol, 'long', 11.0, 1.0, 8.0,
-                    'stop-new', strategy='ma_cross')
 
-            system.handle_open_position_ma_cross = converge
+            system.handle_open_position_ma_cross = observe
 
             system.check_and_execute_trades()
 
-            self.assertEqual(['long'], seen_actions)
-            self.assertEqual('long',
+            self.assertEqual([None], seen_actions)
+            self.assertEqual('short',
                              system.trade_state.get_open_position('BTCUSDT')['side'])
 
 

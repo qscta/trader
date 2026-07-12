@@ -180,90 +180,19 @@ class ExchangeApi:
 
     @retry_on_network_error(max_retries=3)
     def fetch_ohlcv(self, symbol, timeframe='1d', limit=100):
-        """读取最近 ``limit`` 根 K 线，必要时显式分页。
+        """读取最近 ``limit`` 根 K 线；策略行情严格限制为 OKX 单页上限。
 
-        OKX 的单次 candles 请求最多返回 300 根；ccxt 会把更大的 ``limit``
-        静默压到交易所上限。策略层允许的长周期需要超过 300 根历史数据，若
-        直接把期望数量交给 ccxt，配置虽然通过校验，却会永久处于“数据不足”。
-
-        小请求保持原来的单次调用。大请求从足够早的时间点向前分页，用时间戳
-        去重并严格限制返回最近 ``limit`` 根。若交易所提前耗尽历史数据，返回
-        实际可取得的数量，由上层把它作为未完成/配置不足处理，绝不伪造 K 线。
+        所有真钱调用都只依赖最新滚动窗口。超过 300 根时明确拒绝，避免调用者
+        误以为 ccxt 会完整返回，也不再保留曾导致陈旧行情事故的分页路径。
         """
         requested = int(limit)
         if requested <= 0:
             return []
-
-        # OKX public market candles endpoint 的硬上限。放在适配基类是为了让所有
-        # 调用入口（每日任务、管理台预览、即时开仓）获得完全相同的数据语义。
-        page_size = 300
-        if requested <= page_size:
-            return self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested)
-
-        try:
-            timeframe_ms = int(self.exchange.parse_timeframe(timeframe) * 1000)
-        except Exception:
-            timeframe_ms = {
-                '1m': 60_000, '3m': 180_000, '5m': 300_000,
-                '15m': 900_000, '30m': 1_800_000,
-                '1h': 3_600_000, '2h': 7_200_000, '4h': 14_400_000,
-                '6h': 21_600_000, '8h': 28_800_000, '12h': 43_200_000,
-                '1d': 86_400_000, '3d': 259_200_000, '1w': 604_800_000,
-            }.get(timeframe)
-        if not timeframe_ms:
-            raise ValueError(f'无法分页未知 K 线周期: {timeframe!r}')
-
-        now_ms = int(self.exchange.milliseconds()) if hasattr(self.exchange, 'milliseconds') else int(time.time() * 1000)
-        # 多取两根作为时间边界余量：不同交易所对 since 是包含还是排除并不完全
-        # 一致，最终会按 timestamp 去重和裁剪。
-        since = max(0, now_ms - (requested + 2) * timeframe_ms)
-        rows_by_timestamp = {}
-        # 每次迭代把窗口至少推进一根（有数据推进到最新一根之后，空页按整窗跳过），
-        # 上限按窗口数留富余即可保证终止；到达上限仍未越过当下属异常，如实告警。
-        max_pages = math.ceil((requested + 2) / page_size) + 6
-
-        for _page_index in range(max_pages):
-            page = self.exchange.fetch_ohlcv(
-                symbol,
-                timeframe,
-                since=since,
-                limit=page_size,
-            )
-
-            newest_timestamp = None
-            for row in page or []:
-                if not row:
-                    continue
-                timestamp = int(row[0])
-                rows_by_timestamp[timestamp] = row
-                if newest_timestamp is None or timestamp > newest_timestamp:
-                    newest_timestamp = timestamp
-
-            if newest_timestamp is not None:
-                next_since = newest_timestamp + timeframe_ms
-                if next_since <= since:
-                    logger.warning('K 线分页未向前推进，停止读取: %s %s since=%s', symbol, timeframe, since)
-                    break
-                since = next_since
-            else:
-                # 空页 ≠ 历史终点：OKX 会把带 since 的请求限定在
-                # [since, since + limit×timeframe] 的固定时间窗内——上市前的
-                # 窗口、数据缺口的窗口都会返回空页。同理，短页只说明该窗口内
-                # 数据不满，绝不能当「已取完」终止（旧实现在此对上市不满一年
-                # 的品种静默返回截至 now-67 天的陈旧历史，指标全部失真）。
-                # 空页按整窗推进；唯一的终止条件是窗口越过当下。
-                since += page_size * timeframe_ms
-
-            # K 线时间戳是周期起点，恒 ≤ 当前时刻；窗口起点越过当下即取无可取。
-            if since > now_ms:
-                break
-        else:
-            logger.warning(
-                'K 线分页在 %s 页内未覆盖到当前时间（%s %s），返回数据可能不完整',
-                max_pages, symbol, timeframe)
-
-        rows = [rows_by_timestamp[key] for key in sorted(rows_by_timestamp)]
-        return rows[-requested:]
+        if requested > 300:
+            raise ValueError(
+                f'K 线请求 {requested} 根超过 OKX 单页上限 300；'
+                '策略配置必须在最新单页内完成计算')
+        return self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested)
 
     @retry_on_network_error(max_retries=3)
     def get_balance(self):
