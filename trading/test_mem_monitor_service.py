@@ -57,6 +57,17 @@ class ResourceMonitorStartupTest(unittest.TestCase):
                 }):
             self.assertIsNone(mem_monitor.load_webhook())
 
+    def test_top_processes_never_reads_or_returns_command_arguments(self):
+        fake_result = type('Result', (), {
+            'stdout': '/usr/bin/cloudflared 1.9 0.1\n/usr/bin/gunicorn 8.2 3.4\n',
+        })()
+        with patch.object(mem_monitor.subprocess, 'run', return_value=fake_result) as run:
+            processes = mem_monitor.get_top_processes(2)
+        self.assertEqual([p['cmd'] for p in processes], ['cloudflared', 'gunicorn'])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ['/usr/bin/ps', '-eo', 'comm=,%mem=,%cpu='])
+        self.assertNotIn('aux', argv)
+
 
 if __name__ == '__main__':
     unittest.main()

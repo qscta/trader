@@ -147,23 +147,23 @@ def get_disk_usage(path='/'):
 
 
 def get_top_processes(count=5):
-    """获取内存占用最高的Top N个进程"""
+    """获取内存占用最高的 Top N 个进程，只取可执行文件名。
+
+    不得读取 ``ps aux`` 的完整命令行：服务参数可能带 tunnel token、密码或
+    其他凭据，把它们拼进钉钉告警会造成二次泄露。
+    """
     try:
         result = subprocess.run(
-            ['ps', 'aux', '--sort=-rss'],
+            ['/usr/bin/ps', '-eo', 'comm=,%mem=,%cpu=', '--sort=-rss'],
             capture_output=True, text=True, timeout=5
         )
         lines = result.stdout.strip().split('\n')
         processes = []
-        for line in lines[1:]:
-            parts = line.split(None, 10)
-            if len(parts) >= 11:
-                mem_pct = parts[3]
-                cpu_pct = parts[2]
-                cmd = parts[10]
-                cmd_short = cmd.split('/')[-1] if '/' in cmd else cmd
-                if len(cmd_short) > 50:
-                    cmd_short = cmd_short[:50] + '...'
+        for line in lines:
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                cmd, mem_pct, cpu_pct = parts
+                cmd_short = os.path.basename(cmd)
                 processes.append({
                     'cmd': cmd_short,
                     'mem': mem_pct,
