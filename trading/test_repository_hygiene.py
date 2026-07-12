@@ -42,10 +42,20 @@ class RepositoryHygieneTest(unittest.TestCase):
         unit = (root / 'trading' / 'systemd' /
                 'trading-mem-monitor.service').read_text(encoding='utf-8')
         for required in (
-                'User=ubuntu', 'EnvironmentFile=/etc/trading.env',
+                'User=ubuntu',
                 '/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py',
                 'Restart=always', 'UMask=0077'):
             self.assertIn(required, unit)
+        # 最小权限：监控进程只需 webhook（从 config.json 回退取得），绝不通过
+        # EnvironmentFile 加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY 的整份 trading.env。
+        # 只检查生效指令行（忽略注释），注释里出于说明目的提及该路径是允许的。
+        directives = [
+            line.strip() for line in unit.splitlines()
+            if line.strip() and not line.strip().startswith('#')]
+        self.assertFalse(
+            any(line.startswith('EnvironmentFile=') and 'trading.env' in line
+                for line in directives),
+            '监控单元不得通过 EnvironmentFile 加载整份 trading.env')
 
     def test_classifier_covers_runtime_backups_and_daily_equity(self):
         for path in (

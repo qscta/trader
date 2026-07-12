@@ -7,7 +7,10 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/trader/trading
-EnvironmentFile=/etc/trading.env
+# 最小权限：资源监控只需钉钉 webhook，load_webhook() 会从 config.json 的
+# dingtalk.webhook_url 回退取得，因此不加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY
+# 的 /etc/trading.env——避免这个常驻进程无谓地在环境里持有交易凭据。
+# 若确需用环境变量提供 webhook，另建仅含 DINGTALK_WEBHOOK 的专用 EnvironmentFile。
 ExecStart=/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py
 Restart=always
 RestartSec=10

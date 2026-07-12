@@ -33,7 +33,9 @@ ALERT_COOLDOWN = 1800       # 告警冷却时间：30分钟（秒）
 TOP_PROCESS_COUNT = 5       # 告警时展示的Top进程数量
 
 # 日志配置
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mem_monitor.log')
+# 交易账本/权益状态所在目录：其所在盘写满比 / 写满更致命，必须一并监控。
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(DATA_DIR, 'mem_monitor.log')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -103,6 +105,30 @@ def get_memory_usage():
         return None, 0, 0, 0
 
 
+def worst_disk_usage():
+    """在 / 与数据目录所在文件系统中取使用率更高者（同盘自动按 st_dev 去重）。
+
+    历史实现只盯 /：若账本/权益状态所在的数据目录挂在独立卷上、该卷写满，
+    则完全不告警——而那恰是最致命场景（atomic_write_json 失败、交易记不进账本）。
+    这里同时覆盖两处并取更满的一个。返回 (pct, total_gb, used_gb, free_gb, mount)。
+    """
+    candidates = {}
+    for path in ('/', DATA_DIR):
+        try:
+            dev = os.stat(path).st_dev
+        except OSError:
+            continue
+        if dev in candidates:
+            continue  # 与 / 同一文件系统，只报一次
+        usage = get_disk_usage(path)
+        if usage[0] is not None:
+            candidates[dev] = (path, usage)
+    if not candidates:
+        return None, 0, 0, 0, '/'
+    mount, usage = max(candidates.values(), key=lambda item: item[1][0])
+    return usage[0], usage[1], usage[2], usage[3], mount
+
+
 def get_disk_usage(path='/'):
     """获取磁盘使用率"""
     try:
@@ -165,11 +191,12 @@ def build_memory_alert(mem_pct, mem_total, mem_used, mem_avail, is_test=False):
     return msg
 
 
-def build_disk_alert(disk_pct, disk_total, disk_used, disk_free, is_test=False):
+def build_disk_alert(disk_pct, disk_total, disk_used, disk_free, is_test=False, mount='/'):
     """构建磁盘告警消息"""
     test_tag = "（测试）" if is_test else ""
 
     msg = f"交易服务器磁盘告警{test_tag}\n"
+    msg += f"• 挂载点: {mount}\n"
     msg += f"• 当前使用率: {disk_pct}%（阈值: {DISK_THRESHOLD}%）\n"
     msg += f"• 总容量: {disk_total}GB\n"
     msg += f"• 已用: {disk_used}GB\n"
@@ -181,11 +208,11 @@ def build_disk_alert(disk_pct, disk_total, disk_used, disk_free, is_test=False):
 def send_test_message(webhook):
     """发送测试消息"""
     mem_pct, mem_total, mem_used, mem_avail = get_memory_usage()
-    disk_pct, disk_total, disk_used, disk_free = get_disk_usage('/')
+    disk_pct, disk_total, disk_used, disk_free, disk_mount = worst_disk_usage()
 
     msg = build_memory_alert(mem_pct, mem_total, mem_used, mem_avail, is_test=True)
     msg += "\n"
-    msg += f"磁盘使用率: {disk_pct}%（{disk_used}GB/{disk_total}GB）\n"
+    msg += f"磁盘使用率({disk_mount}): {disk_pct}%（{disk_used}GB/{disk_total}GB）\n"
     msg += "这是一条测试消息，交易系统运行正常。"
 
     print(f"发送测试消息:\n{msg}")
@@ -232,18 +259,18 @@ def main():
                 else:
                     logger.info(f"内存正常: {mem_pct}% ({mem_used}MB/{mem_total}MB)")
 
-            # 检查磁盘
-            disk_pct, disk_total, disk_used, disk_free = get_disk_usage('/')
+            # 检查磁盘（/ 与数据目录所在盘取更满者）
+            disk_pct, disk_total, disk_used, disk_free, disk_mount = worst_disk_usage()
             if disk_pct is not None:
                 if disk_pct >= DISK_THRESHOLD:
                     if now - last_alert_time['disk'] >= ALERT_COOLDOWN:
-                        msg = build_disk_alert(disk_pct, disk_total, disk_used, disk_free)
+                        msg = build_disk_alert(disk_pct, disk_total, disk_used, disk_free, mount=disk_mount)
                         send_dingtalk(webhook, msg)
                         last_alert_time['disk'] = now
                     else:
-                        logger.info(f"磁盘 {disk_pct}% 超阈值，但在冷却期内，跳过告警")
+                        logger.info(f"磁盘({disk_mount}) {disk_pct}% 超阈值，但在冷却期内，跳过告警")
                 else:
-                    logger.info(f"磁盘正常: {disk_pct}% ({disk_used}GB/{disk_total}GB)")
+                    logger.info(f"磁盘正常({disk_mount}): {disk_pct}% ({disk_used}GB/{disk_total}GB)")
 
         except Exception as e:
             logger.error(f"监控循环异常: {e}")
