@@ -1,5 +1,7 @@
 import math
 
+from config_validation import MAX_RISK_PER_TRADE
+
 
 class RiskManager:
     def __init__(self, account_equity, risk_per_trade=0.01):
@@ -37,11 +39,12 @@ class RiskManager:
         if not all(math.isfinite(v) for v in
                    (equity, entry_price, stop_loss_price, risk_pct)):
             return 0
-        # 权益/入场价须为正；风险度须在 (0, 1] 内（更严的 50% 上限由上游 config 校验把关）；
+        # 权益/入场价须为正；风险度直接复用三配置入口的同一上限，确保这道
+        # 最后防线被单独调用时也不会接受系统其余位置已经判为非法的风险度；
         # 止损价须为正且不等于入场价（否则风险距离为 0）。
         if equity <= 0 or entry_price <= 0 or stop_loss_price <= 0:
             return 0
-        if not (0 < risk_pct <= 1):
+        if not (0 < risk_pct <= MAX_RISK_PER_TRADE):
             return 0
         if entry_price == stop_loss_price:
             return 0

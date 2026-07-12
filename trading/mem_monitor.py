@@ -61,14 +61,15 @@ def load_webhook():
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        return config.get('dingtalk', {}).get('webhook_url')
+        webhook = config.get('dingtalk', {}).get('webhook_url')
+        return webhook.strip() if isinstance(webhook, str) else None
     except Exception as e:
         logger.error(f"读取配置文件失败: {e}")
         return None
 
 
 def send_dingtalk(webhook, msg):
-    """发送钉钉告警消息"""
+    """发送钉钉告警消息；只有服务端明确接受才返回 True。"""
     try:
         data = {"msgtype": "text", "text": {"content": msg}}
         resp = requests.post(webhook, json=data, timeout=5)
@@ -76,12 +77,14 @@ def send_dingtalk(webhook, msg):
             result = resp.json()
             if result.get('errcode') == 0:
                 logger.info("钉钉告警发送成功")
+                return True
             else:
                 logger.warning(f"钉钉推送被拒: {result.get('errmsg')}")
         else:
             logger.warning(f"钉钉推送返回非200: {resp.status_code}")
     except Exception as e:
         logger.error(f"钉钉推送失败: {_redact_secrets(e)}")
+    return False
 
 
 def get_memory_usage():
@@ -216,7 +219,7 @@ def send_test_message(webhook):
     msg += "这是一条测试消息，交易系统运行正常。"
 
     print(f"发送测试消息:\n{msg}")
-    send_dingtalk(webhook, msg)
+    return send_dingtalk(webhook, msg)
 
 
 def main():
@@ -224,10 +227,10 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == '--test':
         webhook = load_webhook()
         if webhook:
-            send_test_message(webhook)
+            return 0 if send_test_message(webhook) else 1
         else:
             print("无法获取钉钉 webhook")
-        return
+            return 1
 
     logger.info("资源监控服务启动")
     logger.info(f"检查间隔: {CHECK_INTERVAL}秒, 内存阈值: {MEMORY_THRESHOLD}%, 磁盘阈值: {DISK_THRESHOLD}%, 告警冷却: {ALERT_COOLDOWN}秒")
@@ -235,7 +238,7 @@ def main():
     webhook = load_webhook()
     if not webhook:
         logger.error("无法获取钉钉 webhook，退出")
-        return
+        return 1
 
     last_alert_time = {
         'memory': 0,
@@ -252,8 +255,8 @@ def main():
                 if mem_pct >= MEMORY_THRESHOLD:
                     if now - last_alert_time['memory'] >= ALERT_COOLDOWN:
                         msg = build_memory_alert(mem_pct, mem_total, mem_used, mem_avail)
-                        send_dingtalk(webhook, msg)
-                        last_alert_time['memory'] = now
+                        if send_dingtalk(webhook, msg):
+                            last_alert_time['memory'] = now
                     else:
                         logger.info(f"内存 {mem_pct}% 超阈值，但在冷却期内，跳过告警")
                 else:
@@ -265,8 +268,8 @@ def main():
                 if disk_pct >= DISK_THRESHOLD:
                     if now - last_alert_time['disk'] >= ALERT_COOLDOWN:
                         msg = build_disk_alert(disk_pct, disk_total, disk_used, disk_free, mount=disk_mount)
-                        send_dingtalk(webhook, msg)
-                        last_alert_time['disk'] = now
+                        if send_dingtalk(webhook, msg):
+                            last_alert_time['disk'] = now
                     else:
                         logger.info(f"磁盘({disk_mount}) {disk_pct}% 超阈值，但在冷却期内，跳过告警")
                 else:
@@ -279,4 +282,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

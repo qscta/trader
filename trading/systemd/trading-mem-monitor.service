@@ -2,17 +2,20 @@
 Description=Trading System Memory and Disk Monitor
 After=network-online.target
 Wants=network-online.target
+# 配置遗漏时限制失败重启频率，避免每 10 秒永久刷日志。
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/trader/trading
-# 最小权限：资源监控只需钉钉 webhook，load_webhook() 会从 config.json 的
-# dingtalk.webhook_url 回退取得，因此不加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY
-# 的 /etc/trading.env——避免这个常驻进程无谓地在环境里持有交易凭据。
-# 若确需用环境变量提供 webhook，另建仅含 DINGTALK_WEBHOOK 的专用 EnvironmentFile。
+# 最小权限：专用文件只能包含 DINGTALK_WEBHOOK，绝不能换成含 OKX 密钥、
+# 登录口令和 FLASK_SECRET_KEY 的 /etc/trading.env。前缀 '-' 允许 config.json
+# 已配置 dingtalk.webhook_url 的部署不创建该文件。
+EnvironmentFile=-/etc/trading-mem-monitor.env
 ExecStart=/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py
-Restart=always
+Restart=on-failure
 RestartSec=10
 UMask=0077
 NoNewPrivileges=true

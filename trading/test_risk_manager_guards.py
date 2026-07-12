@@ -30,6 +30,11 @@ class PositionSizeGuardTest(unittest.TestCase):
     def test_risk_over_one_returns_zero(self):
         self.assertEqual(RiskManager(10000).calculate_position_size(100.0, 95.0, 5.0), 0)
 
+    def test_guard_uses_same_fifty_percent_limit_as_config(self):
+        manager = RiskManager(10000)
+        self.assertGreater(manager.calculate_position_size(100.0, 95.0, 0.5), 0)
+        self.assertEqual(manager.calculate_position_size(100.0, 95.0, 0.500001), 0)
+
     def test_nonfinite_price_returns_zero(self):
         self.assertEqual(RiskManager(10000).calculate_position_size(float('nan'), 95.0, 0.01), 0)
         self.assertEqual(RiskManager(10000).calculate_position_size(100.0, float('inf'), 0.01), 0)

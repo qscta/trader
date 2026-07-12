@@ -44,7 +44,8 @@ class RepositoryHygieneTest(unittest.TestCase):
         for required in (
                 'User=ubuntu',
                 '/home/ubuntu/trader/trading/.venv/bin/python mem_monitor.py',
-                'Restart=always', 'UMask=0077'):
+                'EnvironmentFile=-/etc/trading-mem-monitor.env',
+                'Restart=on-failure', 'StartLimitBurst=3', 'UMask=0077'):
             self.assertIn(required, unit)
         # 最小权限：监控进程只需 webhook（从 config.json 回退取得），绝不通过
         # EnvironmentFile 加载含 OKX 密钥/登录口令/FLASK_SECRET_KEY 的整份 trading.env。
