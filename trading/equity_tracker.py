@@ -372,9 +372,10 @@ class EquityTracker:
             peak_equity = current_equity
             peak_time = now.isoformat()
             if persist:
-                # 峰值推进的唯一咽喉：先结算刚结束的未创新高周期，再落盘新峰值。
-                # 若只在 build_account_stats 里结算，5 分钟权益采样会抢先把新峰值
-                # 落盘，等统计刷新时已看不到「刚创新高」，历史最长未创新高会漏记。
+                # 结算刚结束的未创新高周期必须与落盘新峰值同一路径完成，否则
+                # 「刚创新高」的信息会在下次统计刷新前丢失、历史最长未创新高漏记。
+                # 峰值按「日收盘」推进：record_daily_equity_snapshot 每日收盘调用 +
+                # 日检末尾 build_account_stats(persist=True)；5 分钟采样不再参与。
                 self._settle_drawdown_streak(old_peak_time, now)
                 peak_data['peak_equity'] = current_equity
                 peak_data['peak_time'] = peak_time
@@ -768,7 +769,9 @@ class EquityTracker:
                     return False
 
             with self._lock:
-                self.reconcile_peak_equity(equity, persist=True, now=now)
+                # 5 分钟按市值采样只维护求索指数，绝不推进「未创新高/回撤」峰值：
+                # 否则日内浮盈冒一个高点就把 days_since_peak 永久清零（回撤时长指标失效）。
+                # 峰值改由每日收盘快照按日推进（见 record_daily_equity_snapshot）。
                 state = self.ensure_qiusuo_index_state(current_equity=equity, now=now, persist=True)
                 qiusuo_index = self.calculate_qiusuo_index(equity, ts=now, state=state)
                 if qiusuo_index is None:
@@ -905,6 +908,14 @@ class EquityTracker:
                     snapshots.append({'date': day_key, 'equity': equity, 'qiusuo_index': qiusuo_index})
                 if not self.save_daily_equity(snapshots):
                     raise RuntimeError('保存每日权益快照失败')
+                # 「未创新高/回撤」峰值按日收盘高水位推进的唯一节拍：用当日收盘权益
+                # 结算并推进峰值。日快照已落盘，峰值/最长回撤周期推进失败不回滚快照，
+                # 只告警并等下一次日检重试（避免把日内浮盈噪声 ratchet 成新高）。
+                try:
+                    self.reconcile_peak_equity(equity, persist=True, now=now)
+                except Exception as peak_exc:
+                    logger.warning(
+                        f"每日收盘高水位推进失败（日快照已存，下次重试）: {peak_exc}")
             logger.info(f"每日权益快照已记录: {day_key} = {equity:.2f} USDT / 求索指数 {qiusuo_index:.2f}")
             self._compact_closed_ticks(now)
         except Exception as e:

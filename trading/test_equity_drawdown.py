@@ -73,16 +73,34 @@ class DrawdownStatsTest(unittest.TestCase):
         self.assertEqual(d['days_since_peak'], 0)
         self.assertEqual(d['longest_drawdown_days'], 10)
 
-    def test_tick_advancing_peak_still_settles_longest_streak(self):
-        """生产时序：5 分钟权益采样先把新峰值落盘，随后的统计刷新已看不到「刚创新高」——
-        结算已下沉到 reconcile_peak_equity，刚结束的未创新高周期(5)不得漏记。"""
+    def test_5min_tick_does_not_advance_peak_daily_snapshot_does(self):
+        """峰值按「日收盘」推进：5 分钟采样只维护求索指数，绝不 ratchet 峰值/结算周期；
+        每日收盘快照才用当日收盘权益结算旧周期(5)并推进峰值。"""
         tmp, t = _make(equity=110, peak=100, peak_days_ago=5, longest=3)
-        self.assertTrue(t.record_equity_tick(equity=110))   # 采样先推进峰值
-        hist = _jload(os.path.join(tmp, 'equity_history.json'))
-        self.assertEqual(hist['longest_drawdown_days'], 5)  # 采样路径已结算
-        d = t.build_account_stats(persist=True)             # 统计刷新时峰值已是新高
-        self.assertEqual(d['days_since_peak'], 0)
-        self.assertEqual(d['longest_drawdown_days'], 5)
+        # 5 分钟采样：峰值与最长回撤都不动
+        self.assertTrue(t.record_equity_tick(equity=110))
+        self.assertEqual(100, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+        self.assertEqual(3, _jload(os.path.join(tmp, 'equity_history.json'))['longest_drawdown_days'])
+        # 每日收盘快照（_make 的余额=当日权益 110）：结算旧周期(5)并按日推进峰值
+        t.record_daily_equity_snapshot()
+        self.assertEqual(110, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+        self.assertEqual(5, _jload(os.path.join(tmp, 'equity_history.json'))['longest_drawdown_days'])
+
+    def test_intraday_tick_new_high_does_not_zero_days_since_peak(self):
+        """回归（本次修复）：日内 5 分钟采样冒出高于按日峰值的点，不得把「未创新高天数」
+        永久清零。旧实现里一次含浮盈的采样会 ratchet 峰值→days_since_peak 卡 0 达 24h。"""
+        tmp, t = _make(equity=1000, peak=1000, peak_days_ago=8, longest=8)
+        # 日内浮盈把按市值权益冲到 1001（旧实现：此处 ratchet 峰值并把天数清零）
+        self.assertTrue(t.record_equity_tick(equity=1001))
+        self.assertEqual(1000, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+        self.assertEqual(
+            (datetime.now() - timedelta(days=8)).isoformat()[:10],
+            _jload(os.path.join(tmp, 'peak_equity.json'))['peak_time'][:10])
+        # 浮盈回落到峰值之下后，统计仍如实反映「已 8 天未创新高」
+        t.system.exchange_api.get_balance = lambda: {'total': {'USDT': 995}, 'free': {'USDT': 995}}
+        d = t.build_account_stats(persist=False)
+        self.assertEqual(d['days_since_peak'], 8)
+        self.assertEqual(d['longest_drawdown_days'], 8)
 
     def test_peak_does_not_advance_when_closed_streak_cannot_persist(self):
         tmp, tracker = _make(equity=110, peak=100, peak_days_ago=5, longest=3)
