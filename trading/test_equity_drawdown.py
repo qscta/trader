@@ -293,6 +293,28 @@ class EquitySyncFlowTest(unittest.TestCase):
             self.assertAlmostEqual(r['qiusuo_index'], 1853.0, places=4)
             self.assertAlmostEqual(t.calculate_qiusuo_index(1500.0), 1853.0, places=4)
 
+    def test_sync_claims_day_blocking_same_day_peak_readvance(self):
+        """回归：资金同步（出金）把基准降到 11000 后，认领当日峰值节拍；同一交易日
+        的兜底重跑不得用同步前的收盘快照(11500)把峰值刷回旧世代（会虚增回撤/天数）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            t, bal = self._tracker(tmp, equity=11000.0)
+            # 出金前当日高水位 11500，已观察当日
+            now = datetime.now()
+            observed = t._qiusuo_trading_day(now)  # 已是 'YYYY-MM-DD' 字符串
+            t.save_peak_equity({'peak_equity': 11500.0, 'peak_time': now.isoformat(),
+                                'peak_observed_day': observed})
+            # 资金同步（出金 500 → 基准 11000）
+            r = t.equity_sync(flow_amount=-500.0)
+            self.assertAlmostEqual(r['new_initial'], 11000.0, places=4)
+            pk = _jload(os.path.join(tmp, 'peak_equity.json'))
+            self.assertAlmostEqual(pk['peak_equity'], 11000.0, places=4)
+            self.assertEqual(pk['peak_observed_day'], observed)  # 同步认领了当日节拍
+            # 同一交易日兜底重跑：用同步前的收盘权益 11500 尝试推进 → 被节拍锁挡住
+            same_day = datetime.fromisoformat(pk['peak_observed_day'] + 'T12:00:00')
+            t.reconcile_peak_equity(11500.0, persist=True, now=same_day, daily_close=True)
+            pk2 = _jload(os.path.join(tmp, 'peak_equity.json'))
+            self.assertAlmostEqual(pk2['peak_equity'], 11000.0, places=4)  # 未被刷回旧世代
+
 
 if __name__ == '__main__':
     unittest.main()
