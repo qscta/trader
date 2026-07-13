@@ -104,8 +104,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.critical(_tz_msg)
             try:
                 self.notifier.notify_error(_tz_msg)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 时区问题已 critical 记录；告警发送再失败不能掩盖主问题，仅 debug 留痕。
+                logger.debug('发送时区异常告警失败（不影响启动）: %s', exc)
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
@@ -116,8 +117,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self.notifier.notify_error(
                     f'[{self.label}] 交易状态账本损坏且备份不可恢复，系统已拒绝启动，'
                     f'请立即人工修复 trade_state.json！\n{e}')
-            except Exception:
-                pass
+            except Exception as exc:
+                # 账本损坏是主错误（下方 raise 拒绝启动）；告警再失败仅 debug 留痕，绝不掩盖 raise。
+                logger.debug('账本损坏告警发送失败: %s', exc)
             raise
         self._guard_state_owner()  # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入
 
@@ -171,8 +173,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self.notifier.notify_error(
                     f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
                     f'进程即将退出，请检查API密钥和网络连接！')
-            except Exception:
-                pass
+            except Exception as exc:
+                # 启动失败是主错误（下方 sys.exit(1)）；告警再失败仅 debug 留痕，不阻挠退出。
+                logger.debug('启动失败告警发送失败: %s', exc)
             sys.exit(1)
 
         self.risk_manager = RiskManager(account_equity, self.config['strategy']['default_risk_per_trade'])

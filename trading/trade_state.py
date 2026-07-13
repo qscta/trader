@@ -111,8 +111,9 @@ def atomic_write_json(filepath, data):
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except Exception:
-            pass
+        except Exception as cleanup_exc:
+            # 真正的保存错误已在上面 logger.error；临时文件清理再失败仅 debug 留痕，不掩盖它。
+            logger.debug('原子写临时文件清理失败: %s', cleanup_exc)
         return False
 
 

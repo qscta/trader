@@ -75,8 +75,9 @@ class EquityTracker:
         if retention_days:
             try:
                 self.EQUITY_TICK_RETENTION_DAYS = max(7, int(retention_days))
-            except Exception:
-                pass
+            except Exception as exc:
+                # 非法 retention_days 退回默认；主入口 load_config 已 fail-loud 校验过，此为二道防线。
+                logger.debug('retention_days 解析失败，沿用默认保留天数: %s', exc)
         self._lock = threading.RLock()
         self._stats_cache = None
         self._stats_cache_ts = 0.0
@@ -493,8 +494,9 @@ class EquityTracker:
                     closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
                     if closed_gap > (eq_hist.get('longest_drawdown_days', 0) or 0):
                         eq_hist['longest_drawdown_days'] = closed_gap
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 仅展示口径的结算计算；坏时间戳不参与交易，跳过即可。
+                    logger.debug('展示用未创新高周期结算跳过: %s', exc)
 
             if persist:
                 if not self.save_equity_history(eq_hist):
@@ -864,7 +866,9 @@ class EquityTracker:
                 try:
                     if date.fromisoformat(item['date']) >= cutoff_day:
                         kept.append(item)
-                except Exception:
+                except Exception as exc:
+                    # 图表用：坏日期的历史 K 线跳过，不影响交易。
+                    logger.debug('求索指数 OHLC 跳过坏日期项 %r: %s', item.get('date'), exc)
                     continue
             candles = kept
 
