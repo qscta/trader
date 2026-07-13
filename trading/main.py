@@ -760,10 +760,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             if position is None or position.get('contracts', 0) == 0:
                 logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
-                try:
-                    exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
-                except Exception:
-                    exit_price = open_positions[symbol]['entry_price']
+                # 进程离线期间仓位消失时，重启后的当前市价与真实退出时刻没有
+                # 因果关系：止损后若已反弹/回落，用裸市价会把亏损记成盈利。
+                # 没有可归因 close intent 时，与盘中 guardian / 日检统一采用
+                # 账本保护止损价作为保守估值；仅兼容无止损字段的旧账本回退入场价。
+                exit_price = (
+                    open_positions[symbol].get('stop_loss_price') or
+                    open_positions[symbol]['entry_price'])
                 closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
                     symbol, ccxt_symbol, open_positions[symbol], exit_price,
                     "启动同步平仓",

@@ -1696,18 +1696,18 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
 
 
 class StartupSyncCompensationTests(unittest.TestCase):
-    def make_system(self):
+    def make_system(self, *, side="long", stop_loss_price=90.0,
+                    current_price=123.45):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
-        exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 123.45}))
+        last_price = Mock(return_value=current_price)
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
             get_position=Mock(return_value=None),
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(return_value=True),
             list_position_symbols=Mock(return_value=[]),
-            exchange=exchange_stub,
-            get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
+            get_last_price=last_price,
         )
         system.trade_state = SimpleNamespace(
             get_all_open_positions=Mock(
@@ -1715,28 +1715,52 @@ class StartupSyncCompensationTests(unittest.TestCase):
                     "BTCUSDT": {
                         "entry_price": 100,
                         "position_size": 2.0,
-                        "side": "long",
+                        "side": side,
+                        "stop_loss_price": stop_loss_price,
                     }
                 }
             ),
-            force_runtime_close_position=Mock(return_value={"pnl": 46.9, "pnl_percent": 23.45}),
-            close_position=Mock(return_value={"pnl": 46.9, "pnl_percent": 23.45}),
+            force_runtime_close_position=Mock(return_value={"pnl": -20.0, "pnl_percent": -10.0}),
+            close_position=Mock(return_value={"pnl": -20.0, "pnl_percent": -10.0}),
+            get_pending_signal_execution=Mock(return_value=None),
             mark_stop_residue=Mock(),
             clear_stop_residue=Mock(),
         )
         system.notifier = SimpleNamespace(notify_error=Mock())
         return system
 
-    def test_sync_positions_uses_runtime_fallback_when_persist_fails(self):
-        system = self.make_system()
-        system.trade_state.close_position.side_effect = trade_state.TradeStatePersistenceError("disk full")
+    def test_sync_positions_uses_stop_estimate_and_runtime_fallback(self):
+        # 旧代码会用重启时的裸市价：long 止损后反弹到 123.45、short 止损后
+        # 下跌到 80 都会被错误记成盈利。正常持久化与磁盘故障运行时回退
+        # 两条分支、两个方向都必须固定采用账本止损估值。
+        for persist_fails in (False, True):
+            for side, stop_price, current_price, expected_exit in (
+                    ("long", 90.0, 123.45, 90.0),
+                    ("short", 110.0, 80.0, 110.0),
+                    ("long", None, 1_000_000.0, 100.0)):
+                with self.subTest(
+                        side=side, persist_fails=persist_fails):
+                    system = self.make_system(
+                        side=side, stop_loss_price=stop_price,
+                        current_price=current_price)
+                    if persist_fails:
+                        system.trade_state.close_position.side_effect = (
+                            trade_state.TradeStatePersistenceError("disk full"))
 
-        system.sync_positions_on_startup()
+                    system.sync_positions_on_startup()
 
-        system.trade_state.force_runtime_close_position.assert_called_once_with(
-            "BTCUSDT", 123.45, stop_cleanup_pending=True,
-            reset_turtle_signal=True)
-        system.notifier.notify_error.assert_called_once()
+                    system.trade_state.close_position.assert_called_once_with(
+                        "BTCUSDT", expected_exit, stop_cleanup_pending=True,
+                        reset_turtle_signal=True)
+                    if persist_fails:
+                        system.trade_state.force_runtime_close_position.assert_called_once_with(
+                            "BTCUSDT", expected_exit, stop_cleanup_pending=True,
+                            reset_turtle_signal=True)
+                        system.notifier.notify_error.assert_called_once()
+                    else:
+                        system.trade_state.force_runtime_close_position.assert_not_called()
+                        system.notifier.notify_error.assert_not_called()
+                    system.exchange_api.get_last_price.assert_not_called()
 
 
 class LoginBackoffTests(unittest.TestCase):

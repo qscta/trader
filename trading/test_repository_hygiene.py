@@ -37,6 +37,28 @@ def _is_forbidden_tracked_path(path):
 
 
 class RepositoryHygieneTest(unittest.TestCase):
+    def test_production_dependency_lock_is_committed_and_used(self):
+        root = Path(__file__).resolve().parents[1]
+        direct = (root / 'trading' / 'requirements.txt').read_text(
+            encoding='utf-8')
+        lock = (root / 'trading' / 'requirements.lock').read_text(
+            encoding='utf-8')
+        workflow = (root / '.github' / 'workflows' / 'tests.yml').read_text(
+            encoding='utf-8')
+
+        expected_direct = (
+            'ccxt==4.5.64', 'pandas==3.0.3', 'flask==3.1.3',
+            'apscheduler==3.11.3', 'requests==2.34.2',
+            'gunicorn==26.0.0')
+        direct_lower = direct.lower()
+        lock_lower = lock.lower()
+        for requirement in expected_direct:
+            self.assertIn(requirement, direct_lower)
+            self.assertIn(requirement, lock_lower)
+        self.assertNotIn('>=', direct)
+        self.assertIn('python-version: "3.12"', workflow)
+        self.assertIn('pip install -r requirements.lock', workflow)
+
     def test_resource_monitor_unit_uses_production_runtime(self):
         root = Path(__file__).resolve().parents[1]
         unit = (root / 'trading' / 'systemd' /
