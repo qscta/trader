@@ -134,10 +134,25 @@ class PerSymbolIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
                 tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'turtle'}])
+            snapshot = Mock()
+            system.equity_tracker.record_daily_equity_snapshot = snapshot
 
             system.check_and_execute_trades(manual_run=True)
 
             self.assertIsNone(system._last_check_date)
+            snapshot.assert_not_called()
+
+    def test_completed_day_guard_runs_before_equity_snapshot(self):
+        """08:01/兜底触发在当日已完成后直接返回，不得覆盖 08:00 收盘快照。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _checked = _build_system(tmp, config_symbols=[])
+            system._last_check_date = date.today().isoformat()
+            snapshot = Mock()
+            system.equity_tracker.record_daily_equity_snapshot = snapshot
+
+            system.check_and_execute_trades()
+
+            snapshot.assert_not_called()
 
 
 class StartupCatchupTest(unittest.TestCase):

@@ -1,41 +1,22 @@
 #!/usr/bin/env python3
-"""一次性状态迁移：把被日内浮盈污染的 peak_equity.json 纠正回「日收盘高水位」口径。
+"""一次性把日内浮盈污染的峰值纠正为日收盘高水位。
 
-背景
-----
-历史实现每 5 分钟按市值总权益（含未实现盈亏）推进峰值，日内浮盈冒一个高点
-就把 `peak_time` 刷成当时刻——`days_since_peak`（未创新高天数）因此被反复清零，
-`peak_drawdown` 也被虚高的峰值放大。新代码已把峰值改为「每交易日按收盘推进
-一次」，但**已经落盘的错误峰值不会被新代码自动纠正**，需要本脚本做一次迁移。
-
-口径
-----
-应有峰值 = 「回撤基准」与「基准之后的各日收盘」的最高者：
-  - 回撤基准 = equity_history.initial_equity @ initial_time
-    （资金同步 equity_sync 会把它重置为同步时权益，并清零回撤统计）；
-  - 各日收盘 = daily_equity.json 中日期 ≥ 基准交易日的 equity。
-本脚本**只向下纠正**（当落盘峰值高于上述高水位时才改），绝不抬高峰值——
-抬高会掩盖真实回撤。向下纠正只会让未创新高天数/回撤更保守、更真实。
-
-用法
-----
-  python3 migrate_peak_baseline.py            # 干跑：只分析并打印，不改任何文件
-  python3 migrate_peak_baseline.py --apply     # 备份后写入纠正值
-  python3 migrate_peak_baseline.py --data-dir /path/to/state --apply
-默认 data-dir 为本脚本所在目录（状态文件通常与代码同目录的项目根）。
-幂等：已纠正过再跑一次会判定「无需纠正」。
+默认只分析；加 ``--apply`` 才会在备份原文件后写入。迁移以最近一次
+``equity_sync`` 重置的 ``equity_history.initial_*`` 为基准，只采用该时刻
+之后的日收盘，避免把同一交易日中、资金同步之前的旧快照带入新基线。
 """
 
 import argparse
 import json
 import os
 import sys
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import atomic_write_json  # 复用命脉级原子写（含 0600 + fsync）
+from trade_state import atomic_write_json, open_private_text_file
 
-ROLLOVER_HOUR = 8  # 与 EquityTracker.QIUSUO_INDEX_ROLLOVER_HOUR 一致
+
+ROLLOVER_HOUR = 8
 
 
 def _pos_float(value):
@@ -45,7 +26,11 @@ def _pos_float(value):
         value = float(value)
     except (TypeError, ValueError):
         return None
-    return value if (value == value and value not in (float('inf'), float('-inf')) and value > 0) else None
+    return value if (
+        value == value
+        and value not in (float('inf'), float('-inf'))
+        and value > 0
+    ) else None
 
 
 def _parse_ts(value):
@@ -56,7 +41,8 @@ def _parse_ts(value):
     except ValueError:
         return None
     if parsed.tzinfo is not None:
-        parsed = parsed.replace(tzinfo=None)
+        parsed = parsed.astimezone(
+            timezone(timedelta(hours=8))).replace(tzinfo=None)
     return parsed
 
 
@@ -65,14 +51,29 @@ def _trading_day(dt):
 
 
 def _day_close_ts(day_str):
-    return datetime.strptime(f'{day_str}T{ROLLOVER_HOUR:02d}:00:00', '%Y-%m-%dT%H:%M:%S')
+    return datetime.strptime(
+        f'{day_str}T{ROLLOVER_HOUR:02d}:00:00',
+        '%Y-%m-%dT%H:%M:%S',
+    )
+
+
+def _snapshot_close_ts(snapshot, day_str):
+    """返回 daily 记录代表的真实收盘边界。
+
+    刚在 08:00 建立的单点快照以当天日期标记；次日压缩后，同一记录会带
+    OHLC/samples，此时 ``date=D`` 代表 D 交易日（D 08:00 至 D+1 08:00），
+    收盘边界应为 D+1 08:00。
+    """
+    boundary = _day_close_ts(day_str)
+    is_compacted = (
+        _pos_float(snapshot.get('samples')) is not None
+        or all(key in snapshot for key in ('open', 'high', 'low', 'close'))
+    )
+    return boundary + timedelta(days=1) if is_compacted else boundary
 
 
 def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
-    """按日收盘高水位口径重算应有峰值。返回分析 dict，或 None（无法判定）。
-
-    纯函数，便于单测：不读文件、不写文件。
-    """
+    """按最近资金基准及其后的日收盘重算峰值；数据不足时返回 ``None``。"""
     stored_eq = _pos_float((peak_data or {}).get('peak_equity'))
     if stored_eq is None:
         return None
@@ -80,10 +81,13 @@ def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
     candidates = []  # (equity, timestamp, source)
     baseline_eq = _pos_float((eq_hist or {}).get('initial_equity'))
     baseline_time = _parse_ts((eq_hist or {}).get('initial_time'))
-    baseline_day = _trading_day(baseline_time) if baseline_time else None
-    if baseline_eq is not None and baseline_time is not None:
-        candidates.append((baseline_eq, baseline_time, 'baseline'))
+    # 没有最近资金同步基准就无法区分入金前后的世代；宁可拒绝迁移，也不能
+    # 仅凭日快照猜测并向下改写真实资金基线。
+    if baseline_eq is None or baseline_time is None:
+        return None
+    candidates.append((baseline_eq, baseline_time, 'baseline'))
 
+    observed_days = []
     for snap in daily_snapshots or []:
         if not isinstance(snap, dict):
             continue
@@ -92,32 +96,41 @@ def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
         if not isinstance(day_str, str) or eq is None:
             continue
         try:
-            snap_day = date.fromisoformat(day_str)
+            date.fromisoformat(day_str)  # 严格校验日期；真实边界由记录形态决定。
+            close_time = _snapshot_close_ts(snap, day_str)
         except ValueError:
             continue
-        # 同步/基准之前的旧收盘不计入（equity_sync 已重置回撤基准）。
-        if baseline_day is not None and snap_day < baseline_day:
+        # 关键边界：资金同步可能发生在 20:29，而同日 08:00 快照属于旧基线。
+        # 只比较日期会错误保留这份同步前快照，必须按完整时间排除。
+        if close_time < baseline_time:
             continue
-        candidates.append((eq, _day_close_ts(day_str), f'daily:{day_str}'))
+        candidates.append((eq, close_time, f'daily:{day_str}'))
+        observed_days.append(_trading_day(close_time))
 
     if not candidates:
         return None
 
-    best_eq, best_time, best_source = max(candidates, key=lambda c: c[0])
+    best_eq, best_time, best_source = max(candidates, key=lambda item: item[0])
+    observed_day = (
+        max(observed_days)
+        if observed_days
+        else _trading_day(baseline_time or best_time)
+    )
     return {
         'stored_peak_equity': stored_eq,
         'stored_peak_time': (peak_data or {}).get('peak_time'),
         'recomputed_peak_equity': best_eq,
         'recomputed_peak_time': best_time.isoformat(timespec='seconds'),
-        'recomputed_peak_advanced_day': _trading_day(best_time).isoformat(),
+        # 这是“最近已消费的日收盘”，不是“峰值发生日”。峰值可能来自更早的基准。
+        'recomputed_peak_observed_day': observed_day.isoformat(),
         'source': best_source,
     }
 
 
 def _load_json(path):
-    if not os.path.exists(path):
+    if not os.path.lexists(path):
         return None
-    with open(path, 'r', encoding='utf-8') as handle:
+    with open_private_text_file(path) as handle:
         return json.load(handle)
 
 
@@ -132,7 +145,10 @@ def run(data_dir, apply):
         return 0
 
     analysis = recompute_daily_close_peak(
-        peak_data, _load_json(hist_path) or {}, _load_json(daily_path) or [])
+        peak_data,
+        _load_json(hist_path) or {},
+        _load_json(daily_path) or [],
+    )
     if analysis is None:
         print('[跳过] 数据不足以判定应有峰值（缺基准与日收盘），不做改动。')
         return 0
@@ -141,18 +157,23 @@ def run(data_dir, apply):
     correct = analysis['recomputed_peak_equity']
     print('—— 峰值口径迁移分析 ——')
     print(f"  落盘峰值:   {stored:.4f} @ {analysis['stored_peak_time']}")
-    print(f"  应有峰值:   {correct:.4f} @ {analysis['recomputed_peak_time']}  (来源 {analysis['source']})")
+    print(
+        f"  应有峰值:   {correct:.4f} @ {analysis['recomputed_peak_time']}  "
+        f"(来源 {analysis['source']})")
 
-    if correct >= stored - max(1e-9, abs(stored) * 1e-9):
-        print('  判定: 落盘峰值未高于日收盘高水位，无需纠正（或将由日检自然推进）。')
+    tolerance = max(1e-9, abs(stored) * 1e-9)
+    if correct >= stored - tolerance:
+        print('  判定: 落盘峰值未高于日收盘高水位，无需向下纠正。')
         return 0
 
     corrected = {
         'peak_equity': correct,
         'peak_time': analysis['recomputed_peak_time'],
-        'peak_advanced_day': analysis['recomputed_peak_advanced_day'],
+        'peak_observed_day': analysis['recomputed_peak_observed_day'],
     }
-    print(f'  判定: 落盘峰值被日内浮盈污染（高于日收盘高水位 {stored - correct:.4f}），应向下纠正。')
+    print(
+        '  判定: 落盘峰值被日内浮盈污染'
+        f'（高于日收盘高水位 {stored - correct:.4f}），应向下纠正。')
 
     if not apply:
         print('  这是干跑；确认无误后加 --apply 执行（会先备份再写入）。')
@@ -162,18 +183,24 @@ def run(data_dir, apply):
     if not atomic_write_json(backup, peak_data):
         print(f'  [失败] 备份原峰值失败，未改动: {backup}')
         return 1
-    if not (atomic_write_json(peak_path, corrected) and
-            atomic_write_json(peak_path + '.bak', corrected)):
-        print('  [失败] 写入纠正峰值失败；原文件请从备份恢复:', backup)
+    if not atomic_write_json(peak_path, corrected):
+        print(f'  [失败] 写入主峰值失败；请从备份恢复: {backup}')
+        return 1
+    if not atomic_write_json(peak_path + '.bak', corrected):
+        print(f'  [失败] 主峰值已纠正但备份刷新失败；原值仍保存在: {backup}')
         return 1
     print(f'  [完成] 已备份到 {backup} 并写入纠正峰值。')
     return 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description='把被日内浮盈污染的峰值纠正回日收盘高水位口径')
-    parser.add_argument('--data-dir', default=os.path.dirname(os.path.abspath(__file__)),
-                        help='状态文件目录（默认脚本所在目录）')
+    parser = argparse.ArgumentParser(
+        description='把被日内浮盈污染的峰值纠正回日收盘高水位口径')
+    parser.add_argument(
+        '--data-dir',
+        default=os.path.dirname(os.path.abspath(__file__)),
+        help='状态文件目录（默认脚本所在目录）',
+    )
     parser.add_argument('--apply', action='store_true', help='实际写入（否则仅干跑分析）')
     args = parser.parse_args()
     return run(args.data_dir, args.apply)

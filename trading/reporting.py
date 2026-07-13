@@ -131,8 +131,10 @@ class ReportingMixin:
                                 self.notifier.notify_error(
                                     f'每日汇总已发送，但去重日期落盘失败: {exc}')
                             except Exception as notify_exc:
-                                # 主问题（去重落盘失败）已 critical 记录；二次告警再失败仅 debug 留痕。
-                                logger.debug('去重落盘失败的二次告警发送失败: %s', notify_exc)
+                                # 主问题已 critical 记录；二次告警失败仅 debug 留痕。
+                                logger.debug(
+                                    '去重落盘失败的二次告警发送失败: %s',
+                                    notify_exc)
                     self._last_summary_date = today
                 else:
                     logger.info(f"今日({today})每日持仓汇总已推送，本次不标记去重日期")

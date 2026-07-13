@@ -13,7 +13,8 @@ import re
 import sys
 import json
 import time
-import subprocess  # nosec B404 - 仅用于调用固定绝对路径命令 /usr/bin/ps，无 shell、无外部输入
+# 仅调用固定绝对路径 /usr/bin/ps，无 shell、无外部输入。
+import subprocess  # nosec B404
 import requests
 import logging
 import logging.handlers
@@ -158,7 +159,8 @@ def get_top_processes(count=5):
     其他凭据，把它们拼进钉钉告警会造成二次泄露。
     """
     try:
-        result = subprocess.run(  # nosec B603 - 绝对路径固定参数数组、无 shell、无外部输入
+        # 固定绝对路径与参数数组，无 shell、无外部输入。
+        result = subprocess.run(  # nosec B603
             ['/usr/bin/ps', '-eo', 'comm=,%mem=,%cpu=', '--sort=-rss'],
             capture_output=True, text=True, timeout=5
         )

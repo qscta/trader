@@ -1352,14 +1352,16 @@ class AccountStatsPersistenceTests(unittest.TestCase):
         save_peak.assert_not_called()
         save_hist.assert_not_called()
 
-    def test_build_account_stats_raises_when_peak_save_fails(self):
+    def test_build_account_stats_persist_never_writes_intraday_peak(self):
         tracker = self.make_tracker()
 
         with patch.object(tracker, "load_peak_equity", Mock(return_value={"peak_equity": 9000, "peak_time": None})), \
              patch.object(tracker, "load_equity_history", Mock(return_value={"initial_equity": 9000, "year_start_equity": 9000})), \
-             patch.object(tracker, "save_peak_equity", Mock(return_value=False)):
-            with self.assertRaises(RuntimeError):
-                tracker.build_account_stats(persist=True)
+             patch.object(tracker, "save_peak_equity", Mock(return_value=False)) as save_peak:
+            data = tracker.build_account_stats(persist=True)
+
+        self.assertEqual(data["peak_equity"], 10000)  # provisional 展示值
+        save_peak.assert_not_called()
 
     def test_record_daily_equity_snapshot_raises_on_save_failure(self):
         tracker = self.make_tracker()

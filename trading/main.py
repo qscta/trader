@@ -105,7 +105,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             try:
                 self.notifier.notify_error(_tz_msg)
             except Exception as exc:
-                # 时区问题已 critical 记录；告警发送再失败不能掩盖主问题，仅 debug 留痕。
+                # 时区问题已 critical 记录；告警发送再失败不能掩盖主问题。
                 logger.debug('发送时区异常告警失败（不影响启动）: %s', exc)
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
@@ -118,7 +118,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     f'[{self.label}] 交易状态账本损坏且备份不可恢复，系统已拒绝启动，'
                     f'请立即人工修复 trade_state.json！\n{e}')
             except Exception as exc:
-                # 账本损坏是主错误（下方 raise 拒绝启动）；告警再失败仅 debug 留痕，绝不掩盖 raise。
+                # 账本损坏是主错误（下方 raise 拒绝启动）；二次告警失败仅留痕。
                 logger.debug('账本损坏告警发送失败: %s', exc)
             raise
         self._guard_state_owner()  # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入
@@ -174,7 +174,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
                     f'进程即将退出，请检查API密钥和网络连接！')
             except Exception as exc:
-                # 启动失败是主错误（下方 sys.exit(1)）；告警再失败仅 debug 留痕，不阻挠退出。
+                # 启动失败是主错误（下方 sys.exit）；二次告警失败不能阻挠退出。
                 logger.debug('启动失败告警发送失败: %s', exc)
             sys.exit(1)
 
@@ -1746,11 +1746,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.warning("交易检查正在执行中(锁冲突)，跳过本次触发")
             return
         try:
-            self.equity_tracker.record_daily_equity_snapshot()  # 记录每日权益快照
             today = scheduled_date or date.today().isoformat()
             if self._last_check_date == today and not manual_run:
                 logger.warning(f"今日({today})已执行过交易检查，跳过重复执行")
                 return
+            # 只有正式调度可建立日收盘快照；手动「立即检查」只跑交易逻辑，
+            # 绝不能把下午含浮盈的权益改写成 08:00 收盘高水位。
+            if not manual_run:
+                self.equity_tracker.record_daily_equity_snapshot()
             logger.info("开始检查交易信号...")
             self._pending_trade_open_notifications = []
             self._pending_trade_close_notifications = []
