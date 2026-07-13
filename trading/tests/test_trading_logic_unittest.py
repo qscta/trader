@@ -1579,7 +1579,9 @@ class MaCrossFlipTests(unittest.TestCase):
         system.trade_state.close_position.assert_called_once_with(
             "BTCUSDT", 99,
             stop_loss_date=date.today().strftime('%Y-%m-%d'),
-            stop_cleanup_pending=True)
+            stop_cleanup_pending=True,
+            exit_price_source='estimated_stop',
+            exit_price_estimated=True)
         self.assertEqual(system.stop_loss_dates['BTCUSDT'],
                          date.today().strftime('%Y-%m-%d'))
         system.record_stop_loss.assert_not_called()
@@ -1753,11 +1755,19 @@ class StartupSyncCompensationTests(unittest.TestCase):
 
                     system.trade_state.close_position.assert_called_once_with(
                         "BTCUSDT", expected_exit, stop_cleanup_pending=True,
-                        reset_turtle_signal=True)
+                        reset_turtle_signal=True,
+                        exit_price_source=(
+                            'estimated_stop' if stop_price is not None
+                            else 'estimated_entry_fallback'),
+                        exit_price_estimated=True)
                     if persist_fails:
                         system.trade_state.force_runtime_close_position.assert_called_once_with(
                             "BTCUSDT", expected_exit, stop_cleanup_pending=True,
-                            reset_turtle_signal=True)
+                            reset_turtle_signal=True,
+                            exit_price_source=(
+                                'estimated_stop' if stop_price is not None
+                                else 'estimated_entry_fallback'),
+                            exit_price_estimated=True)
                         system.notifier.notify_error.assert_called_once()
                     else:
                         system.trade_state.force_runtime_close_position.assert_not_called()
@@ -1970,6 +1980,26 @@ class ApiProcessSafetyTests(unittest.TestCase):
         self.assertEqual(payload["total"], 250)
         self.assertEqual(len(payload["trades"]), 100)
         self.assertEqual(payload["trades"][0]["symbol"], "T149")
+
+    def test_trades_summary_exposes_estimated_exit_count(self):
+        trades = [
+            {"symbol": "BTCUSDT", "side": "long", "entry_price": 100,
+             "exit_price": 90, "position_size": 1,
+             "exit_price_source": "estimated_stop",
+             "exit_price_estimated": True},
+            {"symbol": "ETHUSDT", "side": "short", "entry_price": 100,
+             "exit_price": 90, "position_size": 1,
+             "exit_price_source": "okx_stop_fill",
+             "exit_price_estimated": False},
+        ]
+        system = SimpleNamespace(
+            trade_state=SimpleNamespace(get_closed_trades=lambda: trades))
+
+        with patch.object(api_server, "trading_system", system):
+            response = self.client.get("/api/trades_summary")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["estimated_exit_count"], 1)
 
     def test_logs_reads_tail_and_skips_noisy_http_lines(self):
         with tempfile.TemporaryDirectory() as tmp:

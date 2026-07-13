@@ -859,13 +859,16 @@ def get_trades_summary():
         avg_pnl_pct = sum(t.get('pnl_percent', 0) for t in trades) / total
         max_win = max((t.get('pnl', 0) for t in trades), default=0)
         max_loss = min((t.get('pnl', 0) for t in trades), default=0)
+        estimated_exit_count = sum(
+            t.get('exit_price_estimated') is True for t in trades)
         payload = {
             'total': total, 'win_count': win_count, 'loss_count': loss_count,
             'win_rate': round(win_rate, 1), 'total_pnl': round(total_pnl, 2),
             'avg_win': round(avg_win, 2), 'avg_loss': round(avg_loss, 2),
             'profit_factor': round(profit_factor, 2) if profit_factor else None,
             'avg_pnl_pct': round(avg_pnl_pct, 2),
-            'max_win': round(max_win, 2), 'max_loss': round(max_loss, 2)
+            'max_win': round(max_win, 2), 'max_loss': round(max_loss, 2),
+            'estimated_exit_count': estimated_exit_count,
         }
         if revision is not None:
             system._trades_summary_cache = {'revision': revision, 'payload': payload}

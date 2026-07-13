@@ -50,10 +50,14 @@ def _bare_api():
     api.ORDER_CONFIRM_ATTEMPTS = 3
     api.STOP_CONFIRM_DELAY = 0
     api.STOP_CONFIRM_ATTEMPTS = 3
+    api.STOP_FILL_RECOVERY_DELAY = 0
+    api.STOP_FILL_RECOVERY_ATTEMPTS = 3
     api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub({})
     api.exchange.privateGetTradeOrdersPending.return_value = {
         'code': '0', 'msg': '', 'data': []}
     api.exchange.privateGetTradeOrder.return_value = {
+        'code': '51603', 'msg': 'Order does not exist', 'data': []}
+    api.exchange.privateGetTradeOrderAlgo.return_value = {
         'code': '51603', 'msg': 'Order does not exist', 'data': []}
     api.exchange.fetch_positions.return_value = []
     return api
@@ -1443,6 +1447,255 @@ class OpenPreflightAndLateFillTest(unittest.TestCase):
         api.exchange.cancel_order.assert_called_once_with(
             'old-1', 'BTC/USDT:USDT')
         api.exchange.create_order.assert_not_called()
+
+
+class StopFillEvidenceRecoveryTest(unittest.TestCase):
+    SYMBOL = 'BTC/USDT:USDT'
+    INST_ID = 'BTC-USDT-SWAP'
+
+    def _api(self):
+        api = _bare_api()
+        api._contract_size_cache[self.SYMBOL] = 0.01
+        api._amount_precision_cache[self.SYMBOL] = 0
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _symbol, value: str(int(value)))
+        return api
+
+    def _algo(self, algo_id='algo-1', child_ids=None, **overrides):
+        child_ids = ['child-1'] if child_ids is None else child_ids
+        value = {
+            'algoId': algo_id,
+            'instId': self.INST_ID,
+            'state': 'effective',
+            'actualSide': 'sl',
+            'ordType': 'conditional',
+            'side': 'sell',
+            'reduceOnly': 'true',
+            'posSide': 'net',
+            'sz': '10',
+            'actualSz': '10',
+            # 实盘可为空；真实均价必须来自关联普通子订单。
+            'actualPx': '',
+            'triggerTime': '1783603878719',
+            'ordIdList': list(child_ids),
+            'ordId': child_ids[0] if len(child_ids) == 1 else '',
+        }
+        value.update(overrides)
+        return value
+
+    def _child(self, order_id='child-1', **overrides):
+        value = {
+            'ordId': order_id,
+            'instId': self.INST_ID,
+            'state': 'filled',
+            'ordType': 'market',
+            'side': 'sell',
+            'reduceOnly': 'true',
+            'posSide': 'net',
+            'sz': '10',
+            'accFillSz': '10',
+            'avgPx': '101.25',
+            'fee': '-0.42',
+            'feeCcy': 'USDT',
+            'fillTime': '1783603878720',
+        }
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def _response(item):
+        return {'code': '0', 'msg': '', 'data': [item]}
+
+    def _install(self, api, algos, children):
+        api.exchange.privateGetTradeOrderAlgo.side_effect = (
+            lambda params: self._response(algos[str(params['algoId'])]))
+        api.exchange.privateGetTradeOrder.side_effect = (
+            lambda params: self._response(children[str(params['ordId'])]))
+
+    def test_effective_sl_recovers_child_vwap_fee_ids_and_exchange_time(self):
+        api = self._api()
+        self._install(
+            api, {'algo-1': self._algo()},
+            {'child-1': self._child()})
+
+        evidence = api.recover_stop_fill_evidence(
+            self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+        self.assertEqual(evidence['source'], 'okx_stop_fill')
+        self.assertEqual(evidence['average'], 101.25)
+        self.assertEqual(evidence['filled_contracts'], 10.0)
+        self.assertAlmostEqual(evidence['filled_amount'], 0.1)
+        self.assertEqual(evidence['fee'], 0.42)
+        self.assertEqual(evidence['fee_currency'], 'USDT')
+        self.assertEqual(evidence['order_ids'], ['child-1'])
+        self.assertEqual(evidence['algo_order_ids'], ['algo-1'])
+        self.assertEqual(
+            evidence['fill_time'], '2026-07-09T13:31:18.720000+00:00')
+
+    def test_short_position_requires_buy_side_stop_and_child(self):
+        api = self._api()
+        self._install(
+            api, {'algo-1': self._algo(side='buy')},
+            {'child-1': self._child(side='buy')})
+
+        evidence = api.recover_stop_fill_evidence(
+            self.SYMBOL, 'short', 0.1, ['algo-1'])
+
+        self.assertEqual(evidence['average'], 101.25)
+        self.assertEqual(evidence['order_ids'], ['child-1'])
+
+    def test_multiple_children_use_weighted_vwap_and_sum_fees(self):
+        api = self._api()
+        algo = self._algo(child_ids=['child-1', 'child-2'])
+        child_1 = self._child(
+            'child-1', sz='4', accFillSz='4', avgPx='100', fee='-0.10',
+            fillTime='1783603878720')
+        child_2 = self._child(
+            'child-2', sz='6', accFillSz='6', avgPx='102', fee='-0.20',
+            fillTime='1783603878730')
+        self._install(
+            api, {'algo-1': algo},
+            {'child-1': child_1, 'child-2': child_2})
+
+        evidence = api.recover_stop_fill_evidence(
+            self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+        self.assertAlmostEqual(evidence['average'], 101.2)
+        self.assertAlmostEqual(evidence['fee'], 0.3)
+        self.assertEqual(evidence['order_ids'], ['child-1', 'child-2'])
+        self.assertEqual(
+            evidence['fill_time'], '2026-07-09T13:31:18.730000+00:00')
+
+    def test_eventually_consistent_algo_and_child_are_repolled(self):
+        api = self._api()
+        api.exchange.privateGetTradeOrderAlgo.side_effect = [
+            self._response(self._algo(state='live', actualSide='')),
+            self._response(self._algo()),
+        ]
+        api.exchange.privateGetTradeOrder.side_effect = [
+            self._response(self._child(state='live', accFillSz='0', avgPx='')),
+            self._response(self._child()),
+        ]
+
+        evidence = api.recover_stop_fill_evidence(
+            self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+        self.assertEqual(evidence['average'], 101.25)
+        self.assertEqual(api.exchange.privateGetTradeOrderAlgo.call_count, 2)
+        self.assertEqual(api.exchange.privateGetTradeOrder.call_count, 2)
+
+    def test_canceled_or_tp_algo_is_not_stop_fill_evidence(self):
+        for overrides in (
+                {'state': 'canceled', 'actualSide': ''},
+                {'state': 'effective', 'actualSide': 'tp'}):
+            with self.subTest(overrides=overrides):
+                api = self._api()
+                self._install(
+                    api, {'algo-1': self._algo(**overrides)},
+                    {'child-1': self._child()})
+                self.assertIsNone(api.recover_stop_fill_evidence(
+                    self.SYMBOL, 'long', 0.1, ['algo-1']))
+                api.exchange.privateGetTradeOrder.assert_not_called()
+
+    def test_effective_stop_algo_content_must_match_position(self):
+        bad_fields = (
+            {'instId': 'ETH-USDT-SWAP'},
+            {'ordType': 'oco'},
+            {'side': 'buy'},
+            {'reduceOnly': 'false'},
+            {'posSide': 'long'},
+            {'sz': '9'},
+            {'actualSz': '9'},
+            {'actualSz': '0'},
+            {'actualSz': 'bad'},
+        )
+        for overrides in bad_fields:
+            with self.subTest(overrides=overrides):
+                api = self._api()
+                self._install(
+                    api, {'algo-1': self._algo(**overrides)},
+                    {'child-1': self._child()})
+                with self.assertRaises(RuntimeError):
+                    api.recover_stop_fill_evidence(
+                        self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+    def test_child_must_be_attributable_filled_reduce_only_market_order(self):
+        bad_fields = (
+            {'instId': 'ETH-USDT-SWAP'},
+            {'state': 'live'},
+            {'ordType': 'limit'},
+            {'side': 'buy'},
+            {'reduceOnly': 'false'},
+            {'posSide': 'long'},
+            {'sz': '11'},
+            {'accFillSz': '9'},
+            {'avgPx': ''},
+        )
+        for overrides in bad_fields:
+            with self.subTest(overrides=overrides):
+                api = self._api()
+                self._install(
+                    api, {'algo-1': self._algo()},
+                    {'child-1': self._child(**overrides)})
+                with self.assertRaises(RuntimeError):
+                    api.recover_stop_fill_evidence(
+                        self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+    def test_multiple_effective_stops_are_ambiguous(self):
+        api = self._api()
+        self._install(
+            api,
+            {'algo-1': self._algo('algo-1'),
+             'algo-2': self._algo('algo-2')},
+            {'child-1': self._child()})
+        with self.assertRaisesRegex(RuntimeError, '归因不唯一'):
+            api.recover_stop_fill_evidence(
+                self.SYMBOL, 'long', 0.1, ['algo-1', 'algo-2'])
+
+    def test_algo_child_linkage_must_be_well_formed_and_consistent(self):
+        bad_algos = (
+            self._algo(ordIdList='child-1'),
+            self._algo(ordIdList=['child-1'], ordId='other'),
+            self._algo(ordIdList=[], ordId=''),
+        )
+        for algo in bad_algos:
+            with self.subTest(algo=algo):
+                api = self._api()
+                api.exchange.privateGetTradeOrderAlgo.return_value = (
+                    self._response(algo))
+                with self.assertRaises(RuntimeError):
+                    api.recover_stop_fill_evidence(
+                        self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+    def test_unprovable_fee_does_not_discard_proven_vwap(self):
+        for fee, currency in (('-0.42', 'BTC'), ('0.05', 'USDT'), ('bad', 'USDT')):
+            with self.subTest(fee=fee, currency=currency):
+                api = self._api()
+                self._install(
+                    api, {'algo-1': self._algo()},
+                    {'child-1': self._child(fee=fee, feeCcy=currency)})
+                evidence = api.recover_stop_fill_evidence(
+                    self.SYMBOL, 'long', 0.1, ['algo-1'])
+                self.assertEqual(evidence['average'], 101.25)
+                self.assertIsNone(evidence['fee'])
+                self.assertIsNone(evidence['fee_currency'])
+
+    def test_malformed_exchange_envelopes_and_id_mismatch_fail_closed(self):
+        api = self._api()
+        api.exchange.privateGetTradeOrderAlgo.return_value = {
+            'code': '0', 'data': [self._algo(algo_id='other')]}
+        with self.assertRaisesRegex(RuntimeError, 'ID 不匹配'):
+            api.recover_stop_fill_evidence(
+                self.SYMBOL, 'long', 0.1, ['algo-1'])
+
+        api = self._api()
+        api.exchange.privateGetTradeOrderAlgo.return_value = self._response(
+            self._algo())
+        api.exchange.privateGetTradeOrder.return_value = {
+            'code': '0', 'data': [self._child(order_id='other')]}
+        with self.assertRaisesRegex(RuntimeError, 'ID 不匹配'):
+            api.recover_stop_fill_evidence(
+                self.SYMBOL, 'long', 0.1, ['algo-1'])
 
 
 class LeverageFailClosedTest(unittest.TestCase):

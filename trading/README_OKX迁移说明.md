@@ -16,6 +16,7 @@
 - **内部符号**统一 `BTCUSDT`，由 `to_ccxt_symbol()` 映射为欧易 `BTC/USDT:USDT`。
 - **仓位单位**：上层与本地状态始终用「币的数量」；欧易「张数」换算只在 `okx_api.py` 下单边界内部发生，不外泄，保证风控/盈亏口径与原版一致。
 - **双向事务句柄**：开仓用 `open_intent`，已有仓位的主动平仓用持仓内 `close_intent`；两者都在首次 POST 前固化基础 `clOrdId` 和计划量。平仓恢复会查询基础腿及确定性 `r1/r2`，把真实 VWAP、手续费和订单 ID 与完整/部分账本更新一次性收口。
+- **离线止损成交回查**：启动同步、5 分钟巡检、日检对账和两策略止损确认统一沿本地 `stop_order_id` 查询 OKX 算法单详情，只在 `state=effective + actualSide=sl` 且关联普通子订单完整证明同品种、同方向、reduce-only、filled、累计张数一致时采用真实 VWAP/手续费。否则仍按保护止损价及时记平，并持久化 `exit_price_source` / `exit_price_estimated` 供接口和前端标明估算，查询不确定绝不阻塞仓位状态机。
 - 状态文件直接存在**项目根目录**（不再有 `data/<交易所>/` 子目录）。
 
 ## 二、配置（config.json）

@@ -104,7 +104,7 @@ class SignalHandlersMixin:
                     symbol,
                     self._get_strategy_display_name('turtle'),
                     position.get('side', ''),
-                    exit_price,
+                    closed_position.get('final_exit_price', exit_price),
                     source='日检确认'
                 )
                 if not stop_cleared:
@@ -310,7 +310,7 @@ class SignalHandlersMixin:
                     symbol,
                     self._get_strategy_display_name('ma_cross'),
                     position.get('side', ''),
-                    exit_price,
+                    closed_position.get('final_exit_price', exit_price),
                     source='日检确认（T+1 已记录）'
                 )
                 logger.info(f"{symbol} [双均线] 止损已记录，T+1将检查重入")

@@ -4,6 +4,7 @@ import logging
 import math
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from exchange_base import ExchangeApi, retry_on_network_error
@@ -48,6 +49,8 @@ class OkxApi(ExchangeApi):
     MAX_CLOSE_LEGS = 3
     STOP_CONFIRM_ATTEMPTS = 3
     STOP_CONFIRM_DELAY = 1.0
+    STOP_FILL_RECOVERY_ATTEMPTS = 3
+    STOP_FILL_RECOVERY_DELAY = 0.25
 
     def _create_exchange(self, config):
         ex = ccxt.okx({
@@ -1707,6 +1710,241 @@ class OkxApi(ExchangeApi):
                 f'普通订单终态 ID 不匹配: expected={order_id}, '
                 f"actual={item.get('ordId')}")
         return item
+
+    @retry_on_network_error(max_retries=3)
+    def _fetch_algo_order_raw(self, algo_order_id):
+        """按 algoId 查算法单详情；未找到返回 None，异常信封拒绝裁决。"""
+        try:
+            resp = self.exchange.privateGetTradeOrderAlgo({
+                'algoId': str(algo_order_id),
+            })
+        except ccxt.OrderNotFound:
+            return None
+        if (isinstance(resp, dict) and str(resp.get('code')) in
+                {'51603', '51604'}):
+            return None
+        if (not isinstance(resp, dict) or resp.get('code') != '0' or
+                not isinstance(resp.get('data'), list) or
+                len(resp['data']) != 1 or not isinstance(resp['data'][0], dict)):
+            raise RuntimeError(
+                f'算法订单详情响应异常: {str(resp)[:200]}')
+        item = resp['data'][0]
+        if str(item.get('algoId') or '') != str(algo_order_id):
+            raise RuntimeError(
+                f'算法订单详情 ID 不匹配: expected={algo_order_id}, '
+                f"actual={item.get('algoId')}")
+        return item
+
+    @staticmethod
+    def _exchange_timestamp_iso(value):
+        """OKX 毫秒时间戳 -> UTC ISO；缺失/非法时不伪造时间。"""
+        if value in (None, '') or isinstance(value, bool):
+            return None
+        try:
+            milliseconds = int(value)
+            if milliseconds <= 0:
+                return None
+            return datetime.fromtimestamp(
+                milliseconds / 1000, tz=timezone.utc).isoformat()
+        except (OverflowError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _algo_child_order_ids(algo_order):
+        """严格提取算法单关联的普通子订单 ID（兼容已废弃 ordId 字段）。"""
+        values = algo_order.get('ordIdList')
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            raise RuntimeError('算法订单 ordIdList 不是数组')
+        order_ids = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise RuntimeError('算法订单 ordIdList 含非法订单 ID')
+            order_id = str(value)
+            if not order_id:
+                raise RuntimeError('算法订单 ordIdList 含空订单 ID')
+            if order_id not in order_ids:
+                order_ids.append(order_id)
+        deprecated_id = algo_order.get('ordId')
+        if deprecated_id not in (None, ''):
+            if isinstance(deprecated_id, bool) or not isinstance(
+                    deprecated_id, (str, int)):
+                raise RuntimeError('算法订单 ordId 非法')
+            deprecated_id = str(deprecated_id)
+            if order_ids and deprecated_id not in order_ids:
+                raise RuntimeError('算法订单 ordId 与 ordIdList 不一致')
+            if not order_ids:
+                order_ids.append(deprecated_id)
+        return order_ids
+
+    def recover_stop_fill_evidence(
+            self, symbol, position_side, amount, stop_order_ids):
+        """回查已触发保护止损的真实成交证据；无已触发止损返回 ``None``。
+
+        只有算法单能严格证明为该仓位的 ``SL``，且其全部普通子订单均为同品种、
+        同平仓方向、reduce-only、完整成交，累计张数又与账本剩余仓位精确一致时，
+        才返回真实 VWAP。任一字段缺失/矛盾都会抛出，由上层降级到明确标记的
+        保守估值；本方法只读，不会下单或撤单。
+        """
+        ccxt_symbol = self._resolve_symbol(symbol)
+        if position_side not in ('long', 'short'):
+            raise ValueError('position_side 必须是 long/short')
+        if not isinstance(stop_order_ids, (list, tuple)):
+            raise ValueError('stop_order_ids 必须是数组')
+        unique_algo_ids = []
+        for value in stop_order_ids:
+            if value in (None, ''):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise ValueError('stop_order_ids 含非法 ID')
+            value = str(value)
+            if value not in unique_algo_ids:
+                unique_algo_ids.append(value)
+        if not unique_algo_ids:
+            return None
+
+        expected_contracts = self._coin_to_contracts(ccxt_symbol, amount)
+        tolerance = self._contracts_tolerance(ccxt_symbol)
+        if expected_contracts <= tolerance:
+            raise RuntimeError(
+                f'{ccxt_symbol} 账本仓位不足一个可验证张数，拒绝归因止损成交')
+        expected_inst_id = self._to_inst_id(ccxt_symbol)
+        expected_side = 'sell' if position_side == 'long' else 'buy'
+
+        effective = []
+        for attempt in range(self.STOP_FILL_RECOVERY_ATTEMPTS):
+            effective = []
+            for algo_id in unique_algo_ids:
+                detail = self._fetch_algo_order_raw(algo_id)
+                if detail is None:
+                    continue
+                state = str(detail.get('state') or '').lower()
+                actual_side = str(detail.get('actualSide') or '').lower()
+                if state == 'effective' and actual_side == 'sl':
+                    effective.append((algo_id, detail))
+            if effective:
+                break
+            if attempt < self.STOP_FILL_RECOVERY_ATTEMPTS - 1:
+                time.sleep(self.STOP_FILL_RECOVERY_DELAY)
+        if not effective:
+            return None
+        if len(effective) != 1:
+            raise RuntimeError(
+                f'{ccxt_symbol} 有 {len(effective)} 张止损算法单声称已触发，'
+                '成交归因不唯一')
+
+        algo_id, algo = effective[0]
+        if (algo.get('instId') != expected_inst_id or
+                algo.get('ordType') != 'conditional' or
+                algo.get('side') != expected_side or
+                algo.get('reduceOnly') not in (True, 'true') or
+                algo.get('posSide') not in (None, '', 'net')):
+            raise RuntimeError(
+                f'{ccxt_symbol} 已触发算法单内容与保护止损不一致: algoId={algo_id}')
+        algo_size = self._finite_nonnegative(algo.get('sz'))
+        if (algo_size is None or algo_size <= tolerance or
+                abs(algo_size - expected_contracts) > tolerance):
+            raise RuntimeError(
+                f'{ccxt_symbol} 已触发算法单张数与账本仓位不一致: '
+                f'algo={algo_size}, expected={expected_contracts}')
+
+        child_ids = self._algo_child_order_ids(algo)
+        if not child_ids:
+            raise RuntimeError(
+                f'{ccxt_symbol} 已触发止损没有关联普通子订单: algoId={algo_id}')
+
+        total_contracts = 0.0
+        total_notional = 0.0
+        total_fee = 0.0
+        fee_exact = True
+        fill_times = []
+        for child_id in child_ids:
+            child = None
+            last_child_state = 'not-visible'
+            for attempt in range(self.STOP_FILL_RECOVERY_ATTEMPTS):
+                candidate = self._fetch_normal_order_raw(
+                    ccxt_symbol, child_id)
+                if candidate is not None:
+                    if (candidate.get('instId') != expected_inst_id or
+                            candidate.get('side') != expected_side or
+                            candidate.get('ordType') != 'market' or
+                            candidate.get('reduceOnly') not in (True, 'true') or
+                            candidate.get('posSide') not in (None, '', 'net')):
+                        raise RuntimeError(
+                            f'{ccxt_symbol} 止损子订单内容不一致: '
+                            f'orderId={child_id}')
+                    last_child_state = str(
+                        candidate.get('state') or '').lower()
+                    if last_child_state == 'filled':
+                        child = candidate
+                        break
+                    if last_child_state not in {
+                            'live', 'partially_filled', 'partially-filled'}:
+                        raise RuntimeError(
+                            f'{ccxt_symbol} 止损子订单终态不是 filled: '
+                            f'orderId={child_id}, state={last_child_state}')
+                if attempt < self.STOP_FILL_RECOVERY_ATTEMPTS - 1:
+                    time.sleep(self.STOP_FILL_RECOVERY_DELAY)
+            if child is None:
+                raise RuntimeError(
+                    f'{ccxt_symbol} 止损子订单未确认完整成交: '
+                    f'orderId={child_id}, state={last_child_state}')
+            filled = self._finite_nonnegative(child.get('accFillSz'))
+            average = self._finite_nonnegative(child.get('avgPx'))
+            child_size = self._finite_nonnegative(child.get('sz'))
+            if (filled is None or filled <= tolerance or
+                    child_size is None or
+                    abs(child_size - filled) > tolerance or
+                    average is None or average <= 0):
+                raise RuntimeError(
+                    f'{ccxt_symbol} 止损子订单缺少完整成交量/均价: orderId={child_id}')
+            total_contracts += filled
+            total_notional += filled * average
+            if total_contracts > expected_contracts + tolerance:
+                raise RuntimeError(
+                    f'{ccxt_symbol} 止损子订单累计成交超过账本仓位')
+
+            # OKX 的 fee<0 表示付费，fee>0 表示返佣；当前账本只接受非负成本。
+            # 返佣或非 USDT 费用不影响真实 VWAP，但不能冒充可精确入账的费用。
+            try:
+                raw_fee = float(child.get('fee'))
+            except (TypeError, ValueError):
+                raw_fee = None
+            if (raw_fee is None or not math.isfinite(raw_fee) or raw_fee > 0 or
+                    child.get('feeCcy') != 'USDT'):
+                fee_exact = False
+            else:
+                total_fee += -raw_fee
+            fill_time = self._exchange_timestamp_iso(child.get('fillTime'))
+            if fill_time:
+                fill_times.append(fill_time)
+
+        if abs(total_contracts - expected_contracts) > tolerance:
+            raise RuntimeError(
+                f'{ccxt_symbol} 止损子订单累计成交与账本仓位不一致: '
+                f'filled={total_contracts}, expected={expected_contracts}')
+        raw_actual_size = algo.get('actualSz')
+        if raw_actual_size not in (None, ''):
+            actual_size = self._finite_nonnegative(raw_actual_size)
+            if (actual_size is None or
+                    abs(actual_size - total_contracts) > tolerance):
+                raise RuntimeError(
+                    f'{ccxt_symbol} 算法单 actualSz 与子订单累计成交不一致')
+
+        return {
+            'source': 'okx_stop_fill',
+            'average': total_notional / total_contracts,
+            'filled_contracts': total_contracts,
+            'filled_amount': self._contracts_to_coins(
+                ccxt_symbol, total_contracts),
+            'fee': total_fee if fee_exact else None,
+            'fee_currency': 'USDT' if fee_exact else None,
+            'order_ids': child_ids,
+            'algo_order_ids': [algo_id],
+            'fill_time': (max(fill_times) if fill_times else
+                          self._exchange_timestamp_iso(algo.get('triggerTime'))),
+        }
 
     @staticmethod
     def _normal_order_safely_cancelled(order):

@@ -10,6 +10,7 @@ _stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_dis
 """
 
 import logging
+import math
 from datetime import date, datetime
 
 from trade_state import TradeStatePersistenceError
@@ -152,7 +153,7 @@ class StopGuardianMixin:
             symbol,
             strategy_name,
             position.get('side', ''),
-            exit_price,
+            closed_position.get('final_exit_price', exit_price),
             source='盘中5分钟巡检确认'
         )
 
@@ -502,10 +503,98 @@ class StopGuardianMixin:
         stop_loss_date = (
             date.today().strftime('%Y-%m-%d')
             if effective_strategy == 'ma_cross' and not retired_from_pool else None)
+
+        # 尝试以“已触发止损算法单 → 关联普通子订单 → 完整成交终态”的严格
+        # 证据链回查真实 VWAP/手续费。查询失败或证据不足只影响报表精度，不能
+        # 阻塞交易所已空仓这一事实的账本收尾；降级记录会明确标为估算值。
+        exit_price_source = (
+            'estimated_stop' if position.get('stop_loss_price')
+            else 'estimated_entry_fallback')
+        exit_price_estimated = True
+        exit_fee = None
+        exit_fee_currency = None
+        exit_order_ids = None
+        exit_algo_order_ids = None
+        exchange_exit_time = None
+        stop_order_ids = []
+        for value in ([position.get('stop_order_id')] +
+                      list(position.get('extra_stop_order_ids') or [])):
+            if value and str(value) not in stop_order_ids:
+                stop_order_ids.append(str(value))
+        recover_fill = getattr(
+            getattr(self, 'exchange_api', None),
+            'recover_stop_fill_evidence', None)
+        if stop_order_ids and callable(recover_fill):
+            try:
+                evidence = recover_fill(
+                    ccxt_symbol, position.get('side'),
+                    position.get('position_size'), stop_order_ids)
+                if evidence:
+                    if isinstance(evidence.get('average'), bool):
+                        raise RuntimeError('止损成交证据返回非法均价')
+                    recovered_price = float(evidence.get('average'))
+                    if not math.isfinite(recovered_price) or recovered_price <= 0:
+                        raise RuntimeError('止损成交证据返回非法均价')
+                    if evidence.get('source') != 'okx_stop_fill':
+                        raise RuntimeError('止损成交证据来源标识非法')
+                    recovered_fee = evidence.get('fee')
+                    recovered_currency = evidence.get('fee_currency')
+                    if recovered_fee is not None:
+                        if isinstance(recovered_fee, bool):
+                            raise RuntimeError('止损成交证据返回非法手续费')
+                        recovered_fee = float(recovered_fee)
+                        if (not math.isfinite(recovered_fee) or
+                                recovered_fee < 0 or
+                                recovered_currency != 'USDT'):
+                            raise RuntimeError('止损成交证据返回非法手续费')
+                    elif recovered_currency is not None:
+                        raise RuntimeError('止损成交证据手续费与币种不一致')
+                    recovered_order_ids = evidence.get('order_ids')
+                    recovered_algo_ids = evidence.get('algo_order_ids')
+                    if (not isinstance(recovered_order_ids, list) or
+                            not recovered_order_ids or
+                            any(not isinstance(value, str) or not value
+                                for value in recovered_order_ids) or
+                            not isinstance(recovered_algo_ids, list) or
+                            not recovered_algo_ids or
+                            any(not isinstance(value, str) or not value
+                                for value in recovered_algo_ids)):
+                        raise RuntimeError('止损成交证据返回非法订单 ID')
+                    recovered_time = evidence.get('fill_time')
+                    if recovered_time is not None:
+                        if (not isinstance(recovered_time, str) or
+                                not recovered_time):
+                            raise RuntimeError('止损成交证据返回非法成交时间')
+                        datetime.fromisoformat(recovered_time)
+                    exit_price = recovered_price
+                    exit_price_source = 'okx_stop_fill'
+                    exit_price_estimated = False
+                    exit_fee = recovered_fee
+                    exit_fee_currency = recovered_currency
+                    exit_order_ids = recovered_order_ids
+                    exit_algo_order_ids = recovered_algo_ids
+                    exchange_exit_time = recovered_time
+                    logger.info(
+                        f'{symbol} {context} 已回查 OKX 止损真实成交: '
+                        f'VWAP={exit_price}, 子订单={exit_order_ids}')
+            except Exception as exc:
+                estimate_basis = (
+                    '账本保护价' if position.get('stop_loss_price')
+                    else '旧账本入场价')
+                logger.warning(
+                    f'{symbol} {context} 无法严格证明止损真实成交，'
+                    f'按{estimate_basis}估算收尾: {exc}')
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, exit_price, context, stop_loss_date=stop_loss_date,
             stop_cleanup_pending=True,
-            reset_turtle_signal=(effective_strategy == 'turtle'))
+            reset_turtle_signal=(effective_strategy == 'turtle'),
+            exit_fee=exit_fee,
+            exit_fee_currency=exit_fee_currency,
+            exit_order_ids=exit_order_ids,
+            exit_price_source=exit_price_source,
+            exit_price_estimated=exit_price_estimated,
+            exchange_exit_time=exchange_exit_time,
+            exit_algo_order_ids=exit_algo_order_ids)
         if not closed_position:
             return None, False, False
         if stop_loss_date is not None:
@@ -527,7 +616,11 @@ class StopGuardianMixin:
                                                  stop_loss_date=None,
                                                  stop_cleanup_pending=False,
                                                  reset_turtle_signal=False,
-                                                 close_intent_client_id=None):
+                                                 close_intent_client_id=None,
+                                                 exit_price_source=None,
+                                                 exit_price_estimated=None,
+                                                 exchange_exit_time=None,
+                                                 exit_algo_order_ids=None):
         close_kwargs = {}
         if exit_fee is not None or exit_order_ids:
             close_kwargs.update(
@@ -542,6 +635,14 @@ class StopGuardianMixin:
             close_kwargs['reset_turtle_signal'] = True
         if close_intent_client_id is not None:
             close_kwargs['close_intent_client_id'] = close_intent_client_id
+        if exit_price_source is not None:
+            close_kwargs['exit_price_source'] = exit_price_source
+        if exit_price_estimated is not None:
+            close_kwargs['exit_price_estimated'] = exit_price_estimated
+        if exchange_exit_time is not None:
+            close_kwargs['exchange_exit_time'] = exchange_exit_time
+        if exit_algo_order_ids:
+            close_kwargs['exit_algo_order_ids'] = exit_algo_order_ids
         try:
             closed_position = self.trade_state.close_position(
                 symbol, exit_price, **close_kwargs)

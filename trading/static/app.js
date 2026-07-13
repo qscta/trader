@@ -592,7 +592,10 @@ async function loadTrades() {
         const trades = tradePage.trades || [];
         const summary = await sr.json();
         if (summary && summary.total) {
-            setText('tradesSummary', `共 ${summary.total} 笔 · 胜率 ${summary.win_rate}% · 净盈亏 ${fmt(summary.total_pnl)}U · 盈亏比 ${summary.profit_factor ?? '-'}`);
+            const estimateNote = summary.estimated_exit_count > 0
+                ? ` · 估算出场 ${summary.estimated_exit_count} 笔`
+                : '';
+            setText('tradesSummary', `共 ${summary.total} 笔 · 胜率 ${summary.win_rate}% · 净盈亏 ${fmt(summary.total_pnl)}U · 盈亏比 ${summary.profit_factor ?? '-'}${estimateNote}`);
         } else setText('tradesSummary', '暂无成交');
         if (!trades || !trades.length) { box.innerHTML = '<div class="empty">暂无历史交易</div>'; return; }
         const rows = trades.map(t => {
@@ -600,12 +603,18 @@ async function loadTrades() {
             const closeTime = escapeHtml((t.close_time || '').replace('T', ' ').slice(0, 16));
             const safeSymbol = escapeHtml(t.symbol);
             const pnl = `<span class="${pnlClass(t.pnl)}">${t.pnl>=0?'+':''}${fmt(t.pnl)}</span>`;
+            const exitEstimated = t.exit_price_estimated === true;
+            const exitTitle = exitEstimated
+                ? '未能严格回查真实成交，按账本保护价估算'
+                : (t.exit_price_source === 'okx_stop_fill'
+                    ? '已沿 OKX 止损算法单关联子订单回查真实成交均价'
+                    : '');
             return `<tr>
                 <td>${closeTime}</td>
                 <td><span class="symbol-name">${safeSymbol}</span></td>
                 <td>${side}</td>
                 <td class="number-cell">${fmtPrice(t.entry_price)}</td>
-                <td class="number-cell">${fmtPrice(t.exit_price)}</td>
+                <td class="number-cell" title="${exitTitle}">${exitEstimated ? '≈' : ''}${fmtPrice(t.exit_price)}</td>
                 <td class="number-cell">${pnl}</td>
                 <td class="number-cell">${fmtPct(t.pnl_percent)}</td>
             </tr>`;

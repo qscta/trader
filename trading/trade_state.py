@@ -448,6 +448,55 @@ class TradeState:
                         raise ValueError(f'{symbol}.partial_closes.{field} 非法')
         if any(not isinstance(trade, dict) for trade in state['closed_trades']):
             raise ValueError('closed_trades 的每一项都必须是对象')
+        for index, trade in enumerate(state['closed_trades']):
+            source = trade.get('exit_price_source')
+            if source is not None and source not in {
+                    'okx_stop_fill', 'estimated_stop',
+                    'estimated_entry_fallback'}:
+                raise ValueError(
+                    f'closed_trades[{index}].exit_price_source 非法')
+            estimated = trade.get('exit_price_estimated')
+            if estimated is not None and not isinstance(estimated, bool):
+                raise ValueError(
+                    f'closed_trades[{index}].exit_price_estimated 必须是 bool')
+            if (source is None) != (estimated is None):
+                raise ValueError(
+                    f'closed_trades[{index}] 出场价来源字段不完整')
+            if (source == 'okx_stop_fill' and estimated is not False) or (
+                    source in {'estimated_stop', 'estimated_entry_fallback'} and
+                    estimated is not True):
+                raise ValueError(
+                    f'closed_trades[{index}] 出场价来源与估算标记不一致')
+            exchange_exit_time = trade.get('exchange_exit_time')
+            if exchange_exit_time is not None:
+                if not isinstance(exchange_exit_time, str) or not exchange_exit_time:
+                    raise ValueError(
+                        f'closed_trades[{index}].exchange_exit_time 非法')
+                try:
+                    datetime.fromisoformat(exchange_exit_time)
+                except ValueError as exc:
+                    raise ValueError(
+                        f'closed_trades[{index}].exchange_exit_time 非法') from exc
+            algo_ids = trade.get('exit_algo_order_ids')
+            if algo_ids is not None and (
+                    not isinstance(algo_ids, list) or
+                    any(not isinstance(value, str) or not value
+                        for value in algo_ids)):
+                raise ValueError(
+                    f'closed_trades[{index}].exit_algo_order_ids '
+                    '必须是非空字符串数组')
+            if ((exchange_exit_time is not None or algo_ids is not None) and
+                    source != 'okx_stop_fill'):
+                raise ValueError(
+                    f'closed_trades[{index}] 交易所成交证据来源不一致')
+            if source == 'okx_stop_fill':
+                child_ids = trade.get('exit_order_ids')
+                if (not algo_ids or not isinstance(child_ids, list) or
+                        not child_ids or
+                        any(not isinstance(value, str) or not value
+                            for value in child_ids)):
+                    raise ValueError(
+                        f'closed_trades[{index}] OKX 止损成交证据缺少订单 ID')
         for symbol, record in (state.get('signal_states') or {}).items():
             if not isinstance(symbol, str) or not isinstance(record, dict):
                 raise ValueError('signal_states 必须是 品种→对象')
@@ -1040,13 +1089,49 @@ class TradeState:
             self, symbol, exit_price, exit_fee=None,
             exit_fee_currency=None, exit_order_ids=None,
             stop_loss_date=None, stop_cleanup_pending=False,
-            reset_turtle_signal=False, close_intent_client_id=None):
+            reset_turtle_signal=False, close_intent_client_id=None,
+            exit_price_source=None, exit_price_estimated=None,
+            exchange_exit_time=None, exit_algo_order_ids=None):
         if symbol not in self.state['open_positions']:
             return None
         if stop_loss_date is not None:
             if not isinstance(stop_loss_date, str):
                 raise ValueError('stop_loss_date 必须是 YYYY-MM-DD 字符串')
             datetime.strptime(stop_loss_date, '%Y-%m-%d')
+        if exit_price_source is not None and exit_price_source not in {
+                'okx_stop_fill', 'estimated_stop',
+                'estimated_entry_fallback'}:
+            raise ValueError('exit_price_source 非法')
+        if (exit_price_estimated is not None and
+                not isinstance(exit_price_estimated, bool)):
+            raise ValueError('exit_price_estimated 必须是 bool')
+        if ((exit_price_source is None) !=
+                (exit_price_estimated is None)):
+            raise ValueError('出场价来源字段必须同时提供')
+        if (exit_price_source == 'okx_stop_fill' and
+                exit_price_estimated is not False) or (
+                exit_price_source in {
+                    'estimated_stop', 'estimated_entry_fallback'} and
+                exit_price_estimated is not True):
+            raise ValueError('出场价来源与估算标记不一致')
+        if exchange_exit_time is not None:
+            if not isinstance(exchange_exit_time, str) or not exchange_exit_time:
+                raise ValueError('exchange_exit_time 必须是 ISO 时间字符串')
+            datetime.fromisoformat(exchange_exit_time)
+        if exit_algo_order_ids is not None and (
+                not isinstance(exit_algo_order_ids, list) or
+                any(not isinstance(value, str) or not value
+                    for value in exit_algo_order_ids)):
+            raise ValueError('exit_algo_order_ids 必须是非空字符串数组')
+        if ((exchange_exit_time is not None or exit_algo_order_ids is not None) and
+                exit_price_source != 'okx_stop_fill'):
+            raise ValueError('交易所成交证据只能用于 okx_stop_fill 来源')
+        if (exit_price_source == 'okx_stop_fill' and
+                (not exit_algo_order_ids or not isinstance(exit_order_ids, list) or
+                 not exit_order_ids or
+                 any(not isinstance(value, str) or not value
+                     for value in exit_order_ids))):
+            raise ValueError('OKX 止损成交证据缺少订单 ID')
 
         position = self.state['open_positions'][symbol]
         self._consume_close_intent_locked(
@@ -1106,6 +1191,15 @@ class TradeState:
         combined_order_ids.extend(str(value) for value in (exit_order_ids or []) if value)
         if combined_order_ids:
             position['exit_order_ids'] = combined_order_ids
+        if exit_price_source is not None:
+            position['exit_price_source'] = exit_price_source
+        if exit_price_estimated is not None:
+            position['exit_price_estimated'] = exit_price_estimated
+        if exchange_exit_time is not None:
+            position['exchange_exit_time'] = exchange_exit_time
+        if exit_algo_order_ids:
+            position['exit_algo_order_ids'] = list(dict.fromkeys(
+                exit_algo_order_ids))
 
         self.state['closed_trades'].append(position)
         del self.state['open_positions'][symbol]
@@ -1129,13 +1223,19 @@ class TradeState:
                        exit_fee_currency=None, exit_order_ids=None,
                        stop_loss_date=None, stop_cleanup_pending=False,
                        reset_turtle_signal=False,
-                       close_intent_client_id=None):
+                       close_intent_client_id=None,
+                       exit_price_source=None,
+                       exit_price_estimated=None,
+                       exchange_exit_time=None,
+                       exit_algo_order_ids=None):
         with self.lock:
             snapshot = self._snapshot_locked()
             position = self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
                 stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
-                close_intent_client_id)
+                close_intent_client_id, exit_price_source,
+                exit_price_estimated, exchange_exit_time,
+                exit_algo_order_ids)
             if position is None:
                 return None
             self._save_or_rollback_locked(snapshot)
@@ -1146,12 +1246,18 @@ class TradeState:
                                      stop_loss_date=None,
                                      stop_cleanup_pending=False,
                                      reset_turtle_signal=False,
-                                     close_intent_client_id=None):
+                                     close_intent_client_id=None,
+                                     exit_price_source=None,
+                                     exit_price_estimated=None,
+                                     exchange_exit_time=None,
+                                     exit_algo_order_ids=None):
         with self.lock:
             return self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
                 stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
-                close_intent_client_id)
+                close_intent_client_id, exit_price_source,
+                exit_price_estimated, exchange_exit_time,
+                exit_algo_order_ids)
 
     def get_all_open_positions(self):
         with self.lock:
