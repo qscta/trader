@@ -102,6 +102,32 @@ class DrawdownStatsTest(unittest.TestCase):
         self.assertEqual(d['days_since_peak'], 8)
         self.assertEqual(d['longest_drawdown_days'], 8)
 
+    def test_peak_persists_at_most_once_per_trading_day(self):
+        """同一交易日多次日检/重试/手动「立即检查」只按首个读数(≈08:00 收盘)推进一次峰值；
+        下午浮盈尖峰不得刷新落盘峰值时间——否则 days_since_peak 会被重新清零（本轮根治点）。"""
+        tmp, t = _make(equity=1000, peak=1000, peak_days_ago=3, longest=3)
+        day = datetime(2026, 7, 13, 8, 0, 5)        # 交易日 D 首个收盘读数
+        afternoon = datetime(2026, 7, 13, 14, 0, 0)  # 同一交易日下午（手动检查/浮盈尖峰）
+        nextday = datetime(2026, 7, 14, 8, 0, 5)     # 交易日 D+1 收盘
+
+        t.reconcile_peak_equity(1005, persist=True, now=day)          # 首推进 → 1005 @ D
+        pk = _jload(os.path.join(tmp, 'peak_equity.json'))
+        self.assertEqual(pk['peak_equity'], 1005)
+        self.assertEqual(pk['peak_time'][:19], day.isoformat()[:19])
+        self.assertEqual(pk['peak_advanced_day'], '2026-07-13')
+
+        peak_eq, _ = t.reconcile_peak_equity(1050, persist=True, now=afternoon)
+        self.assertEqual(peak_eq, 1050)                               # 返回展示用 provisional
+        pk2 = _jload(os.path.join(tmp, 'peak_equity.json'))
+        self.assertEqual(pk2['peak_equity'], 1005)                    # 但落盘峰值仍是收盘 1005
+        self.assertEqual(pk2['peak_time'][:19], day.isoformat()[:19]) # 峰值时间未被下午刷新
+
+        t.reconcile_peak_equity(1050, persist=True, now=nextday)      # 跨日 → 允许再次推进
+        pk3 = _jload(os.path.join(tmp, 'peak_equity.json'))
+        self.assertEqual(pk3['peak_equity'], 1050)
+        self.assertEqual(pk3['peak_time'][:19], nextday.isoformat()[:19])
+        self.assertEqual(pk3['peak_advanced_day'], '2026-07-14')
+
     def test_peak_does_not_advance_when_closed_streak_cannot_persist(self):
         tmp, tracker = _make(equity=110, peak=100, peak_days_ago=5, longest=3)
         tracker.save_equity_history = Mock(return_value=False)

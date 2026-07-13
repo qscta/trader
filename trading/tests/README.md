@@ -16,5 +16,5 @@
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-> 项目根目录另有 **425 个无第三方依赖**的测试（`test_*.py`，统一走 `_test_stubs.import_main()` 桩环境），
+> 项目根目录另有 **433 个无第三方依赖**的测试（`test_*.py`，统一走 `_test_stubs.import_main()` 桩环境），
 > `python3 -m unittest discover -s . -p "test_*.py"` 即可本机运行，详见根目录 README。

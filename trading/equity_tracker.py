@@ -227,6 +227,11 @@ class EquityTracker:
         if filename == 'peak_equity.json':
             finite(data.get('peak_equity', 0), 'peak_equity', nonnegative=True)
             iso_time(data.get('peak_time'), 'peak_time')
+            advanced_day = data.get('peak_advanced_day')
+            if advanced_day is not None:
+                if not isinstance(advanced_day, str):
+                    raise ValueError(f'{filepath}:peak_advanced_day 必须是 YYYY-MM-DD 或缺省')
+                datetime.strptime(advanced_day, '%Y-%m-%d')
         elif filename == 'equity_history.json':
             for field in ('max_drawdown', 'longest_drawdown_days'):
                 finite(data.get(field, 0), field, nonnegative=True)
@@ -370,16 +375,21 @@ class EquityTracker:
 
         if current_equity > stored_peak:
             old_peak_time = peak_time
-            peak_equity = current_equity
+            peak_equity = current_equity          # 展示用 provisional 新高（不一定落盘）
             peak_time = now.isoformat()
-            if persist:
+            # 每交易日只把峰值按「首个读数(≈08:00 收盘)」落盘一次。交易日在 08:00
+            # 滚动（QIUSUO_INDEX_ROLLOVER_HOUR），当日第一次持久化推进即为收盘口径；
+            # 之后同一交易日的日检重试/30 分钟兜底/手动「立即检查」即便撞上日内浮盈
+            # 尖峰也不再刷新峰值时间与回撤基准（否则 days_since_peak 会被下午的
+            # 浮盈高点重新清零，正是本次要根治的问题）。跨日后自然允许再次推进。
+            trading_day = self._qiusuo_trading_day(now)
+            if persist and peak_data.get('peak_advanced_day') != trading_day:
                 # 结算刚结束的未创新高周期必须与落盘新峰值同一路径完成，否则
                 # 「刚创新高」的信息会在下次统计刷新前丢失、历史最长未创新高漏记。
-                # 峰值按「日收盘」推进：record_daily_equity_snapshot 每日收盘调用 +
-                # 日检末尾 build_account_stats(persist=True)；5 分钟采样不再参与。
                 self._settle_drawdown_streak(old_peak_time, now)
                 peak_data['peak_equity'] = current_equity
                 peak_data['peak_time'] = peak_time
+                peak_data['peak_advanced_day'] = trading_day
                 if not self.save_peak_equity(peak_data):
                     raise RuntimeError('保存峰值权益失败')
 
@@ -912,9 +922,10 @@ class EquityTracker:
                     snapshots.append({'date': day_key, 'equity': equity, 'qiusuo_index': qiusuo_index})
                 if not self.save_daily_equity(snapshots):
                     raise RuntimeError('保存每日权益快照失败')
-                # 「未创新高/回撤」峰值按日收盘高水位推进的唯一节拍：用当日收盘权益
-                # 结算并推进峰值。日快照已落盘，峰值/最长回撤周期推进失败不回滚快照，
-                # 只告警并等下一次日检重试（避免把日内浮盈噪声 ratchet 成新高）。
+                # 「未创新高/回撤」峰值的按日收盘节拍：日快照运行在日检最前、08:00 交易日
+                # 刚滚动，用此刻权益推进峰值即收盘口径。reconcile_peak_equity 内的
+                # peak_advanced_day 保证每交易日只落盘一次——重试/手动检查/日检末尾的
+                # refresh 都不会二次推进。日快照已落盘，峰值推进失败不回滚快照，只告警重试。
                 try:
                     self.reconcile_peak_equity(equity, persist=True, now=now)
                 except Exception as peak_exc:
@@ -1022,7 +1033,9 @@ class EquityTracker:
                 qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
             new_divisor = current_equity / qiusuo_anchor
 
-            peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
+            # 认领同步当日：同步重置峰值基准后，本交易日不得再被日内浮盈尖峰二次推进。
+            peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat(),
+                         'peak_advanced_day': self._qiusuo_trading_day(now)}
 
             eq_hist = copy.deepcopy(old_history)
             # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），
