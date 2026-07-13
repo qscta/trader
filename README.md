@@ -105,6 +105,7 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 > **依赖锁定**：仓库已提交与生产 Python 3.12 环境同源的 `requirements.lock`；
 > 部署和依赖版 CI 必须使用它。升级时先修改直接依赖 `requirements.txt`，完整测试并完成模拟盘
 > long/short 实弹验证后，再从最终生产候选环境重建锁文件，禁止在部署时临时解析 `>=` 版本。
+> 部署机 `pip config list` 的索引必须是 HTTPS；禁止用明文 HTTP 配合 `trusted-host` 绕过 TLS。
 
 ## 🧪 测试
 
