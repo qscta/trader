@@ -75,8 +75,9 @@ class EquityTracker:
         if retention_days:
             try:
                 self.EQUITY_TICK_RETENTION_DAYS = max(7, int(retention_days))
-            except Exception:
-                pass
+            except Exception as exc:
+                # 主配置入口已 fail-loud 校验；此处只是构造器的兼容二道防线。
+                logger.debug('retention_days 解析失败，沿用默认保留天数: %s', exc)
         self._lock = threading.RLock()
         self._stats_cache = None
         self._stats_cache_ts = 0.0
@@ -360,26 +361,48 @@ class EquityTracker:
         return self._save_json_state(
             self.PEAK_EQUITY_FILE, peak_data, dict, '保存峰值权益失败')
 
-    def reconcile_peak_equity(self, current_equity, persist=False, now=None):
+    def reconcile_peak_equity(self, current_equity, persist=False, now=None,
+                              daily_close=False):
+        """按日收盘口径协调峰值。
+
+        普通统计调用只返回「当前权益若创新高」的临时展示值，绝不落盘；只有
+        ``record_daily_equity_snapshot`` 明确传入 ``daily_close=True`` 时才可
+        推进持久化峰值。``peak_observed_day`` 无论当天是否创新高都会写入，
+        使日检失败重试也只能消费当天第一份已保存的收盘快照。
+        """
         now = now or datetime.now()
         peak_data = self.load_peak_equity()
         stored_peak = float(peak_data.get('peak_equity', 0) or 0)
         peak_equity = stored_peak
         peak_time = peak_data.get('peak_time')
 
+        if persist and not daily_close:
+            raise ValueError('持久化峰值只能由每日收盘快照触发')
+
+        if persist and daily_close:
+            trading_day = self._qiusuo_trading_day(now)
+            if peak_data.get('peak_observed_day') == trading_day:
+                return stored_peak, peak_time
+
+            if current_equity > stored_peak:
+                # 结算刚结束的未创新高周期必须与落盘新峰值同一路径完成，否则
+                # 「刚创新高」的信息会在下次统计刷新前丢失、历史最长未创新高漏记。
+                self._settle_drawdown_streak(peak_time, now)
+                peak_data['peak_equity'] = current_equity
+                peak_data['peak_time'] = now.isoformat()
+
+            # 即便今日没有创新高也必须记录「已观察」；否则下午第一次越过旧峰值
+            # 的手动/重试统计仍会把日内浮盈误当成今日收盘。
+            peak_data['peak_observed_day'] = trading_day
+            peak_data.pop('peak_advanced_day', None)  # 清理 Claude 试验版字段
+            if not self.save_peak_equity(peak_data):
+                raise RuntimeError('保存峰值权益失败')
+            return float(peak_data.get('peak_equity', 0) or 0), peak_data.get('peak_time')
+
         if current_equity > stored_peak:
-            old_peak_time = peak_time
+            # 前端/周报可展示「当下创新高为 0 天」，但不改变日收盘基准。
             peak_equity = current_equity
             peak_time = now.isoformat()
-            if persist:
-                # 峰值推进的唯一咽喉：先结算刚结束的未创新高周期，再落盘新峰值。
-                # 若只在 build_account_stats 里结算，5 分钟权益采样会抢先把新峰值
-                # 落盘，等统计刷新时已看不到「刚创新高」，历史最长未创新高会漏记。
-                self._settle_drawdown_streak(old_peak_time, now)
-                peak_data['peak_equity'] = current_equity
-                peak_data['peak_time'] = peak_time
-                if not self.save_peak_equity(peak_data):
-                    raise RuntimeError('保存峰值权益失败')
 
         return peak_equity, peak_time
 
@@ -389,7 +412,8 @@ class EquityTracker:
             return
         try:
             closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
-        except Exception:
+        except Exception as exc:
+            logger.debug('结算未创新高周期时跳过坏峰值时间 %r: %s', old_peak_time, exc)
             return
         if closed_gap <= 0:
             return
@@ -443,11 +467,12 @@ class EquityTracker:
 
         now = datetime.now()
         with self._lock:
-            # reconcile 前先记录「旧峰值」，用于判定是否创新高、并结算刚结束的未创新高周期
+            # 普通统计只读日收盘峰值；当下若越过峰值，仅返回 provisional 展示值。
             _old_peak = self.load_peak_equity()
             old_peak_equity = float(_old_peak.get('peak_equity', 0) or 0)
             old_peak_time = _old_peak.get('peak_time')
-            peak_equity, peak_time = self.reconcile_peak_equity(current_equity, persist=persist, now=now)
+            peak_equity, peak_time = self.reconcile_peak_equity(
+                current_equity, persist=False, now=now)
             made_new_high = current_equity > old_peak_equity
 
             peak_drawdown = 0
@@ -485,15 +510,15 @@ class EquityTracker:
                 except Exception:
                     days_since_peak = 0
 
-            # 历史最长未创新高：persist=True 时 reconcile_peak_equity 已在落盘新峰值前结算过；
-            # 此处保留同口径计算，让 persist=False 的展示调用也能立即反映刚结束的周期
+            # 当前读数若临时创新高，只影响本次展示；真正的历史结算由每日收盘
+            # reconcile 完成，不能让下午浮盈通过 persist=True 污染 durable 历史。
+            provisional_closed_gap = 0
             if made_new_high and old_peak_time:
                 try:
-                    closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
-                    if closed_gap > (eq_hist.get('longest_drawdown_days', 0) or 0):
-                        eq_hist['longest_drawdown_days'] = closed_gap
-                except Exception:
-                    pass
+                    provisional_closed_gap = max(
+                        0, (now - datetime.fromisoformat(old_peak_time)).days)
+                except Exception as exc:
+                    logger.debug('展示用未创新高周期结算跳过: %s', exc)
 
             if persist:
                 if not self.save_equity_history(eq_hist):
@@ -505,7 +530,11 @@ class EquityTracker:
         total_return = ((current_equity - initial_eq) / initial_eq * 100) if initial_eq and initial_eq > 0 else 0
 
         # 展示用历史最长未创新高 = max(已结算最长, 当前仍未结束的这段)
-        longest_dd = max(eq_hist.get('longest_drawdown_days', 0) or 0, days_since_peak)
+        longest_dd = max(
+            eq_hist.get('longest_drawdown_days', 0) or 0,
+            days_since_peak,
+            provisional_closed_gap,
+        )
 
         stats = {
             'current_equity': current_equity,
@@ -768,7 +797,9 @@ class EquityTracker:
                     return False
 
             with self._lock:
-                self.reconcile_peak_equity(equity, persist=True, now=now)
+                # 5 分钟按市值采样只维护求索指数，绝不推进「未创新高/回撤」峰值：
+                # 否则日内浮盈冒一个高点就把 days_since_peak 永久清零（回撤时长指标失效）。
+                # 峰值改由每日收盘快照按日推进（见 record_daily_equity_snapshot）。
                 state = self.ensure_qiusuo_index_state(current_equity=equity, now=now, persist=True)
                 qiusuo_index = self.calculate_qiusuo_index(equity, ts=now, state=state)
                 if qiusuo_index is None:
@@ -861,7 +892,10 @@ class EquityTracker:
                 try:
                     if date.fromisoformat(item['date']) >= cutoff_day:
                         kept.append(item)
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        '求索指数 OHLC 跳过坏日期项 %r: %s',
+                        item.get('date'), exc)
                     continue
             candles = kept
 
@@ -883,7 +917,7 @@ class EquityTracker:
         }
 
     def record_daily_equity_snapshot(self):
-        """记录每日权益快照，并把已收盘交易日的日内采样压缩成日线 OHLC（定时任务每天调用）。"""
+        """记录每日收盘权益；同一交易日首写后不可被重试/手动检查覆盖。"""
         try:
             balance = self.system.exchange_api.get_balance()
             if not balance:
@@ -894,18 +928,53 @@ class EquityTracker:
             now = datetime.now()
             day_key = self._qiusuo_trading_day(now)
             with self._lock:
-                state = self.ensure_qiusuo_index_state(current_equity=equity, now=now, persist=True)
-                qiusuo_index = self.calculate_qiusuo_index(equity, ts=now, state=state)
                 snapshots = self.load_daily_equity()
                 existing = next((s for s in snapshots if s.get('date') == day_key), None)
                 if existing:
-                    existing['equity'] = equity
+                    close_equity = _coerce_positive_float(existing.get('equity'))
+                    if close_equity is None:
+                        close_equity = equity
+                    close_time = self._qiusuo_day_timestamp(day_key) or now
+                    state = self.ensure_qiusuo_index_state(
+                        current_equity=close_equity, now=close_time, persist=True)
+                    qiusuo_index = _coerce_positive_float(
+                        existing.get('qiusuo_index') or existing.get('index'))
+                    if qiusuo_index is None:
+                        qiusuo_index = self.calculate_qiusuo_index(
+                            close_equity, ts=close_time, state=state)
+                    # 兼容缺字段的旧快照，但绝不覆盖已有有效收盘数值。
+                    existing['equity'] = close_equity
                     existing['qiusuo_index'] = qiusuo_index
                 else:
-                    snapshots.append({'date': day_key, 'equity': equity, 'qiusuo_index': qiusuo_index})
+                    close_equity = equity
+                    close_time = self._qiusuo_day_timestamp(day_key) or now
+                    state = self.ensure_qiusuo_index_state(
+                        current_equity=close_equity, now=close_time, persist=True)
+                    qiusuo_index = self.calculate_qiusuo_index(
+                        close_equity, ts=close_time, state=state)
+                    snapshots.append({
+                        'date': day_key,
+                        'equity': close_equity,
+                        'qiusuo_index': qiusuo_index,
+                    })
                 if not self.save_daily_equity(snapshots):
                     raise RuntimeError('保存每日权益快照失败')
-            logger.info(f"每日权益快照已记录: {day_key} = {equity:.2f} USDT / 求索指数 {qiusuo_index:.2f}")
+                # 「未创新高/回撤」峰值按日收盘高水位推进的唯一节拍：用当日收盘权益
+                # 结算并推进峰值。日快照已落盘，峰值/最长回撤周期推进失败不回滚快照，
+                # 只告警并等下一次日检重试（避免把日内浮盈噪声 ratchet 成新高）。
+                try:
+                    self.reconcile_peak_equity(
+                        close_equity,
+                        persist=True,
+                        now=close_time,
+                        daily_close=True,
+                    )
+                except Exception as peak_exc:
+                    logger.warning(
+                        f"每日收盘高水位推进失败（日快照已存，下次重试）: {peak_exc}")
+            logger.info(
+                f"每日权益快照已记录: {day_key} = {close_equity:.2f} USDT / "
+                f"求索指数 {qiusuo_index:.2f}")
             self._compact_closed_ticks(now)
         except Exception as e:
             logger.error(f"记录权益快照失败: {e}")
