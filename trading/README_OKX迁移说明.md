@@ -70,7 +70,7 @@
 ## 五、运行 / 部署
 
 ```bash
-pip install -r requirements.txt   # ccxt, pandas, flask, apscheduler, requests, gunicorn
+pip install -r requirements.lock  # 生产精确版本及完整传递依赖
 python main.py                  # 直接运行（仅交易调度，无 Web；与 Web 共用单实例锁）
 # 或 Web + 交易一体（推荐，gunicorn 走 wsgi）
 export FLASK_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -126,4 +126,4 @@ python3 -m unittest tests.test_trading_logic_unittest -v
 
 测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。
 
-> 依赖版需要 requirements.txt 中的 pandas/ccxt/flask/apscheduler。
+> 依赖版使用与生产同源的 requirements.lock（Python 3.12）。

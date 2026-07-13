@@ -1,6 +1,6 @@
 # 交易逻辑测试（需完整依赖环境）
 
-本目录的 `test_trading_logic_unittest.py`（109 用例）需要 pandas / ccxt / flask / apscheduler 环境运行，覆盖：
+本目录的 `test_trading_logic_unittest.py`（112 用例）需要 pandas / ccxt / flask / apscheduler 环境运行，覆盖：
 
 - 收盘 K 线时间戳过滤（`filter_closed_candles`）
 - 海龟止损确认分支（含撤销不可确认时不反手）
@@ -16,5 +16,5 @@
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-> 项目根目录另有 **398 个无第三方依赖**的测试（`test_*.py`，统一走 `_test_stubs.import_main()` 桩环境），
+> 项目根目录另有 **425 个无第三方依赖**的测试（`test_*.py`，统一走 `_test_stubs.import_main()` 桩环境），
 > `python3 -m unittest discover -s . -p "test_*.py"` 即可本机运行，详见根目录 README。

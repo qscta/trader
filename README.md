@@ -6,8 +6,8 @@
 
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-398%20stdlib%20%2B%20109%20deps-brightgreen.svg)](trading/tests)
+[![python](https://img.shields.io/badge/production%20python-3.12-blue.svg)](https://www.python.org/)
+[![tests count](https://img.shields.io/badge/tests-425%20stdlib%20%2B%20112%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -31,7 +31,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **507 个测试**——398 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 109 个依赖版集成用例。
+- **537 个测试**——425 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 112 个依赖版集成用例。
 - **行情 fail-closed**——策略日检固定读取 OKX 最新单页 300 根，不为指标计算分页；最新已收盘日 K 陈旧、数据量不足或历史出现大跨度断层时，禁止该品种开仓、平仓、反手及策略止损推进。
 
 ## 🏗️ 架构
@@ -74,7 +74,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 
 ```bash
 cd trading
-pip install -r requirements.txt
+pip install -r requirements.lock       # 生产/部署必须使用完整锁文件
 cp config.example.json config.json        # 填入 OKX 凭据与钉钉 webhook（或用环境变量）
 
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
@@ -102,23 +102,25 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 `FLASK_SECRET_KEY` 可用 `python3 -c 'import secrets; print(secrets.token_hex(32))'`
 生成；生成后仅放在部署环境的 secret manager / 环境变量中。
 
-> **依赖锁定**：上线机器验证通过后，在**该机器上** `pip freeze > requirements.lock` 固化并入库——
-> 锁文件必须来自实际运行环境（ccxt 行为随版本漂移，正是适配层反复警示的风险），不要在 CI/开发机生成。
+> **依赖锁定**：仓库已提交与生产 Python 3.12 环境同源的 `requirements.lock`；
+> 部署和依赖版 CI 必须使用它。升级时先修改直接依赖 `requirements.txt`，完整测试并完成模拟盘
+> long/short 实弹验证后，再从最终生产候选环境重建锁文件，禁止在部署时临时解析 `>=` 版本。
 
 ## 🧪 测试
 
 ```bash
 cd trading
 
-# 398 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 425 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
-# 109 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
-pip install -r requirements.txt
+# 112 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
+pip install -r requirements.lock
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-CI（`.github/workflows/tests.yml`）在 Python 3.10–3.13 上跑标准库套件，在 3.11 上跑依赖版套件，并对前端 `app.js` 做 `node --check` 语法检查。
+CI（`.github/workflows/tests.yml`）在 Python 3.10–3.13 上跑标准库套件，
+在与生产一致的 Python 3.12 + `requirements.lock` 上跑依赖版套件，并对前端 `app.js` 做 `node --check` 语法检查。
 
 ## 🔒 安全须知
 
