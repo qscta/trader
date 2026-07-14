@@ -64,11 +64,14 @@ def _bare_api():
 
 
 def _native_stop(algo_id='stop-1', side='sell', sz='10', px='55000',
-                 client_id=''):
+                 client_id='', inst_id=None):
     """OKX orders-algo-pending 原生响应里的一条 conditional 止损单。"""
-    return {'algoId': algo_id, 'algoClOrdId': client_id, 'side': side,
+    item = {'algoId': algo_id, 'algoClOrdId': client_id, 'side': side,
             'sz': sz, 'slTriggerPx': px, 'slOrdPx': '-1',
             'ordType': 'conditional', 'reduceOnly': 'true'}
+    if inst_id is not None:
+        item['instId'] = inst_id
+    return item
 
 
 def _native_normal(order_id='order-1', side='buy', size='10'):
@@ -847,6 +850,67 @@ class FetchAlgoNativeTest(unittest.TestCase):
         self.assertEqual(sorted(o['id'] for o in orders), ['manual-1', 'stop-1'])
         self.assertEqual(tuple(seen_types), OkxApi.ALGO_ORDER_TYPES)
         self.assertIn('chase', seen_types)
+        self.assertIn('smart_iceberg', seen_types)
+
+    def test_account_snapshot_queries_each_type_once_and_groups_symbols(self):
+        """N 个持仓共享一轮全账户查询；仍覆盖全部类型并按 instId 严格分组。"""
+        api = _bare_api()
+        seen = []
+
+        def record(params):
+            seen.append(dict(params))
+            data = []
+            if params.get('ordType') == 'conditional':
+                data = [
+                    _native_stop(
+                        algo_id='btc-stop', inst_id='BTC-USDT-SWAP'),
+                    _native_stop(
+                        algo_id='eth-stop', inst_id='ETH-USDT-SWAP'),
+                    _native_stop(
+                        algo_id='other-stop', inst_id='SOL-USDT-SWAP'),
+                ]
+            return {'code': '0', 'msg': '', 'data': data}
+
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = record
+        snapshot = api.fetch_stop_order_snapshot(
+            ['BTCUSDT', 'ETH/USDT:USDT', 'XRPUSDT'])
+
+        self.assertEqual(
+            {'BTC/USDT:USDT', 'ETH/USDT:USDT', 'XRP/USDT:USDT'},
+            set(snapshot))
+        self.assertEqual(['btc-stop'], [
+            order['id'] for order in snapshot['BTC/USDT:USDT']])
+        self.assertEqual(['eth-stop'], [
+            order['id'] for order in snapshot['ETH/USDT:USDT']])
+        self.assertEqual((), snapshot['XRP/USDT:USDT'])
+        self.assertEqual(len(OkxApi.ALGO_ORDER_TYPES), len(seen))
+        self.assertEqual(
+            set(OkxApi.ALGO_ORDER_TYPES),
+            {params['ordType'] for params in seen})
+        self.assertTrue(all(params.get('instType') == 'SWAP' for params in seen))
+        self.assertTrue(all('instId' not in params for params in seen))
+
+    def test_account_snapshot_rejects_missing_inst_id(self):
+        """全账户项不能归属品种时，整份快照无效，绝不把它漏成空清单。"""
+        api = _bare_api()
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub({
+            'conditional': [_native_stop()],
+        })
+
+        with self.assertRaises(RuntimeError):
+            api.fetch_stop_order_snapshot(['BTCUSDT'])
+
+    def test_account_snapshot_failure_never_returns_partial_mapping(self):
+        api = _bare_api()
+
+        def fail_one_type(params):
+            if params.get('ordType') == 'twap':
+                raise RuntimeError('twap unavailable')
+            return {'code': '0', 'msg': '', 'data': []}
+
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = fail_one_type
+        with self.assertRaises(RuntimeError):
+            api.fetch_stop_order_snapshot(['BTCUSDT', 'ETHUSDT'])
 
     def test_bad_envelope_raises(self):
         """交易所返回非成功信封（code!='0' / data 非数组）：必须抛出，绝不当空清单。"""
@@ -1220,6 +1284,26 @@ class FindStopOrderStateTest(unittest.TestCase):
         api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub(
             {'conditional': [_native_stop(sz='10', px='55000')]})
         self.assertEqual(api.find_stop_order_state('BTCUSDT', 'long', 0.1, 55000.0, 'stop-1'), 'intact')
+
+    def test_supplied_snapshot_uses_identical_classifier_without_network(self):
+        api = self._api()
+        raw = _native_stop(
+            sz='10', px='55000', inst_id='BTC-USDT-SWAP')
+        order = api._normalize_algo_order(raw)
+
+        self.assertEqual(
+            'intact',
+            api.find_stop_order_state(
+                'BTCUSDT', 'long', 0.1, 55000.0, 'stop-1',
+                algo_orders=(order,)))
+        api.exchange.privateGetTradeOrdersAlgoPending.assert_not_called()
+
+    def test_malformed_supplied_snapshot_fails_closed(self):
+        api = self._api()
+        with self.assertRaises(RuntimeError):
+            api.find_stop_order_state(
+                'BTCUSDT', 'long', 0.1, 55000.0, 'stop-1',
+                algo_orders=('not-an-order',))
 
     def test_same_price_wrong_size_not_intact(self):
         """Codex 场景：同方向同触发价但张数只有一半（人工改挂）→ 不算 intact。"""

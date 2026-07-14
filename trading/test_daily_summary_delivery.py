@@ -139,7 +139,11 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         )
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
+            get_pending_signal_executions=lambda: {},
+            get_open_intents=lambda: {},
             get_open_position=lambda symbol: None,
+            has_stop_residue=lambda symbol: False,
+            clear_position_quarantine=lambda symbol: False,
             get_signal_state=lambda symbol: False,
             set_signal_state=lambda symbol, value: None,
         )
@@ -167,7 +171,11 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         )
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
+            get_pending_signal_executions=lambda: {},
+            get_open_intents=lambda: {},
             get_open_position=lambda symbol: None,
+            has_stop_residue=lambda symbol: False,
+            clear_position_quarantine=lambda symbol: False,
             get_signal_state=lambda symbol: False,
             set_signal_state=lambda symbol, value: None,
         )

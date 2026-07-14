@@ -554,11 +554,9 @@ def add_symbol():
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对已存在'}), 400
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if callable(pending_getter) and pending_getter(new_symbol['name']):
+            if system.trade_state.get_pending_signal_execution(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口订单，禁止重新加入/改配"}), 409
-            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
-            if callable(intent_getter) and intent_getter(new_symbol['name']):
+            if system.trade_state.get_open_intent(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口开仓意图，禁止重新加入/改配"}), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'].append(new_symbol)
@@ -631,12 +629,10 @@ def update_symbol(symbol):
             disabling_only = (
                 clean.get('enabled') is False and
                 not any(key in clean for key in ('risk_per_trade', 'strategy')))
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if (callable(pending_getter) and pending_getter(symbol_u) and
+            if (system.trade_state.get_pending_signal_execution(symbol_u) and
                     not disabling_only):
                 return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止修改配置'}), 409
-            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
-            open_intent = intent_getter(symbol_u) if callable(intent_getter) else None
+            open_intent = system.trade_state.get_open_intent(symbol_u)
             if open_intent and not disabling_only:
                 # 紧急“禁用”必须允许：恢复裁决会在确认从未发单后消费意图；
                 # 若交易所已有真钱仓则仍补账/补止损，并按退池仓只平不开托管。
@@ -698,8 +694,7 @@ def delete_symbol(symbol):
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
             if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对不存在'}), 404
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if callable(pending_getter) and pending_getter(symbol_u):
+            if system.trade_state.get_pending_signal_execution(symbol_u):
                 return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止删除配置'}), 409
             # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，必须先把策略固化进持仓，
             # 否则删除后 check_and_execute 会按默认 turtle 托管，双均线仓位会被错误管理。
@@ -721,14 +716,12 @@ def delete_symbol(symbol):
                 return err_resp
             # 清理也必须留在同一 trade lock 内；否则锁释放后即时开仓可插入，清理线程
             # 还拿旧的 exchange-flat 结论删除新仓的信号/T+1 元数据。
-            if not held and hasattr(system.trade_state, 'remove_symbol_metadata'):
+            if not held:
                 try:
-                    clear_quarantine = False
-                    if hasattr(system.exchange_api, 'get_position'):
-                        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
-                        exchange_position = system.exchange_api.get_position(ccxt_symbol)
-                        clear_quarantine = not exchange_position or float(
-                            exchange_position.get('contracts') or 0) == 0
+                    ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
+                    exchange_position = system.exchange_api.get_position(ccxt_symbol)
+                    clear_quarantine = not exchange_position or float(
+                        exchange_position.get('contracts') or 0) == 0
                     system.trade_state.remove_symbol_metadata(
                         symbol_u, clear_quarantine=clear_quarantine)
                 except Exception as e:
@@ -804,14 +797,8 @@ def get_trades():
             return jsonify({'error': 'page/page_size 必须是整数'}), 400
         if page < 1 or not (1 <= page_size <= 200):
             return jsonify({'error': 'page 必须 >= 1，page_size 必须在 1-200'}), 400
-        page_reader = getattr(system.trade_state, 'get_closed_trades_page', None)
-        if callable(page_reader):
-            selected, total = page_reader(page, page_size)
-        else:
-            all_trades = system.trade_state.get_closed_trades()
-            total = len(all_trades)
-            start = (page - 1) * page_size
-            selected = list(reversed(all_trades))[start:start + page_size]
+        selected, total = system.trade_state.get_closed_trades_page(
+            page, page_size)
         # 接口按最新在前分页，响应和常态内存工作量都限制在 page_size。
         trades = [enrich_closed_trade_with_fees(t) for t in selected]
         total_pages = (total + page_size - 1) // page_size
@@ -833,16 +820,15 @@ def get_trades_summary():
     if err:
         return err
     try:
-        revision_fn = getattr(system.trade_state, 'get_closed_trades_revision', None)
-        revision = revision_fn() if callable(revision_fn) else None
+        revision = system.trade_state.get_closed_trades_revision()
         cached = getattr(system, '_trades_summary_cache', None)
-        if revision is not None and cached and cached.get('revision') == revision:
+        if cached and cached.get('revision') == revision:
             return jsonify(cached['payload'])
         trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
         if not trades:
             payload = {'total': 0}
-            if revision is not None:
-                system._trades_summary_cache = {'revision': revision, 'payload': payload}
+            system._trades_summary_cache = {
+                'revision': revision, 'payload': payload}
             return jsonify(payload)
         total = len(trades)
         wins = [t for t in trades if t.get('pnl', 0) > 0]
@@ -870,8 +856,8 @@ def get_trades_summary():
             'max_win': round(max_win, 2), 'max_loss': round(max_loss, 2),
             'estimated_exit_count': estimated_exit_count,
         }
-        if revision is not None:
-            system._trades_summary_cache = {'revision': revision, 'payload': payload}
+        system._trades_summary_cache = {
+            'revision': revision, 'payload': payload}
         return jsonify(payload)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1283,28 +1269,14 @@ def close_position():
                 return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-            submit_close = getattr(system, '_submit_persisted_close', None)
-            if callable(submit_close):
-                close_order = submit_close(
-                    symbol_name, ccxt_symbol, position, 'API 手动平仓')
-            else:
-                # 兼容旧测试桩；真实 TradingSystem 必须走持久化 close intent。
-                close_order = system.exchange_api.close_position(
-                    ccxt_symbol, position['side'], position['position_size'])
+            close_order = system._submit_persisted_close(
+                symbol_name, ccxt_symbol, position, 'API 手动平仓')
             if not close_order:
                 return jsonify({'error': f'{symbol_name} 平仓失败'}), 500
 
-            reject_partial = getattr(system, '_reject_partial_close', None)
             if close_order.get('fully_closed') is False:
-                handle_partial = getattr(system, '_handle_partial_close', None)
-                safely_reconciled = False
-                if callable(handle_partial):
-                    safely_reconciled = bool(handle_partial(
-                        symbol_name, close_order, position, '手动平仓'))
-                elif callable(reject_partial):
-                    reject_partial(symbol_name, close_order, '手动平仓')
-                else:
-                    logger.critical(f'{symbol_name} 手动平仓仅部分成交，保留账本和止损')
+                safely_reconciled = bool(system._handle_partial_close(
+                    symbol_name, close_order, position, '手动平仓'))
                 # 绝不能继续撤掉保护余仓的止损或删除完整本地账本。
                 return jsonify({
                     'status': 'partial',
@@ -1315,9 +1287,8 @@ def close_position():
                     'safely_reconciled': safely_reconciled,
                 }), 409
 
-            warn_ambiguous = getattr(system, '_warn_ambiguous_close_execution', None)
-            if callable(warn_ambiguous):
-                warn_ambiguous(symbol_name, close_order, '手动平仓')
+            system._warn_ambiguous_close_execution(
+                symbol_name, close_order, '手动平仓')
 
             # 仓位变化与订单成交量不一致时，订单 VWAP 不能代表完整平仓，使用保守行情回退。
             actual_price = None if close_order.get('execution_ambiguous') \
@@ -1338,12 +1309,8 @@ def close_position():
                 logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
 
             # 记平 + 落盘失败的运行时补偿 + 告警 + 止损异常警示清理，统一复用主系统的收口方法
-            extract_fee = getattr(system, '_extract_usdt_fee', None)
-            exit_fee, exit_fee_currency = (
-                extract_fee(close_order) if callable(extract_fee) else (None, None))
-            order_ids_getter = getattr(system, '_order_ids', None)
-            exit_order_ids = (
-                order_ids_getter(close_order) if callable(order_ids_getter) else [])
+            exit_fee, exit_fee_currency = system._extract_usdt_fee(close_order)
+            exit_order_ids = system._order_ids(close_order)
             closed_position, state_saved = system._close_trade_state_with_runtime_fallback(
                 symbol_name, actual_price, "手动平仓",
                 exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,

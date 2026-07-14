@@ -1027,6 +1027,8 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda symbol: symbol,
             get_position=Mock(return_value=exchange_position),
+            fetch_stop_order_snapshot=lambda symbols: {
+                symbol: () for symbol in symbols},
             _coin_to_contracts=lambda _symbol, amount: amount,
             find_stop_order_state=lambda *args, **kwargs: 'intact',
             fetch_ohlcv=lambda *args, **kwargs: [[1]],

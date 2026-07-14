@@ -71,16 +71,10 @@ class TradeExecutorMixin:
 
     def _submit_persisted_close(self, symbol, ccxt_symbol, position, context):
         """先落盘 close intent，再用固定 clOrdId 执行/恢复主动平仓。"""
-        prepare = getattr(self.trade_state, 'prepare_close_intent', None)
-        if not callable(prepare):
-            # 只为尚未升级的测试桩保留兼容；真实 TradeState 必有该原语。
-            logger.warning(
-                f'{symbol} 状态实现缺少 close intent（兼容路径）；请勿用于生产')
-            return self.exchange_api.close_position(
-                ccxt_symbol, position['side'], position['position_size'])
         candidate_id = f'C{uuid.uuid4().hex[:31]}'
         try:
-            intent = prepare(symbol, candidate_id, context)
+            intent = self.trade_state.prepare_close_intent(
+                symbol, candidate_id, context)
         except Exception as exc:
             logger.critical(
                 f'{symbol} 无法在平仓 POST 前持久化 close intent: {exc}')
@@ -106,8 +100,7 @@ class TradeExecutorMixin:
 
     def _resume_persisted_close_intent(self, symbol, position, context):
         """在常规仓位对账前恢复主动平仓，返回 none/partial/closed/unresolved。"""
-        getter = getattr(self.trade_state, 'get_close_intent', None)
-        intent = getter(symbol) if callable(getter) else None
+        intent = self.trade_state.get_close_intent(symbol)
         if not intent:
             return 'none'
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
@@ -122,12 +115,10 @@ class TradeExecutorMixin:
             close_order = None
             logger.exception(f'{symbol} close intent 恢复异常: {exc}')
         if not close_order:
-            quarantine = getattr(self, '_quarantine_position_mismatch', None)
-            if callable(quarantine):
-                quarantine(
-                    symbol, f'{context} close intent 无法确认/继续',
-                    {'client_order_id': intent.get('client_order_id'),
-                     'intent_context': intent_context})
+            self._quarantine_position_mismatch(
+                symbol, f'{context} close intent 无法确认/继续',
+                {'client_order_id': intent.get('client_order_id'),
+                 'intent_context': intent_context})
             return 'unresolved'
         if close_order.get('fully_closed') is False:
             saved = self._handle_partial_close(
@@ -223,16 +214,15 @@ class TradeExecutorMixin:
             msg = (f"{symbol} {context}仅部分成交（实际={actual}币），交易所仍有余仓；"
                    f"已保留本地仓位和止损，禁止反手，请立即复核")
             logger.critical(msg)
-            mark_quarantine = getattr(self.trade_state, 'mark_position_quarantine', None)
-            if callable(mark_quarantine):
-                try:
-                    mark_quarantine(symbol, f'{context}部分成交，等待原子缩减账本', {
+            try:
+                self.trade_state.mark_position_quarantine(
+                    symbol, f'{context}部分成交，等待原子缩减账本', {
                         'actual_closed_amount': actual,
                         'remaining_amount': close_order.get('remaining_amount'),
                         'order_ids': close_order.get('ids'),
                     })
-                except Exception as e:
-                    logger.critical(f"{symbol} 部分成交后的仓位隔离落盘失败: {e}")
+            except Exception as e:
+                logger.critical(f"{symbol} 部分成交后的仓位隔离落盘失败: {e}")
             self.notifier.notify_error(msg)
             return True
         return False
@@ -465,20 +455,16 @@ class TradeExecutorMixin:
 
     def _mark_open_rollback_quarantine(self, symbol, reason, details):
         """持久化隔离；磁盘故障时至少在本进程内保持 fail-closed。"""
-        marker = getattr(self.trade_state, 'mark_position_quarantine', None)
-        if callable(marker):
-            try:
-                marker(symbol, reason, details)
-                return True
-            except Exception as exc:
-                logger.critical(f'{symbol} 紧急回滚隔离落盘失败: {exc}')
-        force_marker = getattr(
-            self.trade_state, 'force_runtime_mark_position_quarantine', None)
-        if callable(force_marker):
-            try:
-                force_marker(symbol, reason, details)
-            except Exception as exc:
-                logger.critical(f'{symbol} 紧急回滚连运行时隔离也失败: {exc}')
+        try:
+            self.trade_state.mark_position_quarantine(symbol, reason, details)
+            return True
+        except Exception as exc:
+            logger.critical(f'{symbol} 紧急回滚隔离落盘失败: {exc}')
+        try:
+            self.trade_state.force_runtime_mark_position_quarantine(
+                symbol, reason, details)
+        except Exception as exc:
+            logger.critical(f'{symbol} 紧急回滚连运行时隔离也失败: {exc}')
         return False
 
     def _mark_possible_unknown_stop_residue(self, symbol):
@@ -488,12 +474,10 @@ class TradeExecutorMixin:
             return True
         except Exception as exc:
             logger.critical(f'{symbol} 未知止损残留标记落盘失败: {exc}')
-        force = getattr(self.trade_state, 'force_runtime_mark_stop_residue', None)
-        if callable(force):
-            try:
-                force(symbol)
-            except Exception as exc:
-                logger.critical(f'{symbol} 未知止损残留运行时标记也失败: {exc}')
+        try:
+            self.trade_state.force_runtime_mark_stop_residue(symbol)
+        except Exception as exc:
+            logger.critical(f'{symbol} 未知止损残留运行时标记也失败: {exc}')
         return False
 
     def _cancel_active_stop_ids_only(self, symbol, ccxt_symbol, order_ids):
@@ -506,16 +490,11 @@ class TradeExecutorMixin:
         for value in order_ids or []:
             if value and str(value) not in ids:
                 ids.append(str(value))
-        cancel_one = getattr(self.exchange_api, 'cancel_stop_order_only', None)
-        if not callable(cancel_one):
-            logger.critical(
-                f'{symbol} 交易所适配器缺少“仅撤指定止损”能力，拒绝在持仓中清单')
-            self._mark_possible_unknown_stop_residue(symbol)
-            return ids
         uncleared = []
         for order_id in ids:
             try:
-                cleared = bool(cancel_one(ccxt_symbol, order_id))
+                cleared = bool(self.exchange_api.cancel_stop_order_only(
+                    ccxt_symbol, order_id))
             except Exception as exc:
                 logger.warning(f'{symbol} 指定止损 {order_id} 撤销异常: {exc}')
                 cleared = False
@@ -531,11 +510,9 @@ class TradeExecutorMixin:
         if (not open_intent or not isinstance(outcome, dict) or
                 outcome.get('status') != 'rolled_back'):
             return outcome
-        finalizer = getattr(self, '_finalize_open_intent_rollback', None)
-        if not callable(finalizer):
-            return outcome
         try:
-            if finalizer(symbol, open_intent, outcome):
+            if self._finalize_open_intent_rollback(
+                    symbol, open_intent, outcome):
                 outcome['open_intent_finalized'] = True
             else:
                 logger.critical(
@@ -652,9 +629,8 @@ class TradeExecutorMixin:
                     f'{symbol} 部分回滚余仓连运行时账本也无法建立: {runtime_exc}')
                 return None, False, protected
             state_saved = False
-            notifier = getattr(self, '_notify_trade_state_persistence_issue', None)
-            if callable(notifier):
-                notifier(symbol, f'{context}部分回滚余仓建账', exc)
+            self._notify_trade_state_persistence_issue(
+                symbol, f'{context}部分回滚余仓建账', exc)
         except Exception as exc:
             logger.critical(f'{symbol} 部分回滚余仓账本建立失败: {exc}')
             return None, False, protected
@@ -735,9 +711,8 @@ class TradeExecutorMixin:
                     f'{symbol} 未决完整余仓连运行时账本也无法建立: {runtime_exc}')
                 return None, False, protected
             state_saved = False
-            notifier = getattr(self, '_notify_trade_state_persistence_issue', None)
-            if callable(notifier):
-                notifier(symbol, f'{context}完整余仓建账', exc)
+            self._notify_trade_state_persistence_issue(
+                symbol, f'{context}完整余仓建账', exc)
         except Exception as exc:
             logger.critical(f'{symbol} 未决完整余仓账本建立失败: {exc}')
             return None, False, protected
@@ -981,8 +956,7 @@ class TradeExecutorMixin:
 
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
-        pending_getter = getattr(self.trade_state, 'get_pending_signal_execution', None)
-        pending_execution = pending_getter(symbol) if callable(pending_getter) else None
+        pending_execution = self.trade_state.get_pending_signal_execution(symbol)
         if pending_execution:
             pending_client_id = pending_execution.get('client_order_id')
             if not client_order_id or str(client_order_id) != str(pending_client_id):
@@ -992,8 +966,7 @@ class TradeExecutorMixin:
                 self.notifier.notify_error(msg)
                 return
 
-        intent_getter = getattr(self.trade_state, 'get_open_intent', None)
-        open_intent = intent_getter(symbol) if callable(intent_getter) else None
+        open_intent = self.trade_state.get_open_intent(symbol)
         if open_intent:
             intent_client_id = open_intent.get('client_order_id')
             if (client_order_id is None or
@@ -1005,31 +978,29 @@ class TradeExecutorMixin:
                 return
         recovery_execution = pending_execution or open_intent
 
-        quarantine_check = getattr(self.trade_state, 'is_position_quarantined', None)
-        if callable(quarantine_check):
-            try:
-                quarantined = quarantine_check(symbol)
-            except Exception as e:
-                msg = f"{symbol} 无法读取仓位隔离状态，按 fail-closed 阻断开仓: {e}"
-                logger.critical(msg)
+        try:
+            quarantined = self.trade_state.is_position_quarantined(symbol)
+        except Exception as e:
+            msg = f"{symbol} 无法读取仓位隔离状态，按 fail-closed 阻断开仓: {e}"
+            logger.critical(msg)
+            self.notifier.notify_error(msg)
+            return
+        if quarantined:
+            pending = (
+                self.trade_state.get_pending_signal_execution(
+                    symbol, client_order_id)
+                if client_order_id else None)
+            intent = (
+                self.trade_state.get_open_intent(symbol, client_order_id)
+                if client_order_id else None)
+            if not pending and not intent:
+                msg = f"{symbol} 处于交易所/本地仓位不一致隔离状态，阻断本次开仓；请先完成对账并解除隔离"
+                logger.error(msg)
                 self.notifier.notify_error(msg)
                 return
-            if quarantined:
-                pending_getter = getattr(self.trade_state, 'get_pending_signal_execution', None)
-                pending = (
-                    pending_getter(symbol, client_order_id)
-                    if client_order_id and callable(pending_getter) else None)
-                intent = (
-                    intent_getter(symbol, client_order_id)
-                    if client_order_id and callable(intent_getter) else None)
-                if not pending and not intent:
-                    msg = f"{symbol} 处于交易所/本地仓位不一致隔离状态，阻断本次开仓；请先完成对账并解除隔离"
-                    logger.error(msg)
-                    self.notifier.notify_error(msg)
-                    return
-                logger.warning(
-                    f"{symbol} 仅允许用 pending clOrdId={client_order_id} 恢复中断交易；"
-                    "适配层必须先查旧订单，不得新建另一单")
+            logger.warning(
+                f"{symbol} 仅允许用 pending clOrdId={client_order_id} 恢复中断交易；"
+                "适配层必须先查旧订单，不得新建另一单")
 
         # 止损残留阻断：该品种可能有撤销未确认的旧止损单，开新仓可能被残留单错杀
         if self.trade_state.has_stop_residue(symbol):
@@ -1171,24 +1142,22 @@ class TradeExecutorMixin:
         # 海龟已有 signal_execution；其余入口在任何 POST 前统一持久化
         # open intent + clOrdId + 固化数量，封住成交后记账前崩溃的孤儿仓窗口。
         if client_order_id is None:
-            prepare_intent = getattr(self.trade_state, 'prepare_open_intent', None)
-            if callable(prepare_intent):
-                generated_client_id = f'I{uuid.uuid4().hex[:31]}'
-                try:
-                    open_intent = prepare_intent(
-                        symbol, symbol_config.get('strategy', 'turtle'), side,
-                        generated_client_id,
-                        {'side': side, 'entry_price': float(entry_price),
-                         'stop_loss_price': float(stop_loss_price)},
-                        planned_position_size=position_size)
-                    position_size = float(open_intent['planned_position_size'])
-                    client_order_id = generated_client_id
-                except Exception as exc:
-                    logger.critical(
-                        f'{symbol} 无法在发单前持久化 open intent: {exc}')
-                    self.notifier.notify_error(
-                        f'{symbol} 开仓意图无法落盘，已拒绝发单: {exc}')
-                    return
+            generated_client_id = f'I{uuid.uuid4().hex[:31]}'
+            try:
+                open_intent = self.trade_state.prepare_open_intent(
+                    symbol, symbol_config.get('strategy', 'turtle'), side,
+                    generated_client_id,
+                    {'side': side, 'entry_price': float(entry_price),
+                     'stop_loss_price': float(stop_loss_price)},
+                    planned_position_size=position_size)
+                position_size = float(open_intent['planned_position_size'])
+                client_order_id = generated_client_id
+            except Exception as exc:
+                logger.critical(
+                    f'{symbol} 无法在发单前持久化 open intent: {exc}')
+                self.notifier.notify_error(
+                    f'{symbol} 开仓意图无法落盘，已拒绝发单: {exc}')
+                return
         open_intent_client_id = (
             client_order_id if open_intent is not None else None)
 

@@ -43,12 +43,96 @@ def _fake_to_ccxt(symbol):
     return symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
 
 
+def _complete_trade_state_stub(state=None):
+    """补齐生产代码依赖的 TradeState 契约，不让测试靠生产降级分支过关。
+
+    各用例仍须显式提供自己要验证的写操作；这里仅给与当前断言无关的查询、
+    隔离和幂等意图原语提供保守默认值。涉及主动平仓时，假账本也必须真的
+    暴露对应持仓，否则 prepare_close_intent 会大声失败。
+    """
+    state = state or SimpleNamespace()
+    defaults = {
+        "get_open_position": lambda _symbol: getattr(state, "position", None),
+        "get_pending_signal_execution": lambda _symbol, _client_id=None: None,
+        "get_pending_signal_executions": lambda: {},
+        "get_open_intent": lambda _symbol, _client_id=None: None,
+        "get_open_intents": lambda: {},
+        "get_close_intent": lambda _symbol: None,
+        "is_position_quarantined": lambda _symbol: False,
+        "get_position_quarantines": lambda: {},
+        "mark_position_quarantine": lambda *_args, **_kwargs: True,
+        "force_runtime_mark_position_quarantine": lambda *_args, **_kwargs: True,
+        "has_stop_residue": lambda _symbol: False,
+        "mark_stop_residue": lambda _symbol: True,
+        "clear_stop_residue": lambda _symbol: True,
+        "force_runtime_mark_stop_residue": lambda _symbol: True,
+        "clear_position_quarantine": lambda _symbol: False,
+        "get_closed_trades": lambda: [],
+        "get_closed_trades_revision": lambda: 0,
+        "remove_symbol_metadata": lambda *_args, **_kwargs: False,
+        "prune_inactive_symbol_metadata": lambda _symbols: [],
+        "set_last_daily_check_date": lambda _day: None,
+        "set_last_daily_summary_date": lambda _day: None,
+    }
+    for name, method in defaults.items():
+        if not hasattr(state, name):
+            setattr(state, name, method)
+
+    if not hasattr(state, "get_closed_trades_page"):
+        def get_closed_trades_page(page, page_size):
+            trades = list(state.get_closed_trades())
+            start = (page - 1) * page_size
+            return list(reversed(trades))[start:start + page_size], len(trades)
+        state.get_closed_trades_page = get_closed_trades_page
+
+    if not hasattr(state, "prepare_open_intent"):
+        def prepare_open_intent(
+                symbol, strategy, side, client_order_id, signal,
+                planned_position_size):
+            return {
+                "symbol": symbol, "strategy": strategy, "side": side,
+                "client_order_id": client_order_id, "signal": signal,
+                "planned_position_size": planned_position_size,
+            }
+        state.prepare_open_intent = prepare_open_intent
+
+    if not hasattr(state, "prepare_close_intent"):
+        def prepare_close_intent(symbol, client_order_id, context):
+            position = state.get_open_position(symbol)
+            if not isinstance(position, dict):
+                raise AssertionError(
+                    f"测试假账本缺少 {symbol} 持仓，不能伪造 close intent")
+            return {
+                "symbol": symbol, "side": position.get("side"),
+                "planned_position_size": position.get("position_size"),
+                "client_order_id": client_order_id, "context": context,
+            }
+        state.prepare_close_intent = prepare_close_intent
+    return state
+
+
+def _assert_persisted_close_call(close_mock, symbol, exit_price):
+    """平仓记账测试也必须证明 close intent 被原子消费。"""
+    close_mock.assert_called_once()
+    args = close_mock.call_args.args
+    kwargs = close_mock.call_args.kwargs
+    if args != (symbol, exit_price):
+        raise AssertionError(f"平仓记账参数不符: {args!r}")
+    client_id = kwargs.get("close_intent_client_id")
+    if (set(kwargs) != {"close_intent_client_id"} or
+            not isinstance(client_id, str) or
+            len(client_id) != 32 or not client_id.startswith("C")):
+        raise AssertionError(f"未携带有效 close intent: {kwargs!r}")
+
+
 def _prep_system(system, persist=True):
     """给假 system 补上 api_server 单所路由需要的属性（_config_lock / _trade_lock / persist_config / config_file）。"""
     system._config_lock = threading.RLock()
     system._trade_lock = threading.RLock()
     system.persist_config = lambda: persist
     system.config_file = "config.json"
+    if hasattr(system, "trade_state"):
+        _complete_trade_state_stub(system.trade_state)
     return system
 
 
@@ -703,7 +787,8 @@ class SymbolInputValidationTests(unittest.TestCase):
     def test_update_symbol_rejects_strategy_change_while_holding(self):
         """有持仓时禁止改策略：现有仓位的止损/出场逻辑不能被换掉。"""
         self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "strategy": "turtle"}]}}
-        self.system.trade_state = SimpleNamespace(get_open_position=Mock(return_value={"symbol": "BTCUSDT"}))
+        self.system.trade_state = _complete_trade_state_stub(SimpleNamespace(
+            get_open_position=Mock(return_value={"symbol": "BTCUSDT"})))
         with patch.object(api_server, "trading_system", self.system), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
@@ -859,6 +944,8 @@ class DeleteSymbolApiTests(unittest.TestCase):
                 close_position=Mock(side_effect=AssertionError("删除不得平仓")),
             ),
             exchange_api=SimpleNamespace(
+                to_ccxt_symbol=_fake_to_ccxt,
+                get_position=Mock(return_value=None),
                 cancel_order=Mock(side_effect=AssertionError("删除不得撤单")),
                 cancel_all_orders=Mock(side_effect=AssertionError("删除不得撤单")),
             ),
@@ -927,14 +1014,14 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             notify_error=Mock(),
             notify_trade_opened=Mock(),
         )
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             add_open_position=Mock(),
             has_stop_residue=Mock(return_value=False),
             clear_stop_residue=Mock(),
             mark_stop_residue=Mock(),
             mark_position_quarantine=Mock(),
             force_runtime_mark_position_quarantine=Mock(),
-        )
+        ))
         system._pending_trade_open_notifications = []
         system.risk_manager = SimpleNamespace(
             account_equity=10000,
@@ -1176,13 +1263,13 @@ class UpdateStopOrderTests(unittest.TestCase):
             cancel_all_orders=Mock(),
             create_stop_loss_order=Mock(return_value={"id": "new-stop"}),
         )
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             update_stop_loss=Mock(),
             force_runtime_update_stop_loss=Mock(),
             has_stop_residue=Mock(return_value=False),
             clear_stop_residue=Mock(),
             mark_stop_residue=Mock(),
-        )
+        ))
         system.notifier = SimpleNamespace(send_message=Mock(), notify_error=Mock())
         system._pending_stop_loss_updates = []
         return system
@@ -1411,13 +1498,15 @@ class HandleCloseSignalTests(unittest.TestCase):
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(),
         )
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             close_position=Mock(return_value={"pnl": 10.5, "pnl_percent": 5.25}),
             force_runtime_close_position=Mock(return_value={"pnl": 10.5, "pnl_percent": 5.25}),
+            get_open_position=Mock(return_value={
+                "symbol": "BTCUSDT", "side": "long", "position_size": 2.0}),
             has_stop_residue=Mock(return_value=False),
             clear_stop_residue=Mock(),
             mark_stop_residue=Mock(),
-        )
+        ))
         system.notifier = SimpleNamespace(
             notify_error=Mock(),
         )
@@ -1435,7 +1524,8 @@ class HandleCloseSignalTests(unittest.TestCase):
         )
 
         self.assertTrue(result)
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 123.45)
+        _assert_persisted_close_call(
+            system.trade_state.close_position, "BTCUSDT", 123.45)
         self.assertEqual(len(system._pending_trade_close_notifications), 1)  # 现行为：缓冲汇总
         self.assertEqual(system._pending_trade_close_notifications[0]["exit_price"], 123.45)
         system.handle_open_signal_turtle.assert_not_called()
@@ -1468,7 +1558,8 @@ class HandleCloseSignalTests(unittest.TestCase):
 
         # 平仓已记账，但返回 False：本函数与调用方都不得进入任何再开仓流程
         self.assertFalse(result)
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 123.45)
+        _assert_persisted_close_call(
+            system.trade_state.close_position, "BTCUSDT", 123.45)
         system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
         system.handle_open_signal_turtle.assert_not_called()
 
@@ -1502,14 +1593,20 @@ class MaCrossFlipTests(unittest.TestCase):
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(),
         )
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             close_position=Mock(return_value={"pnl": 12.0, "pnl_percent": 6.0}),
             force_runtime_close_position=Mock(return_value={"pnl": 12.0, "pnl_percent": 6.0}),
-            get_open_position=Mock(return_value={"symbol": "BTCUSDT"}),
+            get_open_position=Mock(return_value={
+                "symbol": "BTCUSDT", "side": "short", "position_size": 2.0}),
+            prepare_close_intent=Mock(side_effect=lambda symbol, client_id, context: {
+                "symbol": symbol, "side": "short", "position_size": 2.0,
+                "planned_position_size": 2.0,
+                "client_order_id": client_id, "context": context,
+            }),
             has_stop_residue=Mock(return_value=False),
             clear_stop_residue=Mock(),
             mark_stop_residue=Mock(),
-        )
+        ))
         system.notifier = SimpleNamespace(
             notify_error=Mock(),
             send_message=Mock(),
@@ -1528,7 +1625,8 @@ class MaCrossFlipTests(unittest.TestCase):
 
         system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
 
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 112)
+        _assert_persisted_close_call(
+            system.trade_state.close_position, "BTCUSDT", 112)
         self.assertEqual(len(system._pending_trade_close_notifications), 1)  # 现行为：缓冲汇总
         system._execute_open.assert_called_once_with(
             "BTCUSDT", "long", 110, 95, {"name": "BTCUSDT"}
@@ -1546,7 +1644,8 @@ class MaCrossFlipTests(unittest.TestCase):
 
         system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
 
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 112)
+        _assert_persisted_close_call(
+            system.trade_state.close_position, "BTCUSDT", 112)
         system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
         system._execute_open.assert_not_called()
         system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记 T+1，次日按 EMA 方向重入
@@ -1683,7 +1782,8 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
         )
 
         self.assertFalse(result)
-        system.trade_state.force_runtime_close_position.assert_called_once_with(
+        _assert_persisted_close_call(
+            system.trade_state.force_runtime_close_position,
             "BTCUSDT", 123.45)
         system.handle_open_signal_turtle.assert_not_called()
 
@@ -1695,7 +1795,9 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
 
         system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
 
-        system.trade_state.force_runtime_close_position.assert_called_once_with("BTCUSDT", 112)
+        _assert_persisted_close_call(
+            system.trade_state.force_runtime_close_position,
+            "BTCUSDT", 112)
         system._execute_open.assert_not_called()
 
 
@@ -1713,7 +1815,7 @@ class StartupSyncCompensationTests(unittest.TestCase):
             list_position_symbols=Mock(return_value=[]),
             get_last_price=last_price,
         )
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             get_all_open_positions=Mock(
                 return_value={
                     "BTCUSDT": {
@@ -1729,7 +1831,7 @@ class StartupSyncCompensationTests(unittest.TestCase):
             get_pending_signal_execution=Mock(return_value=None),
             mark_stop_residue=Mock(),
             clear_stop_residue=Mock(),
-        )
+        ))
         system.notifier = SimpleNamespace(notify_error=Mock())
         return system
 
@@ -1915,7 +2017,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
         system = SimpleNamespace(
             _trade_lock=trade_lock,
             _config_lock=CheckedConfigLock(),
-            trade_state=SimpleNamespace(get_open_position=lambda _s: holder.position),
+            trade_state=_complete_trade_state_stub(SimpleNamespace(
+                get_open_position=lambda _s: holder.position)),
             config={"trading": {"symbols": [
                 {"name": "BTCUSDT", "strategy": "turtle", "risk_per_trade": 0.01, "enabled": True}
             ]}},
@@ -1972,7 +2075,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
     def test_trades_are_bounded_and_paginated_newest_first(self):
         trades = [{"symbol": f"T{i}"} for i in range(250)]
         system = SimpleNamespace(
-            trade_state=SimpleNamespace(get_closed_trades=lambda: trades))
+            trade_state=_complete_trade_state_stub(SimpleNamespace(
+                get_closed_trades=lambda: trades)))
         with patch.object(api_server, "trading_system", system):
             resp = self.client.get("/api/trades?page=2&page_size=100")
         payload = resp.get_json()
@@ -1993,7 +2097,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
              "exit_price_estimated": False},
         ]
         system = SimpleNamespace(
-            trade_state=SimpleNamespace(get_closed_trades=lambda: trades))
+            trade_state=_complete_trade_state_stub(SimpleNamespace(
+                get_closed_trades=lambda: trades)))
 
         with patch.object(api_server, "trading_system", system):
             response = self.client.get("/api/trades_summary")
@@ -2076,10 +2181,10 @@ class ApiProcessSafetyTests(unittest.TestCase):
         system = SimpleNamespace(
             _trade_lock=trade_lock,
             _config_lock=threading.RLock(),
-            trade_state=SimpleNamespace(
+            trade_state=_complete_trade_state_stub(SimpleNamespace(
                 get_pending_signal_execution=lambda _s: None,
                 get_open_position=lambda _s: None,
-            ),
+            )),
             config={
                 "trading": {"symbols": [{
                     "name": "BTCUSDT", "enabled": True,
@@ -2249,24 +2354,27 @@ class ApiProcessSafetyTests(unittest.TestCase):
         system._trade_lock = threading.Lock()
         system.label = "欧易"
         quarantine = Mock()
-        system.trade_state = SimpleNamespace(
+        system.trade_state = _complete_trade_state_stub(SimpleNamespace(
             get_open_position=lambda _s: {
                 "symbol": "BTCUSDT", "side": "long", "position_size": 1.0,
                 "entry_price": 100.0, "stop_loss_price": 90.0, "stop_order_id": "stop-1",
             },
             mark_position_quarantine=quarantine,
-        )
+        ))
         system.notifier = SimpleNamespace(notify_error=Mock())
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda _s: "BTC/USDT:USDT",
-            close_position=lambda *_args: {
+            close_position=lambda *_args, **_kwargs: {
                 "id": "partial", "amount": 0.4, "remaining_amount": 0.6,
                 "fully_closed": False,
             },
         )
         system._cancel_stop_order_confirmed = Mock()
         system._close_trade_state_with_runtime_fallback = Mock()
-        system._handle_partial_close = None  # 本用例验证 helper 缺席时仍 fail-closed
+        def reject_partial(symbol, close_order, _position, context):
+            quarantine(symbol, f'{context}部分成交', close_order)
+            return False
+        system._handle_partial_close = reject_partial
 
         with patch.object(api_server, "trading_system", system):
             resp = self.client.post("/api/close_position", json={"name": "BTCUSDT"})
@@ -2281,11 +2389,12 @@ class ApiProcessSafetyTests(unittest.TestCase):
         handler = Mock(return_value=True)
         system = SimpleNamespace(
             _trade_lock=threading.Lock(), label="欧易",
-            trade_state=SimpleNamespace(get_open_position=lambda _s: {
+            trade_state=_complete_trade_state_stub(SimpleNamespace(
+                get_open_position=lambda _s: {
                 "symbol": "BTCUSDT", "side": "long", "position_size": 1.0,
                 "entry_price": 100.0, "stop_loss_price": 90.0,
                 "stop_order_id": "stop-old",
-            }),
+            })),
             exchange_api=SimpleNamespace(
                 to_ccxt_symbol=lambda _s: "BTC/USDT:USDT",
                 close_position=lambda *_args: {
@@ -2294,6 +2403,10 @@ class ApiProcessSafetyTests(unittest.TestCase):
                 },
             ),
             _handle_partial_close=handler,
+            _submit_persisted_close=lambda *_args, **_kwargs: {
+                "amount": 0.4, "remaining_amount": 0.6,
+                "fully_closed": False,
+            },
             _cancel_stop_order_confirmed=Mock(),
             _close_trade_state_with_runtime_fallback=Mock(),
         )

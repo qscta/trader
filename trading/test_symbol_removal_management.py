@@ -54,6 +54,8 @@ def _build_system(tmpdir, config_symbols):
     system.exchange_api = SimpleNamespace(
         to_ccxt_symbol=lambda s: s,
         get_position=lambda s: None,
+        fetch_stop_order_snapshot=lambda symbols: {
+            symbol: () for symbol in symbols},
         fetch_ohlcv=lambda *a, **k: [])
     return system, checked
 
@@ -752,7 +754,9 @@ class IntradayPerSymbolIsolationTest(unittest.TestCase):
             system.exchange_api._coin_to_contracts = lambda s, amount: amount
             ensured = []
 
-            def ensure(symbol, ccxt_symbol, position, strategy_name):
+            def ensure(
+                    symbol, ccxt_symbol, position, strategy_name,
+                    algo_orders=None):
                 if symbol == 'AAAUSDT':
                     raise RuntimeError('模拟止损自愈异常（如面值不可得）')
                 ensured.append(symbol)
@@ -943,7 +947,7 @@ class StopSelfHealTest(unittest.TestCase):
                                              stop_order_id='stop-1', strategy='turtle')
         self.created, self.find_calls = [], []
 
-        def find_state(s, side, amount, price, oid=None):
+        def find_state(s, side, amount, price, oid=None, algo_orders=None):
             self.find_calls.append((side, amount, price, oid))
             if state_error:
                 raise state_error
@@ -1087,7 +1091,10 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
             set_signal_state=lambda *a: None,
             get_signal_state=lambda s: True,
             clear_stop_residue=lambda s: None,
-            mark_stop_residue=lambda s: None)
+            mark_stop_residue=lambda s: None,
+            is_position_quarantined=lambda s: False,
+            mark_position_quarantine=lambda *a, **k: None,
+            force_runtime_mark_position_quarantine=lambda *a, **k: None)
         system.handle_open_signal_turtle = lambda *a, **k: self.fail("落盘失败后不得反手开仓")
         system._execute_open = lambda *a, **k: self.fail("落盘失败后不得重入开仓")
         system.record_stop_loss = lambda s: self.fail("落盘失败后不得记录 T+1")

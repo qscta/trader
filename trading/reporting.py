@@ -117,24 +117,21 @@ class ReportingMixin:
 
             if self.send_daily_position_summary():
                 if mark_sent:
-                    setter = getattr(
-                        self.trade_state, 'set_last_daily_summary_date', None)
-                    if callable(setter):
+                    try:
+                        self.trade_state.set_last_daily_summary_date(today)
+                    except Exception as exc:
+                        # 消息已经对外发送，当前进程仍要去重；同时明确告警
+                        # 跨重启去重耐久性已降级，不能静默假装落盘成功。
+                        logger.critical(
+                            f'每日汇总已发送但去重日期落盘失败: {exc}')
                         try:
-                            setter(today)
-                        except Exception as exc:
-                            # 消息已经对外发送，当前进程仍要去重；同时明确告警
-                            # 跨重启去重耐久性已降级，不能静默假装落盘成功。
-                            logger.critical(
-                                f'每日汇总已发送但去重日期落盘失败: {exc}')
-                            try:
-                                self.notifier.notify_error(
-                                    f'每日汇总已发送，但去重日期落盘失败: {exc}')
-                            except Exception as notify_exc:
-                                # 主问题已 critical 记录；二次告警失败仅 debug 留痕。
-                                logger.debug(
-                                    '去重落盘失败的二次告警发送失败: %s',
-                                    notify_exc)
+                            self.notifier.notify_error(
+                                f'每日汇总已发送，但去重日期落盘失败: {exc}')
+                        except Exception as notify_exc:
+                            # 主问题已 critical 记录；二次告警失败仅 debug 留痕。
+                            logger.debug(
+                                '去重落盘失败的二次告警发送失败: %s',
+                                notify_exc)
                     self._last_summary_date = today
                 else:
                     logger.info(f"今日({today})每日持仓汇总已推送，本次不标记去重日期")

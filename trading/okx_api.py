@@ -1441,7 +1441,8 @@ class OkxApi(ExchangeApi):
                 symbols.append(self.to_internal_symbol(ccxt_symbol))
         return symbols
 
-    def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
+    def find_stop_order_state(self, symbol, side, amount, stop_price,
+                              stop_order_id=None, algo_orders=None):
         """检查与「本地持仓记录」对应的止损算法单状态（供主层止损自愈巡检使用）。
 
         amount 为币数，张数换算在本方法内部完成（张数不外泄）。返回：
@@ -1459,7 +1460,16 @@ class OkxApi(ExchangeApi):
         # 本地记录价与交易所存储价须同一口径：交易所按 tick 取整存储，
         # 比对前用同一对齐函数归一本地价（详见 _align_stop_price）
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
-        algos = self._fetch_algo_orders(ccxt_symbol)
+        if algo_orders is None:
+            algos = self._fetch_algo_orders(ccxt_symbol)
+        elif isinstance(algo_orders, (list, tuple)):
+            # 调用方只能传入 fetch_stop_order_snapshot 对本品种切出的完整列表。
+            # 复制容器，保证裁决过程不会污染同轮其它品种共享的只读快照。
+            algos = list(algo_orders)
+            if not all(isinstance(order, dict) for order in algos):
+                raise RuntimeError(f'{ccxt_symbol} 算法单快照含非对象项')
+        else:
+            raise RuntimeError(f'{ccxt_symbol} 算法单快照类型非法')
         reduce_only_algos = []
         for order in algos:
             info = order.get('info') or {}
@@ -1506,8 +1516,8 @@ class OkxApi(ExchangeApi):
     # conditional，但人工 reduce-only iceberg/twap 同样可能在未来新仓上执行，
     # 不能因“不像止损”就在 stale-order 清单里隐身。
     ALGO_ORDER_TYPES = (
-        'conditional', 'oco', 'trigger', 'move_order_stop', 'iceberg', 'twap',
-        'chase')
+        'conditional', 'oco', 'trigger', 'move_order_stop', 'iceberg',
+        'smart_iceberg', 'twap', 'chase')
     ALGO_PAGE_LIMIT = 100
     ALGO_MAX_PAGES = 100
     ALGO_CANCEL_BATCH_LIMIT = 10
@@ -1540,10 +1550,13 @@ class OkxApi(ExchangeApi):
         seen_cursors = set()
         after = None
         for _page in range(self.ALGO_MAX_PAGES):
-            params = {
-                'ordType': ord_type, 'instId': inst_id,
-                'limit': str(self.ALGO_PAGE_LIMIT),
-            }
+            params = {'ordType': ord_type, 'limit': str(self.ALGO_PAGE_LIMIT)}
+            if inst_id:
+                params['instId'] = inst_id
+            else:
+                # OKX 官方接口把 instId 定义为可选；按 SWAP 全账户读取后在本地
+                # 分组，完整性仍由“全类型 + 全分页 + 信封校验”共同证明。
+                params['instType'] = 'SWAP'
             if after is not None:
                 params['after'] = after
             resp = self.exchange.privateGetTradeOrdersAlgoPending(params)
@@ -1573,6 +1586,16 @@ class OkxApi(ExchangeApi):
         raise RuntimeError(
             f'算法单分页超过 {self.ALGO_MAX_PAGES} 页(ordType={ord_type})')
 
+    @staticmethod
+    def _normalize_algo_order(item):
+        return {
+            'id': str(item.get('algoId') or ''),
+            'clientOrderId': str(item.get('algoClOrdId') or ''),
+            'side': item.get('side'),
+            'reduceOnly': item.get('reduceOnly') in (True, 'true'),
+            'info': item,
+        }
+
     def _fetch_algo_orders(self, ccxt_symbol):
         """查询未触发的算法/条件单——直调 OKX 原生 orders-algo-pending 端点。
 
@@ -1589,14 +1612,31 @@ class OkxApi(ExchangeApi):
         orders = []
         for ord_type in self.ALGO_ORDER_TYPES:
             for item in self._fetch_algo_pending_raw(inst_id, ord_type):
-                orders.append({
-                    'id': str(item.get('algoId') or ''),
-                    'clientOrderId': str(item.get('algoClOrdId') or ''),
-                    'side': item.get('side'),
-                    'reduceOnly': item.get('reduceOnly') in (True, 'true'),
-                    'info': item,
-                })
+                orders.append(self._normalize_algo_order(item))
         return orders
+
+    def fetch_stop_order_snapshot(self, symbols):
+        """以 8 类算法单全账户快照替代“每个持仓分别查询 8 次”。
+
+        任一类型、任一页或任一响应项不可验证就整体抛出；调用方随后回退原来的
+        逐品种权威查询。因此优化只减少成功路径的重复 GET，不会把查询失败降级
+        为“没有止损”，也不改变 mismatch/missing/adoptable/intact 的裁决代码。
+        """
+        requested = sorted({self._resolve_symbol(symbol) for symbol in symbols})
+        if not requested:
+            return {}
+        by_inst_id = {self._to_inst_id(symbol): symbol for symbol in requested}
+        snapshot = {symbol: [] for symbol in requested}
+        for ord_type in self.ALGO_ORDER_TYPES:
+            for item in self._fetch_algo_pending_raw(None, ord_type):
+                inst_id = item.get('instId')
+                if not isinstance(inst_id, str) or not inst_id:
+                    raise RuntimeError(
+                        f'全账户算法单快照项缺少 instId(ordType={ord_type})')
+                symbol = by_inst_id.get(inst_id)
+                if symbol is not None:
+                    snapshot[symbol].append(self._normalize_algo_order(item))
+        return {symbol: tuple(orders) for symbol, orders in snapshot.items()}
 
     @retry_on_network_error(max_retries=3)
     def _fetch_normal_pending_raw(self, inst_id):

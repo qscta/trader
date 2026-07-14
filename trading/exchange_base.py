@@ -58,7 +58,8 @@ class ExchangeApi:
 
     子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
     close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
-    round_quantity、get_quantity_precision。
+    round_quantity、get_quantity_precision、list_position_symbols、
+    fetch_stop_order_snapshot。
 
     可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。
 
@@ -119,12 +120,22 @@ class ExchangeApi:
         """开仓前的一次性准备（如设置杠杆/保证金模式）。默认无操作。"""
         return None
 
-    def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
+    def find_stop_order_state(self, symbol, side, amount, stop_price,
+                              stop_order_id=None, algo_orders=None):
         """检查止损：intact/adoptable/mismatch/missing 四种结果。"""
         raise NotImplementedError
 
     def list_position_symbols(self):
         """交易所端当前有实际持仓的内部符号列表（启动孤儿仓核对用）。"""
+        raise NotImplementedError
+
+    def fetch_stop_order_snapshot(self, symbols):
+        """一次取得多个品种的完整待触发算法单快照。
+
+        返回 ``{ccxt_symbol: tuple(order, ...)}``，且必须包含每个请求品种的键；
+        空元组表示已经完整证明该品种没有待触发算法单。任何分页或类型查询不完整
+        都必须抛出，调用方会回退到逐品种权威查询，绝不能把部分清单当成空清单。
+        """
         raise NotImplementedError
 
     # ===================== 交易所无关的通用实现 =====================

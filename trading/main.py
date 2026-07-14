@@ -663,27 +663,23 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self, symbol, reason, details=None, *, notify=True,
             stop_residue_possible=False):
         """隔离仓位不一致品种；磁盘故障时至少保住本进程阻断。"""
-        check = getattr(self.trade_state, 'is_position_quarantined', None)
-        mark = getattr(self.trade_state, 'mark_position_quarantine', None)
-        previous = bool(check(symbol)) if callable(check) else False
+        previous = bool(self.trade_state.is_position_quarantined(symbol))
         persist_error = None
-        if callable(mark):
+        try:
+            mark_kwargs = (
+                {'stop_residue_possible': True}
+                if stop_residue_possible else {})
+            self.trade_state.mark_position_quarantine(
+                symbol, reason, details, **mark_kwargs)
+        except Exception as exc:
+            persist_error = exc
             try:
-                mark_kwargs = (
-                    {'stop_residue_possible': True}
-                    if stop_residue_possible else {})
-                mark(symbol, reason, details, **mark_kwargs)
-            except Exception as exc:
-                persist_error = exc
-                force_mark = getattr(
-                    self.trade_state, 'force_runtime_mark_position_quarantine', None)
-                if callable(force_mark):
-                    try:
-                        force_mark(symbol, reason, details, **mark_kwargs)
-                    except Exception:
-                        logger.exception(f'{symbol} 运行时隔离也失败')
-                logger.critical(
-                    f'{symbol} 隔离状态落盘失败，已尽力启用运行时隔离: {exc}')
+                self.trade_state.force_runtime_mark_position_quarantine(
+                    symbol, reason, details, **mark_kwargs)
+            except Exception:
+                logger.exception(f'{symbol} 运行时隔离也失败')
+            logger.critical(
+                f'{symbol} 隔离状态落盘失败，已尽力启用运行时隔离: {exc}')
         if notify and not previous:
             msg = f"{symbol} 已进入仓位对账隔离: {reason}"
             if persist_error is not None:
@@ -698,25 +694,21 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def _clear_position_quarantine_after_reconcile(self, symbol):
         # 方向/数量一致还不等于“可解除隔离”：应急余仓可能仍无止损，
         # 或有未知算法单残留。等 guardian 验证/补挂保护后再清。
-        get_position = getattr(self.trade_state, 'get_open_position', None)
-        position = get_position(symbol) if callable(get_position) else None
+        position = self.trade_state.get_open_position(symbol)
         if position and (
                 not position.get('stop_order_id') or
                 position.get('stop_resize_pending')):
             return False
-        has_residue = getattr(self.trade_state, 'has_stop_residue', None)
-        if callable(has_residue) and has_residue(symbol):
+        if self.trade_state.has_stop_residue(symbol):
             return False
-        clear = getattr(self.trade_state, 'clear_position_quarantine', None)
-        if callable(clear) and clear(symbol):
+        if self.trade_state.clear_position_quarantine(symbol):
             logger.warning(f"{symbol} 本地/交易所仓位已重新一致，自动解除隔离")
             return True
         return False
 
     def is_symbol_quarantined(self, symbol):
         """API/executor 可调用的统一隔离查询入口。"""
-        check = getattr(self.trade_state, 'is_position_quarantined', None)
-        return bool(check(symbol)) if callable(check) else False
+        return bool(self.trade_state.is_position_quarantined(symbol))
 
     def _verify_existing_position_or_quarantine(
             self, symbol, local_position, exchange_position, clear_on_match=True):
@@ -810,10 +802,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
                         continue
                     self._clear_position_quarantine_after_reconcile(symbol)
-                    intent_getter = getattr(
-                        self.trade_state, 'get_open_intent', None)
-                    intent = (
-                        intent_getter(symbol) if callable(intent_getter) else None)
+                    intent = self.trade_state.get_open_intent(symbol)
                     if intent and intent.get('side') == local_position.get('side'):
                         self.trade_state.resolve_open_intent(
                             symbol, intent.get('client_order_id'))
@@ -842,18 +831,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             orphans = sorted(exchange_symbols - local_symbols)
             if orphans:
                 for orphan in orphans:
-                    pending_getter = getattr(
-                        self.trade_state, 'get_pending_signal_execution', None)
-                    pending = pending_getter(orphan) if callable(pending_getter) else None
+                    pending = self.trade_state.get_pending_signal_execution(orphan)
                     if (pending and pending.get('strategy') == 'turtle' and
                             self._resume_pending_turtle_execution(orphan, pending)):
                         continue
                     self._quarantine_position_mismatch(
                         orphan, '交易所有仓但本地无账本记录（孤儿仓）')
             # 只有本轮完整反向查询成功才可解除已经实际双边空仓的旧隔离。
-            get_quarantines = getattr(self.trade_state, 'get_position_quarantines', None)
-            quarantined_symbols = (
-                list(get_quarantines().keys()) if callable(get_quarantines) else [])
+            quarantined_symbols = list(
+                self.trade_state.get_position_quarantines().keys())
             for quarantined in quarantined_symbols:
                 if quarantined not in exchange_symbols and quarantined not in local_symbols:
                     self._clear_position_quarantine_after_reconcile(quarantined)
@@ -909,12 +895,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def _save_stop_loss_dates(self):
         """保存 T+1：主账本落盘失败向上抛出，由交易调用链 fail-closed。"""
-        if hasattr(self, 'trade_state') and hasattr(self.trade_state, 'replace_stop_loss_dates'):
-            self.stop_loss_dates = self.trade_state.replace_stop_loss_dates(self.stop_loss_dates)
-            return True
-        # 仅为老单元测试的 __new__ 最小桩保留兼容；生产必走主账本。
-        if not atomic_write_json(self.stop_loss_file, self.stop_loss_dates):
-            raise TradeStatePersistenceError(f'保存 T+1 状态失败: {self.stop_loss_file}')
+        self.stop_loss_dates = self.trade_state.replace_stop_loss_dates(
+            self.stop_loss_dates)
         return True
 
     def is_stop_loss_today(self, symbol):
@@ -1296,10 +1278,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 planned_value = float(planned)
                 if not math.isfinite(planned_value) or planned_value <= 0:
                     raise ValueError(f'非法 planned_position_size={planned!r}')
-                finder = getattr(self.exchange_api, 'find_existing_open_order', None)
-                if not callable(finder):
-                    raise RuntimeError('交易所适配层缺少旧 clOrdId 只读查询')
-                order = finder(
+                order = self.exchange_api.find_existing_open_order(
                     self.exchange_api.to_ccxt_symbol(symbol), side,
                     planned_value, execution.get('client_order_id'))
             except Exception as exc:
@@ -1376,8 +1355,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def _reconcile_all_pending_turtle_executions(self, context):
         """主动枚举所有 pending，返回仍未收口的品种集合。"""
-        getter = getattr(self.trade_state, 'get_pending_signal_executions', None)
-        pending_by_symbol = getter() if callable(getter) else {}
+        pending_by_symbol = self.trade_state.get_pending_signal_executions()
         unresolved = set()
         for symbol, execution in sorted(pending_by_symbol.items()):
             if execution.get('strategy') != 'turtle':
@@ -1595,8 +1573,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return False
 
     def _reconcile_all_open_intents(self, context):
-        getter = getattr(self.trade_state, 'get_open_intents', None)
-        intents = getter() if callable(getter) else {}
+        intents = self.trade_state.get_open_intents()
         unresolved = set()
         for symbol, intent in sorted(intents.items()):
             if self.trade_state.get_open_position(symbol):
@@ -1734,9 +1711,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def _mark_daily_check_complete(self, check_date):
         """先持久化调度日，成功后再更新内存守卫。"""
-        setter = getattr(self.trade_state, 'set_last_daily_check_date', None)
-        if callable(setter):
-            setter(check_date)
+        self.trade_state.set_last_daily_check_date(check_date)
         self._last_check_date = check_date
 
     def check_and_execute_trades(self, manual_run=False, scheduled_date=None):
@@ -1745,6 +1720,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if not self._trade_lock.acquire(blocking=False):
             logger.warning("交易检查正在执行中(锁冲突)，跳过本次触发")
             return
+        check_started = time.monotonic()
         try:
             today = scheduled_date or date.today().isoformat()
             if self._last_check_date == today and not manual_run:
@@ -1767,13 +1743,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             # 快照视图（与盘中巡检同一模式）：循环中途 API 增删品种不影响本轮的
             # 一致性，也免去逐品种重扫池子
             all_open_positions = self.trade_state.get_all_open_positions()
-            pending_getter = getattr(
-                self.trade_state, 'get_pending_signal_executions', None)
             pending_after_reconcile = (
-                pending_getter() if callable(pending_getter) else {})
-            intent_getter = getattr(self.trade_state, 'get_open_intents', None)
-            intents_after_reconcile = (
-                intent_getter() if callable(intent_getter) else {})
+                self.trade_state.get_pending_signal_executions())
+            intents_after_reconcile = self.trade_state.get_open_intents()
             symbol_config_map = {s['name']: s for s in self.config['trading']['symbols']}
             symbols_to_check = {name for name, s in symbol_config_map.items() if s.get('enabled', True)}
             symbols_to_check.update(all_open_positions.keys())
@@ -1784,6 +1756,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
             self._retry_clear_stop_residues()
+
+            # 一轮只读取一次全账户算法单清单，再按品种使用同一套四态裁决。
+            # 全局查询任一类型/分页失败时 helper 返回 None，后续自动走原来的
+            # 逐品种完整查询；性能优化绝不改变 fail-closed 结论。
+            stop_orders_snapshot = self._load_stop_order_snapshot(
+                all_open_positions, '日检')
 
             # 账本瘦身：超出保留窗口的平仓历史搬进只追加的史书文件（失败不影响交易）
             try:
@@ -1828,6 +1806,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     # 每一轮正常调度都重新核对仓位现实，不把安全性只寄托在启动时。
                     # 查询失败也必须持久化隔离：未知不等于空仓。
                     local_position = self.trade_state.get_open_position(symbol)
+                    stop_snapshot_valid = True
                     if local_position:
                         close_recovery = self._resume_persisted_close_intent(
                             symbol, local_position, '日检对账')
@@ -1838,6 +1817,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             local_position = None
                         elif close_recovery == 'partial':
                             local_position = self.trade_state.get_open_position(symbol)
+                            # 恢复部分平仓可能已经重挂缩量止损，轮初快照失效。
+                            stop_snapshot_valid = False
                     try:
                         exchange_position = self.exchange_api.get_position(ccxt_symbol)
                     except Exception as exc:
@@ -1853,17 +1834,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             continue
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position,
-                                self._get_strategy_display_name(strategy_type)):
+                                self._get_strategy_display_name(strategy_type),
+                                algo_orders=(
+                                    stop_orders_snapshot[ccxt_symbol]
+                                    if (stop_snapshot_valid and
+                                        stop_orders_snapshot is not None and
+                                        local_position.get('stop_loss_price'))
+                                    else None)):
                             self._quarantine_position_mismatch(
                                 symbol, '日检仓位一致但止损保护未能严格确认')
                             failed_symbols.append(symbol)
                             continue
                         self._clear_position_quarantine_after_reconcile(symbol)
-                        intent_getter = getattr(
-                            self.trade_state, 'get_open_intent', None)
-                        intent = (
-                            intent_getter(symbol)
-                            if callable(intent_getter) else None)
+                        intent = self.trade_state.get_open_intent(symbol)
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
@@ -2146,9 +2129,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     failed_symbols.append(symbol)
 
             try:
-                pruner = getattr(self.trade_state, 'prune_inactive_symbol_metadata', None)
-                removed_metadata = (
-                    pruner(symbol_config_map.keys()) if callable(pruner) else [])
+                removed_metadata = self.trade_state.prune_inactive_symbol_metadata(
+                    symbol_config_map.keys())
                 if removed_metadata:
                     logger.info(
                         f"已清理 {len(removed_metadata)} 个退池且无仓品种的信号元数据: "
@@ -2200,7 +2182,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._pending_trade_close_notifications = []
             self._pending_stop_loss_updates = []
             self._trade_lock.release()
-            logger.info("交易检查锁已释放")
+            logger.info(
+                f"交易检查锁已释放，总耗时={time.monotonic() - check_started:.2f}s")
 
 
     def _catchup_schedule_slot(self, now):

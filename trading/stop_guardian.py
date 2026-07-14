@@ -11,6 +11,7 @@ _stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_dis
 
 import logging
 import math
+import time
 from datetime import date, datetime
 
 from trade_state import TradeStatePersistenceError
@@ -21,6 +22,50 @@ logger = logging.getLogger(__name__)
 class StopGuardianMixin:
 
     STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 10
+
+    def _load_stop_order_snapshot(self, positions, context):
+        """读取本轮共享的完整止损快照；失败时明确回退逐品种查询。
+
+        ``None`` 专门表示“快照不可用，必须走旧的逐品种权威查询”；空字典只在
+        本轮没有需要核验止损的持仓时返回。缺键/坏形状不能被解释成空清单。
+        """
+        try:
+            symbols = sorted({
+                self.exchange_api.to_ccxt_symbol(symbol)
+                for symbol, position in positions.items()
+                if position.get('stop_loss_price')
+            })
+            if not symbols:
+                return {}
+        except Exception as exc:
+            logger.warning(
+                f'{context}无法建立算法单批量快照范围，回退逐品种查询: {exc}')
+            return None
+
+        # 缺少该正式接口属于装配错误，不能被当作普通网络抖动静默掩盖。
+        fetch_snapshot = self.exchange_api.fetch_stop_order_snapshot
+        try:
+            started = time.monotonic()
+            snapshot = fetch_snapshot(symbols)
+            if not isinstance(snapshot, dict) or set(snapshot) != set(symbols):
+                raise RuntimeError(
+                    f'快照键不完整: expected={symbols}, '
+                    f'observed={sorted(snapshot) if isinstance(snapshot, dict) else type(snapshot).__name__}')
+            if any(not isinstance(orders, (list, tuple)) or
+                   not all(isinstance(order, dict) for order in orders)
+                   for orders in snapshot.values()):
+                raise RuntimeError('快照订单列表形状非法')
+            logger.info(
+                f'{context}算法单批量快照完成: 品种={len(symbols)}, '
+                f'订单={sum(len(orders) for orders in snapshot.values())}, '
+                f'耗时={time.monotonic() - started:.2f}s')
+            return snapshot
+        except Exception as exc:
+            # 快照优化不承载安全语义：任何不确定都退回已经验证过的逐品种全类型、
+            # 全分页查询。绝不能返回 {}，否则会把查询失败伪装成 missing 并补挂。
+            logger.warning(
+                f'{context}算法单批量快照失败，回退逐品种完整查询: {exc}')
+            return None
 
     def reconcile_intraday_stop_losses(self):
         """盘中巡检：发现本地有仓而交易所端已无仓时，立即按止损/外部平仓处理并通知。"""
@@ -46,6 +91,9 @@ class StopGuardianMixin:
             if not open_positions:
                 return
 
+            stop_orders_snapshot = self._load_stop_order_snapshot(
+                open_positions, '盘中巡检')
+
             logger.debug(f"开始盘中止损巡检，当前本地持仓数: {len(open_positions)}")
             symbol_configs = {s['name']: s for s in self.config['trading']['symbols']}
 
@@ -53,7 +101,8 @@ class StopGuardianMixin:
                 # 单品种异常只跳过该品种，不得中断其余品种的巡检（与日检同一隔离标准）：
                 # 止损自愈补挂/撤单确认都可能抛出（如面值不可得、撤单重试耗尽）
                 try:
-                    self._reconcile_symbol_intraday(symbol, position, symbol_configs)
+                    self._reconcile_symbol_intraday(
+                        symbol, position, symbol_configs, stop_orders_snapshot)
                 except Exception as sym_e:
                     logger.exception(f"{symbol} 盘中止损巡检单品种异常，跳过该品种继续: {sym_e}")
         except Exception as e:
@@ -63,12 +112,9 @@ class StopGuardianMixin:
 
     def _reconcile_intraday_orphans(self, local_positions):
         """盘中反向核对交易所额外持仓；查询未知也按 fail-closed 隔离空仓品种。"""
-        list_symbols = getattr(self.exchange_api, 'list_position_symbols', None)
-        if not callable(list_symbols):
-            return
         local_symbols = set(local_positions)
         try:
-            exchange_symbols = set(list_symbols())
+            exchange_symbols = set(self.exchange_api.list_position_symbols())
         except Exception as exc:
             # 无法证明空仓品种真的空仓，就不能允许它继续新开。已有本地仓仍由
             # 下方逐仓查询/止损巡检处理，不因反向清单失败而整体中断。
@@ -80,27 +126,23 @@ class StopGuardianMixin:
             return
 
         for symbol in sorted(exchange_symbols - local_symbols):
-            intent_getter = getattr(self.trade_state, 'get_open_intent', None)
-            intent = intent_getter(symbol) if callable(intent_getter) else None
-            resume_intent = getattr(self, '_resume_open_intent_position', None)
-            if intent and callable(resume_intent) and resume_intent(symbol, intent):
+            intent = self.trade_state.get_open_intent(symbol)
+            if intent and self._resume_open_intent_position(symbol, intent):
                 continue
-            pending_getter = getattr(
-                self.trade_state, 'get_pending_signal_execution', None)
-            pending = pending_getter(symbol) if callable(pending_getter) else None
+            pending = self.trade_state.get_pending_signal_execution(symbol)
             if (pending and pending.get('strategy') == 'turtle' and
                     self._resume_pending_turtle_execution(symbol, pending)):
                 continue
             self._quarantine_position_mismatch(
                 symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
 
-        get_quarantines = getattr(self.trade_state, 'get_position_quarantines', None)
-        quarantines = list(get_quarantines()) if callable(get_quarantines) else []
+        quarantines = list(self.trade_state.get_position_quarantines())
         for symbol in quarantines:
             if symbol not in exchange_symbols and symbol not in local_symbols:
                 self._clear_position_quarantine_after_reconcile(symbol)
 
-    def _reconcile_symbol_intraday(self, symbol, position, symbol_configs):
+    def _reconcile_symbol_intraday(
+            self, symbol, position, symbol_configs, stop_orders_snapshot=None):
         """单品种盘中巡检：持仓核对 + 止损自愈 + 交易所端已平的记账。异常由调用方按品种隔离。"""
         close_recovery = self._resume_persisted_close_intent(
             symbol, position, '盘中巡检')
@@ -110,6 +152,8 @@ class StopGuardianMixin:
             position = self.trade_state.get_open_position(symbol)
             if not position:
                 return
+            # 部分平仓恢复可能已缩量并重挂止损；轮初快照在该品种上已经过期。
+            stop_orders_snapshot = None
         symbol_config = symbol_configs.get(symbol, {
             'name': symbol,
             'enabled': True,
@@ -129,16 +173,15 @@ class StopGuardianMixin:
             return
 
         if exchange_position is not None and exchange_position.get('contracts', 0) > 0:
-            verifier = getattr(self, '_verify_existing_position_or_quarantine', None)
-            if callable(verifier) and not verifier(
+            if not self._verify_existing_position_or_quarantine(
                     symbol, position, exchange_position, clear_on_match=False):
                 return
             protected = self._ensure_stop_order_alive(
-                symbol, ccxt_symbol, position, strategy_name)
+                symbol, ccxt_symbol, position, strategy_name,
+                algo_orders=(None if stop_orders_snapshot is None
+                             else stop_orders_snapshot[ccxt_symbol]))
             if protected:
-                clear = getattr(self, '_clear_position_quarantine_after_reconcile', None)
-                if callable(clear):
-                    clear(symbol)
+                self._clear_position_quarantine_after_reconcile(symbol)
             return
 
         logger.warning(f"{symbol} [{strategy_name}] 盘中巡检发现交易所端已无持仓，按止损/外部平仓处理")
@@ -167,7 +210,9 @@ class StopGuardianMixin:
         else:
             logger.info(f"{symbol} [双均线] 盘中止损巡检已与平仓同事务记录 T+1 限制")
 
-    def _ensure_stop_order_alive(self, symbol, ccxt_symbol, position, strategy_name):
+    def _ensure_stop_order_alive(
+            self, symbol, ccxt_symbol, position, strategy_name,
+            algo_orders=None):
         """止损自愈：本地与交易所都有仓时，确认止损单仍挂在交易所；丢失则按本地止损价补挂。
 
         覆盖「建新止损失败 / 人工误撤 / 交易所端丢单」等任何原因的止损缺失——巡检周期内
@@ -182,6 +227,8 @@ class StopGuardianMixin:
                     symbol, ccxt_symbol, position, strategy_name):
                 return False
             position = self.trade_state.get_open_position(symbol) or position
+            # resize 会撤旧/挂新，调用前取得的共享快照不能再用于本品种裁决。
+            algo_orders = None
         residue_present = self.trade_state.has_stop_residue(symbol)
         stop_price = position.get('stop_loss_price')
         if not stop_price:
@@ -192,7 +239,7 @@ class StopGuardianMixin:
             state_result = self.exchange_api.find_stop_order_state(
                 ccxt_symbol, position.get('side'),
                 position.get('stop_order_size') or position.get('position_size'),
-                stop_price, stop_order_id)
+                stop_price, stop_order_id, algo_orders=algo_orders)
         except Exception as e:
             logger.warning(f"{symbol} [{strategy_name}] 止损存在性检查失败，跳过本轮: {e}")
             return False
@@ -255,14 +302,11 @@ class StopGuardianMixin:
             logger.critical(msg)
             first_mismatch = self._stop_anomalies.get(symbol) != 'mismatch'
             self._stop_anomalies[symbol] = 'mismatch'
-            quarantine = getattr(self, '_quarantine_position_mismatch', None)
-            if first_mismatch and callable(quarantine):
-                quarantine(
+            if first_mismatch:
+                self._quarantine_position_mismatch(
                     symbol, '止损单存在多张或内容歧义，禁止自动补挂/新开仓',
                     {'recorded_stop_order_id': stop_order_id},
                     stop_residue_possible=True)
-            elif first_mismatch:
-                self.notifier.notify_error(msg)
             return False
 
         if residue_present:
@@ -282,19 +326,11 @@ class StopGuardianMixin:
             msg = f"{symbol} 持仓缺少止损单且自动补挂失败，仓位暂无止损保护，请立即人工处理！"
             logger.critical(msg)
             self._stop_anomalies[symbol] = 'replant_failed'
-            quarantine = getattr(self, '_quarantine_position_mismatch', None)
-            if callable(quarantine):
-                # 隔离入口负责首轮告警和持久化去重；这里再单独通知会让同一故障
-                # 在一次巡检中连续发送两条错误消息。
-                quarantine(
-                    symbol, '持仓缺少止损且自动补挂失败',
-                    stop_residue_possible=True)
-            else:
-                try:
-                    self.trade_state.mark_stop_residue(symbol)
-                except Exception as exc:
-                    logger.critical(f'{symbol} 补挂失败后的未知止损标记失败: {exc}')
-                self.notifier.notify_error(msg)
+            # 隔离入口负责首轮告警和持久化去重；这里再单独通知会让同一故障
+            # 在一次巡检中连续发送两条错误消息。
+            self._quarantine_position_mismatch(
+                symbol, '持仓缺少止损且自动补挂失败',
+                stop_residue_possible=True)
             return False
         self._stop_anomalies.pop(symbol, None)
         updated, _saved = self._update_trade_state_stop_with_runtime_fallback(
@@ -316,14 +352,7 @@ class StopGuardianMixin:
         new_stop = self.exchange_api.create_stop_loss_order(
             ccxt_symbol, position['side'], remaining, stop_price)
         if not new_stop or not new_stop.get('id'):
-            marker = getattr(self, '_mark_possible_unknown_stop_residue', None)
-            if callable(marker):
-                marker(symbol)
-            else:
-                try:
-                    self.trade_state.mark_stop_residue(symbol)
-                except Exception as exc:
-                    logger.critical(f'{symbol} 止损缩量失败后的未知单标记失败: {exc}')
+            self._mark_possible_unknown_stop_residue(symbol)
             anomaly = 'partial_stop_resize_failed'
             if self._stop_anomalies.get(symbol) != anomaly:
                 self.notifier.notify_error(
@@ -378,15 +407,12 @@ class StopGuardianMixin:
         确认成功时顺带解除该品种的残留标记。
         """
         residue_present = False
-        residue_check = getattr(self.trade_state, 'has_stop_residue', None)
-        if callable(residue_check):
-            try:
-                residue_present = bool(residue_check(symbol))
-            except Exception:
-                residue_present = True
+        try:
+            residue_present = bool(self.trade_state.has_stop_residue(symbol))
+        except Exception:
+            residue_present = True
         if extra_order_ids is None:
-            getter = getattr(self.trade_state, 'get_open_position', None)
-            current = getter(symbol) if callable(getter) else None
+            current = self.trade_state.get_open_position(symbol)
             extra_order_ids = (current or {}).get('extra_stop_order_ids') or []
         order_ids = []
         for value in [stop_order_id] + list(extra_order_ids or []):
@@ -424,13 +450,10 @@ class StopGuardianMixin:
             self.trade_state.mark_stop_residue(symbol)
         except Exception as exc:
             residue_persist_error = exc
-            force_mark = getattr(
-                self.trade_state, 'force_runtime_mark_stop_residue', None)
-            if callable(force_mark):
-                try:
-                    force_mark(symbol)
-                except Exception:
-                    logger.exception(f'{symbol} 运行时止损残留标记也失败')
+            try:
+                self.trade_state.force_runtime_mark_stop_residue(symbol)
+            except Exception:
+                logger.exception(f'{symbol} 运行时止损残留标记也失败')
         msg = (f"{symbol} 旧止损单撤销无法确认，可能残留！已阻断该品种新开仓，"
                f"系统将在每日检查时自动重试清理；请人工核对欧易当前委托")
         if residue_persist_error is not None:
@@ -687,8 +710,6 @@ class StopGuardianMixin:
                f"已执行运行时补偿，请立即核对交易所持仓、止损单和本地状态。")
         logger.critical(msg)
         self.notifier.notify_error(msg)
-        quarantine = getattr(self, '_quarantine_position_mismatch', None)
-        if callable(quarantine):
-            quarantine(
-                symbol, f'{context}后磁盘状态未收口，仅完成运行时补偿',
-                {'persistence_error': str(exc)}, notify=False)
+        self._quarantine_position_mismatch(
+            symbol, f'{context}后磁盘状态未收口，仅完成运行时补偿',
+            {'persistence_error': str(exc)}, notify=False)
