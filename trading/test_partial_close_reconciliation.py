@@ -13,11 +13,13 @@ from trade_state import TradeState, TradeStatePersistenceError
 
 
 class _System(TradeExecutorMixin):
-    pass
+    def __init__(self):
+        self.stop_loss_dates = {}
 
 
 class _GuardianSystem(StopGuardianMixin, TradeExecutorMixin):
-    pass
+    def __init__(self):
+        self.stop_loss_dates = {}
 
 
 class PartialCloseReconciliationTest(unittest.TestCase):
@@ -542,6 +544,10 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             system = _System()
             state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
             state.replace_stop_loss_dates({'BTCUSDT': '2026-07-10'})
+            state.prepare_open_intent(
+                'BTCUSDT', 'turtle', 'long', 'IPERSISTFAIL',
+                {'entry_price': 100.0, 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
             system.trade_state = state
             system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
             rollback = {
@@ -552,6 +558,8 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             }
             system.exchange_api = SimpleNamespace(
                 close_position=Mock(return_value=rollback),
+                compensation_client_order_id=(
+                    lambda open_client_id: f'R{open_client_id[:31]}'),
                 create_stop_loss_order=Mock(),
                 get_last_price=Mock(return_value=99.0),
             )
@@ -570,7 +578,8 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 saved = system._persist_open_position_or_rollback(
                     'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0,
                     90.0, 'stop-original', strategy='turtle',
-                    open_order=open_order)
+                    open_order=open_order,
+                    open_intent_client_id='IPERSISTFAIL')
 
             self.assertEqual('rollback_incomplete', saved['status'])
             position = state.get_open_position('BTCUSDT')
@@ -583,6 +592,9 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertNotIn('BTCUSDT', state.get_stop_loss_dates())
             self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             system.exchange_api.create_stop_loss_order.assert_not_called()
+            system.exchange_api.close_position.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', 1.0,
+                client_order_id='RIPERSISTFAIL')
             system._cancel_stop_order_confirmed.assert_not_called()
             system._notify_trade_state_persistence_issue.assert_called_once()
 

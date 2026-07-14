@@ -1570,6 +1570,20 @@ class OkxApi(ExchangeApi):
                 if not isinstance(item, dict) or not item.get('algoId'):
                     raise RuntimeError(
                         f'算法单分页项缺少 algoId(ordType={ord_type})')
+                for field, expected in (
+                        ('ordType', ord_type), ('instType', 'SWAP')):
+                    if item.get(field) != expected:
+                        raise RuntimeError(
+                            f'算法单响应 {field} 不匹配: '
+                            f'expected={expected}, actual={item.get(field)}')
+                actual_inst_id = item.get('instId')
+                if not isinstance(actual_inst_id, str) or not actual_inst_id:
+                    raise RuntimeError(
+                        f'算法单分页项缺少 instId(ordType={ord_type})')
+                if inst_id is not None and actual_inst_id != inst_id:
+                    raise RuntimeError(
+                        f'算法单响应 instId 不匹配: '
+                        f'expected={inst_id}, actual={actual_inst_id}')
                 algo_id = str(item['algoId'])
                 page_ids.append(algo_id)
                 if algo_id not in seen_ids:
@@ -1629,11 +1643,7 @@ class OkxApi(ExchangeApi):
         snapshot = {symbol: [] for symbol in requested}
         for ord_type in self.ALGO_ORDER_TYPES:
             for item in self._fetch_algo_pending_raw(None, ord_type):
-                inst_id = item.get('instId')
-                if not isinstance(inst_id, str) or not inst_id:
-                    raise RuntimeError(
-                        f'全账户算法单快照项缺少 instId(ordType={ord_type})')
-                symbol = by_inst_id.get(inst_id)
+                symbol = by_inst_id.get(item['instId'])
                 if symbol is not None:
                     snapshot[symbol].append(self._normalize_algo_order(item))
         return {symbol: tuple(orders) for symbol, orders in snapshot.items()}

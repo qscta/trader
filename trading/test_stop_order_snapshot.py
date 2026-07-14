@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import _test_stubs
 
@@ -52,9 +52,34 @@ class StopOrderSnapshotTest(unittest.TestCase):
         snapshot = system._load_stop_order_snapshot(
             self._positions(), '测试巡检')
 
-        self.assertEqual(expected, snapshot)
+        self.assertEqual(expected, snapshot.orders)
         system.exchange_api.fetch_stop_order_snapshot.assert_called_once_with(
             ['BTC/USDT:USDT', 'ETH/USDT:USDT'])
+
+    def test_expired_snapshot_falls_back_to_live_per_symbol_query(self):
+        system = self._system()
+        expected = {
+            'BTC/USDT:USDT': ({'id': 'btc-stop'},),
+            'ETH/USDT:USDT': ({'id': 'eth-stop'},),
+        }
+        system.exchange_api.fetch_stop_order_snapshot.return_value = expected
+        snapshot = system._load_stop_order_snapshot(
+            self._positions(), '测试巡检')
+
+        with patch(
+                'stop_guardian.time.monotonic',
+                return_value=(snapshot.started_at +
+                              system.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS + 0.01)):
+            self.assertIsNone(system._orders_from_stop_snapshot(
+                snapshot, 'BTC/USDT:USDT'))
+
+        system.exchange_api.find_stop_order_state.return_value = 'intact'
+        self.assertTrue(system._ensure_stop_order_alive(
+            'BTCUSDT', 'BTC/USDT:USDT', self._positions()['BTCUSDT'],
+            '测试策略', algo_orders=None))
+        self.assertIsNone(
+            system.exchange_api.find_stop_order_state.call_args.kwargs[
+                'algo_orders'])
 
     def test_partial_or_malformed_snapshot_falls_back_instead_of_assuming_empty(self):
         system = self._system()
@@ -100,6 +125,38 @@ class StopOrderSnapshotTest(unittest.TestCase):
         self.assertIsNone(
             system.exchange_api.find_stop_order_state.call_args.kwargs[
                 'algo_orders'])
+
+
+class CompensationContractTest(unittest.TestCase):
+    def test_compensation_close_always_uses_derived_client_order_id(self):
+        system = TradingSystem.__new__(TradingSystem)
+        system.exchange_api = SimpleNamespace(
+            compensation_client_order_id=Mock(return_value='Rstable'),
+            close_position=Mock(return_value={'id': 'close-1'}),
+        )
+
+        result = system._submit_compensation_close(
+            'BTC/USDT:USDT', 'long', 1.0,
+            open_client_order_id='Istable')
+
+        self.assertEqual({'id': 'close-1'}, result)
+        system.exchange_api.compensation_client_order_id.assert_called_once_with(
+            'Istable')
+        system.exchange_api.close_position.assert_called_once_with(
+            'BTC/USDT:USDT', 'long', 1.0,
+            client_order_id='Rstable')
+
+    def test_missing_compensation_id_contract_never_posts_unkeyed_close(self):
+        system = TradingSystem.__new__(TradingSystem)
+        close_position = Mock()
+        system.exchange_api = SimpleNamespace(close_position=close_position)
+
+        with self.assertRaises(AttributeError):
+            system._submit_compensation_close(
+                'BTC/USDT:USDT', 'long', 1.0,
+                open_client_order_id='Istable')
+
+        close_position.assert_not_called()
 
 
 if __name__ == '__main__':

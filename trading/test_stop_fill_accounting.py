@@ -6,8 +6,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from main import TradingSystem
+import _test_stubs
 from trade_state import TradeState, TradeStatePersistenceError
+
+TradingSystem = _test_stubs.import_main().TradingSystem
 
 
 class StopFillAccountingIntegrationTest(unittest.TestCase):

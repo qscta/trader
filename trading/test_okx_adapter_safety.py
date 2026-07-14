@@ -64,11 +64,13 @@ def _bare_api():
 
 
 def _native_stop(algo_id='stop-1', side='sell', sz='10', px='55000',
-                 client_id='', inst_id=None):
+                 client_id='', inst_id='BTC-USDT-SWAP',
+                 ord_type='conditional', inst_type='SWAP'):
     """OKX orders-algo-pending 原生响应里的一条 conditional 止损单。"""
     item = {'algoId': algo_id, 'algoClOrdId': client_id, 'side': side,
             'sz': sz, 'slTriggerPx': px, 'slOrdPx': '-1',
-            'ordType': 'conditional', 'reduceOnly': 'true'}
+            'ordType': ord_type, 'instType': inst_type,
+            'reduceOnly': 'true'}
     if inst_id is not None:
         item['instId'] = inst_id
     return item
@@ -842,7 +844,9 @@ class FetchAlgoNativeTest(unittest.TestCase):
             return _algo_stub({
                 'conditional': [_native_stop()],
                 'trigger': [{'algoId': 'manual-1', 'side': 'buy', 'sz': '2',
-                             'triggerPx': '60000', 'ordType': 'trigger'}],
+                             'triggerPx': '60000', 'ordType': 'trigger',
+                             'instType': 'SWAP',
+                             'instId': 'BTC-USDT-SWAP'}],
             })(params)
 
         api.exchange.privateGetTradeOrdersAlgoPending.side_effect = record
@@ -894,7 +898,7 @@ class FetchAlgoNativeTest(unittest.TestCase):
         """全账户项不能归属品种时，整份快照无效，绝不把它漏成空清单。"""
         api = _bare_api()
         api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub({
-            'conditional': [_native_stop()],
+            'conditional': [_native_stop(inst_id=None)],
         })
 
         with self.assertRaises(RuntimeError):
@@ -911,6 +915,21 @@ class FetchAlgoNativeTest(unittest.TestCase):
         api.exchange.privateGetTradeOrdersAlgoPending.side_effect = fail_one_type
         with self.assertRaises(RuntimeError):
             api.fetch_stop_order_snapshot(['BTCUSDT', 'ETHUSDT'])
+
+    def test_rejects_semantically_wrong_algo_response_scope(self):
+        """正确形状但答错 ordType/品种/市场也必须整轮失败。"""
+        bad_items = (
+            _native_stop(ord_type='trigger'),
+            _native_stop(inst_id='ETH-USDT-SWAP'),
+            _native_stop(inst_type='SPOT'),
+        )
+        for item in bad_items:
+            with self.subTest(item=item):
+                api = _bare_api()
+                api.exchange.privateGetTradeOrdersAlgoPending.side_effect = (
+                    _algo_stub({'conditional': [item]}))
+                with self.assertRaises(RuntimeError):
+                    api._fetch_algo_orders('BTC/USDT:USDT')
 
     def test_bad_envelope_raises(self):
         """交易所返回非成功信封（code!='0' / data 非数组）：必须抛出，绝不当空清单。"""

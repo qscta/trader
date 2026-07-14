@@ -58,11 +58,11 @@ class TradeExecutorMixin:
         return total, 'USDT'
 
     @staticmethod
-    def _order_actual_amount(order, fallback):
-        """读取适配层确认的实际成交币数；兼容未升级的测试桩/其他适配器。"""
+    def _order_actual_amount(order):
+        """严格读取适配层已确认的实际成交币数。"""
         value = order.get('amount') if isinstance(order, dict) else None
         if value is None:
-            return fallback
+            return None
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -165,11 +165,9 @@ class TradeExecutorMixin:
                 open_order.get('clientOrderId') or
                 open_order.get('client_order_id'))
         open_client_id = open_client_id or fallback
-        builder = getattr(
-            self.exchange_api, 'compensation_client_order_id', None)
-        if not open_client_id or not callable(builder):
+        if not open_client_id:
             return None
-        return builder(open_client_id)
+        return self.exchange_api.compensation_client_order_id(open_client_id)
 
     def _submit_compensation_close(
             self, ccxt_symbol, side, amount, open_order=None,
@@ -178,13 +176,6 @@ class TradeExecutorMixin:
         close_id = self._compensation_close_client_id(
             open_order, open_client_order_id)
         if close_id is None:
-            if not callable(getattr(
-                    self.exchange_api, 'compensation_client_order_id', None)):
-                # 尚未升级的测试桩/非 OKX 兼容路径；真实 OKX 适配器不得走这里。
-                logger.warning(
-                    f'{ccxt_symbol} 交易所桩缺少补偿 clOrdId 派生能力（兼容路径）')
-                return self.exchange_api.close_position(
-                    ccxt_symbol, side, amount)
             logger.critical(
                 f'{ccxt_symbol} 开仓结果缺少持久化 clOrdId，拒绝无句柄补偿 POST')
             return None
@@ -253,7 +244,7 @@ class TradeExecutorMixin:
             logger.critical(f'{symbol} {context}部分成交数量无法做十进制收口: {e}')
             self._reject_partial_close(symbol, close_order, context)
             return False
-        reported_closed = self._order_actual_amount(close_order, closed_size)
+        reported_closed = self._order_actual_amount(close_order)
         tolerance = max(1e-12, math.ulp(local_size) * 8)
         if reported_closed is None or abs(reported_closed - closed_size) > tolerance:
             logger.critical(
@@ -483,8 +474,8 @@ class TradeExecutorMixin:
     def _cancel_active_stop_ids_only(self, symbol, ccxt_symbol, order_ids):
         """持仓仍在时仅验证式撤指定旧止损，返回未能确认撤销的 ID。
 
-        这里故意不调用通用 ``cancel_order``：其兼容 fallback 可能 cancel-all，
-        会把 make-before-break 刚挂好的新保护一起撤掉。
+        这里不调用同时裁决普通单与算法单的通用 ``cancel_order``；持仓未平时
+        只允许触碰指定算法单，不能扩大撤单范围。
         """
         ids = []
         for value in order_ids or []:
@@ -635,9 +626,7 @@ class TradeExecutorMixin:
             logger.critical(f'{symbol} 部分回滚余仓账本建立失败: {exc}')
             return None, False, protected
 
-        in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-        if isinstance(in_memory_t1, dict):
-            in_memory_t1.pop(symbol, None)
+        self.stop_loss_dates.pop(symbol, None)
         msg = (
             f'{symbol} {context}仅部分成交：交易所余仓={remaining}币，'
             f'账本已按实际余仓建立；'
@@ -716,9 +705,7 @@ class TradeExecutorMixin:
         except Exception as exc:
             logger.critical(f'{symbol} 未决完整余仓账本建立失败: {exc}')
             return None, False, protected
-        in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-        if isinstance(in_memory_t1, dict):
-            in_memory_t1.pop(symbol, None)
+        self.stop_loss_dates.pop(symbol, None)
         msg = (
             f'{symbol} {context}未成交/不可确认：完整余仓 {remaining}币已建账；'
             f'{"reduce-only 止损仍在/已重建" if protected else "应急止损无法建立"}，'
@@ -739,10 +726,8 @@ class TradeExecutorMixin:
         contracts = position.get('contracts')
         if contracts is None:
             raise RuntimeError('回滚复核持仓缺少 contracts')
-        converter = getattr(self.exchange_api, '_contracts_to_coins', None)
-        if not callable(converter):
-            raise RuntimeError('交易所适配层缺少 contracts→coins 换算')
-        return float(converter(ccxt_symbol, abs(float(contracts))))
+        return float(self.exchange_api._contracts_to_coins(
+            ccxt_symbol, abs(float(contracts))))
 
     def _finalize_open_rollback(
             self, symbol, ccxt_symbol, side, entry_price, original_size,
@@ -893,9 +878,7 @@ class TradeExecutorMixin:
                 stop_order_id, strategy=strategy,
                 entry_fee=entry_fee, entry_fee_currency=entry_fee_currency,
                 entry_order_ids=self._order_ids(open_order), **add_kwargs)
-            in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-            if isinstance(in_memory_t1, dict):
-                in_memory_t1.pop(symbol, None)
+            self.stop_loss_dates.pop(symbol, None)
             return True
         except TradeStatePersistenceError as e:
             logger.critical(
@@ -1077,7 +1060,7 @@ class TradeExecutorMixin:
             if not math.isfinite(position_size) or position_size <= 0:
                 logger.critical(f'{symbol} pending 恢复的计划仓位非法: {planned!r}')
                 return
-            account_equity = float(getattr(self.risk_manager, 'account_equity', 0) or 0)
+            account_equity = float(self.risk_manager.account_equity or 0)
             raw_position_size = position_size
             price_risk_pct = (
                 abs(calc_price - stop_loss_price) / calc_price if calc_price else 0)
@@ -1161,11 +1144,9 @@ class TradeExecutorMixin:
         open_intent_client_id = (
             client_order_id if open_intent is not None else None)
 
-        if client_order_id is None:
-            open_order = self.exchange_api.open_position(ccxt_symbol, side, position_size)
-        else:
-            open_order = self.exchange_api.open_position(
-                ccxt_symbol, side, position_size, client_order_id=client_order_id)
+        open_order = self.exchange_api.open_position(
+            ccxt_symbol, side, position_size,
+            client_order_id=client_order_id)
         if not open_order:
             logger.error(f"{symbol} 开仓失败")
             self.notifier.notify_error(f"{symbol} 开仓失败")
@@ -1244,7 +1225,7 @@ class TradeExecutorMixin:
                     'remaining_amount': remaining,
                     'execution_ambiguous': True,
                 }
-            original_size = self._order_actual_amount(open_order, position_size)
+            original_size = self._order_actual_amount(open_order)
             if original_size is None:
                 original_size = position_size
             outcome = self._finalize_open_rollback(
@@ -1263,7 +1244,7 @@ class TradeExecutorMixin:
             self.notifier.notify_error(f"{symbol} 开仓订单未获成交确认，请立即核对交易所")
             return
 
-        actual_position_size = self._order_actual_amount(open_order, position_size)
+        actual_position_size = self._order_actual_amount(open_order)
         if actual_position_size is None:
             logger.critical(f"{symbol} 开仓返回的实际成交数量无效，拒绝记账")
             self.notifier.notify_error(f"{symbol} 开仓实际成交数量无效，请立即核对交易所")
@@ -1405,11 +1386,11 @@ class TradeExecutorMixin:
                 existing_stop_order_size=position_size,
                 allow_stop_rebuild=False, stop_residue_possible=True,
                 open_intent_client_id=open_intent_client_id)
-            if outcome.get('status') == 'rolled_back':
-                if not self._cancel_stop_order_confirmed(
-                        symbol, ccxt_symbol, stop_order_id):
-                    logger.critical(
-                        f'{symbol} 风险超标回滚已全平，但止损清理未确认')
+            if (outcome.get('status') == 'rolled_back' and
+                    not self._cancel_stop_order_confirmed(
+                        symbol, ccxt_symbol, stop_order_id)):
+                logger.critical(
+                    f'{symbol} 风险超标回滚已全平，但止损清理未确认')
             return self._finalize_generic_rolled_back_outcome(
                 symbol, open_intent, outcome)
 

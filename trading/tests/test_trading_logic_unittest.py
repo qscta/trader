@@ -43,6 +43,19 @@ def _fake_to_ccxt(symbol):
     return symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
 
 
+def _fake_compensation_client_order_id(open_client_order_id):
+    """测试适配器也必须提供稳定、合法的补偿平仓句柄。"""
+    return f"R{str(open_client_order_id)[:31]}"
+
+
+def _assert_compensation_close_call(system, symbol, side, amount):
+    open_client_id = system.exchange_api.open_position.call_args.kwargs[
+        "client_order_id"]
+    system.exchange_api.close_position.assert_called_once_with(
+        symbol, side, amount,
+        client_order_id=_fake_compensation_client_order_id(open_client_id))
+
+
 def _complete_trade_state_stub(state=None):
     """补齐生产代码依赖的 TradeState 契约，不让测试靠生产降级分支过关。
 
@@ -178,6 +191,9 @@ class TurtleStopLossFollowupTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system.config = {
+            "trading": {"symbols": [{"name": "BTCUSDT", "enabled": True}]}}
+        system.stop_loss_dates = {}
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
             get_position=Mock(return_value=None),
@@ -1023,6 +1039,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             force_runtime_mark_position_quarantine=Mock(),
         ))
         system._pending_trade_open_notifications = []
+        system.stop_loss_dates = {}
         system.risk_manager = SimpleNamespace(
             account_equity=10000,
             risk_per_trade=0.01,
@@ -1036,11 +1053,15 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             get_balance=Mock(return_value={"total": {"USDT": 10000}}),
             round_quantity=Mock(return_value=2.5),
             get_quantity_precision=Mock(return_value=3),
-            open_position=Mock(return_value={"average": 100}),
+            open_position=Mock(return_value={"average": 100, "amount": 2.5}),
             create_stop_loss_order=Mock(return_value={"id": "stop-1"}),
             cancel_order=Mock(return_value=True),
             cancel_all_orders=Mock(),
-            close_position=Mock(return_value={"id": "close-1"}),
+            close_position=Mock(return_value={
+                "id": "close-1", "amount": 2.5,
+                "fully_closed": True, "remaining_amount": 0.0,
+            }),
+            compensation_client_order_id=_fake_compensation_client_order_id,
         )
         return system
 
@@ -1084,7 +1105,8 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
     def test_rolls_back_when_fill_price_crosses_stop(self):
         system = self.make_system()
         system.exchange_api.exchange.fetch_ticker.return_value = {"last": 82}
-        system.exchange_api.open_position.return_value = {"average": 79}
+        system.exchange_api.open_position.return_value = {
+            "average": 79, "amount": 2.5}
 
         system._execute_open(
             "BTCUSDT",
@@ -1094,7 +1116,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             {"name": "BTCUSDT", "risk_per_trade": 0.01},
         )
 
-        system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 2.5)
+        _assert_compensation_close_call(system, "BTC/USDT", "long", 2.5)
         system.exchange_api.create_stop_loss_order.assert_not_called()
         system.trade_state.add_open_position.assert_not_called()
         system.notifier.notify_trade_opened.assert_not_called()
@@ -1102,7 +1124,8 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
     def test_rolls_back_when_stop_order_creation_fails(self):
         system = self.make_system()
         system.exchange_api.exchange.fetch_ticker.return_value = {"last": 100}
-        system.exchange_api.open_position.return_value = {"average": 100}
+        system.exchange_api.open_position.return_value = {
+            "average": 100, "amount": 2.5}
         system.exchange_api.create_stop_loss_order.return_value = None
         system.exchange_api.close_position.return_value = {
             "id": "close-1", "fully_closed": True, "remaining_amount": 0.0}
@@ -1120,7 +1143,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             {"name": "BTCUSDT", "risk_per_trade": 0.01},
         )
 
-        system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 2.5)
+        _assert_compensation_close_call(system, "BTC/USDT", "long", 2.5)
         # 全平确认后撤光该品种挂单，清扫可能的未知止损（防未来错价触发）。
         system.exchange_api.cancel_all_orders.assert_called_once_with("BTC/USDT")
         self.assertEqual(
@@ -1166,8 +1189,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         self.assertEqual('rolled_back', result['status'])
         system.exchange_api.create_stop_loss_order.assert_called_once_with(
             'BTC/USDT', 'long', 2.5, 80)
-        system.exchange_api.close_position.assert_called_once_with(
-            'BTC/USDT', 'long', 2.5)
+        _assert_compensation_close_call(system, 'BTC/USDT', 'long', 2.5)
         system.exchange_api.cancel_order.assert_called_once_with(
             'BTC/USDT', 'stop-1')
         system.trade_state.add_open_position.assert_not_called()
@@ -1584,6 +1606,8 @@ class MaCrossFlipTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system.config = {
+            "trading": {"symbols": [{"name": "BTCUSDT", "enabled": True}]}}
         exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 111}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
@@ -1746,7 +1770,7 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
         )
 
         system.exchange_api.cancel_order.assert_called_once_with("BTC/USDT", "stop-1")
-        system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 2.5)
+        _assert_compensation_close_call(system, "BTC/USDT", "long", 2.5)
         system.notifier.notify_trade_opened.assert_not_called()
 
     def test_update_stop_order_uses_runtime_fallback_when_persist_fails(self):
@@ -1806,6 +1830,8 @@ class StartupSyncCompensationTests(unittest.TestCase):
                     current_price=123.45):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system.config = {"trading": {"symbols": []}}
+        system.stop_loss_dates = {}
         last_price = Mock(return_value=current_price)
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
@@ -2039,6 +2065,12 @@ class ApiProcessSafetyTests(unittest.TestCase):
             config_file="/missing/config.json",
             scheduler=SimpleNamespace(running=False),
             exchange_id="okx", label="欧易", _stop_anomalies={},
+            health_snapshot=lambda: {
+                "scheduler_running": False,
+                "scheduler_thread_alive": False,
+                "runner_heartbeat_ts": None,
+                "stopping": False,
+            },
         )
         dead_thread = SimpleNamespace(is_alive=lambda: False)
         with patch.object(api_server, "trading_system", system), \
@@ -2047,6 +2079,16 @@ class ApiProcessSafetyTests(unittest.TestCase):
             resp = self.client.get("/api/status")
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.get_json()["status"], "degraded")
+
+    def test_missing_health_snapshot_fails_closed(self):
+        live_thread = SimpleNamespace(is_alive=lambda: True)
+        with patch.object(api_server, "_runner_thread", live_thread), \
+             patch.object(api_server, "_runner_failure", None):
+            health = api_server._runner_health(SimpleNamespace())
+
+        self.assertFalse(health["healthy"])
+        self.assertIn("system_health_unavailable", health["issues"])
+        self.assertIn("runner_heartbeat_missing", health["issues"])
 
     def test_status_is_503_when_scheduler_thread_died_but_state_says_running(self):
         system = SimpleNamespace(

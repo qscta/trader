@@ -197,44 +197,27 @@ def _runner_health(system):
         if not thread_alive:
             issues.append('runner_thread_stopped')
 
-    # TradingSystem.health_snapshot 同时检查 APScheduler 内部线程。单看
-    # scheduler.running 会在调度线程异常退出后仍保留 RUNNING 状态；
-    # runner 主循环又会继续更新 heartbeat，从而把「所有 job 都停了」
-    # 误报为健康。测试桩没有 health_snapshot 时才走兼容回退。
-    system_health = {}
-    snapshot_reader = getattr(system, 'health_snapshot', None)
-    if callable(snapshot_reader):
-        try:
-            system_health = snapshot_reader()
-            if not isinstance(system_health, dict):
-                raise TypeError('health_snapshot 必须返回对象')
-        except Exception as exc:
-            logger.error(f'读取交易 runner 健康快照失败: {exc}')
-            issues.append('system_health_unavailable')
-            system_health = {}
+    # 只接受 TradingSystem 统一生成的快照。Web 层若自行拼 scheduler/heartbeat，
+    # 很容易把调度线程已死、状态位仍为 RUNNING 的进程误报为健康。
+    try:
+        system_health = system.health_snapshot()
+        if not isinstance(system_health, dict):
+            raise TypeError('health_snapshot 必须返回对象')
+    except Exception as exc:
+        logger.error(f'读取交易 runner 健康快照失败: {exc}')
+        issues.append('system_health_unavailable')
+        system_health = {}
 
-    scheduler = getattr(system, 'scheduler', None)
-    scheduler_running = bool(system_health.get(
-        'scheduler_running', getattr(scheduler, 'running', False)))
-    scheduler_thread_alive = system_health.get('scheduler_thread_alive')
-    if scheduler_thread_alive is None:
-        scheduler_thread = getattr(scheduler, '_thread', None)
-        if scheduler_thread is None:
-            scheduler_thread_alive = scheduler_running
-        else:
-            try:
-                scheduler_thread_alive = bool(scheduler_thread.is_alive())
-            except Exception:
-                scheduler_thread_alive = False
+    scheduler_running = system_health.get('scheduler_running') is True
+    scheduler_thread_alive = (
+        system_health.get('scheduler_thread_alive') is True)
     if not scheduler_running:
         issues.append('scheduler_not_running')
     elif not scheduler_thread_alive:
         issues.append('scheduler_thread_stopped')
 
-    # main.start 会更新该 epoch；兼容尚未带 heartbeat 的测试桩，但真实部署一旦存在
-    # 心跳，超过阈值就明确降级。阈值需覆盖主循环 60 秒睡眠及短暂调度抖动。
-    heartbeat = system_health.get(
-        'runner_heartbeat_ts', getattr(system, '_runner_heartbeat_ts', None))
+    # 阈值覆盖主循环 60 秒睡眠及短暂调度抖动。
+    heartbeat = system_health.get('runner_heartbeat_ts')
     heartbeat_age = None
     if heartbeat is not None:
         try:
@@ -243,13 +226,9 @@ def _runner_health(system):
                 issues.append('runner_heartbeat_stale')
         except (TypeError, ValueError):
             issues.append('runner_heartbeat_invalid')
-    elif hasattr(system, '_runner_heartbeat_ts'):
+    else:
         issues.append('runner_heartbeat_missing')
-    stop_event = getattr(system, '_stop_event', None)
-    stopping = system_health.get('stopping')
-    if stopping is None and stop_event is not None:
-        stopping = stop_event.is_set()
-    if stopping:
+    if system_health.get('stopping') is True:
         issues.append('runner_stopping')
     if failure:
         issues.append('runner_failed')

@@ -1,6 +1,6 @@
 # 交易逻辑测试（需完整依赖环境）
 
-本目录的 `test_trading_logic_unittest.py`（112 用例）需要 pandas / ccxt / flask / apscheduler 环境运行，覆盖：
+本目录的 `test_trading_logic_unittest.py`（114 用例）需要 pandas / ccxt / flask / apscheduler 环境运行，覆盖：
 
 - 收盘 K 线时间戳过滤（`filter_closed_candles`）
 - 海龟止损确认分支（含撤销不可确认时不反手）

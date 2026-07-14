@@ -1074,10 +1074,16 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
     def _system(self):
         system = TradingSystem.__new__(TradingSystem)
         system._stop_anomalies = {}
+        system.config = {'trading': {'symbols': [
+            {'name': 'BTCUSDT', 'enabled': True},
+            {'name': 'ETHUSDT', 'enabled': True},
+        ]}}
+        system.stop_loss_dates = {}
         cancel_calls = []
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda s: s,
             get_position=lambda s: None,  # 交易所端已无仓
+            recover_stop_fill_evidence=lambda *_args: None,
             cancel_order=lambda s, oid: cancel_calls.append(oid) or True,
             cancel_all_orders=lambda s: True)
         system.notifier = SimpleNamespace(

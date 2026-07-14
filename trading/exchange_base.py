@@ -57,9 +57,10 @@ class ExchangeApi:
     """交易所适配层抽象基类。
 
     子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
-    close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
-    round_quantity、get_quantity_precision、list_position_symbols、
-    fetch_stop_order_snapshot。
+    close_position、create_stop_loss_order、cancel_order、cancel_stop_order_only、
+    cancel_all_orders、round_quantity、get_quantity_precision、find_stop_order_state、
+    list_position_symbols、fetch_stop_order_snapshot、compensation_client_order_id、
+    recover_stop_fill_evidence、_contracts_to_coins。
 
     可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。
 
@@ -86,7 +87,7 @@ class ExchangeApi:
         """获取单个交易对的持仓（ccxt 统一结构，无持仓返回 None 或 contracts=0）。"""
         raise NotImplementedError
 
-    def open_position(self, symbol, side, amount):
+    def open_position(self, symbol, side, amount, client_order_id=None):
         """市价开仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
@@ -94,7 +95,8 @@ class ExchangeApi:
         """市价平仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
-    def create_stop_loss_order(self, symbol, side, amount, stop_price):
+    def create_stop_loss_order(self, symbol, side, amount, stop_price,
+                               client_order_id=None):
         """创建止损单（触发后市价平仓）。amount 单位为‘币数’。"""
         raise NotImplementedError
 
@@ -114,6 +116,10 @@ class ExchangeApi:
 
     def get_quantity_precision(self, symbol):
         """返回下单数量的小数位数（仅用于日志展示）。"""
+        raise NotImplementedError
+
+    def _contracts_to_coins(self, symbol, contracts):
+        """把交易所合约张数换成上层统一使用的币数。"""
         raise NotImplementedError
 
     def setup_symbol(self, ccxt_symbol):
@@ -136,6 +142,16 @@ class ExchangeApi:
         空元组表示已经完整证明该品种没有待触发算法单。任何分页或类型查询不完整
         都必须抛出，调用方会回退到逐品种权威查询，绝不能把部分清单当成空清单。
         """
+        raise NotImplementedError
+
+    @staticmethod
+    def compensation_client_order_id(open_client_order_id):
+        """由已持久化的开仓 clOrdId 派生唯一补偿平仓 clOrdId。"""
+        raise NotImplementedError
+
+    def recover_stop_fill_evidence(
+            self, symbol, position_side, amount, stop_order_ids):
+        """只读回查交易所止损成交证据；无证据返回 None。"""
         raise NotImplementedError
 
     # ===================== 交易所无关的通用实现 =====================

@@ -589,11 +589,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self.trade_state.claim_owner_exchange(self.exchange_id)
             owner = self.exchange_id
 
-        if manifest_owner is None:
-            if not atomic_write_json(manifest_path, {
-                    'exchange': self.exchange_id,
-                    'claimed_at': datetime.now().isoformat()}):
-                raise RuntimeError('无法持久化数据目录归属标记，拒绝启动')
+        if manifest_owner is None and not atomic_write_json(manifest_path, {
+                'exchange': self.exchange_id,
+                'claimed_at': datetime.now().isoformat()}):
+            raise RuntimeError('无法持久化数据目录归属标记，拒绝启动')
         logger.info(f'[{self.label}] 账本与数据目录归属均已确认: {owner}')
 
     def persist_config(self):
@@ -605,8 +604,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         with self._config_lock:
             disk_config = copy.deepcopy(self.config)
             disk_okx = disk_config.setdefault('okx', {})
-            for key in getattr(self, '_env_okx_credential_keys', set()):
-                originals = getattr(self, '_disk_okx_credentials', {})
+            originals = self._disk_okx_credentials
+            for key in self._env_okx_credential_keys:
                 if key in originals:
                     disk_okx[key] = originals[key]
                 else:
@@ -847,7 +846,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             # 无法列出交易所全部持仓时，无法证明任一本地空仓品种真的安全。
             # 将当前配置池的空仓品种全部隔离；后续成功对账时自动解除。
             logger.critical(f"启动孤儿仓核对失败，对本地空仓品种 fail-closed: {e}")
-            for cfg in getattr(self, 'config', {}).get('trading', {}).get('symbols', []):
+            for cfg in self.config.get('trading', {}).get('symbols', []):
                 symbol = cfg.get('name')
                 if symbol and symbol not in open_positions:
                     self._quarantine_position_mismatch(
@@ -860,8 +859,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         strategy_type = symbol_config.get('strategy', 'turtle')
         if strategy_type == 'ma_cross':
             return self.ma_cross_strategy, 'ma_cross'
-        else:
-            return self.turtle_strategy, 'turtle'
+        return self.turtle_strategy, 'turtle'
 
     def _load_stop_loss_dates(self):
         """从主账本加载 T+1；首次升级时严格迁移旧独立 JSON。"""
@@ -1757,17 +1755,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
             self._retry_clear_stop_residues()
 
-            # 一轮只读取一次全账户算法单清单，再按品种使用同一套四态裁决。
-            # 全局查询任一类型/分页失败时 helper 返回 None，后续自动走原来的
-            # 逐品种完整查询；性能优化绝不改变 fail-closed 结论。
-            stop_orders_snapshot = self._load_stop_order_snapshot(
-                all_open_positions, '日检')
-
             # 账本瘦身：超出保留窗口的平仓历史搬进只追加的史书文件（失败不影响交易）
+            # 磁盘归档可能耗时，必须在读取交易所快照之前完成，避免第一个品种就消费旧快照。
             try:
                 self.trade_state.compact_closed_trades()
             except Exception as e:
                 logger.warning(f"平仓历史归档失败（不影响交易，账本保留全部记录）: {e}")
+
+            # 一轮只读取一次全账户算法单清单，再按品种使用同一套四态裁决。
+            # 全局查询任一类型/分页失败时 helper 返回 None，后续自动走原来的
+            # 逐品种完整查询；快照过期的后续品种也单独回退实时查询。
+            stop_orders_snapshot = self._load_stop_order_snapshot(
+                all_open_positions, '日检')
 
             # 逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
             failed_symbols = sorted(unresolved_pending)
@@ -1836,10 +1835,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 symbol, ccxt_symbol, local_position,
                                 self._get_strategy_display_name(strategy_type),
                                 algo_orders=(
-                                    stop_orders_snapshot[ccxt_symbol]
-                                    if (stop_snapshot_valid and
-                                        stop_orders_snapshot is not None and
-                                        local_position.get('stop_loss_price'))
+                                    self._orders_from_stop_snapshot(
+                                        stop_orders_snapshot, ccxt_symbol)
+                                    if stop_snapshot_valid
                                     else None)):
                             self._quarantine_position_mismatch(
                                 symbol, '日检仓位一致但止损保护未能严格确认')

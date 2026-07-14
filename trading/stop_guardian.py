@@ -12,6 +12,7 @@ _stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_dis
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from trade_state import TradeStatePersistenceError
@@ -19,9 +20,16 @@ from trade_state import TradeStatePersistenceError
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _StopOrderSnapshot:
+    orders: dict
+    started_at: float
+
+
 class StopGuardianMixin:
 
     STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 10
+    STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS = 30
 
     def _load_stop_order_snapshot(self, positions, context):
         """读取本轮共享的完整止损快照；失败时明确回退逐品种查询。
@@ -29,14 +37,14 @@ class StopGuardianMixin:
         ``None`` 专门表示“快照不可用，必须走旧的逐品种权威查询”；空字典只在
         本轮没有需要核验止损的持仓时返回。缺键/坏形状不能被解释成空清单。
         """
+        started = time.monotonic()
         try:
             symbols = sorted({
                 self.exchange_api.to_ccxt_symbol(symbol)
-                for symbol, position in positions.items()
-                if position.get('stop_loss_price')
+                for symbol in positions
             })
             if not symbols:
-                return {}
+                return _StopOrderSnapshot({}, started)
         except Exception as exc:
             logger.warning(
                 f'{context}无法建立算法单批量快照范围，回退逐品种查询: {exc}')
@@ -45,7 +53,6 @@ class StopGuardianMixin:
         # 缺少该正式接口属于装配错误，不能被当作普通网络抖动静默掩盖。
         fetch_snapshot = self.exchange_api.fetch_stop_order_snapshot
         try:
-            started = time.monotonic()
             snapshot = fetch_snapshot(symbols)
             if not isinstance(snapshot, dict) or set(snapshot) != set(symbols):
                 raise RuntimeError(
@@ -59,13 +66,25 @@ class StopGuardianMixin:
                 f'{context}算法单批量快照完成: 品种={len(symbols)}, '
                 f'订单={sum(len(orders) for orders in snapshot.values())}, '
                 f'耗时={time.monotonic() - started:.2f}s')
-            return snapshot
+            return _StopOrderSnapshot(snapshot, started)
         except Exception as exc:
             # 快照优化不承载安全语义：任何不确定都退回已经验证过的逐品种全类型、
             # 全分页查询。绝不能返回 {}，否则会把查询失败伪装成 missing 并补挂。
             logger.warning(
                 f'{context}算法单批量快照失败，回退逐品种完整查询: {exc}')
             return None
+
+    def _orders_from_stop_snapshot(self, snapshot, ccxt_symbol):
+        """只在快照足够新时返回单品种订单；过期即回退实时查询。"""
+        if snapshot is None:
+            return None
+        age = time.monotonic() - snapshot.started_at
+        if age > self.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS:
+            logger.info(
+                f'{ccxt_symbol} 算法单快照已过期(age={age:.2f}s)，'
+                '回退该品种实时完整查询')
+            return None
+        return snapshot.orders[ccxt_symbol]
 
     def reconcile_intraday_stop_losses(self):
         """盘中巡检：发现本地有仓而交易所端已无仓时，立即按止损/外部平仓处理并通知。"""
@@ -178,8 +197,8 @@ class StopGuardianMixin:
                 return
             protected = self._ensure_stop_order_alive(
                 symbol, ccxt_symbol, position, strategy_name,
-                algo_orders=(None if stop_orders_snapshot is None
-                             else stop_orders_snapshot[ccxt_symbol]))
+                algo_orders=self._orders_from_stop_snapshot(
+                    stop_orders_snapshot, ccxt_symbol))
             if protected:
                 self._clear_position_quarantine_after_reconcile(symbol)
             return
@@ -506,16 +525,13 @@ class StopGuardianMixin:
         返回 (closed_position, state_saved, stop_cleared)；closed 为 None 时调用方直接放弃。
         """
         effective_strategy = strategy_type or position.get('strategy') or 'turtle'
-        config = getattr(self, 'config', None)
-        pool = (config.get('trading', {}).get('symbols', [])
-                if isinstance(config, dict) else [])
+        pool = self.config.get('trading', {}).get('symbols', [])
         matched = next(
             (cfg for cfg in pool if cfg.get('name') == symbol), None)
         # 已从池删除（不在池）或在池但已禁用：均按「只平不开」处理——退出时不记 T+1，
         # 避免次日按 EMA 方向自动重入。
         retired_from_pool = bool(
-            isinstance(config, dict) and
-            (matched is None or not matched.get('enabled', True)))
+            matched is None or not matched.get('enabled', True))
         # 区分“平仓事务刚建的 crash-cleanup marker”与“之前已有的
         # 未知 POST 残留”。前者经 cancel-all 连续验空即可清；后者还要等满
         # 可见性窗，防止迟到算法单在释放新开仓后才浮现。
@@ -544,12 +560,9 @@ class StopGuardianMixin:
                       list(position.get('extra_stop_order_ids') or [])):
             if value and str(value) not in stop_order_ids:
                 stop_order_ids.append(str(value))
-        recover_fill = getattr(
-            getattr(self, 'exchange_api', None),
-            'recover_stop_fill_evidence', None)
-        if stop_order_ids and callable(recover_fill):
+        if stop_order_ids:
             try:
-                evidence = recover_fill(
+                evidence = self.exchange_api.recover_stop_fill_evidence(
                     ccxt_symbol, position.get('side'),
                     position.get('position_size'), stop_order_ids)
                 if evidence:
@@ -623,9 +636,7 @@ class StopGuardianMixin:
         if stop_loss_date is not None:
             # stop_loss_dates 是主账本的只读镜像；磁盘事务（或 force-runtime
             # 补偿）已经先完成，这里只同步当前进程视图，不再二次落盘。
-            in_memory_dates = getattr(self, 'stop_loss_dates', None)
-            if isinstance(in_memory_dates, dict):
-                in_memory_dates[symbol] = stop_loss_date
+            self.stop_loss_dates[symbol] = stop_loss_date
         stop_cleared = self._cancel_stop_order_confirmed(
             symbol, ccxt_symbol, position.get('stop_order_id'),
             position.get('extra_stop_order_ids'),

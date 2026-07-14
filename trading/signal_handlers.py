@@ -126,9 +126,8 @@ class SignalHandlersMixin:
                     logger.info(f"{symbol} [海龟] 当前无开仓信号({signal.get('action')}), 等待后续信号")
                 return
 
-        if signal['action'] == 'close_long' and position['side'] == 'long':
-            self.handle_close_signal(symbol, signal, position, symbol_config)
-        elif signal['action'] == 'close_short' and position['side'] == 'short':
+        if ((signal['action'], position['side']) in
+                (('close_long', 'long'), ('close_short', 'short'))):
             self.handle_close_signal(symbol, signal, position, symbol_config)
         elif signal['action'] in ('long', 'short') and signal.get('mid_line_crossed'):
             # 同一天穿越中轨+突破轨道：先平反向仓位，再开新仓

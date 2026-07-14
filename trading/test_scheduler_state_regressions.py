@@ -165,6 +165,8 @@ class SignalExecutionStateTest(unittest.TestCase):
                     'remaining_amount': 0.0, 'fully_closed': True,
                     'fee': {'cost': 0.03, 'currency': 'USDT'},
                 }),
+                compensation_client_order_id=(
+                    lambda open_client_id: f'R{open_client_id[:31]}'),
                 create_stop_loss_order=Mock(),
             )
             system.config = {
@@ -268,6 +270,8 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             get_quantity_precision=lambda _symbol: 3,
             open_position=open_position,
             create_stop_loss_order=lambda *args, **kwargs: {'id': 'stop-1'},
+            compensation_client_order_id=(
+                lambda open_client_id: f'R{open_client_id[:31]}'),
             get_position=lambda _symbol: exchange_position,
         )
         system.config = {
