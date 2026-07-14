@@ -1,0 +1,26 @@
+[Unit]
+Description=Consistent Trading State Backup
+After=local-fs.target
+ConditionPathIsDirectory=/home/ubuntu/trader/trading
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/trading-state-backup
+TimeoutStartSec=20min
+UMask=0077
+StateDirectory=trading-backups
+StateDirectoryMode=0700
+RuntimeDirectory=trading-state-backup
+RuntimeDirectoryMode=0700
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

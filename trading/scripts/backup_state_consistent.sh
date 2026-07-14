@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly SERVICE=trading.service
+readonly SOURCE=/home/ubuntu/trader/trading
+readonly DESTINATION=/var/lib/trading-backups
+readonly LOCK_DIRECTORY=/run/trading-state-backup
+
+/usr/bin/install -d -m 0700 -o root -g root "$LOCK_DIRECTORY"
+exec 9>"$LOCK_DIRECTORY/backup.lock"
+if ! /usr/bin/flock -n 9; then
+    echo 'another trading backup is already running'
+    exit 0
+fi
+
+/usr/bin/install -d -m 0700 -o root -g root "$DESTINATION"
+stamp=$(/usr/bin/date +%Y%m%d-%H%M%S)
+archive="$DESTINATION/state-$stamp-$$.tgz"
+temporary="$archive.tmp"
+restart_service=0
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    /usr/bin/rm -f -- "$temporary"
+    exec 8>&- 2>/dev/null || true
+    if ((restart_service)); then
+        /usr/bin/systemctl start "$SERVICE" || status=1
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if /usr/bin/systemctl is-active --quiet "$SERVICE"; then
+    restart_service=1
+    /usr/bin/systemctl stop "$SERVICE"
+fi
+if /usr/bin/systemctl is-active --quiet "$SERVICE"; then
+    echo 'trading service did not stop; refusing an inconsistent backup' >&2
+    exit 1
+fi
+if [[ ! -f "$SOURCE/.runtime/runner.lock" ||
+      -L "$SOURCE/.runtime/runner.lock" ]]; then
+    echo 'runner lock is missing or unsafe; refusing an unverified backup' >&2
+    exit 1
+fi
+exec 8<"$SOURCE/.runtime/runner.lock"
+if ! /usr/bin/flock -n 8; then
+    echo 'another trading runner still holds the project lock' >&2
+    exit 1
+fi
+
+/usr/bin/tar \
+    --exclude='./.runtime' \
+    --exclude='./.venv' \
+    --exclude='*/__pycache__' \
+    --exclude='*.py[co]' \
+    --exclude='./trading.log*' \
+    -czf "$temporary" -C "$SOURCE" .
+/usr/bin/tar -tzf "$temporary" ./config.json ./trade_state.json >/dev/null
+/usr/bin/chmod 0600 "$temporary"
+/usr/bin/mv "$temporary" "$archive"
+/usr/bin/sync -f "$archive"
+echo "consistent trading backup created: $archive"

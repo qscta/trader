@@ -145,11 +145,9 @@ def start_runner_thread(system):
     with _runner_guard:
         if _runner_thread is not None and _runner_thread.is_alive():
             return _runner_thread
-        stop_event = getattr(system, '_stop_event', None)
-        if stop_event is not None:
-            # 必须在线程启动前清；若让 main.start 在线程内清，紧随 start 的 stop()
-            # 可能先 set、后被后台线程 clear，丢失退出请求并卡住 worker shutdown。
-            stop_event.clear()
+        # 必须在线程启动前清；若让 main.start 在线程内清，紧随 start 的 stop()
+        # 可能先 set、后被后台线程 clear，丢失退出请求并卡住 worker shutdown。
+        system._stop_event.clear()
         _runner_failure = None
         _runner_started_at = datetime.now().isoformat()
         _runner_thread = threading.Thread(
@@ -164,7 +162,7 @@ def stop_runner_thread(timeout=895):
     with _runner_guard:
         thread = _runner_thread
     system = trading_system
-    if system is not None and hasattr(system, 'stop'):
+    if system is not None:
         try:
             system.stop()
         except Exception:
@@ -294,7 +292,7 @@ def send_dingtalk(msg):
       等消息原文本不含关键词，text 直发会被静默拒收）。
     """
     try:
-        notifier = getattr(trading_system, 'notifier', None) if trading_system else None
+        notifier = trading_system.notifier if trading_system else None
         if not notifier:
             logger.warning(f"钉钉推送跳过: 系统尚未就绪: {msg[:40]}")
             return
@@ -315,9 +313,7 @@ def _require_system():
 
 def _persist_config():
     """把整份 config 写回磁盘。"""
-    if trading_system and hasattr(trading_system, 'persist_config'):
-        return trading_system.persist_config()
-    return False
+    return bool(trading_system and trading_system.persist_config())
 
 
 def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_message):
@@ -444,15 +440,11 @@ def get_status():
         except Exception as e:
             logger.warning(f"忽略异常: {e}")
         manual_symbols = [s['name'] for s in system.config['trading']['symbols'] if s.get('enabled', True)]
-        try:
-            stop_residues = list(system.trade_state.get_stop_residues().keys())
-        except Exception:
-            stop_residues = []
-        try:
-            position_quarantines = system.trade_state.get_position_quarantines()
-        except Exception:
-            position_quarantines = {}
-        stop_anomalies = dict(getattr(system, '_stop_anomalies', {}) or {})
+        # 这三项是运维安全状态：读取失败必须让接口失败，不能用
+        # 空集合把“状态未知”伪装成“没有残留/隔离”。
+        stop_residues = list(system.trade_state.get_stop_residues())
+        position_quarantines = system.trade_state.get_position_quarantines()
+        stop_anomalies = dict(system._stop_anomalies)
         health = _runner_health(system)
         payload = {
             'status': 'running' if health['healthy'] else 'degraded',
@@ -720,43 +712,40 @@ def get_positions():
         return err
     try:
         positions = json.loads(json.dumps(system.trade_state.get_all_open_positions()))
-        try:
-            for symbol, pos in positions.items():
-                try:
-                    ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-                    current_price = system.exchange_api.get_last_price(ccxt_symbol)
-                    pos['current_price'] = current_price
-                    entry = pos['entry_price']
-                    size = pos['position_size']
-                    if pos['side'] == 'long':
-                        pnl = (current_price - entry) * size
-                        pnl_pct = (current_price - entry) / entry * 100
+        for symbol, pos in positions.items():
+            try:
+                ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
+                current_price = system.exchange_api.get_last_price(ccxt_symbol)
+                pos['current_price'] = current_price
+                entry = pos['entry_price']
+                size = pos['position_size']
+                if pos['side'] == 'long':
+                    pnl = (current_price - entry) * size
+                    pnl_pct = (current_price - entry) / entry * 100
+                else:
+                    pnl = (entry - current_price) * size
+                    pnl_pct = (entry - current_price) / entry * 100
+                pos['unrealized_pnl'] = round(pnl, 2)
+                pos['unrealized_pnl_pct'] = round(pnl_pct, 2)
+            except Exception:
+                pos['current_price'] = None
+                pos['unrealized_pnl'] = None
+                pos['unrealized_pnl_pct'] = None
+            try:
+                open_time = pos.get('open_time')
+                if open_time:
+                    if isinstance(open_time, str):
+                        try:
+                            open_dt = datetime.fromisoformat(open_time.replace('Z', '+00:00')).replace(tzinfo=None)
+                        except Exception:
+                            open_dt = datetime.strptime(open_time[:19], '%Y-%m-%dT%H:%M:%S')
                     else:
-                        pnl = (entry - current_price) * size
-                        pnl_pct = (entry - current_price) / entry * 100
-                    pos['unrealized_pnl'] = round(pnl, 2)
-                    pos['unrealized_pnl_pct'] = round(pnl_pct, 2)
-                except Exception:
-                    pos['current_price'] = None
-                    pos['unrealized_pnl'] = None
-                    pos['unrealized_pnl_pct'] = None
-                try:
-                    open_time = pos.get('open_time')
-                    if open_time:
-                        if isinstance(open_time, str):
-                            try:
-                                open_dt = datetime.fromisoformat(open_time.replace('Z', '+00:00')).replace(tzinfo=None)
-                            except Exception:
-                                open_dt = datetime.strptime(open_time[:19], '%Y-%m-%dT%H:%M:%S')
-                        else:
-                            open_dt = datetime.fromtimestamp(open_time / 1000)
-                        pos['holding_days'] = (datetime.now() - open_dt).days
-                    else:
-                        pos['holding_days'] = None
-                except Exception:
+                        open_dt = datetime.fromtimestamp(open_time / 1000)
+                    pos['holding_days'] = (datetime.now() - open_dt).days
+                else:
                     pos['holding_days'] = None
-        except Exception as e:
-            logger.warning(f"忽略异常: {e}")
+            except Exception:
+                pos['holding_days'] = None
         return jsonify(positions)
     except Exception as e:
         return jsonify({'error': str(e)}), 500

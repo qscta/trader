@@ -2060,7 +2060,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
     def test_status_is_503_when_scheduler_stopped(self):
         system = SimpleNamespace(
             trade_state=SimpleNamespace(
-                get_all_open_positions=lambda: {}, get_stop_residues=lambda: {}),
+                get_all_open_positions=lambda: {}, get_stop_residues=lambda: {},
+                get_position_quarantines=lambda: {}),
             config={"trading": {"symbols": []}},
             config_file="/missing/config.json",
             scheduler=SimpleNamespace(running=False),
@@ -2080,6 +2081,23 @@ class ApiProcessSafetyTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.get_json()["status"], "degraded")
 
+    def test_status_fails_closed_when_safety_state_is_unreadable(self):
+        def unreadable():
+            raise OSError("state read failed")
+
+        system = SimpleNamespace(
+            trade_state=SimpleNamespace(
+                get_all_open_positions=lambda: {}, get_stop_residues=unreadable,
+                get_position_quarantines=lambda: {}),
+            config={"trading": {"symbols": []}},
+            config_file="/missing/config.json",
+        )
+        with patch.object(api_server, "trading_system", system):
+            resp = self.client.get("/api/status")
+
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(resp.get_json()["error"], "state read failed")
+
     def test_missing_health_snapshot_fails_closed(self):
         live_thread = SimpleNamespace(is_alive=lambda: True)
         with patch.object(api_server, "_runner_thread", live_thread), \
@@ -2093,7 +2111,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
     def test_status_is_503_when_scheduler_thread_died_but_state_says_running(self):
         system = SimpleNamespace(
             trade_state=SimpleNamespace(
-                get_all_open_positions=lambda: {}, get_stop_residues=lambda: {}),
+                get_all_open_positions=lambda: {}, get_stop_residues=lambda: {},
+                get_position_quarantines=lambda: {}),
             config={"trading": {"symbols": []}},
             config_file="/missing/config.json",
             scheduler=SimpleNamespace(running=True),
@@ -2265,6 +2284,9 @@ class ApiProcessSafetyTests(unittest.TestCase):
         started = threading.Event()
 
         class Runner:
+            def __init__(self):
+                self._stop_event = threading.Event()
+
             def start(self):
                 started.set()
                 stopped.wait(2)

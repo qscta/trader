@@ -776,9 +776,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     continue
                 # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
                 # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
-                if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
-                    pass
-                else:
+                if (open_positions[symbol].get('strategy') or 'turtle') != 'ma_cross':
                     pending = self.trade_state.get_pending_signal_execution(symbol)
                     if (pending and (pending.get('payload') or {}).get('side') ==
                             open_positions[symbol].get('side')):
