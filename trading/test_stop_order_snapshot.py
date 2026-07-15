@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import _test_stubs
 
@@ -80,6 +80,93 @@ class StopOrderSnapshotTest(unittest.TestCase):
         self.assertIsNone(
             system.exchange_api.find_stop_order_state.call_args.kwargs[
                 'algo_orders'])
+
+    def test_expired_snapshot_is_refreshed_once_for_all_remaining_symbols(self):
+        system = self._system()
+        first_orders = {
+            'BTC/USDT:USDT': ({'id': 'btc-old'},),
+            'ETH/USDT:USDT': ({'id': 'eth-old'},),
+        }
+        refreshed_orders = {
+            'BTC/USDT:USDT': ({'id': 'btc-new'},),
+            'ETH/USDT:USDT': ({'id': 'eth-new'},),
+        }
+        system.exchange_api.fetch_stop_order_snapshot.return_value = first_orders
+        snapshot = system._load_stop_order_snapshot(
+            self._positions(), '测试巡检')
+        system.exchange_api.fetch_stop_order_snapshot.return_value = (
+            refreshed_orders)
+        base = snapshot.started_at
+        after_expiry = (
+            base + system.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS + 1)
+
+        with patch(
+                'stop_guardian.time.monotonic',
+                side_effect=(
+                    after_expiry, after_expiry + 0.1,
+                    after_expiry + 0.2, after_expiry + 0.2,
+                    after_expiry + 0.2)):
+            current = system._refresh_stop_order_snapshot_if_expired(
+                snapshot, self._positions(), '日检')
+            # 第二个品种复用同一份新快照，不触发第三轮批量读取。
+            current = system._refresh_stop_order_snapshot_if_expired(
+                current, self._positions(), '日检')
+
+        self.assertEqual(
+            system.exchange_api.fetch_stop_order_snapshot.call_args_list,
+            [
+                call(
+                    ['BTC/USDT:USDT', 'ETH/USDT:USDT']),
+                call(
+                    ['BTC/USDT:USDT', 'ETH/USDT:USDT']),
+            ])
+        self.assertEqual(
+            system._orders_from_stop_snapshot(
+                current, 'BTC/USDT:USDT'),
+            refreshed_orders['BTC/USDT:USDT'])
+        self.assertEqual(
+            system._orders_from_stop_snapshot(
+                current, 'ETH/USDT:USDT'),
+            refreshed_orders['ETH/USDT:USDT'])
+
+    def test_failed_or_already_stale_batch_refresh_is_sticky_fallback(self):
+        system = self._system()
+        expected = {
+            'BTC/USDT:USDT': ({'id': 'btc-old'},),
+            'ETH/USDT:USDT': ({'id': 'eth-old'},),
+        }
+        system.exchange_api.fetch_stop_order_snapshot.return_value = expected
+        snapshot = system._load_stop_order_snapshot(
+            self._positions(), '测试巡检')
+        expired_at = (
+            snapshot.started_at +
+            system.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS + 1)
+
+        with self.subTest('refresh failure'), patch(
+                'stop_guardian.time.monotonic',
+                return_value=expired_at), patch.object(
+                    system, '_load_stop_order_snapshot',
+                    return_value=None) as reload_snapshot:
+            current = system._refresh_stop_order_snapshot_if_expired(
+                snapshot, self._positions(), '日检')
+            current = system._refresh_stop_order_snapshot_if_expired(
+                current, self._positions(), '日检')
+            self.assertIsNone(current)
+            reload_snapshot.assert_called_once()
+
+        stale_refresh = SimpleNamespace(
+            orders=expected, started_at=snapshot.started_at)
+        with self.subTest('slow refresh'), patch(
+                'stop_guardian.time.monotonic',
+                return_value=expired_at), patch.object(
+                    system, '_load_stop_order_snapshot',
+                    return_value=stale_refresh) as reload_snapshot:
+            current = system._refresh_stop_order_snapshot_if_expired(
+                snapshot, self._positions(), '日检')
+            current = system._refresh_stop_order_snapshot_if_expired(
+                current, self._positions(), '日检')
+            self.assertIsNone(current)
+            reload_snapshot.assert_called_once()
 
     def test_partial_or_malformed_snapshot_falls_back_instead_of_assuming_empty(self):
         system = self._system()

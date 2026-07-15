@@ -86,6 +86,34 @@ class StopGuardianMixin:
             return None
         return snapshot.orders[ccxt_symbol]
 
+    def _refresh_stop_order_snapshot_if_expired(
+            self, snapshot, positions, context):
+        """共享快照过期时整批续刷一次；续刷失败才回退逐品种查询。
+
+        不能靠延长有效期换速度：超过 30 秒的订单状态可能已被触发、撤销或人工
+        修改。整批重读既保留新鲜度边界，也避免长日检对余下每个持仓重复查询
+        全部算法单类型。``None`` 表示本轮批量路径已不可用，调用方沿用权威的
+        逐品种查询，不在每个后续品种上反复尝试批量续刷。
+        """
+        if snapshot is None:
+            return None
+        age = time.monotonic() - snapshot.started_at
+        if age <= self.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS:
+            return snapshot
+        logger.info(
+            f'{context}算法单共享快照已过期(age={age:.2f}s)，整批续刷')
+        refreshed = self._load_stop_order_snapshot(
+            positions, f'{context}续刷')
+        if (refreshed is not None and
+                time.monotonic() - refreshed.started_at >
+                self.STOP_ORDER_SNAPSHOT_MAX_AGE_SECONDS):
+            # 极端慢查询本身已经超过有效期；置 None 后统一走逐品种路径，
+            # 避免后续每个品种再次触发一轮同样超时的批量续刷。
+            logger.warning(
+                f'{context}算法单批量续刷完成时已过期，回退逐品种完整查询')
+            return None
+        return refreshed
+
     def reconcile_intraday_stop_losses(self):
         """盘中巡检：发现本地有仓而交易所端已无仓时，立即按止损/外部平仓处理并通知。"""
         if not self._trade_lock.acquire(blocking=False):
@@ -117,6 +145,8 @@ class StopGuardianMixin:
             symbol_configs = {s['name']: s for s in self.config['trading']['symbols']}
 
             for symbol, position in sorted(open_positions.items()):
+                stop_orders_snapshot = self._refresh_stop_order_snapshot_if_expired(
+                    stop_orders_snapshot, open_positions, '盘中巡检')
                 # 单品种异常只跳过该品种，不得中断其余品种的巡检（与日检同一隔离标准）：
                 # 止损自愈补挂/撤单确认都可能抛出（如面值不可得、撤单重试耗尽）
                 try:
@@ -262,12 +292,41 @@ class StopGuardianMixin:
         except Exception as e:
             logger.warning(f"{symbol} [{strategy_name}] 止损存在性检查失败，跳过本轮: {e}")
             return False
+        invalid_state_result = False
         if isinstance(state_result, dict):
             state = state_result.get('state')
             discovered_order_id = state_result.get('order_id')
+            if state != 'adoptable':
+                invalid_state_result = True
         else:
             state = state_result
             discovered_order_id = None
+            if (not isinstance(state, str) or
+                    state not in {'intact', 'mismatch', 'missing'}):
+                invalid_state_result = True
+        if invalid_state_result:
+            # 适配层契约是三个字符串状态，或唯一一种 adoptable 对象。任何其它
+            # 类型/结构都代表“无法裁决”，绝不能向下落入 missing 后创建第二张
+            # 止损。隔离必须在这里完成：盘中巡检调用方对 False 只会跳过本轮。
+            state_label = (
+                state if isinstance(state, str) and state else
+                type(state_result).__name__)
+            msg = (
+                f'{symbol} 止损状态裁决返回非法结果({state_label})；'
+                '已隔离该品种并禁止自动补挂，请核对适配器与欧易委托')
+            logger.critical(msg)
+            first_unknown = self._stop_anomalies.get(symbol) != 'state_unknown'
+            self._stop_anomalies[symbol] = 'state_unknown'
+            if first_unknown:
+                self._quarantine_position_mismatch(
+                    symbol, '止损状态裁决结果非法，禁止自动补挂/新开仓',
+                    {
+                        'recorded_stop_order_id': stop_order_id,
+                        'result_type': type(state_result).__name__,
+                        'state': state_label,
+                    },
+                    stop_residue_possible=True)
+            return False
         if state == 'intact':
             if residue_present:
                 try:
@@ -281,7 +340,9 @@ class StopGuardianMixin:
             self._stop_anomalies.pop(symbol, None)  # 状态恢复正常，解除前端警示
             return True
         if state == 'adoptable':
-            if not discovered_order_id:
+            if (not isinstance(discovered_order_id, str) or
+                    not discovered_order_id or
+                    discovered_order_id != discovered_order_id.strip()):
                 state = 'mismatch'
             else:
                 updated, _saved = self._update_trade_state_stop_with_runtime_fallback(

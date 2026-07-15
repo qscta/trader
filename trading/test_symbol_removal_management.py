@@ -1004,12 +1004,73 @@ class StopSelfHealTest(unittest.TestCase):
             self.assertEqual(len(self.messages), 1)
 
     def test_adoptable_without_id_becomes_mismatch_and_never_replants(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system = self._system(tmp, state={'state': 'adoptable'})
-            self._run(system)
+        for state_result in (
+                {'state': 'adoptable'},
+                {'state': 'adoptable', 'order_id': ''},
+                {'state': 'adoptable', 'order_id': ' '},
+                {'state': 'adoptable', 'order_id': ' 123 '},
+                {'state': 'adoptable', 'order_id': 123}):
+            with self.subTest(state_result=state_result), tempfile.TemporaryDirectory() as tmp:
+                system = self._system(tmp, state=state_result)
+                self._run(system)
 
-            self.assertEqual(self.created, [])
-            self.assertEqual(system._stop_anomalies, {'BTCUSDT': 'mismatch'})
+                self.assertEqual(self.created, [])
+                self.assertEqual(
+                    system._stop_anomalies, {'BTCUSDT': 'mismatch'})
+
+    def test_invalid_state_shapes_are_quarantined_and_never_replanted(self):
+        invalid_results = (
+            None, {}, [], ['missing'], 'unknown', 'adoptable', False,
+            {'state': 'missing'}, {'state': 'intact'},
+        )
+        for state_result in invalid_results:
+            with self.subTest(state_result=state_result), tempfile.TemporaryDirectory() as tmp:
+                system = self._system(
+                    tmp, state=state_result,
+                    create_result={'id': 'stop-new'})
+                system.trade_state.mark_stop_residue('BTCUSDT')
+                position = system.trade_state.get_open_position('BTCUSDT')
+
+                self.assertFalse(system._ensure_stop_order_alive(
+                    'BTCUSDT', 'BTCUSDT', position, '海龟通道'))
+                # 同一非法状态重复出现仍只建立一次隔离/告警，绝不补挂。
+                self.assertFalse(system._ensure_stop_order_alive(
+                    'BTCUSDT', 'BTCUSDT', position, '海龟通道'))
+
+                self.assertEqual(self.created, [])
+                self.assertEqual(
+                    system.trade_state.get_open_position('BTCUSDT')[
+                        'stop_order_id'],
+                    'stop-1')
+                self.assertEqual(
+                    system._stop_anomalies, {'BTCUSDT': 'state_unknown'})
+                self.assertTrue(
+                    system.trade_state.is_position_quarantined('BTCUSDT'))
+                self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+                self.assertEqual(len(self.errors), 1)
+
+    def test_valid_intact_state_clears_unknown_state_quarantine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(
+                tmp, state='unknown', create_result={'id': 'stop-new'})
+            position = system.trade_state.get_open_position('BTCUSDT')
+
+            self.assertFalse(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT', position, '海龟通道'))
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
+
+            system.exchange_api.find_stop_order_state = (
+                lambda *args, **kwargs: 'intact')
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT', position, '海龟通道'))
+            self.assertEqual(system._stop_anomalies, {})
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(
+                system._clear_position_quarantine_after_reconcile('BTCUSDT'))
+            self.assertFalse(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_intact_clears_anomaly_state(self):
         """状态恢复正常：清除异常记录，前端警示消失。"""

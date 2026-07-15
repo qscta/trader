@@ -1718,7 +1718,7 @@ class OkxApi(ExchangeApi):
 
         OKX 没有“普通+算法单”单一原子端点。按 normal→algo→normal
         复读普通单并取并集：只有三次都空才返回空。algo 端点一次
-        完整快照已需按类型请求 7 次，由外层“连续空轮”复读，避免超过
+        完整快照已需按类型请求 8 次，由外层“连续空轮”复读，避免超过
         OKX 20 次/2s 的算法单查询限额。这不替代账户单写者约束。
         """
         ccxt_symbol = self._resolve_symbol(ccxt_symbol)
@@ -2113,7 +2113,7 @@ class OkxApi(ExchangeApi):
         """撤销未知类型订单；普通单还必须证明不是在撤单竞态中成交。"""
         ccxt_symbol = self._resolve_symbol(symbol)
         try:
-            # 单 ID 撤单不先扫两轮全部算法类型：否则 7 类预查+撤后
+            # 单 ID 撤单不先扫两轮全部算法类型：否则 8 类预查+撤后
             # 复验会超过 OKX 20 次/2s 限额。普通单可按 ID 查终态，算法单
             # 直接发验证式撤单，最后各自再查一次。
             normal_seen = any(

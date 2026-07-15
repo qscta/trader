@@ -1760,9 +1760,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             except Exception as e:
                 logger.warning(f"平仓历史归档失败（不影响交易，账本保留全部记录）: {e}")
 
-            # 一轮只读取一次全账户算法单清单，再按品种使用同一套四态裁决。
+            # 优先共享全账户算法单快照，再按品种使用同一套四态裁决。
             # 全局查询任一类型/分页失败时 helper 返回 None，后续自动走原来的
-            # 逐品种完整查询；快照过期的后续品种也单独回退实时查询。
+            # 逐品种完整查询；快照过期则整批续刷，续刷失败才逐品种回退。
             stop_orders_snapshot = self._load_stop_order_snapshot(
                 all_open_positions, '日检')
 
@@ -1829,6 +1829,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 clear_on_match=False):
                             failed_symbols.append(symbol)
                             continue
+                        if stop_snapshot_valid:
+                            # 长日检超过 30 秒时保留新鲜度边界，但整批续刷一次，
+                            # 不让余下每个持仓各自重复查询全部算法单类型。
+                            stop_orders_snapshot = (
+                                self._refresh_stop_order_snapshot_if_expired(
+                                    stop_orders_snapshot,
+                                    all_open_positions,
+                                    '日检'))
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position,
                                 self._get_strategy_display_name(strategy_type),
