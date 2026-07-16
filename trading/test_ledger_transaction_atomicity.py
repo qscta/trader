@@ -213,6 +213,28 @@ class ForceRuntimeInputBoundaryTest(unittest.TestCase):
             self.assertTrue(math.isfinite(trade['pnl']))
 
 
+class SafeFillPriceTest(unittest.TestCase):
+    """成交均价解析反例：垃圾字符串/NaN/bool 一律回退兜底价，绝不裸抛。
+
+    开仓路径若在「已成交、未挂止损」之间因 float('垃圾') 崩溃，会留下
+    最长一个巡检周期的无止损裸仓；NaN 会静默滑过止损失效比较。
+    """
+
+    def test_garbage_average_falls_back_instead_of_raising(self):
+        safe = trade_executor.TradeExecutorMixin._safe_fill_price
+        for bad in ('垃圾', 'nan', float('nan'), float('inf'), -1, 0,
+                    True, None, [50000.0]):
+            with self.subTest(bad=bad):
+                self.assertEqual(100.0, safe({'average': bad}, 100.0))
+        self.assertEqual(100.0, safe({}, 100.0))
+        self.assertEqual(100.0, safe(None, 100.0))
+
+    def test_valid_average_is_used(self):
+        safe = trade_executor.TradeExecutorMixin._safe_fill_price
+        self.assertEqual(50000.5, safe({'average': 50000.5}, 100.0))
+        self.assertEqual(50000.5, safe({'average': '50000.5'}, 100.0))
+
+
 class _EvidenceHost(trade_executor.TradeExecutorMixin):
     def __init__(self, exchange_api):
         self.exchange_api = exchange_api

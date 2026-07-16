@@ -58,6 +58,25 @@ class TradeExecutorMixin:
         return total, 'USDT'
 
     @staticmethod
+    def _safe_fill_price(order, fallback):
+        """从交易所结果读成交均价：读不出正有限数一律用调用方兜底价。
+
+        average 偶发为垃圾字符串/NaN 时绝不能裸抛——开仓路径崩在“已成交、
+        未挂止损”之间会留下裸仓窗口；NaN 滑过止损失效比较（NaN 比较恒 False）
+        会跳过本该立即执行的回滚。
+        """
+        value = order.get('average') if isinstance(order, dict) else None
+        if isinstance(value, bool):
+            value = None
+        try:
+            value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value) or value <= 0:
+            return fallback
+        return value
+
+    @staticmethod
     def _order_actual_amount(order, fallback):
         """读取适配层确认的实际成交币数；兼容未升级的测试桩/其他适配器。"""
         value = order.get('amount') if isinstance(order, dict) else None
@@ -1348,11 +1367,7 @@ class TradeExecutorMixin:
                 f"后续止损、风险与账本全部按实际量")
         position_size = actual_position_size
 
-        actual_price = open_order.get('average', calc_price)
-        if isinstance(actual_price, str):
-            actual_price = float(actual_price)
-        if actual_price is None:
-            actual_price = calc_price
+        actual_price = self._safe_fill_price(open_order, calc_price)
         if open_order.get('fee') is not None or open_order.get('fees'):
             logger.info(
                 f"{symbol} 开仓真实手续费: fee={open_order.get('fee')}, fees={open_order.get('fees')}")
@@ -1586,11 +1601,7 @@ class TradeExecutorMixin:
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, position.get('stop_order_id'))
 
         # BUG-3 修复: 使用实际成交价记录盈亏，而非K线收盘价
-        exit_price = close_order.get('average', signal['current_close'])
-        if isinstance(exit_price, str):
-            exit_price = float(exit_price)
-        if exit_price is None:
-            exit_price = signal['current_close']
+        exit_price = self._safe_fill_price(close_order, signal['current_close'])
         if close_order.get('fee') is not None or close_order.get('fees'):
             logger.info(
                 f"{symbol} 平仓真实手续费: fee={close_order.get('fee')}, fees={close_order.get('fees')}")
