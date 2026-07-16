@@ -1137,6 +1137,10 @@ class TradeExecutorMixin:
                 logger.critical(f'{symbol} pending 恢复的计划仓位非法: {planned!r}')
                 return
             account_equity = float(getattr(self.risk_manager, 'account_equity', 0) or 0)
+            if not math.isfinite(account_equity) or account_equity < 0:
+                # 权益不可信时风险基准归零：成交后风险校验按“无基准”显式跳过，
+                # 而不是让 NaN 在比较中静默吞掉这道防线。
+                account_equity = 0.0
             raw_position_size = position_size
             price_risk_pct = (
                 abs(calc_price - stop_loss_price) / calc_price if calc_price else 0)
