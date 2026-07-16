@@ -766,6 +766,15 @@ class TradeState:
                                  stop_resize_pending):
         if symbol not in self.state['open_positions']:
             return None
+        # 数值边界在修改入口执行：落盘路径本有 validate_state 兜底，
+        # 但 force_runtime（仅内存）路径不落盘，NaN/bool 会直接住进账本。
+        new_stop_price = _require_positive_finite(
+            new_stop_price, f'{symbol}.stop_loss_price')
+        if new_stop_order_id is not None and not isinstance(new_stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
+        if stop_order_size is not None:
+            stop_order_size = _require_positive_finite(
+                stop_order_size, f'{symbol}.stop_order_size')
         position = self.state['open_positions'][symbol]
         position['stop_loss_price'] = new_stop_price
         position['stop_order_id'] = new_stop_order_id
@@ -811,11 +820,8 @@ class TradeState:
             return None
         position = self.state['open_positions'][symbol]
         current_size = float(position['position_size'])
-        closed_size = float(closed_size)
-        exit_price = float(exit_price)
-        if (not math.isfinite(closed_size) or closed_size <= 0 or
-                not math.isfinite(exit_price) or exit_price <= 0):
-            raise ValueError('部分平仓数量和成交价必须是正有限数')
+        closed_size = _require_positive_finite(closed_size, '部分平仓数量')
+        exit_price = _require_positive_finite(exit_price, '部分平仓成交价')
         tolerance = max(1e-15, math.ulp(current_size) * 8)
         if closed_size >= current_size - tolerance:
             raise ValueError('部分平仓数量已覆盖全部仓位，应走 close_position')
@@ -855,7 +861,8 @@ class TradeState:
         position['position_size'] = remaining
         position['stop_order_id'] = new_stop_order_id
         position['stop_order_size'] = (
-            remaining if stop_order_size is None else float(stop_order_size))
+            remaining if stop_order_size is None else
+            _require_positive_finite(stop_order_size, f'{symbol}.stop_order_size'))
         position['extra_stop_order_ids'] = [
             str(value) for value in (extra_stop_order_ids or []) if value]
         position['stop_resize_pending'] = bool(stop_resize_pending)
@@ -1098,7 +1105,15 @@ class TradeState:
         position = self.state['open_positions'][symbol]
         self._consume_close_intent_locked(
             position, close_intent_client_id)
-        if not exit_price or exit_price <= 0:
+        # 退出价读不出正有限数（含 NaN/inf/bool/字符串垃圾）一律按既有契约
+        # 回退入场价记账，绝不让 NaN 流进 pnl 污染已平仓记录。
+        if isinstance(exit_price, bool):
+            exit_price = None
+        try:
+            exit_price = float(exit_price) if exit_price is not None else None
+        except (TypeError, ValueError):
+            exit_price = None
+        if exit_price is None or not math.isfinite(exit_price) or exit_price <= 0:
             exit_price = position['entry_price']
 
         final_size = float(position['position_size'])

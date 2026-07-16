@@ -9,6 +9,7 @@
    close_position——极端竞态下那会把用户人工开出的同向仓平掉。
 """
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -165,6 +166,51 @@ class AddOpenPositionGuardTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 state.add_open_position('ETHUSDT', 'buy', 100.0, 1.0, 90.0)
             self.assertIsNone(state.get_open_position('ETHUSDT'))
+
+
+class ForceRuntimeInputBoundaryTest(unittest.TestCase):
+    """对抗复审反例 D：仅内存（force_runtime）路径同样拒绝 NaN/错误类型。
+
+    落盘路径有 validate_state 兜底；不落盘路径此前没有任何校验，
+    NaN 止损价/bool 数量会直接住进账本并污染后续风控计算。
+    """
+
+    def _state(self, temp_dir):
+        state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+        state.add_open_position(
+            'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='turtle')
+        return state
+
+    def test_force_runtime_stop_update_rejects_nan_and_bad_types(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            for bad in (float('nan'), float('inf'), True, 0, -1, '价格', None):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    state.force_runtime_update_stop_loss('BTCUSDT', bad, 'stop-2')
+            with self.assertRaises(ValueError):
+                state.force_runtime_update_stop_loss('BTCUSDT', 95.0, 123)
+            with self.assertRaises(ValueError):
+                state.force_runtime_update_stop_loss(
+                    'BTCUSDT', 95.0, 'stop-2', stop_order_size=float('nan'))
+            position = state.get_open_position('BTCUSDT')
+            self.assertEqual(90.0, position['stop_loss_price'])
+            self.assertEqual('stop-1', position['stop_order_id'])
+
+    def test_force_runtime_partial_close_rejects_bool_stop_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            with self.assertRaises(ValueError):
+                state.force_runtime_apply_partial_close(
+                    'BTCUSDT', 2.0, 105.0, stop_order_size=True)
+            self.assertEqual(
+                10.0, state.get_open_position('BTCUSDT')['position_size'])
+
+    def test_force_runtime_close_books_entry_price_instead_of_nan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            trade = state.force_runtime_close_position('BTCUSDT', float('nan'))
+            self.assertEqual(100.0, trade['exit_price'])
+            self.assertTrue(math.isfinite(trade['pnl']))
 
 
 class _EvidenceHost(trade_executor.TradeExecutorMixin):

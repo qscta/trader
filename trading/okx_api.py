@@ -259,6 +259,30 @@ class OkxApi(ExchangeApi):
 
     # ===================== 读操作 =====================
 
+    def _assert_position_entry_symbol(self, entry, info, ccxt_symbol):
+        """持仓条目必须可归属到所查品种；归属错误/无法归属一律拒绝。
+
+        没有这道核验时，`fetch_positions([BTC])` 若因参数映射漂移返回
+        ETH 的持仓（或空字典 {}），会被直接当成 BTC 的仓/空仓——随后的
+        方向校验、止损巡检、重复开仓判断全部建立在错误品种之上。
+        """
+        observed_symbol = entry.get('symbol')
+        observed_inst = info.get('instId')
+        if not observed_symbol and not observed_inst:
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓条目缺少品种标识，拒绝裁决: "
+                f"{str(entry)[:120]}")
+        if observed_symbol is not None and (
+                self._resolve_symbol(str(observed_symbol)) != ccxt_symbol):
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓查询返回错误品种 symbol={observed_symbol!r}，"
+                "拒绝采用")
+        if observed_inst is not None and (
+                str(observed_inst) != self._to_inst_id(ccxt_symbol)):
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓查询返回错误品种 instId={observed_inst!r}，"
+                "拒绝采用")
+
     @staticmethod
     def _parse_signed_size(value, field, ccxt_symbol):
         """持仓数量字段的严格解析：None/空串返回 None，其余必须是有限数。"""
@@ -304,6 +328,7 @@ class OkxApi(ExchangeApi):
                 raise PositionModeError(
                     f"{ccxt_symbol} 持仓条目结构异常: {type(p).__name__}")
             info = p.get('info') or {}
+            self._assert_position_entry_symbol(p, info, ccxt_symbol)
             contracts_signed = self._parse_signed_size(
                 p.get('contracts'), 'contracts', ccxt_symbol)
             raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
@@ -381,7 +406,6 @@ class OkxApi(ExchangeApi):
         """归一 reduceOnly：优先标准字段，缺失回退原生 info；只认 True/'true'。
 
         读不到一律 False——不可证明 reduce-only 的订单绝不当保护性止损。
-        （pending 包装层已把该字段压成 bool，info 回退服务未经包装的原始结构。）
         """
         if not isinstance(order, dict):
             return False
@@ -389,6 +413,20 @@ class OkxApi(ExchangeApi):
         if value is None:
             value = (order.get('info') or {}).get('reduceOnly')
         return value in (True, 'true')
+
+    @staticmethod
+    def _reduce_only_unknown(order):
+        """reduceOnly 在标准字段与原生 info 中都读不到 → 未知。
+
+        未知 ≠ 否：未知订单不能证明是保护（不参与 intact 匹配），但也
+        不能隐身——四态裁决必须把它当候选计入，宁可 mismatch 交人工，
+        绝不因看不见而判 missing 再挂第二张止损。
+        """
+        if not isinstance(order, dict):
+            return False
+        if order.get('reduceOnly') is not None:
+            return False
+        return (order.get('info') or {}).get('reduceOnly') is None
 
     def _fetch_order_for_confirmation(self, ccxt_symbol, order_id, client_order_id):
         """按交易所订单 id；ACK 丢失时按预先生成的 clOrdId 查询。"""
@@ -1568,6 +1606,9 @@ class OkxApi(ExchangeApi):
                     f"持仓清单条目结构异常: {type(p).__name__}")
             info = p.get('info') or {}
             ccxt_symbol = p.get('symbol') or info.get('instId') or ''
+            if not ccxt_symbol:
+                raise PositionModeError(
+                    f"持仓清单条目缺少品种标识，拒绝裁决: {str(p)[:120]}")
             contracts = self._parse_signed_size(
                 p.get('contracts'), 'contracts', ccxt_symbol)
             raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
@@ -1602,8 +1643,11 @@ class OkxApi(ExchangeApi):
         # 比对前用同一对齐函数归一本地价（详见 _align_stop_price）
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
         algos = self._fetch_algo_orders(ccxt_symbol)
+        # reduceOnly 未知的算法单必须可见：它可能就是真实保护单（字段暂缺），
+        # 计入候选会把裁决推向 mismatch（fail-safe），绝不会推向补挂双止损。
         reduce_only_algos = [
-            order for order in algos if self._order_reduce_only(order)]
+            order for order in algos
+            if self._order_reduce_only(order) or self._reduce_only_unknown(order)]
         protective = [
             order for order in reduce_only_algos
             if self._is_protective_stop_candidate(order, stop_side)]
@@ -1730,11 +1774,15 @@ class OkxApi(ExchangeApi):
         orders = []
         for ord_type in self.ALGO_ORDER_TYPES:
             for item in self._fetch_algo_pending_raw(inst_id, ord_type):
+                raw_reduce_only = item.get('reduceOnly')
                 orders.append({
                     'id': str(item.get('algoId') or ''),
                     'clientOrderId': str(item.get('algoClOrdId') or ''),
                     'side': item.get('side'),
-                    'reduceOnly': item.get('reduceOnly') in (True, 'true'),
+                    # 字段缺失保留 None（未知）：压成 False 会让该单在
+                    # 四态裁决的 reduce-only 清单里隐身，missing 误判触发双止损。
+                    'reduceOnly': (raw_reduce_only in (True, 'true')
+                                   if raw_reduce_only is not None else None),
                     'info': item,
                 })
         return orders
@@ -1788,7 +1836,8 @@ class OkxApi(ExchangeApi):
             'id': str(item['ordId']),
             'clientOrderId': str(item.get('clOrdId') or ''),
             'side': item.get('side'),
-            'reduceOnly': item.get('reduceOnly') in (True, 'true'),
+            'reduceOnly': (item.get('reduceOnly') in (True, 'true')
+                           if item.get('reduceOnly') is not None else None),
             'info': item,
         } for item in records]
 

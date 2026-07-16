@@ -202,8 +202,8 @@ class PositionModeFailClosedTest(unittest.TestCase):
     def test_get_position_refuses_to_hide_two_legs(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 2, 'side': 'long', 'info': {}},
-            {'contracts': 3, 'side': 'short', 'info': {}},
+            {'contracts': 2, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {}},
+            {'contracts': 3, 'side': 'short', 'symbol': 'BTC/USDT:USDT', 'info': {}},
         ]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
@@ -211,7 +211,7 @@ class PositionModeFailClosedTest(unittest.TestCase):
     def test_get_position_rejects_explicit_hedge_leg(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 2, 'side': 'long', 'info': {'posSide': 'long'}},
+            {'contracts': 2, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'long'}},
         ]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
@@ -219,7 +219,7 @@ class PositionModeFailClosedTest(unittest.TestCase):
     def test_get_position_rejects_nonzero_position_with_unknown_direction(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 2, 'info': {'posSide': 'net'}},
+            {'contracts': 2, 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}},
         ]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
@@ -341,7 +341,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
 
         api.exchange.fetch_positions.side_effect = None
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 2, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 2, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
         self.assertIsNone(api.open_position('BTC/USDT:USDT', 'long', 0.1))
         api.exchange.create_order.assert_not_called()
 
@@ -353,7 +353,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         api.exchange.fetch_positions.side_effect = [
             [],
             [],
-            [{'contracts': 4, 'side': 'long', 'info': {'posSide': 'net'}}],
+            [{'contracts': 4, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}],
         ]
 
         order = api.open_position('BTC/USDT:USDT', 'long', 0.1)
@@ -368,7 +368,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         terminal = {'id': 'ord-live', 'status': 'canceled', 'filled': 4, 'average': 99}
         api.exchange.fetch_order.side_effect = [live, live, live, terminal]
         partial_position = [
-            {'contracts': 4, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 4, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
         api.exchange.fetch_positions.side_effect = [
             [], [], partial_position, partial_position, partial_position, partial_position,
         ]
@@ -386,7 +386,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         terminal = {'id': 'ord-live-full', 'status': 'closed', 'filled': 10, 'average': 100}
         api.exchange.fetch_order.side_effect = [live, live, live, terminal]
         full_position = [
-            {'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
         api.exchange.fetch_positions.side_effect = [
             [], [], full_position, full_position, full_position, full_position,
         ]
@@ -406,8 +406,8 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         api.exchange.fetch_order.return_value = {
             'id': 'close-partial', 'status': 'canceled', 'filled': 6, 'average': 102}
         api.exchange.fetch_positions.side_effect = [
-            [{'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}],
-            [{'contracts': 4, 'side': 'long', 'info': {'posSide': 'net'}}],
+            [{'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}],
+            [{'contracts': 4, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}],
         ]
 
         order = api.close_position('BTC/USDT:USDT', 'long', 0.1)
@@ -430,8 +430,8 @@ class MarketOrderConfirmationTest(unittest.TestCase):
              'fee': {'cost': 0.2, 'currency': 'USDT'}},
         ]
         api.exchange.fetch_positions.side_effect = [
-            [{'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}],
-            [{'contracts': 4, 'side': 'long', 'info': {'posSide': 'net'}}],
+            [{'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}],
+            [{'contracts': 4, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}],
             [],
         ]
 
@@ -455,7 +455,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         }
         # 订单仅报 6 张，但仓位从 10 直接归零：其余 4 张可能由止损/人工平掉。
         api.exchange.fetch_positions.side_effect = [
-            [{'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}], []]
+            [{'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}], []]
 
         order = api.close_position('BTC/USDT:USDT', 'long', 0.1)
 
@@ -475,7 +475,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         }
         api.exchange.fetch_order.side_effect = [existing, existing]
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
 
         order = api.open_position(
             'BTC/USDT:USDT', 'long', 0.1,
@@ -494,7 +494,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         }
         api.exchange.fetch_order.return_value = existing
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
 
         order = api.open_position(
             'BTC/USDT:USDT', 'long', 0.1,
@@ -514,7 +514,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         }
         api.exchange.fetch_order.return_value = existing
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 5, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 5, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
 
         order = api.open_position(
             'BTC/USDT:USDT', 'long', 0.1,
@@ -533,7 +533,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         }
         api.exchange.fetch_order.return_value = existing
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 10, 'side': 'long', 'info': {'posSide': 'net'}}]
+            {'contracts': 10, 'side': 'long', 'symbol': 'BTC/USDT:USDT', 'info': {'posSide': 'net'}}]
 
         order = api.open_position(
             'BTC/USDT:USDT', 'long', 0.1,
@@ -1478,7 +1478,8 @@ class PositionParsingStrictnessTest(unittest.TestCase):
     def test_missing_contracts_with_nonzero_raw_pos_is_not_flat(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': None, 'info': {'pos': '5'}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': None,
+             'info': {'pos': '5'}}]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
 
@@ -1486,25 +1487,29 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         for bad in (float('nan'), float('inf'), True, 'garbage'):
             api = _bare_api()
             api.exchange.fetch_positions.return_value = [
-                {'contracts': bad, 'side': 'long', 'info': {'pos': '5'}}]
+                {'symbol': 'BTC/USDT:USDT', 'contracts': bad,
+                 'side': 'long', 'info': {'pos': '5'}}]
             with self.subTest(bad=bad), self.assertRaises(PositionModeError):
                 api.get_position('BTC/USDT:USDT')
 
     def test_side_contradicting_raw_pos_sign_rejected(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 5.0, 'side': 'long', 'info': {'pos': '-5'}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 5.0,
+             'side': 'long', 'info': {'pos': '-5'}}]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
 
     def test_contracts_and_raw_pos_zero_nonzero_contradictions_rejected(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 0.0, 'info': {'pos': '5'}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 0.0,
+             'info': {'pos': '5'}}]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 5.0, 'side': 'long', 'info': {'pos': '0'}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 5.0,
+             'side': 'long', 'info': {'pos': '0'}}]
         with self.assertRaises(PositionModeError):
             api.get_position('BTC/USDT:USDT')
 
@@ -1513,12 +1518,42 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         api.exchange.fetch_positions.return_value = []
         self.assertIsNone(api.get_position('BTC/USDT:USDT'))
         api.exchange.fetch_positions.return_value = [
-            {'contracts': None, 'info': {}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': None, 'info': {}}]
         self.assertIsNone(api.get_position('BTC/USDT:USDT'))
-        good = {'contracts': '5', 'side': 'long',
+        good = {'contracts': '5', 'side': 'long', 'symbol': 'BTC/USDT:USDT',
                 'info': {'pos': '5', 'posSide': 'net'}}
         api.exchange.fetch_positions.return_value = [good]
         self.assertEqual(good, api.get_position('BTC/USDT:USDT'))
+
+    def test_entry_without_symbol_identity_rejected(self):
+        """对抗复审反例 A：{} / 无标识条目是「无法归属」，不是空仓。"""
+        for malformed in ({}, {'contracts': None, 'info': {}},
+                          {'contracts': 5.0, 'side': 'long', 'info': {}}):
+            api = _bare_api()
+            api.exchange.fetch_positions.return_value = [malformed]
+            with self.subTest(malformed=malformed), \
+                    self.assertRaises(PositionModeError):
+                api.get_position('BTC/USDT:USDT')
+
+    def test_wrong_symbol_entry_rejected(self):
+        """对抗复审反例 B：错误品种的持仓绝不能当成所查品种的仓。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'ETH/USDT:USDT', 'contracts': '5', 'side': 'long',
+             'info': {'pos': '5', 'posSide': 'net'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': '5', 'side': 'long',
+             'info': {'pos': '5', 'instId': 'ETH-USDT-SWAP'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+
+    def test_list_position_symbols_rejects_unidentifiable_entry(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [{'contracts': 2.0}]
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
 
     def test_list_position_symbols_refuses_uncertain_snapshot(self):
         api = _bare_api()
@@ -1669,6 +1704,28 @@ class StopProtectionSemanticsTest(unittest.TestCase):
             with self.subTest(pos_side=pos_side):
                 self.assertFalse(
                     OkxApi._algo_order_matches(bad, 'sell', 98.5, 25.0))
+
+    def test_unknown_reduce_only_forces_mismatch_not_missing(self):
+        """对抗复审反例 C：唯一保护单 reduceOnly 字段暂缺 → mismatch。
+
+        缺字段的单若在 reduce-only 清单里隐身，四态裁决会判 missing，
+        上层随即补挂第二张止损——它可能就是真实保护单本身。
+        """
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _s, v: str(int(float(v))))
+        api.exchange.price_to_precision = lambda _s, p: f'{float(p):.2f}'
+        stop = _native_stop(algo_id='real-stop', sz='10', px='55000.38')
+        del stop['reduceOnly']
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = _algo_stub(
+            {'conditional': [stop]})
+        self.assertEqual(
+            'mismatch',
+            api.find_stop_order_state(
+                'BTCUSDT', 'long', 0.1, 55000.38, 'gone-id'))
 
 
 class SafeCancelAccFillTest(unittest.TestCase):
