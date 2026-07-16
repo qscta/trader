@@ -143,7 +143,9 @@ class OkxApi(ExchangeApi):
             contract_size = float(market.get('contractSize') or 0)
         except Exception as e:
             raise ContractSizeUnavailable(f"{ccxt_symbol} 合约面值获取失败: {e}，拒绝换算/交易") from e
-        if contract_size <= 0:
+        if not math.isfinite(contract_size) or contract_size <= 0:
+            # "1e999" 之类畸形字符串会解析成 inf 并越过 <=0 检查；面值一旦
+            # 进缓存会污染所有币数/张数换算，必须与缺失同等 fail-closed。
             raise ContractSizeUnavailable(f"{ccxt_symbol} 市场数据缺少有效 contractSize，拒绝换算/交易")
         self._contract_size_cache[ccxt_symbol] = contract_size
         return contract_size

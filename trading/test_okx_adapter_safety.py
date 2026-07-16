@@ -132,6 +132,16 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         with self.assertRaises(ContractSizeUnavailable):
             api._get_contract_size('BTC/USDT:USDT')
 
+    def test_nonfinite_contract_size_raises(self):
+        """畸形面值（'1e999'→inf / NaN）不得越过校验进入换算缓存。"""
+        for bad in ('1e999', float('inf'), float('nan'), '-0.01'):
+            api = _bare_api()
+            api.exchange.market.return_value = {'contractSize': bad}
+            with self.subTest(bad=bad), \
+                    self.assertRaises(ContractSizeUnavailable):
+                api._get_contract_size('BTC/USDT:USDT')
+            self.assertNotIn('BTC/USDT:USDT', api._contract_size_cache)
+
     def test_market_query_failure_raises(self):
         api = _bare_api()
         api.exchange.market.side_effect = RuntimeError('网络错误')
