@@ -430,12 +430,8 @@ class TradeExecutorMixin:
 
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, old_position.get('stop_order_id'))
 
-        # 用平仓订单的实际成交价记录
-        actual_exit = close_order.get('average', exit_price)
-        if isinstance(actual_exit, str):
-            actual_exit = float(actual_exit)
-        if actual_exit is None:
-            actual_exit = exit_price
+        # 用平仓订单的实际成交价记录；读不出正有限数回退信号价
+        actual_exit = self._safe_fill_price(close_order, exit_price)
 
         exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
