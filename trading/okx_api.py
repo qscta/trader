@@ -383,6 +383,26 @@ class OkxApi(ExchangeApi):
         return self.exchange.fetch_order(
             client_order_id, ccxt_symbol, params={'clOrdId': client_order_id})
 
+    def _fetch_order_tristate(self, ccxt_symbol, client_order_id):
+        """订单三态裁决的唯一原语：('found', order) / ('absent', None)。
+
+        只有交易所明确 OrderNotFound 才是「明确不存在」；{}/None/缺身份
+        字段属「无法裁决」，一律抛出——把畸形响应当不存在，幂等开仓会
+        重复下单、平仓恢复会漏算真实成交腿。所有按 clOrdId 的存在性
+        查询都必须走这里，不得各自临时判定。
+        """
+        try:
+            order = self._fetch_order_for_confirmation(
+                ccxt_symbol, None, client_order_id)
+        except ccxt.OrderNotFound:
+            return 'absent', None
+        if not isinstance(order, dict) or not (
+                order.get('id') or order.get('status')):
+            raise RuntimeError(
+                f'{ccxt_symbol} clOrdId={client_order_id} 查询返回无法识别的'
+                f'响应，拒绝当订单不存在: {str(order)[:120]}')
+        return 'found', order
+
     @staticmethod
     def _client_order_id(value=None):
         """生成或校验 OKX clOrdId（1-32 位 ASCII 字母数字）。"""
@@ -428,20 +448,12 @@ class OkxApi(ExchangeApi):
             for leg_index in range(self.MAX_CLOSE_LEGS):
                 leg_client_id = self._close_leg_client_order_id(
                     base_client_order_id, leg_index)
-                try:
-                    candidate = self._fetch_order_for_confirmation(
-                        ccxt_symbol, None, leg_client_id)
-                except ccxt.OrderNotFound:
+                status, candidate = self._fetch_order_tristate(
+                    ccxt_symbol, leg_client_id)
+                if status == 'absent':
                     # 后续腿只可能在前一腿已经存在之后创建；首个明确缺口
                     # 之后不再查询更后缀，减少限频压力。
                     break
-                if not isinstance(candidate, dict) or not (
-                        candidate.get('id') or candidate.get('status')):
-                    # {}/None/缺身份字段是「无法裁决」而非「不存在」：把畸形
-                    # 响应当缺口会让恢复漏算真实成交腿。
-                    raise RuntimeError(
-                        f'{ccxt_symbol} 平仓恢复腿 {leg_client_id} 查询返回'
-                        f'无法识别的响应，拒绝当不存在: {str(candidate)[:120]}')
                 info = candidate.get('info') or {}
                 observed_client_id = (
                     candidate.get('clientOrderId') or info.get('clOrdId'))
@@ -871,17 +883,9 @@ class OkxApi(ExchangeApi):
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
         if contracts <= 0:
             raise ValueError(f"{ccxt_symbol} 查询既有开仓单时预期张数无效: {amount}")
-        try:
-            order = self._fetch_order_for_confirmation(
-                ccxt_symbol, None, client_order_id)
-        except ccxt.OrderNotFound:
+        status, order = self._fetch_order_tristate(ccxt_symbol, client_order_id)
+        if status == 'absent':
             return None
-        if not isinstance(order, dict) or not (order.get('id') or order.get('status')):
-            # {} / None / 缺身份字段是「无法裁决」，不是「不存在」；当不存在
-            # 会让调用方再发一张真实开仓单。
-            raise RuntimeError(
-                f"{ccxt_symbol} clOrdId={client_order_id} 查询返回无法识别的响应，"
-                f"拒绝当订单不存在: {str(order)[:120]}")
         if not self._existing_order_matches_request(
                 order, ccxt_symbol, order_side, contracts, reduce_only=False):
             raise RuntimeError(
@@ -913,24 +917,13 @@ class OkxApi(ExchangeApi):
         # 三态裁决：OrderNotFound=确定不存在（可新发单）；命中且一致=复用；
         # 响应畸形/查询失败=无法裁决，一律拒绝新 POST。
         if supplied_client_id:
-            confirmed_absent = False
             try:
-                existing = self._fetch_order_for_confirmation(
-                    ccxt_symbol, None, client_order_id)
-            except ccxt.OrderNotFound:
-                existing = None
-                confirmed_absent = True
+                status, existing = self._fetch_order_tristate(
+                    ccxt_symbol, client_order_id)
             except Exception as e:
-                logger.error(f"{ccxt_symbol} 幂等开仓订单查询失败，拒绝新下单: {e}")
+                logger.error(f"{ccxt_symbol} 幂等开仓订单查询无法裁决，拒绝新下单: {e}")
                 return None
-            if not confirmed_absent and (
-                    not isinstance(existing, dict) or
-                    not (existing.get('id') or existing.get('status'))):
-                logger.error(
-                    f"{ccxt_symbol} 幂等开仓订单查询返回无法识别的响应，"
-                    f"拒绝当订单不存在再新下单: {str(existing)[:120]}")
-                return None
-            if isinstance(existing, dict) and (existing.get('id') or existing.get('status')):
+            if status == 'found':
                 if not self._existing_order_matches_request(
                         existing, ccxt_symbol, order_side, contracts, reduce_only=False):
                     return None
