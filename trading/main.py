@@ -63,7 +63,12 @@ def _parse_startup_equity(balance):
     """
     if not isinstance(balance, dict):
         return None
-    value = (balance.get('total') or {}).get('USDT')
+    total = balance.get('total')
+    if not isinstance(total, dict):
+        # total 为字符串/数字等真值垃圾时，(x or {}).get 会 AttributeError；
+        # 本函数调用点在启动重试 try 之外，裸抛=进程裸 traceback 死亡。
+        return None
+    value = total.get('USDT')
     if value is None or isinstance(value, bool):
         return None
     try:

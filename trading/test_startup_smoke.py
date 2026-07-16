@@ -353,6 +353,7 @@ class StartupEquityParsingTest(unittest.TestCase):
 
     def test_garbage_equity_rejected(self):
         for bad in (None, {}, {'total': None}, {'total': {}},
+                    {'total': '垃圾'}, {'total': 5}, {'total': ['USDT']},
                     {'total': {'USDT': None}}, {'total': {'USDT': True}},
                     {'total': {'USDT': float('nan')}},
                     {'total': {'USDT': float('inf')}},
