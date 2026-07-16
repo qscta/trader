@@ -66,9 +66,10 @@
 
 `/api/login`、`/api/logout`、`/api/check_auth`、`/api/logs`、`/api/status`、`/api/positions`、
 `/api/symbols`、`/api/account_stats`、`/api/equity_ohlc`(=`/api/qiusuo_index_ohlc`)、`/api/instant_open`、
-`/api/close_position`、`/api/strategy_params`、`/api/equity_sync`、`/api/trades`、`/api/channel_data`、`/api/manual_check`。
+`/api/close_position`、`/api/strategy_params`、`/api/equity_sync`、`/api/trades`、`/api/manual_check`。
 
-> 多所时代的 `/api/exchanges`、`/api/overview`、`/api/overview_ohlc` 已删除；其余路由不再接受 `?exchange=` 或 body 里的 `exchange` 字段。
+> 多所时代的 `/api/exchanges`、`/api/overview`、`/api/overview_ohlc` 已删除；前端通道图下线后残留的
+> `/api/channel_data` 孤儿路由也已删除。其余路由不再接受 `?exchange=` 或 body 里的 `exchange` 字段。
 
 ## 五、运行 / 部署
 
