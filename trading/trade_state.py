@@ -608,9 +608,13 @@ class TradeState:
 
         修改阶段抛出的任何异常都会先把内存恢复到快照再向上抛——不允许出现
         「内存已缩仓、磁盘还是旧仓位」的中间态（如部分平仓改完余仓后 close
-        intent 校验失败）。mutate 返回 None 表示未发生任何修改（品种无持仓等），
-        跳过落盘。save=False 供 force_runtime_* 使用：磁盘已失效时只改内存，
-        但修改本身非法时同样必须整体回滚，不能留下半截账本。
+        intent 校验失败）。save=False 供 force_runtime_* 使用：磁盘已失效时
+        只改内存，但修改本身非法时同样必须整体回滚，不能留下半截账本。
+
+        契约：mutate 返回 None 当且仅当未发生任何修改（品种无持仓等），
+        此时跳过落盘。该契约由下方等值核对强制执行——若未来某个 mutate
+        改了账本却返回 None，这里会回滚并抛出，而不是静默留下
+        「内存已改、磁盘未存」的观测盲区。
         """
         snapshot = self._snapshot_locked()
         try:
@@ -619,6 +623,11 @@ class TradeState:
             self.state = snapshot
             raise
         if result is None:
+            if self.state != snapshot:
+                self.state = snapshot
+                raise TradeStatePersistenceError(
+                    '账本事务契约违规：mutate 宣称未修改（返回 None）'
+                    '但状态已变化；已回滚全部修改')
             return None
         if save:
             self._save_or_rollback_locked(snapshot)

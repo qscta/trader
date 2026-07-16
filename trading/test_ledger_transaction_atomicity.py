@@ -87,6 +87,33 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
                 position['close_intent']['client_order_id'])
             self.assertNotIn('last_close_client_order_id', position)
 
+    def test_contract_violation_mutate_none_after_change_is_rolled_back(self):
+        """加固反例：mutate 宣称未修改（返回 None）却改了账本 → 回滚并抛出。
+
+        没有这道守卫时，违约的 mutate 会静默跳过落盘，留下「内存已改、
+        磁盘未存」的观测盲区——正是本轮修复要消灭的中间态。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+
+            def rogue_mutate():
+                state.state['open_positions']['BTCUSDT']['position_size'] = 1.0
+                return None
+
+            with state.lock:
+                with self.assertRaises(TradeStatePersistenceError):
+                    state._transact_locked(rogue_mutate)
+            self.assertEqual(
+                10.0, state.get_open_position('BTCUSDT')['position_size'])
+
+    def test_true_noop_mutate_returning_none_skips_save_quietly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            with state.lock:
+                self.assertIsNone(state._transact_locked(lambda: None))
+            self.assertEqual(
+                10.0, state.get_open_position('BTCUSDT')['position_size'])
+
     def test_update_stop_loss_rolls_back_on_bad_extra_ids(self):
         """反例：extra_stop_order_ids 非法时，止损价/ID 不得留下半截修改。"""
         with tempfile.TemporaryDirectory() as temp_dir:
