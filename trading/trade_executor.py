@@ -202,15 +202,23 @@ class TradeExecutorMixin:
 
     def _recover_flat_compensation_evidence(
             self, ccxt_symbol, side, amount, open_client_order_id):
-        """已确认空仓时只读找回确定性补偿腿；无旧腿时不会新发单。"""
-        close_id = self._compensation_close_client_id(
-            fallback=open_client_order_id)
-        if close_id is None:
+        """已确认空仓时只读找回确定性补偿腿；绝不发送任何下单请求。
+
+        历史实现复用可下单的 close_position() 当查询：确认空仓与查询之间
+        若有人工开出同方向同数量仓位，reduce-only「查询」会真把人工仓平掉。
+        """
+        if not open_client_order_id:
             return None
-        result = self.exchange_api.close_position(
-            ccxt_symbol, side, amount, client_order_id=close_id)
+        finder = getattr(
+            self.exchange_api, 'find_compensation_close_evidence', None)
+        if not callable(finder):
+            # 未升级的适配器/测试桩没有只读找回能力；宁可让调用方用保守
+            # 退出价兜底，也不允许退回可能真实下单的路径。
+            logger.warning(
+                f'{ccxt_symbol} 交易所适配器缺少只读补偿证据查找，按无证据处理')
+            return None
+        result = finder(ccxt_symbol, side, amount, open_client_order_id)
         if (not isinstance(result, dict) or
-                result.get('id') == 'already_closed' or
                 result.get('execution_ambiguous') or
                 result.get('fully_closed') is not True):
             return None
@@ -922,9 +930,12 @@ class TradeExecutorMixin:
             if isinstance(in_memory_t1, dict):
                 in_memory_t1.pop(symbol, None)
             return True
-        except TradeStatePersistenceError as e:
+        except (TradeStatePersistenceError, ValueError) as e:
+            # ValueError＝账本入口拒绝了非法开仓数据（覆盖/NaN/非正数），
+            # 与保存失败同责：成交已发生，必须交易所侧回滚而不是裸抛。
             logger.critical(
-                f"{symbol} 开仓后本地状态保存失败；保留现有止损保护并执行交易所侧回滚: {e}")
+                f"{symbol} 开仓后本地状态落账被拒或保存失败；"
+                f"保留现有止损保护并执行交易所侧回滚: {e}")
             # 先平、确认归零后再撤止损。旧顺序“先撤保护再平仓”在三腿仍部分
             # 成交时会留下既无账本又无止损的真钱裸仓。
             self._mark_possible_unknown_stop_residue(symbol)

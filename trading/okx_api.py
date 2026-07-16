@@ -259,6 +259,24 @@ class OkxApi(ExchangeApi):
 
     # ===================== 读操作 =====================
 
+    @staticmethod
+    def _parse_signed_size(value, field, ccxt_symbol):
+        """持仓数量字段的严格解析：None/空串返回 None，其余必须是有限数。"""
+        if value is None or value == '':
+            return None
+        if isinstance(value, bool):
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓 {field} 字段是 bool，拒绝裁决: {value!r}")
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError) as e:
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓 {field} 字段异常: {value!r}") from e
+        if not math.isfinite(parsed):
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓 {field} 字段非有限数: {value!r}")
+        return parsed
+
     @retry_on_network_error(max_retries=3)
     def get_position(self, symbol):
         """获取特定交易对的持仓（单向模式下只有一条）。
@@ -266,24 +284,58 @@ class OkxApi(ExchangeApi):
         无实仓时返回 None。OKX 可能返回 contracts=None/0 的空仓条目，
         若原样外泄，上层（币安时代写下的）`contracts == 0` / `contracts > 0`
         判断会因 None 误判甚至 TypeError——统一在适配层归一化掉。
+
+        「无法确定」绝不当「空仓」：响应 None/非列表、contracts 缺失但原始
+        pos 非零、NaN/无穷/bool、标准 side 与原始 pos 符号矛盾，一律抛
+        PositionModeError，交由上层 fail-safe（跳过本轮/隔离），否则孤儿仓
+        漏检与重复开仓都会落在真钱仓位上。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
         positions = self.exchange.fetch_positions([ccxt_symbol])
+        if positions is None or not isinstance(positions, (list, tuple)):
+            raise PositionModeError(
+                f"{ccxt_symbol} 持仓查询返回 {type(positions).__name__}，"
+                "不确定不得当空仓")
         nonzero = []
-        for p in positions or []:
-            if not p or p.get('contracts') is None:
+        for p in positions:
+            if p is None:
                 continue
-            try:
-                contracts = abs(float(p['contracts']))
-            except (TypeError, ValueError) as e:
-                raise PositionModeError(f"{ccxt_symbol} 持仓张数字段异常: {p.get('contracts')!r}") from e
-            if contracts <= 0:
-                continue
+            if not isinstance(p, dict):
+                raise PositionModeError(
+                    f"{ccxt_symbol} 持仓条目结构异常: {type(p).__name__}")
             info = p.get('info') or {}
+            contracts_signed = self._parse_signed_size(
+                p.get('contracts'), 'contracts', ccxt_symbol)
+            raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
+            if contracts_signed is None:
+                if raw_pos is None:
+                    # 两个来源都明确为空才是可证明的空仓条目。
+                    continue
+                if raw_pos != 0:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
+                        "非零，拒绝当空仓")
+                continue
+            contracts = abs(contracts_signed)
+            if contracts <= 0:
+                if raw_pos is not None and raw_pos != 0:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} contracts=0 与原始 pos={info.get('pos')!r} 矛盾")
+                continue
+            if raw_pos is not None and raw_pos == 0:
+                raise PositionModeError(
+                    f"{ccxt_symbol} contracts={p.get('contracts')!r} 与原始 pos=0 矛盾")
             if p.get('hedged') is True or info.get('posSide') in ('long', 'short'):
                 raise PositionModeError(f"{ccxt_symbol} 检测到双向持仓腿(posSide={info.get('posSide')})，拒绝裁剪为单腿")
-            if self._position_side(p) not in ('long', 'short'):
+            side = self._position_side(p)
+            if side not in ('long', 'short'):
                 raise PositionModeError(f"{ccxt_symbol} 非零持仓方向不可判定，拒绝继续交易")
+            if raw_pos is not None and raw_pos != 0:
+                raw_side = 'long' if raw_pos > 0 else 'short'
+                if raw_side != side:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} 标准 side={side} 与原始 pos={info.get('pos')!r} "
+                        "符号矛盾，拒绝裁决")
             nonzero.append(p)
         if len(nonzero) > 1:
             raise PositionModeError(f"{ccxt_symbol} 同时存在 {len(nonzero)} 条非零持仓，拒绝隐藏任何一腿")
@@ -380,12 +432,16 @@ class OkxApi(ExchangeApi):
                     candidate = self._fetch_order_for_confirmation(
                         ccxt_symbol, None, leg_client_id)
                 except ccxt.OrderNotFound:
-                    candidate = None
+                    # 后续腿只可能在前一腿已经存在之后创建；首个明确缺口
+                    # 之后不再查询更后缀，减少限频压力。
+                    break
                 if not isinstance(candidate, dict) or not (
                         candidate.get('id') or candidate.get('status')):
-                    # 后续腿只可能在前一腿已经存在之后创建；首个缺口之后
-                    # 不再查询更后缀，既减少限频压力也避免把异常响应拼成腿。
-                    break
+                    # {}/None/缺身份字段是「无法裁决」而非「不存在」：把畸形
+                    # 响应当缺口会让恢复漏算真实成交腿。
+                    raise RuntimeError(
+                        f'{ccxt_symbol} 平仓恢复腿 {leg_client_id} 查询返回'
+                        f'无法识别的响应，拒绝当不存在: {str(candidate)[:120]}')
                 info = candidate.get('info') or {}
                 observed_client_id = (
                     candidate.get('clientOrderId') or info.get('clOrdId'))
@@ -821,7 +877,11 @@ class OkxApi(ExchangeApi):
         except ccxt.OrderNotFound:
             return None
         if not isinstance(order, dict) or not (order.get('id') or order.get('status')):
-            return None
+            # {} / None / 缺身份字段是「无法裁决」，不是「不存在」；当不存在
+            # 会让调用方再发一张真实开仓单。
+            raise RuntimeError(
+                f"{ccxt_symbol} clOrdId={client_order_id} 查询返回无法识别的响应，"
+                f"拒绝当订单不存在: {str(order)[:120]}")
         if not self._existing_order_matches_request(
                 order, ccxt_symbol, order_side, contracts, reduce_only=False):
             raise RuntimeError(
@@ -850,14 +910,25 @@ class OkxApi(ExchangeApi):
             return None
 
         # 信号层提供确定性 clOrdId 时，重试/重启先查询同一订单，绝不再次 create。
+        # 三态裁决：OrderNotFound=确定不存在（可新发单）；命中且一致=复用；
+        # 响应畸形/查询失败=无法裁决，一律拒绝新 POST。
         if supplied_client_id:
+            confirmed_absent = False
             try:
                 existing = self._fetch_order_for_confirmation(
                     ccxt_symbol, None, client_order_id)
             except ccxt.OrderNotFound:
                 existing = None
+                confirmed_absent = True
             except Exception as e:
                 logger.error(f"{ccxt_symbol} 幂等开仓订单查询失败，拒绝新下单: {e}")
+                return None
+            if not confirmed_absent and (
+                    not isinstance(existing, dict) or
+                    not (existing.get('id') or existing.get('status'))):
+                logger.error(
+                    f"{ccxt_symbol} 幂等开仓订单查询返回无法识别的响应，"
+                    f"拒绝当订单不存在再新下单: {str(existing)[:120]}")
                 return None
             if isinstance(existing, dict) and (existing.get('id') or existing.get('status')):
                 if not self._existing_order_matches_request(
@@ -1134,7 +1205,25 @@ class OkxApi(ExchangeApi):
             logger.error(f"平仓成交无法确认: {ccxt_symbol} {side} {amount}")
             return None
 
-        # 聚合多腿真实执行：币数、VWAP、cost、fee/fees 都不丢失。
+        aggregate = self._aggregate_close_legs(
+            ccxt_symbol, legs, target_contracts,
+            total_filled_contracts, last_contracts)
+
+        if aggregate['fully_closed']:
+            aggregate['status'] = 'closed'
+            logger.info(
+                f"平仓成交已确认且仓位归零: {ccxt_symbol} {side} "
+                f"{aggregate['amount']}币, 订单={aggregate['ids']}")
+        else:
+            logger.critical(
+                f"{ccxt_symbol} {len(legs)}腿补平后仍剩 {aggregate['remaining_amount']}币；"
+                f"返回实际部分成交，调用方必须原子缩减账本并重挂余仓止损")
+        return aggregate
+
+    def _aggregate_close_legs(self, ccxt_symbol, legs, target_contracts,
+                              total_filled_contracts, last_contracts):
+        """聚合多腿真实执行：币数、VWAP、cost、fee/fees 都不丢失。"""
+        tolerance = self._contracts_tolerance(ccxt_symbol)
         aggregate = dict(legs[-1][0])
         aggregate['ids'] = [str(leg.get('id')) for leg, _qty in legs]
         aggregate['clientOrderIds'] = [leg.get('clientOrderId') for leg, _qty in legs]
@@ -1175,16 +1264,47 @@ class OkxApi(ExchangeApi):
             costs = [self._finite_nonnegative(f.get('cost')) for f in fees if isinstance(f, dict)]
             if len(currencies) == 1 and None not in currencies and all(v is not None for v in costs):
                 aggregate['fee'] = {'currency': next(iter(currencies)), 'cost': sum(costs)}
+        return aggregate
 
-        if aggregate['fully_closed']:
-            aggregate['status'] = 'closed'
-            logger.info(
-                f"平仓成交已确认且仓位归零: {ccxt_symbol} {side} "
-                f"{aggregate['amount']}币, 订单={aggregate['ids']}")
-        else:
-            logger.critical(
-                f"{ccxt_symbol} {len(legs)}腿补平后仍剩 {aggregate['remaining_amount']}币；"
-                f"返回实际部分成交，调用方必须原子缩减账本并重挂余仓止损")
+    def find_compensation_close_evidence(self, symbol, side, amount,
+                                         open_client_order_id):
+        """只读找回由开仓句柄派生的补偿平仓腿聚合成交；绝不发送下单请求。
+
+        前置条件：调用方已确认交易所该品种净持仓为零。用途是判断历史补偿
+        平仓是否真实发生过，以便用真实退出价补记往返——此前该场景误用可
+        下单的 close_position()，极端竞态下（确认空仓后用户人工开出同方向
+        同数量仓位）会把人工仓平掉。返回：
+          - None — 明确不存在补偿腿（OrderNotFound），或成交未覆盖请求量
+                   （证据不完整，调用方按保守价兜底）；
+          - dict — 全部腿终态且覆盖请求量的聚合结果（average/fees/ids）。
+        查询不确定或腿内容与请求不一致一律抛出。
+        """
+        ccxt_symbol = self._resolve_symbol(symbol)
+        close_side = 'sell' if side == 'long' else 'buy'
+        base_client_id = self.compensation_client_order_id(open_client_order_id)
+        requested_contracts = self._coin_to_contracts(ccxt_symbol, amount)
+        if requested_contracts <= 0:
+            raise ValueError(
+                f"{ccxt_symbol} 查询补偿平仓腿时预期张数无效: {amount}")
+        existing_legs = self._collect_existing_close_legs(
+            ccxt_symbol, close_side, requested_contracts, base_client_id)
+        if not existing_legs:
+            return None
+        tolerance = self._contracts_tolerance(ccxt_symbol)
+        total_filled = sum(leg[3] for leg in existing_legs)
+        if total_filled + tolerance < requested_contracts:
+            logger.warning(
+                f'{ccxt_symbol} 补偿腿累计成交 {total_filled} 张未覆盖请求 '
+                f'{requested_contracts} 张，证据不完整，不当完整补偿')
+            return None
+        legs = [(leg[1], leg[3]) for leg in existing_legs if leg[3] > tolerance]
+        if not legs:
+            return None
+        aggregate = self._aggregate_close_legs(
+            ccxt_symbol, legs, requested_contracts, total_filled, 0.0)
+        aggregate.setdefault('clientOrderId', base_client_id)
+        aggregate['status'] = 'closed'
+        aggregate['read_only_evidence'] = True
         return aggregate
 
     @staticmethod
@@ -1192,7 +1312,9 @@ class OkxApi(ExchangeApi):
         """严格判断算法单是否为本地记录的保护性止损。
 
         必须同时满足：记录 ID（若有）、conditional 类型、reduceOnly、触发后市价
-        (slOrdPx=-1)、方向、触发价、张数。任何字段读不到一律视为不匹配。
+        (slOrdPx=-1)、state=live、slTriggerPxType=last（与本系统创建口径一致）、
+        非对冲 posSide、方向、触发价、张数。任何字段读不到一律视为不匹配——
+        已暂停/已触发/已撤销或触发价类型不同的算法单都不是完整保护。
         """
         if not order or order.get('side') != stop_side:
             return False
@@ -1205,6 +1327,12 @@ class OkxApi(ExchangeApi):
         if reduce_only not in (True, 'true'):
             return False
         if info.get('ordType') != 'conditional':
+            return False
+        if info.get('state') != 'live':
+            return False
+        if info.get('slTriggerPxType') != 'last':
+            return False
+        if info.get('posSide') in ('long', 'short'):
             return False
         try:
             if float(info.get('slOrdPx')) != -1.0:
@@ -1426,16 +1554,38 @@ class OkxApi(ExchangeApi):
 
     @retry_on_network_error(max_retries=3)
     def list_position_symbols(self):
-        """列出 U 本位永续真实持仓；币本位合约不属于本系统边界。"""
+        """列出 U 本位永续真实持仓；币本位合约不属于本系统边界。
+
+        孤儿仓核对依赖本清单完整：响应 None/非列表、张数字段不可解析或
+        contracts 缺失但原始 pos 非零，都必须抛出——静默跳过等于让守护
+        程序漏检真钱仓位。
+        """
+        positions = self.exchange.fetch_positions()
+        if positions is None or not isinstance(positions, (list, tuple)):
+            raise PositionModeError(
+                f"持仓清单查询返回 {type(positions).__name__}，不确定不得当无持仓")
         symbols = []
-        for p in self.exchange.fetch_positions() or []:
-            if not p or not p.get('contracts'):
+        for p in positions:
+            if p is None:
                 continue
-            ccxt_symbol = p.get('symbol') or ''
+            if not isinstance(p, dict):
+                raise PositionModeError(
+                    f"持仓清单条目结构异常: {type(p).__name__}")
+            info = p.get('info') or {}
+            ccxt_symbol = p.get('symbol') or info.get('instId') or ''
+            contracts = self._parse_signed_size(
+                p.get('contracts'), 'contracts', ccxt_symbol)
+            raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
+            if contracts is None:
+                if raw_pos is not None and raw_pos != 0:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
+                        "非零，孤儿仓核对拒绝跳过")
+                continue
             # BTC/USD:BTC 若被 to_internal_symbol 会错映成 BTCUSDT，导致把
             # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓。
-            if abs(float(p['contracts'])) > 0 and ccxt_symbol.endswith(':USDT'):
-                symbols.append(self.to_internal_symbol(ccxt_symbol))
+            if abs(contracts) > 0 and str(p.get('symbol') or '').endswith(':USDT'):
+                symbols.append(self.to_internal_symbol(p['symbol']))
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
@@ -1556,9 +1706,14 @@ class OkxApi(ExchangeApi):
                         f'算法单分页项缺少 algoId(ordType={ord_type})')
                 algo_id = str(item['algoId'])
                 page_ids.append(algo_id)
-                if algo_id not in seen_ids:
-                    seen_ids.add(algo_id)
-                    records.append(item)
+                if algo_id in seen_ids:
+                    # OKX 分页语义：after 返回边界 ID 之前的记录，同一 ID 不应
+                    # 再次出现。重复 ID 说明分页异常，静默去重会把可能截断/
+                    # 错乱的清单宣布为完整快照。
+                    raise RuntimeError(
+                        f'算法单分页重复 ID(ordType={ord_type}): {algo_id}')
+                seen_ids.add(algo_id)
+                records.append(item)
             if len(page) < self.ALGO_PAGE_LIMIT:
                 return records
             next_after = page_ids[-1]
@@ -1620,9 +1775,11 @@ class OkxApi(ExchangeApi):
                     raise RuntimeError('普通挂单分页项缺少 ordId')
                 order_id = str(item['ordId'])
                 page_ids.append(order_id)
-                if order_id not in seen_ids:
-                    seen_ids.add(order_id)
-                    records.append(item)
+                if order_id in seen_ids:
+                    # 同算法单分页：边界 ID 不应重复出现，重复即分页异常。
+                    raise RuntimeError(f'普通挂单分页重复 ID: {order_id}')
+                seen_ids.add(order_id)
+                records.append(item)
             if len(page) < self.NORMAL_PAGE_LIMIT:
                 return records
             next_after = page_ids[-1]
@@ -1710,14 +1867,21 @@ class OkxApi(ExchangeApi):
 
     @staticmethod
     def _normal_order_safely_cancelled(order):
-        """只有非成交终态且累计成交为零，才能证明“撤单未改变仓位”。"""
+        """只有非成交终态且累计成交为零，才能证明“撤单未改变仓位”。
+
+        accFillSz 缺失/空串是「不知道成交了多少」，不是「明确零成交」；
+        压成 0 会把可能已部分成交的撤单误报为未动仓位。
+        """
         if not isinstance(order, dict):
             return False
         if str(order.get('state') or '').lower() not in {
                 'canceled', 'cancelled', 'mmp_canceled', 'rejected', 'expired'}:
             return False
+        raw_filled = order.get('accFillSz')
+        if raw_filled is None or raw_filled == '' or isinstance(raw_filled, bool):
+            return False
         try:
-            filled = float(order.get('accFillSz') or 0)
+            filled = float(raw_filled)
         except (TypeError, ValueError):
             return False
         return math.isfinite(filled) and filled == 0

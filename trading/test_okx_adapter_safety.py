@@ -60,11 +60,14 @@ def _bare_api():
 
 
 def _native_stop(algo_id='stop-1', side='sell', sz='10', px='55000',
-                 client_id=''):
+                 client_id='', state='live', trigger_px_type='last',
+                 pos_side='net'):
     """OKX orders-algo-pending 原生响应里的一条 conditional 止损单。"""
     return {'algoId': algo_id, 'algoClOrdId': client_id, 'side': side,
             'sz': sz, 'slTriggerPx': px, 'slOrdPx': '-1',
-            'ordType': 'conditional', 'reduceOnly': 'true'}
+            'ordType': 'conditional', 'reduceOnly': 'true',
+            'state': state, 'slTriggerPxType': trigger_px_type,
+            'posSide': pos_side}
 
 
 def _native_normal(order_id='order-1', side='buy', size='10'):
@@ -1291,7 +1294,9 @@ class StopOrderMatchTest(unittest.TestCase):
     GOOD = {
         'id': 'stop-1', 'side': 'sell', 'amount': 25.0,
         'stopLossPrice': 98.5, 'reduceOnly': True,
-        'info': {'ordType': 'conditional', 'slOrdPx': '-1'},
+        'info': {'ordType': 'conditional', 'slOrdPx': '-1',
+                 'state': 'live', 'slTriggerPxType': 'last',
+                 'posSide': 'net'},
     }
 
     def test_full_match(self):
@@ -1315,7 +1320,8 @@ class StopOrderMatchTest(unittest.TestCase):
     def test_trigger_from_okx_info_field(self):
         o = {'side': 'sell', 'reduceOnly': True,
              'info': {'slTriggerPx': '98.5', 'sz': '25',
-                      'ordType': 'conditional', 'slOrdPx': '-1'}}
+                      'ordType': 'conditional', 'slOrdPx': '-1',
+                      'state': 'live', 'slTriggerPxType': 'last'}}
         self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
 
     def test_non_reduce_only_or_non_market_stop_rejected(self):
@@ -1458,6 +1464,362 @@ class LeverageFailClosedTest(unittest.TestCase):
             api.setup_symbol('BTC/USDT:USDT')
 
         self.assertNotIn('BTC/USDT:USDT', api._leverage_done)
+
+
+class PositionParsingStrictnessTest(unittest.TestCase):
+    """终审缺陷反例：交易所持仓响应的「不确定」绝不能滑向「空仓」。"""
+
+    def test_none_response_is_not_flat(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = None
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+
+    def test_missing_contracts_with_nonzero_raw_pos_is_not_flat(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': None, 'info': {'pos': '5'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+
+    def test_nan_or_bool_contracts_rejected(self):
+        for bad in (float('nan'), float('inf'), True, 'garbage'):
+            api = _bare_api()
+            api.exchange.fetch_positions.return_value = [
+                {'contracts': bad, 'side': 'long', 'info': {'pos': '5'}}]
+            with self.subTest(bad=bad), self.assertRaises(PositionModeError):
+                api.get_position('BTC/USDT:USDT')
+
+    def test_side_contradicting_raw_pos_sign_rejected(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 5.0, 'side': 'long', 'info': {'pos': '-5'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+
+    def test_contracts_and_raw_pos_zero_nonzero_contradictions_rejected(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 0.0, 'info': {'pos': '5'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 5.0, 'side': 'long', 'info': {'pos': '0'}}]
+        with self.assertRaises(PositionModeError):
+            api.get_position('BTC/USDT:USDT')
+
+    def test_clean_flat_and_clean_position_still_work(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = []
+        self.assertIsNone(api.get_position('BTC/USDT:USDT'))
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': None, 'info': {}}]
+        self.assertIsNone(api.get_position('BTC/USDT:USDT'))
+        good = {'contracts': '5', 'side': 'long',
+                'info': {'pos': '5', 'posSide': 'net'}}
+        api.exchange.fetch_positions.return_value = [good]
+        self.assertEqual(good, api.get_position('BTC/USDT:USDT'))
+
+    def test_list_position_symbols_refuses_uncertain_snapshot(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = None
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'BTC/USDT:USDT', 'contracts': None,
+             'info': {'pos': '3'}}]
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
+
+    def test_list_position_symbols_reports_clean_positions(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 2.0,
+             'info': {'pos': '2'}},
+            {'symbol': 'ETH/USDT:USDT', 'contracts': 0.0, 'info': {'pos': '0'}},
+            {'symbol': 'LTC/USD:LTC', 'contracts': 1.0, 'info': {'pos': '1'}},
+        ]
+        self.assertEqual(['BTCUSDT'], api.list_position_symbols())
+
+
+class OrderTriStateAdjudicationTest(unittest.TestCase):
+    """终审缺陷反例：只有 OrderNotFound 才是「明确不存在」。
+
+    确定性 clOrdId 查询返回 {} 后再新发一张开仓 POST，就是重复建仓。
+    """
+
+    def _api(self):
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        api._leverage_done = {'BTC/USDT:USDT'}
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _symbol, value: str(int(value)))
+        return api
+
+    def test_find_existing_open_order_raises_on_malformed_response(self):
+        for malformed in ({}, None, {'noise': 1}):
+            api = self._api()
+            api.exchange.fetch_order.return_value = malformed
+            with self.subTest(malformed=malformed), \
+                    self.assertRaises(RuntimeError):
+                api.find_existing_open_order(
+                    'BTCUSDT', 'long', 0.1, 'CID123')
+
+    def test_find_existing_open_order_none_only_on_order_not_found(self):
+        api = self._api()
+        api.exchange.fetch_order.side_effect = OrderNotFound('gone')
+        self.assertIsNone(
+            api.find_existing_open_order('BTCUSDT', 'long', 0.1, 'CID123'))
+
+    def test_open_position_refuses_new_post_after_malformed_lookup(self):
+        api = self._api()
+        api.exchange.fetch_order.return_value = {}
+        result = api.open_position(
+            'BTCUSDT', 'long', 0.1, client_order_id='CID123')
+        self.assertIsNone(result)
+        api.exchange.create_order.assert_not_called()
+
+    def test_close_leg_recovery_raises_on_malformed_response(self):
+        api = self._api()
+        api.exchange.fetch_order.return_value = {}
+        with self.assertRaises(RuntimeError):
+            api._collect_existing_close_legs(
+                'BTC/USDT:USDT', 'sell', 10.0, 'C' + 'a' * 31)
+
+
+class PaginationDuplicateIdTest(unittest.TestCase):
+    """终审缺陷反例：分页重复 ID 说明快照异常，静默去重会伪造完整清单。"""
+
+    def test_algo_duplicate_across_pages_raises(self):
+        api = _bare_api()
+        full_page = [_native_stop(algo_id=f'a{i}')
+                     for i in range(api.ALGO_PAGE_LIMIT)]
+        duplicate_page = [_native_stop(algo_id=f'a{api.ALGO_PAGE_LIMIT - 1}')]
+        responses = iter([
+            {'code': '0', 'data': full_page},
+            {'code': '0', 'data': duplicate_page},
+        ])
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = (
+            lambda params: next(responses))
+        with self.assertRaises(RuntimeError):
+            api._fetch_algo_pending_raw('BTC-USDT-SWAP', 'conditional')
+
+    def test_algo_duplicate_within_page_raises(self):
+        api = _bare_api()
+        api.exchange.privateGetTradeOrdersAlgoPending.side_effect = (
+            lambda params: {
+                'code': '0',
+                'data': [_native_stop(algo_id='dup'),
+                         _native_stop(algo_id='dup')]})
+        with self.assertRaises(RuntimeError):
+            api._fetch_algo_pending_raw('BTC-USDT-SWAP', 'conditional')
+
+    def test_normal_duplicate_across_pages_raises(self):
+        api = _bare_api()
+        full_page = [_native_normal(order_id=f'n{i}')
+                     for i in range(api.NORMAL_PAGE_LIMIT)]
+        duplicate_page = [_native_normal(
+            order_id=f'n{api.NORMAL_PAGE_LIMIT - 1}')]
+        responses = iter([
+            {'code': '0', 'data': full_page},
+            {'code': '0', 'data': duplicate_page},
+        ])
+        api.exchange.privateGetTradeOrdersPending.side_effect = (
+            lambda params: next(responses))
+        with self.assertRaises(RuntimeError):
+            api._fetch_normal_pending_raw('BTC-USDT-SWAP')
+
+
+class StopProtectionSemanticsTest(unittest.TestCase):
+    """终审缺陷反例：已暂停/已触发/触发价类型错误的算法单不是完整保护。"""
+
+    GOOD = StopOrderMatchTest.GOOD
+
+    def test_non_live_states_rejected(self):
+        for state in ('pause', 'canceled', 'effective', 'order_failed'):
+            bad = dict(self.GOOD,
+                       info=dict(self.GOOD['info'], state=state))
+            with self.subTest(state=state):
+                self.assertFalse(
+                    OkxApi._algo_order_matches(bad, 'sell', 98.5, 25.0))
+
+    def test_missing_state_rejected(self):
+        info = dict(self.GOOD['info'])
+        info.pop('state')
+        self.assertFalse(OkxApi._algo_order_matches(
+            dict(self.GOOD, info=info), 'sell', 98.5, 25.0))
+
+    def test_wrong_or_missing_trigger_price_type_rejected(self):
+        for trigger_type in ('mark', 'index', '', None):
+            info = dict(self.GOOD['info'])
+            if trigger_type is None:
+                info.pop('slTriggerPxType')
+            else:
+                info['slTriggerPxType'] = trigger_type
+            with self.subTest(trigger_type=trigger_type):
+                self.assertFalse(OkxApi._algo_order_matches(
+                    dict(self.GOOD, info=info), 'sell', 98.5, 25.0))
+
+    def test_hedge_pos_side_rejected(self):
+        for pos_side in ('long', 'short'):
+            bad = dict(self.GOOD,
+                       info=dict(self.GOOD['info'], posSide=pos_side))
+            with self.subTest(pos_side=pos_side):
+                self.assertFalse(
+                    OkxApi._algo_order_matches(bad, 'sell', 98.5, 25.0))
+
+
+class SafeCancelAccFillTest(unittest.TestCase):
+    """终审缺陷反例：accFillSz 缺失是「不知道」，不是「明确零成交」。"""
+
+    def test_missing_or_empty_acc_fill_is_not_proof_of_zero(self):
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled'}))
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled', 'accFillSz': ''}))
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled', 'accFillSz': None}))
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled', 'accFillSz': True}))
+
+    def test_explicit_zero_fill_still_confirms(self):
+        self.assertTrue(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled', 'accFillSz': '0'}))
+
+    def test_partial_fill_or_live_state_rejected(self):
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'canceled', 'accFillSz': '2'}))
+        self.assertFalse(OkxApi._normal_order_safely_cancelled(
+            {'state': 'live', 'accFillSz': '0'}))
+
+
+class OhlcvBoundaryValidationTest(unittest.TestCase):
+    """终审缺陷反例：坏蜡烛必须在适配层被整批拒绝，不得进入策略计算。"""
+
+    GOOD = [
+        [1000, 10.0, 12.0, 9.0, 11.0, 100.0],
+        [2000, 11.0, 13.0, 10.0, 12.0, 50.0],
+    ]
+
+    def test_good_batch_passes_through(self):
+        self.assertEqual(self.GOOD, OkxApi.validate_ohlcv(self.GOOD, 'BTC'))
+        self.assertEqual([], OkxApi.validate_ohlcv([], 'BTC'))
+
+    def test_none_response_rejected(self):
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv(None, 'BTC')
+
+    def test_duplicate_or_out_of_order_timestamps_rejected(self):
+        duplicate = [self.GOOD[0], list(self.GOOD[0])]
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv(duplicate, 'BTC')
+        reordered = [self.GOOD[1], self.GOOD[0]]
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv(reordered, 'BTC')
+
+    def test_nonfinite_bool_or_nonpositive_prices_rejected(self):
+        for bad in (float('nan'), float('inf'), 0.0, -1.0, True, '10'):
+            for column in (1, 2, 3, 4):
+                row = list(self.GOOD[0])
+                row[column] = bad
+                with self.subTest(bad=bad, column=column), \
+                        self.assertRaises(ValueError):
+                    OkxApi.validate_ohlcv([row], 'BTC')
+
+    def test_candle_internal_contradiction_rejected(self):
+        high_below_close = [1000, 10.0, 10.5, 9.0, 11.0, 1.0]
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv([high_below_close], 'BTC')
+        low_above_open = [1000, 8.0, 12.0, 9.0, 11.0, 1.0]
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv([low_above_open], 'BTC')
+        high_below_low = [1000, 10.0, 9.0, 11.0, 10.0, 1.0]
+        with self.assertRaises(ValueError):
+            OkxApi.validate_ohlcv([high_below_low], 'BTC')
+
+    def test_negative_or_nonfinite_volume_rejected(self):
+        for bad in (-1.0, float('nan'), True):
+            row = list(self.GOOD[0])
+            row[5] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                OkxApi.validate_ohlcv([row], 'BTC')
+
+    def test_fetch_ohlcv_entry_point_enforces_validation(self):
+        api = _bare_api()
+        api.exchange.fetch_ohlcv.return_value = [
+            [1000, 10.0, float('nan'), 9.0, 11.0, 1.0]]
+        with self.assertRaises(ValueError):
+            api.fetch_ohlcv('BTC/USDT:USDT', '1d', limit=10)
+
+
+class CompensationEvidenceReadOnlyTest(unittest.TestCase):
+    """终审缺陷反例：补偿证据找回全程只读，任何分支都不得下单。"""
+
+    def _api(self):
+        api = _bare_api()
+        api.margin_mode = 'cross'
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _symbol, value: str(int(value)))
+        return api
+
+    def test_not_found_returns_none_without_any_post(self):
+        api = self._api()
+        api.exchange.fetch_order.side_effect = OrderNotFound('no legs')
+        self.assertIsNone(api.find_compensation_close_evidence(
+            'BTC/USDT:USDT', 'long', 0.1, 'OPENID1'))
+        api.exchange.create_order.assert_not_called()
+
+    def test_full_terminal_legs_return_aggregate_without_any_post(self):
+        api = self._api()
+        base = OkxApi.compensation_client_order_id('OPENID1')
+        leg = {'id': 'o1', 'clientOrderId': base, 'symbol': 'BTC/USDT:USDT',
+               'type': 'market', 'side': 'sell', 'amount': 10.0,
+               'filled': 10.0, 'remaining': 0.0, 'status': 'closed',
+               'average': 50000.0, 'reduceOnly': True, 'info': {}}
+
+        def fetch_order(order_id, _symbol, params=None):
+            if (params or {}).get('clOrdId') == base:
+                return dict(leg)
+            raise OrderNotFound(str(order_id))
+
+        api.exchange.fetch_order.side_effect = fetch_order
+        result = api.find_compensation_close_evidence(
+            'BTC/USDT:USDT', 'long', 0.1, 'OPENID1')
+        self.assertTrue(result['fully_closed'])
+        self.assertTrue(result['read_only_evidence'])
+        self.assertEqual(50000.0, result['average'])
+        self.assertEqual(['o1'], result['ids'])
+        api.exchange.create_order.assert_not_called()
+
+    def test_partial_evidence_is_reported_as_incomplete(self):
+        api = self._api()
+        base = OkxApi.compensation_client_order_id('OPENID1')
+        leg = {'id': 'o1', 'clientOrderId': base, 'symbol': 'BTC/USDT:USDT',
+               'type': 'market', 'side': 'sell', 'amount': 6.0,
+               'filled': 6.0, 'remaining': 0.0, 'status': 'canceled',
+               'average': 50000.0, 'reduceOnly': True, 'info': {}}
+
+        def fetch_order(order_id, _symbol, params=None):
+            if (params or {}).get('clOrdId') == base:
+                return dict(leg)
+            raise OrderNotFound(str(order_id))
+
+        api.exchange.fetch_order.side_effect = fetch_order
+        self.assertIsNone(api.find_compensation_close_evidence(
+            'BTC/USDT:USDT', 'long', 0.1, 'OPENID1'))
+        api.exchange.create_order.assert_not_called()
+
+    def test_uncertain_lookup_raises_instead_of_guessing(self):
+        api = self._api()
+        api.exchange.fetch_order.return_value = {}
+        with self.assertRaises(RuntimeError):
+            api.find_compensation_close_evidence(
+                'BTC/USDT:USDT', 'long', 0.1, 'OPENID1')
+        api.exchange.create_order.assert_not_called()
 
 
 if __name__ == '__main__':
