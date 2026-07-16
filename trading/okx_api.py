@@ -376,6 +376,20 @@ class OkxApi(ExchangeApi):
             return None
         return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
+    @staticmethod
+    def _order_reduce_only(order):
+        """归一 reduceOnly：优先标准字段，缺失回退原生 info；只认 True/'true'。
+
+        读不到一律 False——不可证明 reduce-only 的订单绝不当保护性止损。
+        （pending 包装层已把该字段压成 bool，info 回退服务未经包装的原始结构。）
+        """
+        if not isinstance(order, dict):
+            return False
+        value = order.get('reduceOnly')
+        if value is None:
+            value = (order.get('info') or {}).get('reduceOnly')
+        return value in (True, 'true')
+
     def _fetch_order_for_confirmation(self, ccxt_symbol, order_id, client_order_id):
         """按交易所订单 id；ACK 丢失时按预先生成的 clOrdId 查询。"""
         if order_id:
@@ -429,6 +443,28 @@ class OkxApi(ExchangeApi):
         return (base_client_order_id if not suffix else
                 base_client_order_id[:32 - len(suffix)] + suffix)
 
+    CLOSE_LEG_TERMINAL_STATUSES = frozenset({
+        'closed', 'filled', 'canceled', 'cancelled', 'rejected', 'expired',
+        'mmp_canceled', 'mmp_cancelled'})
+
+    def _terminal_fill(self, order, amount, tolerance):
+        """读取订单终态与可归因成交量：返回 (terminal, filled, status)。
+
+        filled 缺失时用 amount-remaining 推导；closed/filled 终态且无余量
+        视为按委托量全额成交；仍推不出则 filled=None，由调用方拒绝裁决。
+        """
+        info = order.get('info') or {}
+        status = str(order.get('status') or info.get('state') or '').lower()
+        terminal = status in self.CLOSE_LEG_TERMINAL_STATUSES
+        filled = self._finite_nonnegative(order.get('filled'))
+        remaining = self._finite_nonnegative(order.get('remaining'))
+        if filled is None and remaining is not None:
+            filled = max(0.0, amount - remaining)
+        if (filled is None and status in {'closed', 'filled'} and
+                (remaining is None or remaining <= tolerance)):
+            filled = amount
+        return terminal, filled, status
+
     def _collect_existing_close_legs(
             self, ccxt_symbol, close_side, requested_contracts,
             base_client_order_id):
@@ -438,9 +474,6 @@ class OkxApi(ExchangeApi):
         恢复若只看首腿，会把 r1/r2 的仓位变化误算到首腿并丢掉 VWAP/fee。
         """
         tolerance = self._contracts_tolerance(ccxt_symbol)
-        terminal_statuses = {
-            'closed', 'filled', 'canceled', 'cancelled', 'rejected', 'expired',
-            'mmp_canceled', 'mmp_cancelled'}
         last_problem = None
         for attempt in range(self.ORDER_CONFIRM_ATTEMPTS):
             found = {}
@@ -448,9 +481,9 @@ class OkxApi(ExchangeApi):
             for leg_index in range(self.MAX_CLOSE_LEGS):
                 leg_client_id = self._close_leg_client_order_id(
                     base_client_order_id, leg_index)
-                status, candidate = self._fetch_order_tristate(
+                presence, candidate = self._fetch_order_tristate(
                     ccxt_symbol, leg_client_id)
-                if status == 'absent':
+                if presence == 'absent':
                     # 后续腿只可能在前一腿已经存在之后创建；首个明确缺口
                     # 之后不再查询更后缀，减少限频压力。
                     break
@@ -476,22 +509,9 @@ class OkxApi(ExchangeApi):
                         f'{leg_client_id}')
                 found[leg_index] = [
                     leg_client_id, dict(candidate), observed_amount, None]
-                preliminary_status = str(
-                    candidate.get('status') or info.get('state') or '').lower()
-                preliminary_filled = self._finite_nonnegative(
-                    candidate.get('filled'))
-                preliminary_remaining = self._finite_nonnegative(
-                    candidate.get('remaining'))
-                if preliminary_filled is None and preliminary_remaining is not None:
-                    preliminary_filled = max(
-                        0.0, observed_amount - preliminary_remaining)
-                if (preliminary_filled is None and
-                        preliminary_status in {'closed', 'filled'} and
-                        (preliminary_remaining is None or
-                         preliminary_remaining <= tolerance)):
-                    preliminary_filled = observed_amount
-                if (preliminary_status not in terminal_statuses or
-                        preliminary_filled is None):
+                terminal, preliminary_filled, _status = self._terminal_fill(
+                    candidate, observed_amount, tolerance)
+                if not terminal or preliminary_filled is None:
                     break
                 known_filled += preliminary_filled
                 if known_filled + tolerance >= requested_contracts:
@@ -508,22 +528,13 @@ class OkxApi(ExchangeApi):
             total_filled = 0.0
             for leg_index in indices:
                 leg_client_id, order, amount, _filled = found[leg_index]
-                info = order.get('info') or {}
-                status = str(
-                    order.get('status') or info.get('state') or '').lower()
-                terminal = status in terminal_statuses
-                filled = self._finite_nonnegative(order.get('filled'))
-                remaining = self._finite_nonnegative(order.get('remaining'))
-                if filled is None and remaining is not None:
-                    filled = max(0.0, amount - remaining)
-                if (filled is None and status in {'closed', 'filled'} and
-                        (remaining is None or remaining <= tolerance)):
-                    filled = amount
+                terminal, filled, order_status = self._terminal_fill(
+                    order, amount, tolerance)
                 if (not terminal or filled is None or
                         filled > amount + tolerance):
                     all_terminal = False
                     last_problem = (
-                        f'{leg_client_id}: status={status}, filled={filled}, '
+                        f'{leg_client_id}: status={order_status}, filled={filled}, '
                         f'amount={amount}')
                     break
                 order.setdefault('clientOrderId', leg_client_id)
@@ -569,10 +580,7 @@ class OkxApi(ExchangeApi):
         if observed_amount is None:
             observed_amount = info.get('sz')
         observed_amount = self._finite_nonnegative(observed_amount)
-        observed_reduce_only = order.get('reduceOnly')
-        if observed_reduce_only is None:
-            observed_reduce_only = info.get('reduceOnly')
-        observed_reduce_only = observed_reduce_only in (True, 'true')
+        observed_reduce_only = self._order_reduce_only(order)
         amount_matches = (
             observed_amount is not None and
             abs(observed_amount - requested_contracts) <= self._contracts_tolerance(ccxt_symbol))
@@ -1314,10 +1322,7 @@ class OkxApi(ExchangeApi):
         if expected_order_id is not None and str(order.get('id')) != str(expected_order_id):
             return False
         info = order.get('info') or {}
-        reduce_only = order.get('reduceOnly')
-        if reduce_only is None:
-            reduce_only = info.get('reduceOnly')
-        if reduce_only not in (True, 'true'):
+        if not OkxApi._order_reduce_only(order):
             return False
         if info.get('ordType') != 'conditional':
             return False
@@ -1378,11 +1383,8 @@ class OkxApi(ExchangeApi):
         if not order or order.get('side') != stop_side:
             return False
         info = order.get('info') or {}
-        reduce_only = order.get('reduceOnly')
-        if reduce_only is None:
-            reduce_only = info.get('reduceOnly')
         return (
-            reduce_only in (True, 'true') and
+            OkxApi._order_reduce_only(order) and
             info.get('ordType') in {'conditional', 'oco', 'trigger', 'move_order_stop'})
 
     def assert_no_stale_protective_orders(self, symbol):
@@ -1600,14 +1602,8 @@ class OkxApi(ExchangeApi):
         # 比对前用同一对齐函数归一本地价（详见 _align_stop_price）
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
         algos = self._fetch_algo_orders(ccxt_symbol)
-        reduce_only_algos = []
-        for order in algos:
-            info = order.get('info') or {}
-            reduce_only = order.get('reduceOnly')
-            if reduce_only is None:
-                reduce_only = info.get('reduceOnly')
-            if reduce_only in (True, 'true'):
-                reduce_only_algos.append(order)
+        reduce_only_algos = [
+            order for order in algos if self._order_reduce_only(order)]
         protective = [
             order for order in reduce_only_algos
             if self._is_protective_stop_candidate(order, stop_side)]
