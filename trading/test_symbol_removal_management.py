@@ -82,8 +82,8 @@ class RemovedSymbolStillManagedTest(unittest.TestCase):
 
             self.assertEqual(sorted(checked), [('BTCUSDT', 'turtle'), ('ETHUSDT', 'ma_cross')])
 
-    def test_orphan_position_without_strategy_falls_back_to_turtle(self):
-        """老仓缺 strategy 字段时按 turtle 兜底（删除入口已被阻止，此为最后防线）。"""
+    def test_orphan_position_without_strategy_falls_back_to_ma_cross(self):
+        """老仓缺 strategy 字段时按 ma_cross 兜底（海龟已下线，唯一在役策略）。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, checked = _build_system(tmp, config_symbols=[])
             system.trade_state.add_open_position(
@@ -91,7 +91,7 @@ class RemovedSymbolStillManagedTest(unittest.TestCase):
 
             system.check_and_execute_trades()
 
-            self.assertEqual(checked, [('LTCUSDT', 'turtle')])
+            self.assertEqual(checked, [('LTCUSDT', 'ma_cross')])
 
 
 class PerSymbolIsolationTest(unittest.TestCase):
@@ -382,27 +382,6 @@ class RetiredTurtleExitOnlyTest(unittest.TestCase):
              'upper_line': 110.0},
             {'name': 'BTCUSDT', '_retired_from_pool': True})
         self.assertEqual(outcome, {'status': 'retired_no_reopen'})
-
-    def test_cross_break_closes_retired_position_without_reverse(self):
-        system = TradingSystem.__new__(TradingSystem)
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=lambda value: value,
-            get_position=lambda value: {'contracts': 1})
-        system.handle_close_signal = Mock(return_value=True)
-        system.handle_open_signal_turtle = Mock()
-        position = {'side': 'short', 'stop_loss_price': 110.0}
-        signal = {
-            'action': 'long', 'mid_line_crossed': True,
-            'current_close': 120.0, 'mid_line': 100.0,
-            'upper_line': 115.0, 'lower_line': 85.0,
-        }
-
-        system.handle_open_position_turtle(
-            'BTCUSDT', signal, position,
-            {'name': 'BTCUSDT', '_retired_from_pool': True})
-
-        system.handle_close_signal.assert_called_once()
-        system.handle_open_signal_turtle.assert_not_called()
 
     def test_partial_explicit_exit_remains_pending(self):
         before = {'side': 'long', 'position_size': 10}
@@ -1096,15 +1075,6 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
     @staticmethod
     def _raise_persistence_error(symbol, exit_price, **kwargs):
         raise TradeStatePersistenceError('磁盘故障')
-
-    def test_turtle_branch_still_confirms_stop_cancel(self):
-        system, cancel_calls = self._system()
-        signal = {'action': 'short', 'mid_line_crossed': True, 'current_close': 38, 'mid_line': 56}
-        position = {'side': 'long', 'stop_loss_price': 40, 'position_size': 1, 'stop_order_id': 'stop-1'}
-
-        system.handle_open_position_turtle('BTCUSDT', signal, position, {'name': 'BTCUSDT'})
-
-        self.assertEqual(cancel_calls, ['stop-1'])  # 撤旧止损确认必须执行
 
     def test_ma_cross_branch_still_confirms_stop_cancel(self):
         system, cancel_calls = self._system()
