@@ -546,7 +546,7 @@ def add_symbol():
         clean, invalid = _validate_symbol_input(
             data.get('name'),
             data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
-            data['strategy'] if 'strategy' in data else 'turtle',
+            data['strategy'] if 'strategy' in data else 'ma_cross',
             data['enabled'] if 'enabled' in data else True)
         if invalid:
             return jsonify({'error': invalid}), 400
@@ -1111,7 +1111,7 @@ def instant_open():
             clean, invalid = _validate_symbol_input(
                 data.get('name'),
                 data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
-                data['strategy'] if 'strategy' in data else 'turtle')
+                data['strategy'] if 'strategy' in data else 'ma_cross')
             if invalid:
                 return jsonify({'error': invalid}), 400
             symbol_name = clean['name']
@@ -1124,8 +1124,8 @@ def instant_open():
             # 品种池已有该交易对且策略不同：拒绝。日检对在池品种一律按池内策略托管，
             # 按请求策略开出的仓会立刻被另一套止损/出场逻辑接管（与「有持仓禁改策略」同一护栏）
             pool_cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_name), None)
-            if pool_cfg and pool_cfg.get('strategy', 'turtle') != strategy_type:
-                pool_strategy = pool_cfg.get('strategy', 'turtle')
+            if pool_cfg and pool_cfg.get('strategy', 'ma_cross') != strategy_type:
+                pool_strategy = pool_cfg.get('strategy', 'ma_cross')
                 return jsonify({'error': f'{symbol_name} 已在品种池中且策略为 {pool_strategy}，'
                                          f'与本次请求的 {strategy_type} 不一致——开仓后将被日检按池内策略托管。'
                                          '请改按池内策略开仓，或先在品种池中调整该交易对的策略'}), 400

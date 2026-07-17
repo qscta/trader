@@ -181,7 +181,7 @@ class StartupSmokeTest(unittest.TestCase):
 
     def test_string_typed_params_normalized(self):
         """字符串数值（"28" / "0.01"）通过校验后必须规范化为 int/float 写回——
-        否则构造 TurtleStrategy("28")/RiskManager 权益×"0.01" 会在盘中 TypeError。
+        否则构造 MaCrossStrategy("28")/RiskManager 权益×"0.01" 会在盘中 TypeError。
         品种名小写/带空格规范化为大写；字符串 "true"/"false" 解析为真 bool。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_config(tmp)
@@ -189,7 +189,7 @@ class StartupSmokeTest(unittest.TestCase):
             cfg['strategy']['channel_period'] = "28"
             cfg['strategy']['default_risk_per_trade'] = "0.01"
             cfg['trading']['symbols'] = [
-                {'name': ' btcusdt ', 'risk_per_trade': "0.02", 'strategy': 'turtle', 'enabled': 'true'}]
+                {'name': ' btcusdt ', 'risk_per_trade': "0.02", 'strategy': 'ma_cross', 'enabled': 'true'}]
             _jdump(cfg, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi):
                 system = TradingSystem(config_file=path)

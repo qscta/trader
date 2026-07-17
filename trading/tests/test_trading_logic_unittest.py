@@ -394,7 +394,7 @@ class InstantOpenApiTests(unittest.TestCase):
 
         trade_state.get_open_position = get_open_position
 
-        df_marker = [None] * 30
+        df_marker = [None] * 60
         filter_mock = Mock(return_value=df_marker)
         execute_calls = []
 
@@ -416,23 +416,21 @@ class InstantOpenApiTests(unittest.TestCase):
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
                 to_ccxt_symbol=_fake_to_ccxt,
-                fetch_ohlcv=Mock(return_value=[[1]] * 120),
+                fetch_ohlcv=Mock(return_value=[[1]] * 200),
                 ohlcv_to_dataframe=Mock(return_value=df_marker),
                 filter_closed_candles=filter_mock,
                 exchange=exchange_stub,
                 get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
-            turtle_strategy=SimpleNamespace(
+            ma_cross_strategy=SimpleNamespace(
                 check_current_state=Mock(
                     return_value={
                         "action": "long",
-                        "upper_line": 130,
-                        "lower_line": 100,
-                        "mid_line": 115,
+                        "upper_stop": 130,
+                        "lower_stop": 100,
                     }
                 )
             ),
-            ma_cross_strategy=SimpleNamespace(check_current_state=Mock()),
             _execute_open=execute_open,
             _daily_candle_is_fresh=lambda _df, _day: (True, 'today', 'minimum'),
             config={"trading": {"symbols": []}},
@@ -456,7 +454,7 @@ class InstantOpenApiTests(unittest.TestCase):
             resp = self.client.post(
                 "/api/instant_open",
                 json={"name": "BTCUSDT", "risk_per_trade": 0.01,
-                      "strategy": "turtle"},
+                      "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 409)
@@ -474,7 +472,7 @@ class InstantOpenApiTests(unittest.TestCase):
             resp = self.client.post(
                 "/api/instant_open",
                 json={"name": "BTCUSDT", "risk_per_trade": 0.01,
-                      "strategy": "turtle"},
+                      "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 503)
@@ -489,7 +487,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 400)
@@ -504,7 +502,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 200)
@@ -515,7 +513,7 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(side, "long")
         self.assertEqual(entry_price, 123.45)
         self.assertEqual(stop_loss_price, 100)
-        self.assertEqual(symbol_config["strategy"], "turtle")
+        self.assertEqual(symbol_config["strategy"], "ma_cross")
         fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=300)
 
     def test_instant_open_uses_single_page_at_capacity_boundary(self):
@@ -534,7 +532,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 200)
@@ -561,15 +559,16 @@ class InstantOpenApiTests(unittest.TestCase):
         止损/出场逻辑与请求的策略不一致（与「有持仓禁改策略」同一护栏）。"""
         self.authenticate()
         fake_system = self.make_system()
+        # 遗留 turtle 品种（已强制禁用，仍在池中）vs 请求 ma_cross：策略不一致必拒。
         fake_system.config = {"trading": {"symbols": [
-            {"name": "BTCUSDT", "enabled": True, "risk_per_trade": 0.01, "strategy": "ma_cross"}]}}
+            {"name": "BTCUSDT", "enabled": False, "risk_per_trade": 0.01, "strategy": "turtle"}]}}
 
         with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 400)
@@ -595,7 +594,7 @@ class InstantOpenApiTests(unittest.TestCase):
                 api_server, 'send_dingtalk', dingtalk):
             resp = self.client.post('/api/instant_open', json={
                 'name': 'BTCUSDT', 'risk_per_trade': 0.01,
-                'strategy': 'turtle'})
+                'strategy': 'ma_cross'})
 
         self.assertEqual(409, resp.status_code)
         self.assertEqual('quarantined', resp.get_json()['status'])
@@ -663,13 +662,13 @@ class SymbolInputValidationTests(unittest.TestCase):
     def test_validate_symbol_input_normalizes(self):
         """API 归一化契约：返回规范化 clean——name 大写、risk→float、enabled→真 bool。
         杜绝 "0.01"/"false" 字符串混入下单/开仓资格路径（否则盘中 TypeError 或被当启用）。"""
-        clean, err = api_server._validate_symbol_input("btcusdt", "0.01", "turtle", "false")
+        clean, err = api_server._validate_symbol_input("btcusdt", "0.01", "ma_cross", "false")
         self.assertIsNone(err)
         self.assertEqual(clean["name"], "BTCUSDT")
         self.assertIsInstance(clean["risk_per_trade"], float)
         self.assertEqual(clean["risk_per_trade"], 0.01)
         self.assertIs(clean["enabled"], False)   # "false" 解析为 False，而非 Python 真值陷阱
-        self.assertEqual(clean["strategy"], "turtle")
+        self.assertEqual(clean["strategy"], "ma_cross")
 
     def test_validate_symbol_input_rejects_non_string_name(self):
         clean, err = api_server._validate_symbol_input(123)
@@ -723,14 +722,14 @@ class SymbolInputValidationTests(unittest.TestCase):
 
     def test_update_symbol_rejects_strategy_change_while_holding(self):
         """有持仓时禁止改策略：现有仓位的止损/出场逻辑不能被换掉。"""
-        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "strategy": "turtle"}]}}
+        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "strategy": "ma_cross"}]}}
         self.system.trade_state = SimpleNamespace(get_open_position=Mock(return_value={"symbol": "BTCUSDT"}))
         with patch.object(api_server, "trading_system", self.system), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
             resp = self.client.put("/api/symbols/BTCUSDT", json={"strategy": "ma_cross"})
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "turtle")
+        self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "ma_cross")
 
     def test_strategy_params_rejects_short_not_less_than_long(self):
         self.system.config = {"strategy": {"ma_short_period": 6, "ma_long_period": 28}}
@@ -1303,23 +1302,21 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
                 to_ccxt_symbol=_fake_to_ccxt,
-                fetch_ohlcv=Mock(return_value=[[1]] * 120),
-                ohlcv_to_dataframe=Mock(return_value=[None] * 30),
-                filter_closed_candles=Mock(return_value=[None] * 30),
+                fetch_ohlcv=Mock(return_value=[[1]] * 200),
+                ohlcv_to_dataframe=Mock(return_value=[None] * 60),
+                filter_closed_candles=Mock(return_value=[None] * 60),
                 exchange=exchange_stub,
                 get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
-            turtle_strategy=SimpleNamespace(
+            ma_cross_strategy=SimpleNamespace(
                 check_current_state=Mock(
                     return_value={
                         "action": "long",
-                        "upper_line": 130,
-                        "lower_line": 100,
-                        "mid_line": 115,
+                        "upper_stop": 130,
+                        "lower_stop": 100,
                     }
                 )
             ),
-            ma_cross_strategy=SimpleNamespace(check_current_state=Mock()),
             _execute_open=execute_open,
             config={"trading": {"symbols": []}},
             config_file="config.json",
@@ -1333,7 +1330,7 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 500)

@@ -82,9 +82,10 @@ class StrategyOhlcvLimitTest(unittest.TestCase):
         self.assertEqual(cv.required_closed_candles_for_strategy('turtle', config), 299)
         self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 299)
 
-    def test_turtle_period_over_single_page_capacity_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, '超过单次 300 根上限'):
-            cv.validate_strategy_ohlcv_capacity({'channel_period': 298})
+    def test_retired_turtle_not_validated_by_capacity_check(self):
+        # 海龟已下线：容量校验只覆盖启用策略（ma_cross），不再对 turtle 参数计算。
+        self.assertNotIn('turtle', cv.STRATEGY_WHITELIST)
+        self.assertIn('turtle', cv.RETIRED_STRATEGIES)
 
     def test_ma_period_over_single_page_capacity_is_rejected(self):
         with self.assertRaisesRegex(ValueError, '超过单次 300 根上限'):

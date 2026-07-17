@@ -24,8 +24,11 @@ OPEN_CANDLE_FETCH_BUFFER = 1
 MAX_RISK_PER_TRADE = 0.5
 # 内部交易对名：大写字母/数字，以 USDT 结尾（U 本位永续）
 SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
-# 支持的策略
-STRATEGY_WHITELIST = ('turtle', 'ma_cross')
+# 支持的策略。海龟已下线：新增/改配一律只接受 ma_cross；账本/config 里
+# 遗留的 turtle 品种由启动加载强制禁用（只平不开），不再当合法新配置接受。
+STRATEGY_WHITELIST = ('ma_cross',)
+# 已退役策略：仅用于识别遗留配置并安全禁用，绝不再参与开仓/信号计算。
+RETIRED_STRATEGIES = ('turtle',)
 
 
 def _strategy_period(strategy_config, key, default):
@@ -60,7 +63,7 @@ def ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config=None):
 
 
 def validate_strategy_ohlcv_capacity(strategy_config=None):
-    """确保两套策略均可由一次 300 根请求完整计算。"""
+    """确保启用策略均可由一次 300 根请求完整计算。"""
     for strategy_type in STRATEGY_WHITELIST:
         ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config)
     return True

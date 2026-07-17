@@ -363,8 +363,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
             if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
                 s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
-            if s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
-                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 turtle / ma_cross）")
+            if s.get('strategy') in cfgv.RETIRED_STRATEGIES:
+                # 海龟已下线：遗留品种不崩溃启动，改为强制禁用（只平不开）并
+                # 大声告警。fail-closed——禁用品种不会开新仓，配合“已无海龟仓”
+                # 前提等于安全空转；请人工从品种池删除或改配 ma_cross。
+                logger.critical(
+                    f"{name} 配置为已退役策略 {s['strategy']!r}，已强制禁用（只平不开）；"
+                    "请从品种池删除或改配 ma_cross")
+                s['enabled'] = False
+            elif s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
+                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 ma_cross）")
 
     @staticmethod
     def _state_has_lifecycle_data(state):
@@ -918,12 +926,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         logger.info("持仓状态同步完成")
 
     def get_strategy_for_symbol(self, symbol_config):
-        """根据交易对配置获取对应策略"""
-        strategy_type = symbol_config.get('strategy', 'turtle')
-        if strategy_type == 'ma_cross':
-            return self.ma_cross_strategy, 'ma_cross'
-        else:
+        """根据交易对配置获取对应策略。海龟下线后默认 ma_cross；
+        显式 turtle（仅遗留、已强制禁用的品种）仍分派原策略以支持只平不开。"""
+        strategy_type = symbol_config.get('strategy', 'ma_cross')
+        if strategy_type == 'turtle':
             return self.turtle_strategy, 'turtle'
+        return self.ma_cross_strategy, 'ma_cross'
 
     def _load_stop_loss_dates(self):
         """从主账本加载 T+1；首次升级时严格迁移旧独立 JSON。"""
