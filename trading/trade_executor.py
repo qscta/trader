@@ -58,6 +58,25 @@ class TradeExecutorMixin:
         return total, 'USDT'
 
     @staticmethod
+    def _safe_fill_price(order, fallback):
+        """从交易所结果读成交均价：读不出正有限数一律用调用方兜底价。
+
+        average 偶发为垃圾字符串/NaN 时绝不能裸抛——开仓路径崩在“已成交、
+        未挂止损”之间会留下裸仓窗口；NaN 滑过止损失效比较（NaN 比较恒 False）
+        会跳过本该立即执行的回滚。
+        """
+        value = order.get('average') if isinstance(order, dict) else None
+        if isinstance(value, bool):
+            value = None
+        try:
+            value = float(value) if value is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value) or value <= 0:
+            return fallback
+        return value
+
+    @staticmethod
     def _order_actual_amount(order, fallback):
         """读取适配层确认的实际成交币数；兼容未升级的测试桩/其他适配器。"""
         value = order.get('amount') if isinstance(order, dict) else None
@@ -202,15 +221,23 @@ class TradeExecutorMixin:
 
     def _recover_flat_compensation_evidence(
             self, ccxt_symbol, side, amount, open_client_order_id):
-        """已确认空仓时只读找回确定性补偿腿；无旧腿时不会新发单。"""
-        close_id = self._compensation_close_client_id(
-            fallback=open_client_order_id)
-        if close_id is None:
+        """已确认空仓时只读找回确定性补偿腿；绝不发送任何下单请求。
+
+        历史实现复用可下单的 close_position() 当查询：确认空仓与查询之间
+        若有人工开出同方向同数量仓位，reduce-only「查询」会真把人工仓平掉。
+        """
+        if not open_client_order_id:
             return None
-        result = self.exchange_api.close_position(
-            ccxt_symbol, side, amount, client_order_id=close_id)
+        finder = getattr(
+            self.exchange_api, 'find_compensation_close_evidence', None)
+        if not callable(finder):
+            # 未升级的适配器/测试桩没有只读找回能力；宁可让调用方用保守
+            # 退出价兜底，也不允许退回可能真实下单的路径。
+            logger.warning(
+                f'{ccxt_symbol} 交易所适配器缺少只读补偿证据查找，按无证据处理')
+            return None
+        result = finder(ccxt_symbol, side, amount, open_client_order_id)
         if (not isinstance(result, dict) or
-                result.get('id') == 'already_closed' or
                 result.get('execution_ambiguous') or
                 result.get('fully_closed') is not True):
             return None
@@ -403,12 +430,8 @@ class TradeExecutorMixin:
 
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, old_position.get('stop_order_id'))
 
-        # 用平仓订单的实际成交价记录
-        actual_exit = close_order.get('average', exit_price)
-        if isinstance(actual_exit, str):
-            actual_exit = float(actual_exit)
-        if actual_exit is None:
-            actual_exit = exit_price
+        # 用平仓订单的实际成交价记录；读不出正有限数回退信号价
+        actual_exit = self._safe_fill_price(close_order, exit_price)
 
         exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
@@ -922,9 +945,12 @@ class TradeExecutorMixin:
             if isinstance(in_memory_t1, dict):
                 in_memory_t1.pop(symbol, None)
             return True
-        except TradeStatePersistenceError as e:
+        except (TradeStatePersistenceError, ValueError) as e:
+            # ValueError＝账本入口拒绝了非法开仓数据（覆盖/NaN/非正数），
+            # 与保存失败同责：成交已发生，必须交易所侧回滚而不是裸抛。
             logger.critical(
-                f"{symbol} 开仓后本地状态保存失败；保留现有止损保护并执行交易所侧回滚: {e}")
+                f"{symbol} 开仓后本地状态落账被拒或保存失败；"
+                f"保留现有止损保护并执行交易所侧回滚: {e}")
             # 先平、确认归零后再撤止损。旧顺序“先撤保护再平仓”在三腿仍部分
             # 成交时会留下既无账本又无止损的真钱裸仓。
             self._mark_possible_unknown_stop_residue(symbol)
@@ -1107,6 +1133,10 @@ class TradeExecutorMixin:
                 logger.critical(f'{symbol} pending 恢复的计划仓位非法: {planned!r}')
                 return
             account_equity = float(getattr(self.risk_manager, 'account_equity', 0) or 0)
+            if not math.isfinite(account_equity) or account_equity < 0:
+                # 权益不可信时风险基准归零：成交后风险校验按“无基准”显式跳过，
+                # 而不是让 NaN 在比较中静默吞掉这道防线。
+                account_equity = 0.0
             raw_position_size = position_size
             price_risk_pct = (
                 abs(calc_price - stop_loss_price) / calc_price if calc_price else 0)
@@ -1337,11 +1367,7 @@ class TradeExecutorMixin:
                 f"后续止损、风险与账本全部按实际量")
         position_size = actual_position_size
 
-        actual_price = open_order.get('average', calc_price)
-        if isinstance(actual_price, str):
-            actual_price = float(actual_price)
-        if actual_price is None:
-            actual_price = calc_price
+        actual_price = self._safe_fill_price(open_order, calc_price)
         if open_order.get('fee') is not None or open_order.get('fees'):
             logger.info(
                 f"{symbol} 开仓真实手续费: fee={open_order.get('fee')}, fees={open_order.get('fees')}")
@@ -1575,11 +1601,7 @@ class TradeExecutorMixin:
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, position.get('stop_order_id'))
 
         # BUG-3 修复: 使用实际成交价记录盈亏，而非K线收盘价
-        exit_price = close_order.get('average', signal['current_close'])
-        if isinstance(exit_price, str):
-            exit_price = float(exit_price)
-        if exit_price is None:
-            exit_price = signal['current_close']
+        exit_price = self._safe_fill_price(close_order, signal['current_close'])
         if close_order.get('fee') is not None or close_order.get('fees'):
             logger.info(
                 f"{symbol} 平仓真实手续费: fee={close_order.get('fee')}, fees={close_order.get('fees')}")

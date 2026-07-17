@@ -90,6 +90,27 @@ class FilterClosedCandlesTests(unittest.TestCase):
         self.assertEqual(len(filtered), 2)
 
 
+class OhlcvBoundaryValidationTests(unittest.TestCase):
+    """行情入口统一边界校验：坏蜡烛整批拒绝，好数据原样通过。"""
+
+    GOOD = [[1000, 10.0, 12.0, 9.0, 11.0, 100.0],
+            [2000, 11.0, 13.0, 10.0, 12.0, 50.0]]
+
+    def test_good_batch_passes_and_bad_candles_reject(self):
+        self.assertEqual(
+            self.GOOD, exchange_base.ExchangeApi.validate_ohlcv(self.GOOD, "BTC"))
+        for bad in (
+            None,
+            [self.GOOD[0], list(self.GOOD[0])],           # 重复时间戳
+            [self.GOOD[1], self.GOOD[0]],                  # 乱序
+            [[1000, 10.0, float("nan"), 9.0, 11.0, 1.0]],  # NaN 价格
+            [[1000, 10.0, 10.5, 9.0, 11.0, 1.0]],          # 收盘越出高点
+            [[1000, 10.0, 12.0, 9.0, 11.0, -1.0]],         # 负成交量
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                exchange_base.ExchangeApi.validate_ohlcv(bad, "BTC")
+
+
 class TurtleStopLossFollowupTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)

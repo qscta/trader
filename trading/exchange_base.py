@@ -58,7 +58,9 @@ class ExchangeApi:
 
     子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
     close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
-    round_quantity、get_quantity_precision。
+    round_quantity、get_quantity_precision、find_stop_order_state、
+    list_position_symbols、find_existing_open_order、
+    find_compensation_close_evidence。
 
     可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。
 
@@ -127,6 +129,25 @@ class ExchangeApi:
         """交易所端当前有实际持仓的内部符号列表（启动孤儿仓核对用）。"""
         raise NotImplementedError
 
+    def find_existing_open_order(self, symbol, side, amount, client_order_id):
+        """只读查询确定性 clOrdId 的既有开仓单（幂等恢复用）。
+
+        契约：明确不存在返回 None；命中且与请求一致返回订单；查询不确定或
+        内容不一致必须抛出。本方法永不创建订单。主系统的 pending 恢复链
+        依赖该能力，适配器必须实现而不是留到运行时才暴露缺方法。
+        """
+        raise NotImplementedError
+
+    def find_compensation_close_evidence(self, symbol, side, amount,
+                                         open_client_order_id):
+        """已确认空仓后，只读找回由开仓句柄派生的补偿平仓聚合成交。
+
+        契约：明确无补偿腿或证据不完整返回 None；完整证据返回聚合结果；
+        查询不确定必须抛出。本方法永不创建订单——「查询」绝不允许用可
+        下单的 close_position 模拟。
+        """
+        raise NotImplementedError
+
     # ===================== 交易所无关的通用实现 =====================
 
     @staticmethod
@@ -148,6 +169,62 @@ class ExchangeApi:
         elif value > 0:
             return max(0, round(-math.log10(value)))
         return 3
+
+    @staticmethod
+    def validate_ohlcv(ohlcv, symbol=''):
+        """统一 K 线边界校验：任何一根坏蜡烛都整批拒绝（抛 ValueError）。
+
+        服务所有行情入口（日检、即时开仓、API 展示）：时间戳必须严格递增
+        不得重复；开高低收必须是有限正数（拒绝 bool/NaN/无穷）；蜡烛内部
+        关系必须成立（low<=open/close<=high）；成交量必须是有限非负数。
+        坏数据进入 EMA/突破计算仍可能算出「有效」信号并进入开仓链路，
+        因此只能拒绝，不能静默丢弃或修补。
+        """
+        if ohlcv is None:
+            raise ValueError(f'{symbol} K 线响应为 None，拒绝当空数据')
+        if not isinstance(ohlcv, (list, tuple)):
+            raise ValueError(
+                f'{symbol} K 线响应类型异常: {type(ohlcv).__name__}')
+        prev_ts = None
+        for index, row in enumerate(ohlcv):
+            if not isinstance(row, (list, tuple)) or len(row) < 6:
+                raise ValueError(f'{symbol} 第{index}根 K 线结构异常: {row!r}')
+            ts, open_, high, low, close, volume = row[:6]
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                raise ValueError(f'{symbol} 第{index}根 K 线时间戳非法: {ts!r}')
+            ts = float(ts)
+            if not math.isfinite(ts):
+                raise ValueError(f'{symbol} 第{index}根 K 线时间戳非有限数')
+            if prev_ts is not None and ts <= prev_ts:
+                raise ValueError(
+                    f'{symbol} 第{index}根 K 线时间戳未严格递增: '
+                    f'{prev_ts} -> {ts}（重复或乱序）')
+            prev_ts = ts
+            prices = {}
+            for name, value in (('open', open_), ('high', high),
+                                ('low', low), ('close', close)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(
+                        f'{symbol} 第{index}根 K 线 {name} 非法: {value!r}')
+                value = float(value)
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        f'{symbol} 第{index}根 K 线 {name} 必须是有限正数: {value!r}')
+                prices[name] = value
+            if (prices['low'] > min(prices['open'], prices['close']) or
+                    prices['high'] < max(prices['open'], prices['close'])):
+                raise ValueError(
+                    f'{symbol} 第{index}根 K 线高低区间与开收盘矛盾: '
+                    f"O={prices['open']} H={prices['high']} "
+                    f"L={prices['low']} C={prices['close']}")
+            if volume is not None:
+                if isinstance(volume, bool) or not isinstance(volume, (int, float)):
+                    raise ValueError(
+                        f'{symbol} 第{index}根 K 线成交量非法: {volume!r}')
+                if not math.isfinite(float(volume)) or float(volume) < 0:
+                    raise ValueError(
+                        f'{symbol} 第{index}根 K 线成交量必须是有限非负数: {volume!r}')
+        return ohlcv
 
     def ohlcv_to_dataframe(self, ohlcv):
         """将 OHLCV 数据转换为 DataFrame。"""
@@ -192,7 +269,11 @@ class ExchangeApi:
             raise ValueError(
                 f'K 线请求 {requested} 根超过 OKX 单页上限 300；'
                 '策略配置必须在最新单页内完成计算')
-        return self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested)
+        # 所有行情入口共用同一边界校验：坏蜡烛（NaN/重复/乱序/区间矛盾）
+        # 一律在适配层拒绝，绝不让 EMA/突破在污染数据上算出“有效”信号。
+        return self.validate_ohlcv(
+            self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested),
+            symbol)
 
     @retry_on_network_error(max_retries=3)
     def get_balance(self):

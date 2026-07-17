@@ -4,6 +4,7 @@ from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import logging
+import math
 import threading
 import time
 import os
@@ -334,6 +335,23 @@ def _require_system():
     return trading_system, None
 
 
+def _load_closed_daily_df(system, symbol, fetch_limit):
+    """统一的日 K 加载：内部符号 → fetch → DataFrame → 过滤未收盘。
+
+    新增品种回溯与即时开仓两处路由共用同一流程；K 线为空返回
+    (ccxt_symbol, None)，由调用方按各自路由语义处理。行情边界校验
+    （NaN/乱序/区间矛盾整批拒绝）已在适配层 fetch_ohlcv 出口统一执行，
+    异常按各路由自身的 try/except 语义向上抛。
+    """
+    ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
+    ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
+    if not ohlcv:
+        return ccxt_symbol, None
+    df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
+    return ccxt_symbol, system.exchange_api.filter_closed_candles(
+        df, timeframe='1d')
+
+
 def _persist_config():
     """把整份 config 写回磁盘。"""
     if trading_system and hasattr(trading_system, 'persist_config'):
@@ -570,13 +588,11 @@ def add_symbol():
         if new_symbol['strategy'] == 'turtle':
             try:
                 symbol_name = new_symbol['name']
-                ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
                 fetch_limit = ohlcv_fetch_limit_for_strategy('turtle', system.config.get('strategy', {}))
                 required_closed = required_closed_candles_for_strategy('turtle', system.config.get('strategy', {}))
-                ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
-                if ohlcv:
-                    df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
-                    df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
+                _ccxt_symbol, df = _load_closed_daily_df(
+                    system, symbol_name, fetch_limit)
+                if df is not None:
                     if len(df) < required_closed:
                         logger.warning(
                             f"[{system.label}] {symbol_name} 历史回溯K线不足：海龟策略配置至少需要 "
@@ -1114,15 +1130,13 @@ def instant_open():
                                          f'与本次请求的 {strategy_type} 不一致——开仓后将被日检按池内策略托管。'
                                          '请改按池内策略开仓，或先在品种池中调整该交易对的策略'}), 400
 
-            ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
             fetch_limit = ohlcv_fetch_limit_for_strategy(strategy_type, system.config.get('strategy', {}))
             required_closed = required_closed_candles_for_strategy(strategy_type, system.config.get('strategy', {}))
-            ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
-            if not ohlcv:
+            ccxt_symbol, df = _load_closed_daily_df(
+                system, symbol_name, fetch_limit)
+            if df is None:
                 return jsonify({'error': f'{symbol_name} 获取K线数据失败'}), 500
 
-            df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
-            df = system.exchange_api.filter_closed_candles(df, '1d')
             if len(df) < required_closed:
                 return jsonify({'error': f'{symbol_name} K线数据不足：{strategy_type} 策略至少需要 '
                                          f'{required_closed} 根已收盘K线，当前仅 {len(df)} 根'}), 400
@@ -1317,10 +1331,18 @@ def close_position():
                 warn_ambiguous(symbol_name, close_order, '手动平仓')
 
             # 仓位变化与订单成交量不一致时，订单 VWAP 不能代表完整平仓，使用保守行情回退。
+            # average 为垃圾字符串/NaN 时绝不裸抛/放行：与 _safe_fill_price 同一口径。
             actual_price = None if close_order.get('execution_ambiguous') \
                 else close_order.get('average', None)
-            if actual_price and isinstance(actual_price, str):
-                actual_price = float(actual_price)
+            if isinstance(actual_price, bool):
+                actual_price = None
+            try:
+                actual_price = float(actual_price) if actual_price is not None else None
+            except (TypeError, ValueError):
+                actual_price = None
+            if actual_price is not None and (
+                    not math.isfinite(actual_price) or actual_price <= 0):
+                actual_price = None
             if not actual_price:
                 try:
                     actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
@@ -1361,71 +1383,6 @@ def close_position():
     except Exception as e:
         logger.error(f"手动平仓异常: {e}")
         return jsonify({'error': f'手动平仓异常: {str(e)}'}), 500
-
-
-@app.route('/api/channel_data', methods=['GET'])
-@require_auth
-def get_channel_data():
-    """获取某个持仓的K线和通道数据。"""
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        symbol = request.args.get('symbol', '')
-        if not symbol:
-            return jsonify({'error': '缺少symbol参数'}), 400
-
-        strategy_config = system.config.get('strategy', {})
-        period = strategy_config.get('channel_period', 28)  # 兜底与 TurtleStrategy 默认一致
-        required_closed = required_closed_candles_for_strategy('turtle', strategy_config)
-        fetch_limit = max(60, required_closed + 1)
-
-        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol)
-        ohlcv = system.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
-        df = system.exchange_api.ohlcv_to_dataframe(ohlcv)
-        df = system.exchange_api.filter_closed_candles(df, timeframe='1d')
-        if len(df) < period + 1:
-            return jsonify({'error': f'{symbol} K线数据不足：海龟通道周期 {period} 至少需要 '
-                                     f'{period + 1} 根已收盘K线，当前仅 {len(df)} 根'}), 400
-
-        closes = df['close'].values
-        upper_list, lower_list = [], []
-        for i in range(len(closes)):
-            if i < period:
-                upper_list.append(None)
-                lower_list.append(None)
-            else:
-                upper_list.append(max(closes[i-period:i]))
-                lower_list.append(min(closes[i-period:i]))
-        df['upper'] = upper_list
-        df['lower'] = lower_list
-        df = df.dropna(subset=['upper', 'lower']).copy()
-        df['middle'] = (df['upper'] + df['lower']) / 2
-
-        positions = system.trade_state.get_all_open_positions()
-        pos = positions.get(symbol, {})
-        dates = df['timestamp'].dt.strftime('%m-%d').tolist()
-        result = {
-            'dates': dates, 'closes': df['close'].tolist(),
-            'upper': df['upper'].tolist(), 'lower': df['lower'].tolist(), 'middle': df['middle'].tolist(),
-            'entry_price': pos.get('entry_price'), 'stop_loss': pos.get('stop_loss_price'),
-            'current_price': df['close'].iloc[-1] if len(df) > 0 else None,
-            'side': pos.get('side', ''), 'unrealized_pnl': None, 'unrealized_pnl_pct': None
-        }
-        if result['entry_price'] and result['current_price']:
-            ep = result['entry_price']
-            cp = result['current_price']
-            size = pos.get('position_size', 0)
-            if pos.get('side') == 'long':
-                result['unrealized_pnl'] = (cp - ep) * size
-                result['unrealized_pnl_pct'] = (cp - ep) / ep * 100
-            else:
-                result['unrealized_pnl'] = (ep - cp) * size
-                result['unrealized_pnl_pct'] = (ep - cp) / ep * 100
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"获取通道数据失败: {e}")
-        return jsonify({'error': str(e)}), 500
 
 
 def _set_manual_check_running(value):

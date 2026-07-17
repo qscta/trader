@@ -53,6 +53,33 @@ _PENDING_ORDER_ABSENCE_PROOF_WINDOW = timedelta(hours=2)
 _PENDING_TIMESTAMP_FUTURE_TOLERANCE = timedelta(minutes=5)
 
 
+def _parse_startup_equity(balance):
+    """启动权益解析：读不出有限非负数一律返回 None（触发重试/退出）。
+
+    只查 'USDT' in total 会放行 None/字符串垃圾/NaN——NaN 一旦住进
+    RiskManager，pending 恢复分支的成交后风险校验（risk_amount > 0 对
+    NaN 恒 False）会被静默禁用。启动权益必须与开仓前重取同一校验口径。
+    允许 0（空账户可以启动，只是算不出任何仓位）。
+    """
+    if not isinstance(balance, dict):
+        return None
+    total = balance.get('total')
+    if not isinstance(total, dict):
+        # total 为字符串/数字等真值垃圾时，(x or {}).get 会 AttributeError；
+        # 本函数调用点在启动重试 try 之外，裸抛=进程裸 traceback 死亡。
+        return None
+    value = total.get('USDT')
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
 class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, TradeExecutorMixin):
     """欧易单所交易系统的装配与调度核心。
 
@@ -160,10 +187,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             except Exception as e:
                 balance = None
                 logger.warning(f'[{self.label}] 启动时获取账户权益异常: {e}')
-            if balance and 'USDT' in balance.get('total', {}):
-                account_equity = balance['total']['USDT']
+            account_equity = _parse_startup_equity(balance)
+            if account_equity is not None:
                 break
-            logger.warning(f'[{self.label}] 启动时获取账户权益失败，10秒后重试... (第{_retry_i+1}/3次)')
+            logger.warning(f'[{self.label}] 启动时获取账户权益失败或非有限非负数，'
+                           f'10秒后重试... (第{_retry_i+1}/3次)')
             time.sleep(10)
 
         if account_equity is None:

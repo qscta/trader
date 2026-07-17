@@ -127,6 +127,19 @@ def _normalise_optional_fee(value):
     return value if math.isfinite(value) and value >= 0 else None
 
 
+def _require_positive_finite(value, field):
+    """账本写入口统一的数值边界：拒绝 bool/NaN/无穷/非正/不可转换。"""
+    if isinstance(value, bool):
+        raise ValueError(f'{field} 不能是 bool')
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{field} 非法: {value!r}') from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f'{field} 必须是正有限数: {value!r}')
+    return number
+
+
 def calculate_closed_trade_metrics(side, entry_price, exit_price, position_size,
                                    fee_rate=TRADING_FEE_RATE,
                                    entry_fee=None, exit_fee=None):
@@ -590,49 +603,96 @@ class TradeState:
             self.state = snapshot
             raise
 
+    def _transact_locked(self, mutate, save=True):
+        """账本事务原语：快照 → 修改 → 校验 → 保存 → 任意异常回滚。
+
+        修改阶段抛出的任何异常都会先把内存恢复到快照再向上抛——不允许出现
+        「内存已缩仓、磁盘还是旧仓位」的中间态（如部分平仓改完余仓后 close
+        intent 校验失败）。save=False 供 force_runtime_* 使用：磁盘已失效时
+        只改内存，但修改本身非法时同样必须整体回滚，不能留下半截账本。
+
+        契约：mutate 返回 None 当且仅当未发生任何修改（品种无持仓等），
+        此时跳过落盘。该契约由下方等值核对强制执行——若未来某个 mutate
+        改了账本却返回 None，这里会回滚并抛出，而不是静默留下
+        「内存已改、磁盘未存」的观测盲区。
+        """
+        snapshot = self._snapshot_locked()
+        try:
+            result = mutate()
+        except BaseException:
+            self.state = snapshot
+            raise
+        if result is None:
+            if self.state != snapshot:
+                self.state = snapshot
+                raise TradeStatePersistenceError(
+                    '账本事务契约违规：mutate 宣称未修改（返回 None）'
+                    '但状态已变化；已回滚全部修改')
+            return None
+        if save:
+            self._save_or_rollback_locked(snapshot)
+        return result
+
+    def _add_open_position_locked(self, symbol, side, entry_price, position_size,
+                                  stop_loss_price, stop_order_id, strategy,
+                                  entry_fee, entry_fee_currency,
+                                  entry_order_ids, open_intent_client_id):
+        if symbol in self.state['open_positions']:
+            raise TradeStatePersistenceError(
+                f'{symbol} 已有本地持仓，拒绝静默覆盖既有账本')
+        if side not in ('long', 'short'):
+            raise ValueError('side 必须是 long/short')
+        entry_price = _require_positive_finite(entry_price, f'{symbol}.entry_price')
+        position_size = _require_positive_finite(
+            position_size, f'{symbol}.position_size')
+        stop_loss_price = _require_positive_finite(
+            stop_loss_price, f'{symbol}.stop_loss_price')
+        if open_intent_client_id is not None:
+            intent = (self.state.get('open_intents') or {}).get(symbol) or {}
+            if (intent.get('status') != 'pending' or
+                    intent.get('client_order_id') != str(open_intent_client_id)):
+                raise TradeStatePersistenceError(
+                    f'{symbol} 开仓落账与 pending open intent 不匹配')
+        position = {
+            'symbol': symbol,
+            'side': side,
+            'entry_price': entry_price,
+            'position_size': position_size,
+            'original_position_size': position_size,
+            'stop_loss_price': stop_loss_price,
+            'stop_order_id': stop_order_id,
+            'stop_order_size': position_size,
+            'strategy': strategy,
+            'open_time': datetime.now().isoformat()
+        }
+        actual_entry_fee = _normalise_optional_fee(entry_fee)
+        if actual_entry_fee is not None:
+            position['entry_fee'] = actual_entry_fee
+            position['entry_fee_currency'] = entry_fee_currency
+            position['entry_fee_source'] = 'exchange'
+        if entry_order_ids:
+            position['entry_order_ids'] = [str(value) for value in entry_order_ids if value]
+        if open_intent_client_id is not None:
+            position['client_order_id'] = str(open_intent_client_id)
+        self.state['open_positions'][symbol] = position
+        # T+1 只描述“当前仍空仓、等待重入”。真实持仓一旦与账本同事务建立，
+        # 陈旧标记必须同时消失，否则人工平仓后会被误判为待重入再开一笔。
+        self.state.setdefault('stop_loss_dates', {}).pop(symbol, None)
+        self._set_signal_state_locked(symbol, False)
+        if open_intent_client_id is not None:
+            del self.state['open_intents'][symbol]
+        return copy.deepcopy(position)
+
     def add_open_position(self, symbol, side, entry_price, position_size,
                           stop_loss_price, stop_order_id=None, strategy=None,
                           entry_fee=None, entry_fee_currency=None,
                           entry_order_ids=None,
                           open_intent_client_id=None):
         with self.lock:
-            snapshot = self._snapshot_locked()
-            if open_intent_client_id is not None:
-                intent = (self.state.get('open_intents') or {}).get(symbol) or {}
-                if (intent.get('status') != 'pending' or
-                        intent.get('client_order_id') != str(open_intent_client_id)):
-                    raise TradeStatePersistenceError(
-                        f'{symbol} 开仓落账与 pending open intent 不匹配')
-            position = {
-                'symbol': symbol,
-                'side': side,
-                'entry_price': entry_price,
-                'position_size': position_size,
-                'original_position_size': position_size,
-                'stop_loss_price': stop_loss_price,
-                'stop_order_id': stop_order_id,
-                'stop_order_size': position_size,
-                'strategy': strategy,
-                'open_time': datetime.now().isoformat()
-            }
-            actual_entry_fee = _normalise_optional_fee(entry_fee)
-            if actual_entry_fee is not None:
-                position['entry_fee'] = actual_entry_fee
-                position['entry_fee_currency'] = entry_fee_currency
-                position['entry_fee_source'] = 'exchange'
-            if entry_order_ids:
-                position['entry_order_ids'] = [str(value) for value in entry_order_ids if value]
-            if open_intent_client_id is not None:
-                position['client_order_id'] = str(open_intent_client_id)
-            self.state['open_positions'][symbol] = position
-            # T+1 只描述“当前仍空仓、等待重入”。真实持仓一旦与账本同事务建立，
-            # 陈旧标记必须同时消失，否则人工平仓后会被误判为待重入再开一笔。
-            self.state.setdefault('stop_loss_dates', {}).pop(symbol, None)
-            self._set_signal_state_locked(symbol, False)
-            if open_intent_client_id is not None:
-                del self.state['open_intents'][symbol]
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(position)
+            return self._transact_locked(lambda: self._add_open_position_locked(
+                symbol, side, entry_price, position_size, stop_loss_price,
+                stop_order_id, strategy, entry_fee, entry_fee_currency,
+                entry_order_ids, open_intent_client_id))
 
     def get_open_position(self, symbol):
         with self.lock:
@@ -701,42 +761,47 @@ class TradeState:
         position['last_close_client_order_id'] = str(client_order_id)
         return consumed
 
+    def _update_stop_loss_locked(self, symbol, new_stop_price, new_stop_order_id,
+                                 stop_order_size, extra_stop_order_ids,
+                                 stop_resize_pending):
+        if symbol not in self.state['open_positions']:
+            return None
+        # 数值边界在修改入口执行：落盘路径本有 validate_state 兜底，
+        # 但 force_runtime（仅内存）路径不落盘，NaN/bool 会直接住进账本。
+        new_stop_price = _require_positive_finite(
+            new_stop_price, f'{symbol}.stop_loss_price')
+        if new_stop_order_id is not None and not isinstance(new_stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
+        if stop_order_size is not None:
+            stop_order_size = _require_positive_finite(
+                stop_order_size, f'{symbol}.stop_order_size')
+        position = self.state['open_positions'][symbol]
+        position['stop_loss_price'] = new_stop_price
+        position['stop_order_id'] = new_stop_order_id
+        position['stop_order_size'] = (
+            position['position_size'] if stop_order_size is None else stop_order_size)
+        position['extra_stop_order_ids'] = [
+            str(value) for value in (extra_stop_order_ids or []) if value]
+        position['stop_resize_pending'] = bool(stop_resize_pending)
+        position['last_stop_update'] = datetime.now().isoformat()
+        return copy.deepcopy(position)
+
     def update_stop_loss(self, symbol, new_stop_price, new_stop_order_id,
                          stop_order_size=None, extra_stop_order_ids=None,
                          stop_resize_pending=False):
         with self.lock:
-            if symbol not in self.state['open_positions']:
-                return None
-            snapshot = self._snapshot_locked()
-            position = self.state['open_positions'][symbol]
-            position['stop_loss_price'] = new_stop_price
-            position['stop_order_id'] = new_stop_order_id
-            position['stop_order_size'] = (
-                position['position_size'] if stop_order_size is None else stop_order_size)
-            position['extra_stop_order_ids'] = [
-                str(value) for value in (extra_stop_order_ids or []) if value]
-            position['stop_resize_pending'] = bool(stop_resize_pending)
-            position['last_stop_update'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(position)
+            return self._transact_locked(lambda: self._update_stop_loss_locked(
+                symbol, new_stop_price, new_stop_order_id, stop_order_size,
+                extra_stop_order_ids, stop_resize_pending))
 
     def force_runtime_update_stop_loss(self, symbol, new_stop_price, new_stop_order_id,
                                        stop_order_size=None,
                                        extra_stop_order_ids=None,
                                        stop_resize_pending=False):
         with self.lock:
-            if symbol not in self.state['open_positions']:
-                return None
-            position = self.state['open_positions'][symbol]
-            position['stop_loss_price'] = new_stop_price
-            position['stop_order_id'] = new_stop_order_id
-            position['stop_order_size'] = (
-                position['position_size'] if stop_order_size is None else stop_order_size)
-            position['extra_stop_order_ids'] = [
-                str(value) for value in (extra_stop_order_ids or []) if value]
-            position['stop_resize_pending'] = bool(stop_resize_pending)
-            position['last_stop_update'] = datetime.now().isoformat()
-            return copy.deepcopy(position)
+            return self._transact_locked(lambda: self._update_stop_loss_locked(
+                symbol, new_stop_price, new_stop_order_id, stop_order_size,
+                extra_stop_order_ids, stop_resize_pending), save=False)
 
     @staticmethod
     def _gross_pnl(side, entry_price, exit_price, size):
@@ -755,11 +820,8 @@ class TradeState:
             return None
         position = self.state['open_positions'][symbol]
         current_size = float(position['position_size'])
-        closed_size = float(closed_size)
-        exit_price = float(exit_price)
-        if (not math.isfinite(closed_size) or closed_size <= 0 or
-                not math.isfinite(exit_price) or exit_price <= 0):
-            raise ValueError('部分平仓数量和成交价必须是正有限数')
+        closed_size = _require_positive_finite(closed_size, '部分平仓数量')
+        exit_price = _require_positive_finite(exit_price, '部分平仓成交价')
         tolerance = max(1e-15, math.ulp(current_size) * 8)
         if closed_size >= current_size - tolerance:
             raise ValueError('部分平仓数量已覆盖全部仓位，应走 close_position')
@@ -799,7 +861,8 @@ class TradeState:
         position['position_size'] = remaining
         position['stop_order_id'] = new_stop_order_id
         position['stop_order_size'] = (
-            remaining if stop_order_size is None else float(stop_order_size))
+            remaining if stop_order_size is None else
+            _require_positive_finite(stop_order_size, f'{symbol}.stop_order_size'))
         position['extra_stop_order_ids'] = [
             str(value) for value in (extra_stop_order_ids or []) if value]
         position['stop_resize_pending'] = bool(stop_resize_pending)
@@ -817,16 +880,11 @@ class TradeState:
                             close_intent_client_id=None):
         """原子缩减余仓并累计分段成交；不会把部分成交伪装成完整平仓。"""
         with self.lock:
-            snapshot = self._snapshot_locked()
-            position = self._apply_partial_close_locked(
+            return self._transact_locked(lambda: self._apply_partial_close_locked(
                 symbol, closed_size, exit_price, exit_fee, exit_fee_currency,
                 exit_order_ids, new_stop_order_id, remaining_size, stop_order_size,
                 extra_stop_order_ids, stop_resize_pending,
-                close_intent_client_id)
-            if position is None:
-                return None
-            self._save_or_rollback_locked(snapshot)
-            return position
+                close_intent_client_id))
 
     def force_runtime_apply_partial_close(self, symbol, closed_size, exit_price,
                                           exit_fee=None, exit_fee_currency=None,
@@ -838,11 +896,11 @@ class TradeState:
                                           stop_resize_pending=False,
                                           close_intent_client_id=None):
         with self.lock:
-            return self._apply_partial_close_locked(
+            return self._transact_locked(lambda: self._apply_partial_close_locked(
                 symbol, closed_size, exit_price, exit_fee, exit_fee_currency,
                 exit_order_ids, new_stop_order_id, remaining_size, stop_order_size,
                 extra_stop_order_ids, stop_resize_pending,
-                close_intent_client_id)
+                close_intent_client_id), save=False)
 
     def _add_open_after_partial_rollback_locked(
             self, symbol, side, entry_price, original_size, remaining_size,
@@ -936,20 +994,16 @@ class TradeState:
     def add_open_after_partial_rollback(self, *args, **kwargs):
         """把未曾落盘的开仓及其部分补偿平仓一次性写成受保护余仓。"""
         with self.lock:
-            snapshot = self._snapshot_locked()
-            try:
-                position = self._add_open_after_partial_rollback_locked(
-                    *args, **kwargs)
-                self._save_or_rollback_locked(snapshot)
-                return position
-            except Exception:
-                self.state = snapshot
-                raise
+            return self._transact_locked(
+                lambda: self._add_open_after_partial_rollback_locked(
+                    *args, **kwargs))
 
     def force_runtime_add_open_after_partial_rollback(self, *args, **kwargs):
         """磁盘失效时仍让本进程内账本反映交易所余仓；重启前必须人工修复磁盘。"""
         with self.lock:
-            return self._add_open_after_partial_rollback_locked(*args, **kwargs)
+            return self._transact_locked(
+                lambda: self._add_open_after_partial_rollback_locked(
+                    *args, **kwargs), save=False)
 
     def _add_untracked_open_position_locked(
             self, symbol, side, entry_price, position_size, stop_loss_price,
@@ -1051,7 +1105,15 @@ class TradeState:
         position = self.state['open_positions'][symbol]
         self._consume_close_intent_locked(
             position, close_intent_client_id)
-        if not exit_price or exit_price <= 0:
+        # 退出价读不出正有限数（含 NaN/inf/bool/字符串垃圾）一律按既有契约
+        # 回退入场价记账，绝不让 NaN 流进 pnl 污染已平仓记录。
+        if isinstance(exit_price, bool):
+            exit_price = None
+        try:
+            exit_price = float(exit_price) if exit_price is not None else None
+        except (TypeError, ValueError):
+            exit_price = None
+        if exit_price is None or not math.isfinite(exit_price) or exit_price <= 0:
             exit_price = position['entry_price']
 
         final_size = float(position['position_size'])
@@ -1131,15 +1193,10 @@ class TradeState:
                        reset_turtle_signal=False,
                        close_intent_client_id=None):
         with self.lock:
-            snapshot = self._snapshot_locked()
-            position = self._close_position_locked(
+            return self._transact_locked(lambda: self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
                 stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
-                close_intent_client_id)
-            if position is None:
-                return None
-            self._save_or_rollback_locked(snapshot)
-            return position
+                close_intent_client_id))
 
     def force_runtime_close_position(self, symbol, exit_price, exit_fee=None,
                                      exit_fee_currency=None, exit_order_ids=None,
@@ -1148,10 +1205,10 @@ class TradeState:
                                      reset_turtle_signal=False,
                                      close_intent_client_id=None):
         with self.lock:
-            return self._close_position_locked(
+            return self._transact_locked(lambda: self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
                 stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
-                close_intent_client_id)
+                close_intent_client_id), save=False)
 
     def get_all_open_positions(self):
         with self.lock:

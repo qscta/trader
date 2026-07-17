@@ -347,5 +347,28 @@ class StartupSmokeTest(unittest.TestCase):
                     system.config['scheduler']['stop_loss_scan_interval_minutes'], interval)
 
 
+class StartupEquityParsingTest(unittest.TestCase):
+    """启动权益必须是有限非负数：NaN 住进 RiskManager 会静默禁用
+    pending 恢复分支的成交后风险校验（NaN 与 0 比较恒 False）。"""
+
+    def test_garbage_equity_rejected(self):
+        for bad in (None, {}, {'total': None}, {'total': {}},
+                    {'total': '垃圾'}, {'total': 5}, {'total': ['USDT']},
+                    {'total': {'USDT': None}}, {'total': {'USDT': True}},
+                    {'total': {'USDT': float('nan')}},
+                    {'total': {'USDT': float('inf')}},
+                    {'total': {'USDT': -1.0}}, {'total': {'USDT': '垃圾'}}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(main._parse_startup_equity(bad))
+
+    def test_valid_equity_accepted_including_empty_account(self):
+        self.assertEqual(10000.5, main._parse_startup_equity(
+            {'total': {'USDT': 10000.5}}))
+        self.assertEqual(10000.5, main._parse_startup_equity(
+            {'total': {'USDT': '10000.5'}}))
+        self.assertEqual(0.0, main._parse_startup_equity(
+            {'total': {'USDT': 0}}))
+
+
 if __name__ == '__main__':
     unittest.main()
