@@ -489,10 +489,10 @@ class MarketOrderConfirmationTest(unittest.TestCase):
 
         order = api.open_position(
             'BTC/USDT:USDT', 'long', 0.1,
-            client_order_id='btcTurtle20260710')
+            client_order_id='btcOrder20260710')
 
         self.assertTrue(order['confirmed'])
-        self.assertEqual(order['clientOrderId'], 'btcTurtle20260710')
+        self.assertEqual(order['clientOrderId'], 'btcOrder20260710')
         api.exchange.create_order.assert_not_called()
 
     def test_recovered_zero_fill_order_does_not_claim_or_close_manual_position(self):
@@ -565,7 +565,7 @@ class MarketOrderConfirmationTest(unittest.TestCase):
             api.exchange.fetch_order.return_value = dict(valid, **mutation)
             result = api.open_position(
                 'BTC/USDT:USDT', 'long', 0.1,
-                client_order_id='btcTurtleCollision')
+                client_order_id='btcOrderCollision')
             self.assertIsNone(result, mutation)
             api.exchange.create_order.assert_not_called()
             api.exchange.fetch_positions.assert_not_called()

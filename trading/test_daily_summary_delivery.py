@@ -140,10 +140,8 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
             get_open_position=lambda symbol: None,
-            get_signal_state=lambda symbol: False,
-            set_signal_state=lambda symbol, value: None,
         )
-        system.config = {'strategy': {'channel_period': 28}, 'trading': {'symbols': []}}
+        system.config = {'strategy': {'default_risk_per_trade': 0.01}, 'trading': {'symbols': []}}
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = (
@@ -168,19 +166,16 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
             get_open_position=lambda symbol: None,
-            get_signal_state=lambda symbol: False,
-            set_signal_state=lambda symbol, value: None,
         )
         system.config = {
-            'strategy': {'channel_period': 297},
-            'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'turtle'}]},
+            'strategy': {'default_risk_per_trade': 0.01},
+            'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}]},
         }
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda symbol: symbol,
             get_position=lambda symbol: None,
             fetch_ohlcv=lambda symbol, timeframe='1d', limit=100: requested_limits.append(limit) or [],
         )
-        system.turtle_strategy = SimpleNamespace()
         system.ma_cross_strategy = SimpleNamespace()
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
@@ -233,8 +228,6 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
             get_open_position=lambda symbol: None,
-            get_signal_state=lambda symbol: False,
-            set_signal_state=lambda symbol, value: None,
         )
         system.config = {'trading': {'symbols': []}}
         system.exchange_api = SimpleNamespace(fetch_ohlcv=lambda *args, **kwargs: [], get_balance=lambda: {'total': {'USDT': 1000}})

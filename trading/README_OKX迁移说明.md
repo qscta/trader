@@ -29,8 +29,8 @@
     "margin_mode": "cross", "leverage": 5, "leverage_overrides": {"BTCUSDT": 10},
     "sandbox": false
   },
-  "strategy": { "ma_short_period": 7, "ma_long_period": 28, "channel_period": 28, ... },
-  "trading":  { "symbols": [ {"name": "BTCUSDT", "enabled": true, "strategy": "turtle", ...} ] },
+  "strategy": { "ma_short_period": 7, "ma_long_period": 28, "ma_stop_period": 28, ... },
+  "trading":  { "symbols": [ {"name": "BTCUSDT", "enabled": true, "strategy": "ma_cross", ...} ] },
   "equity_tick_retention_days": 30,
   "scheduler": {...},
   "dingtalk": {"webhook_url": "..."}
@@ -51,7 +51,7 @@
 
 ### 删除交易对的语义
 - 删除 ≠ 立即平仓、≠ 立即停止保护。正确语义：**从品种池移除，只托管当前仓位到下一次平仓**；`DELETE /api/symbols/<symbol>` 不动当前持仓、不撤保护止损，但退池后禁止反手、止损后重入或任何新腿；当前仓一旦结束即彻底停止监控和交易。
-- 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（turtle / ma_cross）继续跟踪、推进止损、处理平仓，直到仓位自然结束。
+- 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（唯一在役策略 ma_cross；遗留 turtle 持仓亦按双均线语义托管）继续跟踪、推进止损、处理平仓，直到仓位自然结束。
 - 老仓兜底：若删除时发现该持仓缺 `strategy` 字段，会先从当前配置补写进持仓再删；配置里也没有时**拒绝删除**，提示先明确策略。
 
 ### 未创新高统计口径

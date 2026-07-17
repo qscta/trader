@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -23,7 +23,7 @@ class SignalExecutionStateTest(unittest.TestCase):
             state = TradeState(path)
             state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1',
-                strategy='turtle')
+                strategy='ma_cross')
             first = state.prepare_close_intent(
                 'BTCUSDT', 'CloseIntent123', '信号平仓')
             retry = TradeState(path).prepare_close_intent(
@@ -48,7 +48,7 @@ class SignalExecutionStateTest(unittest.TestCase):
             state = TradeState(path)
             state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1',
-                strategy='turtle')
+                strategy='ma_cross')
             state.prepare_close_intent(
                 'BTCUSDT', 'ClosePartial123', '手动平仓')
 
@@ -63,76 +63,6 @@ class SignalExecutionStateTest(unittest.TestCase):
             self.assertIsNone(reloaded.get_close_intent('BTCUSDT'))
             self.assertEqual(
                 'ClosePartial123', position['last_close_client_order_id'])
-
-    def test_confirmed_signal_and_candle_survive_armed_reset_and_restart(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'trade_state.json')
-            state = TradeState(path)
-            execution = state.prepare_signal_execution(
-                'BTCUSDT', 'turtle', '2026-07-10T00:00:00|short',
-                'T1234567890',
-                payload={'side': 'short', 'entry_price': 90, 'stop_loss_price': 100})
-            self.assertEqual('pending', execution['status'])
-            state.set_pending_signal_order_amount('BTCUSDT', 'T1234567890', 2.5)
-            state.confirm_signal_execution(
-                'BTCUSDT', 'turtle', '2026-07-10T00:00:00|short')
-            state.mark_candle_processed('BTCUSDT', 'turtle', '2026-07-10T00:00:00')
-
-            # 盘中止损只能重置 armed，不能擦掉 candle/signal 幂等键。
-            state.set_signal_state('BTCUSDT', False)
-            reloaded = TradeState(path)
-            metadata = reloaded.get_signal_metadata('BTCUSDT')
-            self.assertFalse(metadata['mid_line_crossed'])
-            self.assertEqual('2026-07-10T00:00:00', metadata['last_processed_candle'])
-            self.assertEqual('confirmed', metadata['signal_execution']['status'])
-            self.assertEqual(2.5, metadata['signal_execution']['planned_position_size'])
-
-    def test_pending_retry_reuses_original_client_id_and_amount(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'trade_state.json')
-            state = TradeState(path)
-            first = state.prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle|long', 'TABC123', payload={'side': 'long'})
-            state.set_pending_signal_order_amount('ETHUSDT', 'TABC123', 1.25)
-            second = TradeState(path).prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle|long', 'TDIFFERENT')
-            self.assertEqual(first['client_order_id'], second['client_order_id'])
-            self.assertEqual(1.25, second['planned_position_size'])
-
-    def test_different_signal_cannot_overwrite_unreconciled_pending_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            state.prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle-1|long', 'TABC123',
-                payload={'side': 'long'})
-
-            with self.assertRaises(TradeStatePersistenceError):
-                state.prepare_signal_execution(
-                    'ETHUSDT', 'turtle', 'candle-2|short', 'TNEW456',
-                    payload={'side': 'short'})
-
-            pending = state.get_pending_signal_execution('ETHUSDT')
-            self.assertEqual('candle-1|long', pending['signal_id'])
-            self.assertEqual('TABC123', pending['client_order_id'])
-
-    def test_round_trip_deduplication_is_scoped_to_symbol(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            for symbol, client_id in (
-                    ('ETHUSDT', 'TETH123'), ('BTCUSDT', 'TBTC123')):
-                state.prepare_signal_execution(
-                    symbol, 'turtle', 'same-candle|long', client_id,
-                    payload={'side': 'long'})
-                state.finalize_recovered_signal_round_trip(
-                    symbol, 'turtle', 'same-candle|long', 'long',
-                    100.0, 90.0, 1.0, 95.0,
-                    entry_order_ids=[f'open-{symbol}'],
-                    exit_order_ids=[f'close-{symbol}'])
-
-            trades = state.get_closed_trades()
-            self.assertEqual(2, len(trades))
-            self.assertEqual({'BTCUSDT', 'ETHUSDT'}, {
-                trade['symbol'] for trade in trades})
 
 
 
@@ -584,35 +514,35 @@ class MaCatchupStateTest(unittest.TestCase):
             self.assertEqual('long', signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
 
-    def test_turtle_missing_marker_requires_rebaseline(self):
+    def test_missing_marker_requires_rebaseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
             rebaseline, previous, current, gap = (
-                system._history_requires_rebaseline('BTCUSDT', 'turtle', frame))
+                system._history_requires_rebaseline('BTCUSDT', 'ma_cross', frame))
 
             self.assertTrue(rebaseline)
             self.assertIsNone(previous)
             self.assertEqual('t5', current)
             self.assertIsNone(gap)
 
-    def test_turtle_large_gap_requires_rebaseline_but_short_gap_does_not(self):
+    def test_large_gap_requires_rebaseline_but_short_gap_does_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
-            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't1')
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
 
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'turtle', frame)
+                'BTCUSDT', 'ma_cross', frame)
             self.assertTrue(rebaseline)
             self.assertEqual(4, gap)
 
-            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't2')
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't2')
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'turtle', frame)
+                'BTCUSDT', 'ma_cross', frame)
             self.assertFalse(rebaseline)
             self.assertEqual(3, gap)
 
@@ -726,7 +656,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't3')
         system.config = {
             'strategy': {
-                'default_risk_per_trade': 0.01, 'channel_period': 2,
+                'default_risk_per_trade': 0.01,
                 'ma_short_period': 2, 'ma_long_period': 2, 'ma_stop_period': 2,
             },
             'trading': {'symbols': [{
@@ -933,7 +863,7 @@ class ConfigSecretPersistenceTest(unittest.TestCase):
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump({
                     'okx': {'sandbox': True},
-                    'strategy': {'channel_period': 28, 'default_risk_per_trade': 0.01},
+                    'strategy': {'default_risk_per_trade': 0.01},
                     'trading': {'symbols': []},
                 }, handle)
             system = TradingSystem.__new__(TradingSystem)
@@ -964,7 +894,7 @@ class ConfigSecretPersistenceTest(unittest.TestCase):
                         'password': 'disk-pass',
                     },
                     'strategy': {
-                        'channel_period': 28, 'default_risk_per_trade': 0.01,
+                        'default_risk_per_trade': 0.01,
                     },
                     'trading': {'symbols': []},
                 }, handle)

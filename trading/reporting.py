@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 class ReportingMixin:
 
     def _get_strategy_display_name(self, strategy_type):
-        return '海龟通道' if strategy_type == 'turtle' else '双均线 EMA'
+        # 唯一在役策略；遗留标签也按当前实际托管语义（双均线）显示
+        return '双均线 EMA'
 
 
     def _notify_missing_position_after_signal(self, symbol, strategy_type, side, signal, reason):

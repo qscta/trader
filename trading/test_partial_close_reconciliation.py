@@ -25,7 +25,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
         system = _System()
         system.trade_state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
         system.trade_state.add_open_position(
-            'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old', strategy='turtle')
+            'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old', strategy='ma_cross')
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
             get_last_price=lambda _symbol: 105.0,
@@ -121,7 +121,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 str(Path(temp_dir) / 'trade_state.json'))
             system.trade_state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old',
-                strategy='turtle')
+                strategy='ma_cross')
             intent = system.trade_state.prepare_close_intent(
                 'BTCUSDT', 'CloseRecover123', '信号平仓')
             system.exchange_api = SimpleNamespace(
@@ -181,7 +181,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 str(Path(temp_dir) / 'trade_state.json'))
             system.trade_state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 0.6, 90.0, 'stop-old',
-                strategy='turtle')
+                strategy='ma_cross')
             system.trade_state.update_stop_loss(
                 'BTCUSDT', 90.0, 'stop-old', stop_order_size=1.0,
                 stop_resize_pending=True)
@@ -199,7 +199,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             protected = system._ensure_stop_order_alive(
                 'BTCUSDT', 'BTC/USDT:USDT',
-                system.trade_state.get_open_position('BTCUSDT'), '海龟通道')
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
 
             self.assertFalse(protected)
             self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
@@ -211,7 +211,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 str(Path(temp_dir) / 'trade_state.json'))
             system.trade_state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 0.6, 90.0, 'stop-new',
-                strategy='turtle')
+                strategy='ma_cross')
             system.trade_state.update_stop_loss(
                 'BTCUSDT', 90.0, 'stop-new', stop_order_size=0.6,
                 extra_stop_order_ids=['stop-old'], stop_resize_pending=True)
@@ -228,7 +228,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             protected = system._ensure_stop_order_alive(
                 'BTCUSDT', 'BTC/USDT:USDT',
-                system.trade_state.get_open_position('BTCUSDT'), '海龟通道')
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
 
             self.assertTrue(protected)
             position = system.trade_state.get_open_position('BTCUSDT')
@@ -340,7 +340,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             outcome = system._finalize_open_rollback(
                 'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0, 90.0,
-                'turtle', open_order, rollback, '测试紧急回滚')
+                'ma_cross', open_order, rollback, '测试紧急回滚')
 
             self.assertEqual('rollback_incomplete', outcome['status'])
             self.assertTrue(outcome['residual_ledger_reconciled'])
@@ -376,7 +376,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             outcome = system._finalize_open_rollback(
                 'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0, 80.0,
-                'turtle', {'id': 'open-1'},
+                'ma_cross', {'id': 'open-1'},
                 {'id': 'close-1', 'average': 79.0, 'fully_closed': False,
                  'amount': 0.5, 'remaining_amount': 0.5},
                 '止损失效回滚', allow_stop_rebuild=False)
@@ -404,7 +404,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             outcome = system._finalize_open_rollback(
                 'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0, 90.0,
-                'turtle', {'id': 'open-1'},
+                'ma_cross', {'id': 'open-1'},
                 {'id': 'close-1', 'average': 99.0, 'fully_closed': False,
                  'amount': 0.6, 'remaining_amount': 0.4},
                 '止损确认不确定后的回滚', stop_residue_possible=True)
@@ -430,7 +430,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             outcome = system._finalize_open_rollback(
                 'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0, 90.0,
-                'turtle', {'id': 'open-1'},
+                'ma_cross', {'id': 'open-1'},
                 {'id': 'close-zero', 'fully_closed': False,
                  'amount': 0.0, 'remaining_amount': 1.0},
                 '补偿零成交')
@@ -531,7 +531,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             outcome = system._finalize_open_rollback(
                 'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0, 90.0,
-                'turtle', {'id': 'open-1'}, None, '回滚结果丢失')
+                'ma_cross', {'id': 'open-1'}, None, '回滚结果丢失')
 
             self.assertEqual('rollback_incomplete', outcome['status'])
             self.assertEqual(
@@ -569,7 +569,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                     side_effect=TradeStatePersistenceError('disk still full')):
                 saved = system._persist_open_position_or_rollback(
                     'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0,
-                    90.0, 'stop-original', strategy='turtle',
+                    90.0, 'stop-original', strategy='ma_cross',
                     open_order=open_order)
 
             self.assertEqual('rollback_incomplete', saved['status'])

@@ -46,9 +46,6 @@ def required_closed_candles_for_strategy(strategy_type, strategy_config=None):
         long_period = _strategy_period(strategy_config, 'ma_long_period', 28)
         stop_period = _strategy_period(strategy_config, 'ma_stop_period', 28)
         return max(long_period * 2, stop_period + 1)
-    if strategy_type == 'turtle':
-        channel_period = _strategy_period(strategy_config, 'channel_period', 28)
-        return channel_period + 2
     raise ValueError(f'未知策略: {strategy_type!r}')
 
 

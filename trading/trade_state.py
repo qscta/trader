@@ -373,8 +373,10 @@ class TradeState:
             order_id = position.get('stop_order_id')
             if order_id is not None and not isinstance(order_id, str):
                 raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 null')
+            # 'turtle' 仅为旧账本数据容忍（海龟策略已移除）：带该标签的遗留
+            # 仓位照常加载，并按双均线语义托管退出；新写入只会产生 ma_cross。
             if position.get('strategy') not in (None, 'turtle', 'ma_cross'):
-                raise ValueError(f'{symbol}.strategy 必须是 turtle/ma_cross/null')
+                raise ValueError(f'{symbol}.strategy 必须是 ma_cross/null（容忍遗留 turtle）')
             for field in ('original_position_size', 'stop_order_size'):
                 if field in position:
                     if isinstance(position[field], bool):
@@ -461,6 +463,9 @@ class TradeState:
                         raise ValueError(f'{symbol}.partial_closes.{field} 非法')
         if any(not isinstance(trade, dict) for trade in state['closed_trades']):
             raise ValueError('closed_trades 的每一项都必须是对象')
+        # signal_states 的 mid_line_crossed / signal_execution 是海龟时代的遗留
+        # 字段：读写机制已全部移除，这里仅在旧账本携带时做类型把关，保证
+        # 升级后启动不因历史数据崩溃；新代码不会再写入这些字段。
         for symbol, record in (state.get('signal_states') or {}).items():
             if not isinstance(symbol, str) or not isinstance(record, dict):
                 raise ValueError('signal_states 必须是 品种→对象')
@@ -503,6 +508,8 @@ class TradeState:
                           'created_at', 'updated_at'):
                 if not isinstance(intent.get(field), str) or not intent[field]:
                     raise ValueError(f'{symbol}.open_intent.{field} 必须是非空字符串')
+            # 'turtle' 仅为旧账本遗留意图容忍：泛型 open-intent 裁决与策略标签
+            # 无关（按 clOrdId 查证后收口/建账），新写入只会产生 ma_cross。
             if intent['strategy'] not in ('turtle', 'ma_cross'):
                 raise ValueError(f'{symbol}.open_intent.strategy 非法')
             if intent['side'] not in ('long', 'short'):
@@ -548,19 +555,7 @@ class TradeState:
     def _snapshot_locked(self):
         return copy.deepcopy(self.state)
 
-    def _ensure_signal_states_locked(self):
-        if 'signal_states' not in self.state:
-            self.state['signal_states'] = {}
 
-    def _set_signal_state_locked(self, symbol, mid_line_crossed):
-        self._ensure_signal_states_locked()
-        # 保留 last_processed_candle / last_consumed_signal_id：它们是防止停损后
-        # 重放同一根突破 K 线的持久化幂等键，不能被单纯布尔更新覆盖。
-        record = self.state['signal_states'].setdefault(symbol, {})
-        record.update({
-            'mid_line_crossed': bool(mid_line_crossed),
-            'last_update': datetime.now().isoformat()
-        })
 
     def save_state(self):
         with self.lock:
@@ -678,7 +673,6 @@ class TradeState:
         # T+1 只描述“当前仍空仓、等待重入”。真实持仓一旦与账本同事务建立，
         # 陈旧标记必须同时消失，否则人工平仓后会被误判为待重入再开一笔。
         self.state.setdefault('stop_loss_dates', {}).pop(symbol, None)
-        self._set_signal_state_locked(symbol, False)
         if open_intent_client_id is not None:
             del self.state['open_intents'][symbol]
         return copy.deepcopy(position)
@@ -965,7 +959,6 @@ class TradeState:
             position['client_order_id'] = str(open_intent_client_id)
         self.state['open_positions'][symbol] = position
         self.state.setdefault('stop_loss_dates', {}).pop(symbol, None)
-        self._set_signal_state_locked(symbol, False)
         updated = self._apply_partial_close_locked(
             symbol, closed_size, partial_exit_price,
             exit_fee, exit_fee_currency, exit_order_ids,
@@ -1058,7 +1051,6 @@ class TradeState:
             position['client_order_id'] = str(open_intent_client_id)
         self.state['open_positions'][symbol] = position
         self.state.setdefault('stop_loss_dates', {}).pop(symbol, None)
-        self._set_signal_state_locked(symbol, False)
         quarantines = self.state.setdefault('position_quarantines', {})
         previous = quarantines.get(symbol) or {}
         quarantines[symbol] = {
@@ -1094,7 +1086,7 @@ class TradeState:
             self, symbol, exit_price, exit_fee=None,
             exit_fee_currency=None, exit_order_ids=None,
             stop_loss_date=None, stop_cleanup_pending=False,
-            reset_turtle_signal=False, close_intent_client_id=None):
+            close_intent_client_id=None):
         if symbol not in self.state['open_positions']:
             return None
         if stop_loss_date is not None:
@@ -1183,31 +1175,27 @@ class TradeState:
             # 再把可见性等待窗从零计时；普通平仓则在此原子创建 marker。
             self.state.setdefault('stop_residues', {}).setdefault(
                 symbol, datetime.now().isoformat())
-        if reset_turtle_signal:
-            self._set_signal_state_locked(symbol, False)
         return copy.deepcopy(position)
 
     def close_position(self, symbol, exit_price, exit_fee=None,
                        exit_fee_currency=None, exit_order_ids=None,
                        stop_loss_date=None, stop_cleanup_pending=False,
-                       reset_turtle_signal=False,
                        close_intent_client_id=None):
         with self.lock:
             return self._transact_locked(lambda: self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
-                stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
+                stop_loss_date, stop_cleanup_pending,
                 close_intent_client_id))
 
     def force_runtime_close_position(self, symbol, exit_price, exit_fee=None,
                                      exit_fee_currency=None, exit_order_ids=None,
                                      stop_loss_date=None,
                                      stop_cleanup_pending=False,
-                                     reset_turtle_signal=False,
                                      close_intent_client_id=None):
         with self.lock:
             return self._transact_locked(lambda: self._close_position_locked(
                 symbol, exit_price, exit_fee, exit_fee_currency, exit_order_ids,
-                stop_loss_date, stop_cleanup_pending, reset_turtle_signal,
+                stop_loss_date, stop_cleanup_pending,
                 close_intent_client_id), save=False)
 
     def get_all_open_positions(self):
@@ -1433,22 +1421,7 @@ class TradeState:
                 continue
         return matched
 
-    def set_signal_state(self, symbol, mid_line_crossed):
-        """设置品种的中轨穿越状态。"""
-        with self.lock:
-            snapshot = self._snapshot_locked()
-            self._set_signal_state_locked(symbol, mid_line_crossed)
-            self._save_or_rollback_locked(snapshot)
 
-    def get_signal_state(self, symbol):
-        """获取品种的中轨穿越状态。"""
-        with self.lock:
-            self._ensure_signal_states_locked()
-            if symbol not in self.state['signal_states']:
-                snapshot = self._snapshot_locked()
-                self._set_signal_state_locked(symbol, False)
-                self._save_or_rollback_locked(snapshot)
-            return self.state['signal_states'][symbol].get('mid_line_crossed', False)
 
     def remove_symbol_metadata(self, symbol, clear_quarantine=False):
         """清除已退池且无持仓/止损残留品种的辅助状态。
@@ -1491,11 +1464,6 @@ class TradeState:
             protected.update((self.state.get('open_intents') or {}).keys())
             protected.update((self.state.get('stop_residues') or {}).keys())
             protected.update((self.state.get('position_quarantines') or {}).keys())
-            protected.update(
-                symbol for symbol, record in (self.state.get('signal_states') or {}).items()
-                if isinstance(record, dict) and
-                isinstance(record.get('signal_execution'), dict) and
-                record['signal_execution'].get('status') == 'pending')
             candidates = (
                 set((self.state.get('signal_states') or {}).keys()) |
                 set((self.state.get('stop_loss_dates') or {}).keys())
@@ -1513,8 +1481,8 @@ class TradeState:
     def get_signal_metadata(self, symbol):
         """返回品种信号幂等元数据的快照。"""
         with self.lock:
-            self._ensure_signal_states_locked()
-            return copy.deepcopy(self.state['signal_states'].get(symbol) or {})
+            return copy.deepcopy(
+                (self.state.get('signal_states') or {}).get(symbol) or {})
 
     def mark_candle_processed(self, symbol, strategy, candle_id):
         """持久化某策略最后成功处理的已收盘 K 线 ID。"""
@@ -1522,20 +1490,19 @@ class TradeState:
             raise ValueError('candle_id 不能为空')
         with self.lock:
             snapshot = self._snapshot_locked()
-            self._ensure_signal_states_locked()
-            record = self.state['signal_states'].setdefault(symbol, {})
+            record = self.state.setdefault('signal_states', {}).setdefault(symbol, {})
             record['strategy'] = strategy
             record['last_processed_candle'] = str(candle_id)
             record['last_update'] = datetime.now().isoformat()
             self._save_or_rollback_locked(snapshot)
 
-    # ---- 所有非海龟开仓入口共用的两阶段意图 ----
+    # ---- 所有开仓入口共用的两阶段意图 ----
 
     def prepare_open_intent(
             self, symbol, strategy, side, client_order_id, payload,
             planned_position_size=None):
-        if strategy not in ('turtle', 'ma_cross'):
-            raise ValueError('open intent strategy 必须是 turtle/ma_cross')
+        if strategy != 'ma_cross':
+            raise ValueError('open intent strategy 必须是 ma_cross')
         if side not in ('long', 'short'):
             raise ValueError('open intent side 必须是 long/short')
         if not client_order_id or not isinstance(payload, dict):
@@ -1691,282 +1658,12 @@ class TradeState:
             self._save_or_rollback_locked(snapshot)
             return copy.deepcopy(existing)
 
-    def prepare_signal_execution(self, symbol, strategy, signal_id, client_order_id, payload=None):
-        """在外部交易前持久化 pending，但不提前宣称信号已消费。
 
-        同一 signal_id 重启/重试时返回原确定性 client_order_id，适配层会先按
-        clOrdId 查找旧订单，因此同时消除“落盘后下单前崩溃吞信号”与
-        “下单后记账前崩溃重复下单”两个窗口。
-        """
-        if not signal_id or not client_order_id:
-            raise ValueError('signal_id/client_order_id 不能为空')
-        with self.lock:
-            self._ensure_signal_states_locked()
-            record = self.state['signal_states'].setdefault(symbol, {})
-            execution = record.get('signal_execution') or {}
-            if (execution.get('strategy') == strategy and
-                    execution.get('signal_id') == str(signal_id)):
-                return copy.deepcopy(execution)
-            if execution.get('status') == 'pending':
-                raise TradeStatePersistenceError(
-                    f'{symbol} 仍有未收口信号 '
-                    f"{execution.get('signal_id')} / {execution.get('client_order_id')}，"
-                    f'拒绝用新信号 {signal_id} 覆盖唯一恢复句柄')
-            snapshot = self._snapshot_locked()
-            execution = {
-                'strategy': strategy,
-                'signal_id': str(signal_id),
-                'client_order_id': str(client_order_id),
-                'status': 'pending',
-                'payload': copy.deepcopy(payload) if payload is not None else None,
-                'updated_at': datetime.now().isoformat(),
-            }
-            record['strategy'] = strategy
-            record['signal_execution'] = execution
-            record['last_update'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(execution)
 
-    def get_pending_signal_execution(self, symbol, client_order_id=None):
-        with self.lock:
-            self._ensure_signal_states_locked()
-            execution = copy.deepcopy(
-                (self.state['signal_states'].get(symbol) or {}).get('signal_execution') or {})
-            if execution.get('status') != 'pending':
-                return None
-            if (client_order_id is not None and
-                    execution.get('client_order_id') != str(client_order_id)):
-                return None
-            return execution
 
-    def get_pending_signal_executions(self):
-        """返回全部未收口信号，供启动/日检主动裁决。"""
-        with self.lock:
-            self._ensure_signal_states_locked()
-            pending = {}
-            for symbol, record in self.state['signal_states'].items():
-                if not isinstance(record, dict):
-                    continue
-                execution = record.get('signal_execution') or {}
-                if execution.get('status') == 'pending':
-                    pending[symbol] = copy.deepcopy(execution)
-            return pending
 
-    def set_pending_signal_order_amount(self, symbol, client_order_id, position_size):
-        """在首次发单前固化计划币数，重启不因行情/权益变化改变同 clOrdId 的数量。"""
-        if isinstance(position_size, bool):
-            raise ValueError('计划仓位数量不能是 bool')
-        try:
-            amount = float(position_size)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('计划仓位数量非法') from exc
-        if not math.isfinite(amount) or amount <= 0:
-            raise ValueError('计划仓位数量必须是有限正数')
-        with self.lock:
-            self._ensure_signal_states_locked()
-            record = self.state['signal_states'].get(symbol) or {}
-            execution = record.get('signal_execution') or {}
-            if (execution.get('status') != 'pending' or
-                    execution.get('client_order_id') != str(client_order_id)):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 不存在匹配的 pending 信号，拒绝固化下单量')
-            existing = execution.get('planned_position_size')
-            if existing is not None:
-                return float(existing)
-            snapshot = self._snapshot_locked()
-            execution['planned_position_size'] = amount
-            execution['updated_at'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return amount
 
-    def confirm_signal_execution(self, symbol, strategy, signal_id):
-        """仅在交易结果已经与主账本对齐后，把 pending 改为 confirmed。"""
-        with self.lock:
-            self._ensure_signal_states_locked()
-            record = self.state['signal_states'].get(symbol) or {}
-            execution = record.get('signal_execution') or {}
-            if (execution.get('strategy') != strategy or
-                    execution.get('signal_id') != str(signal_id)):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 信号确认与 pending 不匹配，拒绝错记幂等状态')
-            if execution.get('status') == 'confirmed':
-                return copy.deepcopy(execution)
-            snapshot = self._snapshot_locked()
-            execution['status'] = 'confirmed'
-            execution['updated_at'] = datetime.now().isoformat()
-            record['last_consumed_signal_id'] = str(signal_id)
-            if strategy == 'turtle':
-                record['mid_line_crossed'] = False
-            record['last_update'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(execution)
 
-    def finalize_signal_without_trade(
-            self, symbol, strategy, signal_id, candle_id=None,
-            resolution='unsubmitted_expired', reason=None, order=None):
-        """原子消费已明确不会产生持仓的 pending 信号。
-
-        仅用于“从未发单且原止损已失效”或“旧订单已终态且零成交”。
-        signal_execution 与 candle marker 同一次落盘，不留“已消费但重启又重放”窗口。
-        """
-        with self.lock:
-            self._ensure_signal_states_locked()
-            record = self.state['signal_states'].get(symbol) or {}
-            execution = record.get('signal_execution') or {}
-            if (execution.get('strategy') != strategy or
-                    execution.get('signal_id') != str(signal_id) or
-                    execution.get('status') != 'pending'):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 无成交收口与当前 pending 不匹配')
-            snapshot = self._snapshot_locked()
-            now = datetime.now().isoformat()
-            execution['status'] = 'confirmed'
-            execution['resolution'] = str(resolution)
-            execution['resolution_reason'] = str(reason or resolution)
-            execution['updated_at'] = now
-            if isinstance(order, dict):
-                execution['resolution_order'] = {
-                    'id': str(order.get('id')) if order.get('id') is not None else None,
-                    'status': str(order.get('status')) if order.get('status') is not None else None,
-                    'filled': order.get('filled'),
-                }
-            record['last_consumed_signal_id'] = str(signal_id)
-            if strategy == 'turtle':
-                record['mid_line_crossed'] = False
-            if candle_id:
-                record['last_processed_candle'] = str(candle_id)
-            record['strategy'] = strategy
-            record['last_update'] = now
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(execution)
-
-    def finalize_recovered_signal_round_trip(
-            self, symbol, strategy, signal_id, side, entry_price, exit_price,
-            position_size, stop_loss_price, candle_id=None,
-            entry_fee=None, entry_fee_currency=None, entry_order_ids=None,
-            exit_fee=None, exit_fee_currency=None, exit_order_ids=None,
-            reason='pending 崩溃恢复时止损已失效，补偿平仓'):
-        """原子记录 pending 已成交后又全量回滚的完整往返，并消费信号。
-
-        不能先 append 成交史、再另存 confirmed：任一步崩溃都会造成重复回滚或
-        丢交易。该方法把成交史、signal_execution 和 candle marker 合并为一次
-        主账本事务；调用方只能在交易所已明确 ``fully_closed=True`` 后使用。
-        """
-        if side not in ('long', 'short'):
-            raise ValueError('side 必须是 long/short')
-        try:
-            entry_price = float(entry_price)
-            exit_price = float(exit_price)
-            position_size = float(position_size)
-            stop_loss_price = float(stop_loss_price)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('恢复往返的价格/数量必须是正有限数') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, exit_price, position_size, stop_loss_price)):
-            raise ValueError('恢复往返的价格/数量必须是正有限数')
-
-        with self.lock:
-            self._ensure_signal_states_locked()
-            signal_record = self.state['signal_states'].get(symbol) or {}
-            execution = signal_record.get('signal_execution') or {}
-            if (execution.get('strategy') != strategy or
-                    execution.get('signal_id') != str(signal_id) or
-                    execution.get('status') != 'pending'):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 恢复往返与当前 pending 不匹配，拒绝错记成交史')
-
-            snapshot = self._snapshot_locked()
-            now = datetime.now().isoformat()
-            actual_entry_fee = _normalise_optional_fee(entry_fee)
-            actual_exit_fee = _normalise_optional_fee(exit_fee)
-            incoming_order_ids = {
-                str(value) for value in (entry_order_ids or []) if value}
-            existing_trade = None
-            def matches_existing(candidate):
-                # signal_id 只在“单个 symbol 的 signal_states”内唯一；不同品种
-                # 同一根日线、同一方向会得到相同 candle|side。缺少品种约束会把
-                # ETH 的历史误当 BTC 已记账，确认 pending 却吞掉真实成交史。
-                if candidate.get('symbol') != symbol:
-                    return False
-                candidate_ids = {
-                    str(value) for value in (candidate.get('entry_order_ids') or []) if value}
-                return bool(
-                    candidate.get('signal_id') == str(signal_id) or
-                    candidate.get('client_order_id') == execution.get('client_order_id') or
-                    (incoming_order_ids and incoming_order_ids & candidate_ids))
-
-            for candidate in reversed(self.state['closed_trades']):
-                if matches_existing(candidate):
-                    existing_trade = candidate
-                    break
-            if existing_trade is None:
-                archive, archive_ok = self._read_archive(copy_records=False)
-                if not archive_ok:
-                    raise TradeStatePersistenceError(
-                        '平仓史书不可验证，拒绝追加可能重复的 pending 恢复往返')
-                for candidate in reversed(archive):
-                    if matches_existing(candidate):
-                        existing_trade = candidate
-                        break
-            if existing_trade is not None:
-                # 可能崩溃在“真实平仓已记入 closed_trades”后、pending 确认前。
-                # 只补幂等元数据，绝不追加第二条往返成交。
-                execution['status'] = 'confirmed'
-                execution['resolution'] = 'existing_closed_trade'
-                execution['updated_at'] = now
-                signal_record['last_consumed_signal_id'] = str(signal_id)
-                if strategy == 'turtle':
-                    signal_record['mid_line_crossed'] = False
-                if candle_id:
-                    signal_record['last_processed_candle'] = str(candle_id)
-                signal_record['strategy'] = strategy
-                signal_record['last_update'] = now
-                self._save_or_rollback_locked(snapshot)
-                return copy.deepcopy(existing_trade)
-            trade = {
-                'symbol': symbol,
-                'side': side,
-                'strategy': strategy,
-                'entry_price': entry_price,
-                'exit_price': exit_price,
-                'final_exit_price': exit_price,
-                'position_size': position_size,
-                'original_position_size': position_size,
-                'stop_loss_price': stop_loss_price,
-                'stop_order_id': None,
-                'open_time': execution.get('updated_at') or now,
-                'close_time': now,
-                'recovered_round_trip': True,
-                'recovery_reason': str(reason),
-                'signal_id': str(signal_id),
-                'client_order_id': execution.get('client_order_id'),
-            }
-            trade.update(calculate_closed_trade_metrics(
-                side, entry_price, exit_price, position_size,
-                entry_fee=actual_entry_fee, exit_fee=actual_exit_fee))
-            if entry_fee_currency is not None:
-                trade['entry_fee_currency'] = entry_fee_currency
-            if exit_fee_currency is not None:
-                trade['exit_fee_currency'] = exit_fee_currency
-            if entry_order_ids:
-                trade['entry_order_ids'] = [
-                    str(value) for value in entry_order_ids if value]
-            if exit_order_ids:
-                trade['exit_order_ids'] = [
-                    str(value) for value in exit_order_ids if value]
-            self.state['closed_trades'].append(trade)
-
-            execution['status'] = 'confirmed'
-            execution['updated_at'] = now
-            signal_record['last_consumed_signal_id'] = str(signal_id)
-            if strategy == 'turtle':
-                signal_record['mid_line_crossed'] = False
-            if candle_id:
-                signal_record['last_processed_candle'] = str(candle_id)
-            signal_record['strategy'] = strategy
-            signal_record['last_update'] = now
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(trade)
 
     # ---- 双均线 T+1：与持仓/止损/信号共用同一账本事务 ----
 

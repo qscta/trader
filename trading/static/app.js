@@ -223,11 +223,11 @@ async function loadAccountStats() {
         setText('potentialDetail', '最低权益 ' + fmt(d.worst_case_equity));
         setText('daysSincePeak', d.days_since_peak);
         setText('longestDrawdownDetail', '历史最长 ' + d.longest_drawdown_days + ' 天');
-        // 品种池构成
+        // 品种池构成（按启用/禁用统计）
         if (window._symbolsData) {
-            let t = 0, m = 0;
-            window._symbolsData.forEach(s => { if (s.strategy === 'turtle') t++; else m++; });
-            setText('symbolPoolDetail', '海龟 ' + t + ' · 均线 ' + m);
+            let en = 0, dis = 0;
+            window._symbolsData.forEach(s => { if (s.enabled) en++; else dis++; });
+            setText('symbolPoolDetail', '启用 ' + en + ' · 禁用 ' + dis);
         }
     } catch (e) { setEquityNA(); }
 }
@@ -407,25 +407,23 @@ async function loadSymbols() {
         const symbols = await res.json();
         window._symbolsData = symbols;
         // 品种池构成直接在此更新，不依赖 loadAccountStats 的返回时序
-        let _t = 0, _m = 0;
-        symbols.forEach(s => { if ((s.strategy || 'turtle') === 'turtle') _t++; else _m++; });
-        setText('symbolPoolDetail', symbols.length ? ('海龟 ' + _t + ' · 均线 ' + _m) : '');
+        let _en = 0, _dis = 0;
+        symbols.forEach(s => { if (s.enabled) _en++; else _dis++; });
+        setText('symbolPoolDetail', symbols.length ? ('启用 ' + _en + ' · 禁用 ' + _dis) : '');
         if (!symbols.length) { box.innerHTML = '<div class="empty">品种池为空，添加一个交易对</div>'; return; }
         let rows = symbols.map(s => {
             const safeName = escapeHtml(s.name);
-            const stratBadge = (s.strategy || 'turtle') === 'turtle' ? '<span class="badge badge-turtle">海龟</span>' : '<span class="badge badge-ma">双均线</span>';
             const stateBadge = s.enabled ? '<span class="badge badge-on">启用</span>' : '<span class="badge badge-off">禁用</span>';
             const holding = s.has_open_position ? '<span class="badge badge-holding">持仓中</span>' : '';
             return `<tr>
                 <td><span class="symbol-name">${safeName}</span>${holding}</td>
-                <td>${stratBadge}</td>
                 <td class="number-cell" data-action="risk" data-symbol="${safeName}" data-risk="${s.risk_per_trade}" style="cursor:pointer">${(s.risk_per_trade*100).toFixed(1)}%</td>
                 <td><span style="cursor:pointer" data-action="toggle" data-symbol="${safeName}" data-enabled="${s.enabled?1:0}">${stateBadge}</span></td>
                 <td class="center-cell"><button class="btn btn-sm btn-danger" data-action="del" data-symbol="${safeName}">删除</button></td>
             </tr>`;
         }).join('');
         box.innerHTML = `<div class="table-wrap"><table class="data"><thead><tr>
-            <th>交易对</th><th>策略</th><th class="number-cell">风险</th><th>状态</th><th class="center-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+            <th>交易对</th><th class="number-cell">风险</th><th>状态</th><th class="center-cell">操作</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     } catch (e) {
         box.innerHTML = '<div class="empty">品种池加载失败</div>';
     }
@@ -436,9 +434,8 @@ async function addSymbol() {
     if (!name) { showAlert('请输入交易对', 'error'); return; }
     const risk = Number(el('riskPerTrade').value) / 100;
     if (!Number.isFinite(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
-    const strategy = el('symbolStrategy').value;
     try {
-        const res = await postJSON('/api/symbols', { name, risk_per_trade: risk, strategy });
+        const res = await postJSON('/api/symbols', { name, risk_per_trade: risk });
         const data = await res.json();
         if (res.ok) { showAlert(data.message || '已添加', 'success'); el('symbolName').value = ''; loadSymbols(); refreshStatus(); }
         else showAlert(data.error || '添加失败', 'error');
@@ -479,11 +476,10 @@ async function instantOpen() {
     if (!name) { showAlert('请输入交易对', 'error'); return; }
     const risk = Number(el('instantRiskPerTrade').value) / 100;
     if (!Number.isFinite(risk) || risk <= 0) { showAlert('风险度无效', 'error'); return; }
-    const strategy = el('instantStrategy').value;
     const out = el('instantResult');
     out.className = 'result-line'; out.textContent = '检测信号并开仓中...';
     try {
-        const res = await postJSON('/api/instant_open', { name, risk_per_trade: risk, strategy });
+        const res = await postJSON('/api/instant_open', { name, risk_per_trade: risk });
         const data = await res.json();
         if (res.ok) {
             out.className = 'result-line ok';
@@ -517,7 +513,6 @@ async function loadStrategyParams() {
     try {
         const res = await authFetch('/api/strategy_params');
         const p = await res.json();
-        el('paramChannelPeriod').value = p.channel_period ?? '';
         el('paramMaShort').value = p.ma_short_period ?? '';
         el('paramMaLong').value = p.ma_long_period ?? '';
         el('paramMaStop').value = p.ma_stop_period ?? '';
@@ -528,7 +523,6 @@ async function loadStrategyParams() {
 async function saveStrategyParams() {
     const out = el('strategyParamResult');
     const periods = [
-        Number(el('paramChannelPeriod').value),
         Number(el('paramMaShort').value),
         Number(el('paramMaLong').value),
         Number(el('paramMaStop').value),
@@ -540,10 +534,9 @@ async function saveStrategyParams() {
         return;
     }
     const body = {
-        channel_period: periods[0],
-        ma_short_period: periods[1],
-        ma_long_period: periods[2],
-        ma_stop_period: periods[3],
+        ma_short_period: periods[0],
+        ma_long_period: periods[1],
+        ma_stop_period: periods[2],
         default_risk_per_trade: defaultRisk,
     };
     try {

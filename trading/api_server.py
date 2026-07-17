@@ -41,7 +41,7 @@ def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=Non
         return None, str(e)
     if strategy is not None:
         if strategy not in STRATEGY_WHITELIST:
-            return None, f'未知策略: {strategy!r}（只支持 turtle / ma_cross）'
+            return None, f'未知策略: {strategy!r}（只支持 ma_cross）'
         clean['strategy'] = strategy
     return clean, None
 
@@ -572,9 +572,6 @@ def add_symbol():
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对已存在'}), 400
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if callable(pending_getter) and pending_getter(new_symbol['name']):
-                return jsonify({'error': f"{new_symbol['name']} 存在未收口订单，禁止重新加入/改配"}), 409
             intent_getter = getattr(system.trade_state, 'get_open_intent', None)
             if callable(intent_getter) and intent_getter(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口开仓意图，禁止重新加入/改配"}), 409
@@ -584,32 +581,7 @@ def add_symbol():
             if err_resp:
                 return err_resp
 
-        # 海龟策略：回溯历史，中轨后尚未突破则激活可开仓状态
-        if new_symbol['strategy'] == 'turtle':
-            try:
-                symbol_name = new_symbol['name']
-                fetch_limit = ohlcv_fetch_limit_for_strategy('turtle', system.config.get('strategy', {}))
-                required_closed = required_closed_candles_for_strategy('turtle', system.config.get('strategy', {}))
-                _ccxt_symbol, df = _load_closed_daily_df(
-                    system, symbol_name, fetch_limit)
-                if df is not None:
-                    if len(df) < required_closed:
-                        logger.warning(
-                            f"[{system.label}] {symbol_name} 历史回溯K线不足：海龟策略配置至少需要 "
-                            f"{required_closed} 根已收盘K线，本轮仅取得 {len(df)} 根"
-                            f"（请求 {fetch_limit} 根）")
-                    else:
-                        strategy = system.get_strategy_for_symbol({'strategy': 'turtle'})[0]
-                        armed = strategy.is_first_breakout_armed(df)
-                        if armed:
-                            system.trade_state.set_signal_state(symbol_name, True)
-                            logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为可开仓状态")
-                        else:
-                            logger.info(f"[{system.label}] {symbol_name} 历史回溯判定为未激活状态")
-            except Exception as e:
-                logger.warning(f"初始化 {new_symbol['name']} 状态失败: {e}")
-
-        strategy_text = '海龟通道' if new_symbol['strategy'] == 'turtle' else '双均线EMA'
+        strategy_text = '双均线EMA'
         send_dingtalk(f'[{system.label}] 新增交易对: {new_symbol["name"]}, 策略: {strategy_text}, '
                       f'风险度: {new_symbol["risk_per_trade"]*100:.1f}%, 状态: {"启用" if new_symbol["enabled"] else "禁用"}')
         return jsonify({'status': 'success', 'message': f'交易对 {new_symbol["name"]} 已添加', 'symbol': new_symbol})
@@ -642,15 +614,10 @@ def update_symbol(symbol):
             if not locked:
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             # 未收口生命周期存在时，只允许“单独禁用”这一紧急收口动作；风险/
-            # 策略修改或重新启用可能让旧意图被另一套配置接管。海龟 pending 与
-            # 通用 open intent 用同一口径，避免先被 pending 分支挡掉紧急禁用。
+            # 策略修改或重新启用可能让旧意图被另一套配置接管。
             disabling_only = (
                 clean.get('enabled') is False and
                 not any(key in clean for key in ('risk_per_trade', 'strategy')))
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if (callable(pending_getter) and pending_getter(symbol_u) and
-                    not disabling_only):
-                return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止修改配置'}), 409
             intent_getter = getattr(system.trade_state, 'get_open_intent', None)
             open_intent = intent_getter(symbol_u) if callable(intent_getter) else None
             if open_intent and not disabling_only:
@@ -682,8 +649,7 @@ def update_symbol(symbol):
                     if 'risk_per_trade' in clean:
                         changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
                     if 'strategy' in clean:
-                        strategy_text = '海龟通道' if clean['strategy'] == 'turtle' else '双均线EMA'
-                        changes.append(f'策略: {strategy_text}')
+                        changes.append('策略: 双均线EMA')
                     break
         if changes is None:
             return jsonify({'error': '交易对不存在'}), 404
@@ -714,11 +680,8 @@ def delete_symbol(symbol):
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
             if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对不存在'}), 404
-            pending_getter = getattr(system.trade_state, 'get_pending_signal_execution', None)
-            if callable(pending_getter) and pending_getter(symbol_u):
-                return jsonify({'error': f'{symbol_u} 存在未收口订单，禁止删除配置'}), 409
-            # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，必须先把策略固化进持仓，
-            # 否则删除后 check_and_execute 会按默认 turtle 托管，双均线仓位会被错误管理。
+            # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，先把策略固化进持仓，
+            # 保证删除后按明确记录的策略托管到仓位结束。
             held = system.trade_state.get_open_position(symbol_u)
             if held and not held.get('strategy'):
                 cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_u), None)
@@ -1023,14 +986,14 @@ def update_strategy_params():
         if not isinstance(data, dict) or not data:
             return jsonify({'error': '缺少参数'}), 400
         allowed_fields = {
-            'channel_period', 'ma_short_period', 'ma_long_period',
+            'ma_short_period', 'ma_long_period',
             'ma_stop_period', 'default_risk_per_trade',
         }
         unknown = sorted(set(data) - allowed_fields)
         if unknown:
             return jsonify({'error': f'未知策略参数: {unknown}'}), 400
         null_error = _explicit_null_error(
-            data, ('channel_period', 'ma_short_period', 'ma_long_period',
+            data, ('ma_short_period', 'ma_long_period',
                    'ma_stop_period', 'default_risk_per_trade'))
         if null_error:
             return jsonify({'error': null_error}), 400
@@ -1038,7 +1001,7 @@ def update_strategy_params():
         # strict_int 与启动校验同源：28.9 拒绝而非截断，三入口口径完全一致
         try:
             parsed = {}
-            for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
+            for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
                 if key in data:
                     v = strict_int(data[key], key)
                     if not (PERIOD_MIN <= v <= PERIOD_MAX):
@@ -1071,7 +1034,7 @@ def update_strategy_params():
             backup = json.loads(json.dumps(system.config.get('strategy', {})))
             sp = system.config.setdefault('strategy', {})
 
-            label_map = {'channel_period': '海龟通道周期', 'ma_short_period': 'EMA短期周期',
+            label_map = {'ma_short_period': 'EMA短期周期',
                          'ma_long_period': 'EMA长期周期', 'ma_stop_period': 'EMA止损周期'}
             for key, v in parsed.items():
                 sp[key] = v
@@ -1160,38 +1123,21 @@ def instant_open():
                 logger.error(f"{symbol_name} 获取实时市价失败，拒绝即时开仓: {e}")
                 return jsonify({'error': f'{symbol_name} 无法取得实时市价，禁止即时开仓'}), 503
 
-            signal_side = None
-            stop_loss_price = None
-            signal_info = {}
-
-            if strategy_type == 'ma_cross':
-                signal = system.ma_cross_strategy.check_current_state(df)
-                if not signal:
-                    return jsonify({'error': f'{symbol_name} K线数据不足，无法计算EMA信号'}), 400
-                signal_side = signal.get('action')
-                if signal_side not in ('long', 'short'):
-                    return jsonify({'error': f'{symbol_name} 当前EMA无明确方向（短期EMA≈长期EMA）',
-                                    'info': {'ema_short': float(signal.get('ema_short', 0)),
-                                             'ema_long': float(signal.get('ema_long', 0)),
-                                             'current_price': current_price}}), 400
-                stop_loss_price = signal['lower_stop'] if signal_side == 'long' else signal['upper_stop']
-                signal_info = {'ema_short': float(signal.get('ema_short', 0)),
-                               'ema_long': float(signal.get('ema_long', 0)),
-                               'upper_stop': float(signal.get('upper_stop', 0)),
-                               'lower_stop': float(signal.get('lower_stop', 0)),
-                               'strategy': 'ma_cross'}
-            else:
-                signal = system.turtle_strategy.check_current_state(df)
-                if not signal:
-                    return jsonify({'error': f'{symbol_name} K线数据不足，无法计算信号'}), 400
-                signal_side = signal.get('action')
-                if signal_side not in ('long', 'short'):
-                    return jsonify({'error': f'{symbol_name} 当前无海龟通道突破信号',
-                                    'info': {'upper': signal.get('upper_line'), 'lower': signal.get('lower_line'),
-                                             'mid': signal.get('mid_line'), 'current_price': current_price}}), 400
-                stop_loss_price = signal['lower_line'] if signal_side == 'long' else signal['upper_line']
-                signal_info = {'upper': signal.get('upper_line'), 'lower': signal.get('lower_line'),
-                               'mid': signal.get('mid_line'), 'strategy': 'turtle'}
+            signal = system.ma_cross_strategy.check_current_state(df)
+            if not signal:
+                return jsonify({'error': f'{symbol_name} K线数据不足，无法计算EMA信号'}), 400
+            signal_side = signal.get('action')
+            if signal_side not in ('long', 'short'):
+                return jsonify({'error': f'{symbol_name} 当前EMA无明确方向（短期EMA≈长期EMA）',
+                                'info': {'ema_short': float(signal.get('ema_short', 0)),
+                                         'ema_long': float(signal.get('ema_long', 0)),
+                                         'current_price': current_price}}), 400
+            stop_loss_price = signal['lower_stop'] if signal_side == 'long' else signal['upper_stop']
+            signal_info = {'ema_short': float(signal.get('ema_short', 0)),
+                           'ema_long': float(signal.get('ema_long', 0)),
+                           'upper_stop': float(signal.get('upper_stop', 0)),
+                           'lower_stop': float(signal.get('lower_stop', 0)),
+                           'strategy': 'ma_cross'}
 
             symbol_config = {'name': symbol_name, 'enabled': True,
                              'risk_per_trade': risk_per_trade, 'strategy': strategy_type}
@@ -1248,7 +1194,7 @@ def instant_open():
                 }), 500
 
             direction_text = '做多' if signal_side == 'long' else '做空'
-            strategy_text = '海龟通道' if strategy_type == 'turtle' else '双均线EMA'
+            strategy_text = '双均线EMA'
             send_dingtalk(f'[{system.label}-即时开仓] {symbol_name} {direction_text} ({strategy_text})\n'
                           f'入场价: {new_position["entry_price"]}\n'
                           f'数量: {new_position["position_size"]}\n'

@@ -28,7 +28,7 @@ def _close_n(ts, n, start=0):
     """开 n 笔并立即平掉，产生按序的平仓历史（符号 C<i>USDT 可追溯顺序）。"""
     for i in range(start, start + n):
         sym = f'C{i}USDT'
-        ts.add_open_position(sym, 'long', 100.0 + i, 1.0, 90.0, strategy='turtle')
+        ts.add_open_position(sym, 'long', 100.0 + i, 1.0, 90.0, strategy='ma_cross')
         ts.close_position(sym, 110.0 + i)
 
 

@@ -1010,17 +1010,6 @@ class TradeExecutorMixin:
 
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
-        pending_getter = getattr(self.trade_state, 'get_pending_signal_execution', None)
-        pending_execution = pending_getter(symbol) if callable(pending_getter) else None
-        if pending_execution:
-            pending_client_id = pending_execution.get('client_order_id')
-            if not client_order_id or str(client_order_id) != str(pending_client_id):
-                msg = (f"{symbol} 存在未收口的幂等订单 {pending_client_id}，"
-                       "阻断另一笔开仓；须先按原订单完成对账")
-                logger.error(msg)
-                self.notifier.notify_error(msg)
-                return
-
         intent_getter = getattr(self.trade_state, 'get_open_intent', None)
         open_intent = intent_getter(symbol) if callable(intent_getter) else None
         if open_intent:
@@ -1032,7 +1021,6 @@ class TradeExecutorMixin:
                 logger.error(msg)
                 self.notifier.notify_error(msg)
                 return
-        recovery_execution = pending_execution or open_intent
 
         quarantine_check = getattr(self.trade_state, 'is_position_quarantined', None)
         if callable(quarantine_check):
@@ -1044,14 +1032,10 @@ class TradeExecutorMixin:
                 self.notifier.notify_error(msg)
                 return
             if quarantined:
-                pending_getter = getattr(self.trade_state, 'get_pending_signal_execution', None)
-                pending = (
-                    pending_getter(symbol, client_order_id)
-                    if client_order_id and callable(pending_getter) else None)
                 intent = (
                     intent_getter(symbol, client_order_id)
                     if client_order_id and callable(intent_getter) else None)
-                if not pending and not intent:
+                if not intent:
                     msg = f"{symbol} 处于交易所/本地仓位不一致隔离状态，阻断本次开仓；请先完成对账并解除隔离"
                     logger.error(msg)
                     self.notifier.notify_error(msg)
@@ -1122,10 +1106,10 @@ class TradeExecutorMixin:
         logger.info(f"{symbol} 使用风险度: {risk_per_trade*100:.1f}%")
 
         if recover_pending_position:
-            # 发单前 set_pending_signal_order_amount 已经与 pending 原子落盘。恢复真实
-            # 孤儿仓时不能再依赖余额、风险公式或当前止损距离；这些外部/过期输入会
-            # 阻断旧 clOrdId 查询。缺计划量意味着没有证据证明请求参数，按 fail-closed。
-            planned = (recovery_execution or {}).get('planned_position_size')
+            # 发单前计划量已随 open intent 原子落盘。恢复真实孤儿仓时不能再依赖
+            # 余额、风险公式或当前止损距离；这些外部/过期输入会阻断旧 clOrdId
+            # 查询。缺计划量意味着没有证据证明请求参数，按 fail-closed。
+            planned = (open_intent or {}).get('planned_position_size')
             try:
                 position_size = float(planned)
             except (TypeError, ValueError):
@@ -1176,13 +1160,7 @@ class TradeExecutorMixin:
             precision = self.exchange_api.get_quantity_precision(ccxt_symbol)
 
             # 确定性 clOrdId 首次发单前固化数量；普通重试也必须复用，不能随行情改变。
-            if client_order_id and pending_execution:
-                if pending_execution.get('planned_position_size') is not None:
-                    position_size = float(pending_execution['planned_position_size'])
-                else:
-                    position_size = self.trade_state.set_pending_signal_order_amount(
-                        symbol, client_order_id, position_size)
-            elif client_order_id and open_intent:
+            if client_order_id and open_intent:
                 if open_intent.get('planned_position_size') is not None:
                     position_size = float(open_intent['planned_position_size'])
                 else:
@@ -1201,15 +1179,15 @@ class TradeExecutorMixin:
             logger.error(f"{symbol} 头寸大小无效: {position_size}")
             return
 
-        # 海龟已有 signal_execution；其余入口在任何 POST 前统一持久化
-        # open intent + clOrdId + 固化数量，封住成交后记账前崩溃的孤儿仓窗口。
+        # 所有开仓入口在任何 POST 前统一持久化 open intent + clOrdId + 固化
+        # 数量，封住成交后记账前崩溃的孤儿仓窗口。
         if client_order_id is None:
             prepare_intent = getattr(self.trade_state, 'prepare_open_intent', None)
             if callable(prepare_intent):
                 generated_client_id = f'I{uuid.uuid4().hex[:31]}'
                 try:
                     open_intent = prepare_intent(
-                        symbol, symbol_config.get('strategy', 'turtle'), side,
+                        symbol, symbol_config.get('strategy', 'ma_cross'), side,
                         generated_client_id,
                         {'side': side, 'entry_price': float(entry_price),
                          'stop_loss_price': float(stop_loss_price)},
@@ -1315,7 +1293,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 original_size, stop_loss_price,
-                symbol_config.get('strategy', 'turtle'),
+                symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback_contract, '未决开仓内部补偿',
                 allow_stop_rebuild=not recovery_requires_close,
                 open_intent_client_id=open_intent_client_id)
@@ -1341,7 +1319,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 actual_position_size, stop_loss_price,
-                symbol_config.get('strategy', 'turtle'),
+                symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback, '歧义开仓紧急回滚',
                 open_intent_client_id=open_intent_client_id)
             self.notifier.notify_error(f"{symbol} 开仓成交存在外部并发歧义，已尝试回滚，请核对交易所")
@@ -1358,7 +1336,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 actual_position_size, stop_loss_price,
-                symbol_config.get('strategy', 'turtle'),
+                symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback, '超量开仓紧急回滚',
                 open_intent_client_id=open_intent_client_id)
             self.notifier.notify_error(f"{symbol} 开仓超量成交，已尝试回滚，请核对交易所")
@@ -1390,7 +1368,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'turtle'),
+                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback, '止损失效后的紧急回滚',
                 allow_stop_rebuild=False,
                 open_intent_client_id=open_intent_client_id)
@@ -1414,7 +1392,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'turtle'),
+                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback, '止损创建失败后的紧急回滚',
                 stop_residue_possible=True,
                 open_intent_client_id=open_intent_client_id)
@@ -1459,7 +1437,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'turtle'),
+                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
                 open_order, rollback, '成交后风险超标紧急回滚',
                 existing_stop_order_id=stop_order_id,
                 existing_stop_order_size=position_size,
@@ -1475,7 +1453,7 @@ class TradeExecutorMixin:
 
         persist_result = self._persist_open_position_or_rollback(
             symbol, ccxt_symbol, side, actual_price, position_size, stop_loss_price, stop_order_id,
-            strategy=symbol_config.get('strategy', 'turtle'), open_order=open_order,
+            strategy=symbol_config.get('strategy', 'ma_cross'), open_order=open_order,
             open_intent_client_id=open_intent_client_id
         )
         if persist_result is not True:

@@ -493,8 +493,7 @@ class StopGuardianMixin:
             if effective_strategy == 'ma_cross' and not retired_from_pool else None)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, exit_price, context, stop_loss_date=stop_loss_date,
-            stop_cleanup_pending=True,
-            reset_turtle_signal=(effective_strategy == 'turtle'))
+            stop_cleanup_pending=True)
         if not closed_position:
             return None, False, False
         if stop_loss_date is not None:
@@ -515,7 +514,6 @@ class StopGuardianMixin:
                                                  exit_order_ids=None,
                                                  stop_loss_date=None,
                                                  stop_cleanup_pending=False,
-                                                 reset_turtle_signal=False,
                                                  close_intent_client_id=None):
         close_kwargs = {}
         if exit_fee is not None or exit_order_ids:
@@ -527,8 +525,6 @@ class StopGuardianMixin:
             close_kwargs['stop_loss_date'] = stop_loss_date
         if stop_cleanup_pending:
             close_kwargs['stop_cleanup_pending'] = True
-        if reset_turtle_signal:
-            close_kwargs['reset_turtle_signal'] = True
         if close_intent_client_id is not None:
             close_kwargs['close_intent_client_id'] = close_intent_client_id
         try:

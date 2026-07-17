@@ -98,7 +98,7 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
     def test_backup_failure_aborts_commit_and_rolls_back_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            state.set_signal_state('BTCUSDT', False)
+            state.mark_candle_processed('BTCUSDT', 'ma_cross', 'c1')
             real_write = trade_state_module.atomic_write_json
 
             def fail_backup(path, data):
@@ -106,13 +106,14 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
 
             with patch.object(trade_state_module, 'atomic_write_json', side_effect=fail_backup):
                 with self.assertRaises(TradeStatePersistenceError):
-                    state.set_signal_state('BTCUSDT', True)
-            self.assertFalse(state.get_signal_state('BTCUSDT'))
+                    state.mark_candle_processed('BTCUSDT', 'ma_cross', 'c2')
+            self.assertEqual(
+                'c1', state.get_signal_metadata('BTCUSDT')['last_processed_candle'])
 
     def test_symbol_metadata_cleanup_preserves_quarantine_until_confirmed_flat(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            state.set_signal_state('OLDUSDT', True)
+            state.mark_candle_processed('OLDUSDT', 'ma_cross', 'c1')
             state.replace_stop_loss_dates({'OLDUSDT': '2026-07-10'})
             state.mark_position_quarantine('OLDUSDT', 'exchange orphan')
 
@@ -128,9 +129,9 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
     def test_inactive_metadata_pruning_keeps_active_and_quarantined_symbols(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            state.set_signal_state('ACTIVEUSDT', True)
-            state.set_signal_state('OLDUSDT', True)
-            state.set_signal_state('QUARANTINEDUSDT', True)
+            state.mark_candle_processed('ACTIVEUSDT', 'ma_cross', 'c1')
+            state.mark_candle_processed('OLDUSDT', 'ma_cross', 'c1')
+            state.mark_candle_processed('QUARANTINEDUSDT', 'ma_cross', 'c1')
             state.replace_stop_loss_dates({
                 'ACTIVEUSDT': '2026-07-10', 'OLDUSDT': '2026-07-10'})
             state.mark_position_quarantine('QUARANTINEDUSDT', 'exchange orphan')

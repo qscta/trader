@@ -183,7 +183,6 @@ body {
 .badge-short { background: var(--red-soft); color: var(--red-strong); }
 .badge-on { background: var(--green-soft); color: var(--green-strong); }
 .badge-off { background: var(--orange-soft); color: var(--orange); }
-.badge-turtle { background: var(--accent-soft); color: var(--accent); }
 .badge-ma { background: var(--purple-soft); color: var(--purple); }
 .badge-holding { background: var(--accent-soft); color: var(--accent); border-radius: var(--r-pill); margin-left: 8px; vertical-align: middle; padding: 2px 8px; font-size: 11px; }
 .table-wrap { overflow: auto; -webkit-overflow-scrolling: touch; }
@@ -339,9 +338,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
                         <div class="form-group"><label>交易对</label><input type="text" id="symbolName" placeholder="如 LTCUSDT"></div>
                         <div class="form-group"><label>风险度 (%)</label><input type="number" id="riskPerTrade" value="1" min="0.1" max="10" step="0.1"></div>
                     </div>
-                    <div class="form-group"><label>策略</label>
-                        <select id="symbolStrategy"><option value="ma_cross">双均线交叉 (EMA)</option><option value="turtle">海龟通道突破</option></select>
-                    </div>
                     <button class="btn btn-primary btn-block" id="addSymbolBtn">添加交易对</button>
                     <div id="symbolsList" class="card-scroll" style="margin-top:16px;"><div class="loading"><div class="spinner"></div><span>加载中...</span></div></div>
                 </div>
@@ -363,9 +359,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
                         <div class="form-group"><label>交易对</label><input type="text" id="instantSymbolName" placeholder="如 BTCUSDT"></div>
                         <div class="form-group"><label>风险度 (%)</label><input type="number" id="instantRiskPerTrade" value="1" min="0.1" max="10" step="0.1"></div>
                     </div>
-                    <div class="form-group"><label>策略</label>
-                        <select id="instantStrategy"><option value="ma_cross">双均线交叉 (EMA)</option><option value="turtle">海龟通道突破</option></select>
-                    </div>
                     <button class="btn btn-open btn-block" id="instantOpenBtn">按当前信号即时开仓</button>
                     <div class="result-line" id="instantResult"></div>
                 </div>
@@ -374,7 +367,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
                 <div class="card-header"><h2>策略参数</h2></div>
                 <div class="card-body">
                     <div class="param-grid">
-                        <div class="form-group"><label>海龟通道周期</label><input type="number" id="paramChannelPeriod" min="2" max="297" step="1"></div>
                         <div class="form-group"><label>默认风险度 (%)</label><input type="number" id="paramDefaultRisk" step="0.1"></div>
                         <div class="form-group"><label>EMA 短期</label><input type="number" id="paramMaShort" min="2" max="148" step="1"></div>
                         <div class="form-group"><label>EMA 长期</label><input type="number" id="paramMaLong" min="3" max="149" step="1"></div>

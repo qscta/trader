@@ -77,7 +77,7 @@ class TradeStateFeeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
             state.add_open_position(
-                'BTCUSDT', 'long', 100, 1.0, 90, 'stop-old', strategy='turtle',
+                'BTCUSDT', 'long', 100, 1.0, 90, 'stop-old', strategy='ma_cross',
                 entry_fee=0.02, entry_fee_currency='USDT', entry_order_ids=['open-1'])
 
             remaining = state.apply_partial_close(

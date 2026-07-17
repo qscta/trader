@@ -70,27 +70,27 @@ class NormalizeSymbolTest(unittest.TestCase):
 
 class StrategyOhlcvLimitTest(unittest.TestCase):
     def test_default_periods_always_request_one_full_okx_page(self):
-        config = {'channel_period': 28, 'ma_long_period': 28, 'ma_stop_period': 28}
+        config = {'ma_long_period': 28, 'ma_stop_period': 28}
 
-        self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('turtle', config), 300)
         self.assertEqual(cv.ohlcv_fetch_limit_for_strategy('ma_cross', config), 300)
 
     def test_capacity_boundary_leaves_one_open_candle_buffer(self):
-        config = {'channel_period': 297, 'ma_long_period': 149, 'ma_stop_period': 298}
+        config = {'ma_long_period': 149, 'ma_stop_period': 298}
 
         self.assertTrue(cv.validate_strategy_ohlcv_capacity(config))
-        self.assertEqual(cv.required_closed_candles_for_strategy('turtle', config), 299)
         self.assertEqual(cv.required_closed_candles_for_strategy('ma_cross', config), 299)
 
-    def test_retired_turtle_not_validated_by_capacity_check(self):
-        # 海龟已下线：容量校验只覆盖启用策略（ma_cross），不再对 turtle 参数计算。
+    def test_retired_turtle_is_rejected_as_unknown_strategy(self):
+        # 海龟已彻底下线：既不在白名单，也不再有任何周期/容量计算分支。
         self.assertNotIn('turtle', cv.STRATEGY_WHITELIST)
         self.assertIn('turtle', cv.RETIRED_STRATEGIES)
+        with self.assertRaisesRegex(ValueError, '未知策略'):
+            cv.required_closed_candles_for_strategy('turtle', {})
 
     def test_ma_period_over_single_page_capacity_is_rejected(self):
         with self.assertRaisesRegex(ValueError, '超过单次 300 根上限'):
             cv.validate_strategy_ohlcv_capacity({
-                'channel_period': 28, 'ma_long_period': 150,
+                'ma_long_period': 150,
                 'ma_stop_period': 28})
 
 
