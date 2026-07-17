@@ -4,12 +4,12 @@ from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import logging
-import math
 import threading
 import time
 import os
 import secrets
 from datetime import datetime
+from trade_executor import safe_fill_price
 from trade_state import enrich_closed_trade_with_fees
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
@@ -1331,18 +1331,8 @@ def close_position():
                 warn_ambiguous(symbol_name, close_order, '手动平仓')
 
             # 仓位变化与订单成交量不一致时，订单 VWAP 不能代表完整平仓，使用保守行情回退。
-            # average 为垃圾字符串/NaN 时绝不裸抛/放行：与 _safe_fill_price 同一口径。
             actual_price = None if close_order.get('execution_ambiguous') \
-                else close_order.get('average', None)
-            if isinstance(actual_price, bool):
-                actual_price = None
-            try:
-                actual_price = float(actual_price) if actual_price is not None else None
-            except (TypeError, ValueError):
-                actual_price = None
-            if actual_price is not None and (
-                    not math.isfinite(actual_price) or actual_price <= 0):
-                actual_price = None
+                else safe_fill_price(close_order, None)
             if not actual_price:
                 try:
                     actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']

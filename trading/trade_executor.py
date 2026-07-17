@@ -24,7 +24,29 @@ from trade_state import TradeStatePersistenceError
 logger = logging.getLogger(__name__)
 
 
+def safe_fill_price(order, fallback):
+    """从交易所结果读成交均价：读不出正有限数一律用调用方兜底价。
+
+    average 偶发为垃圾字符串/NaN 时绝不能裸抛——开仓路径崩在“已成交、
+    未挂止损”之间会留下裸仓窗口；NaN 滑过止损失效比较（NaN 比较恒 False）
+    会跳过本该立即执行的回滚。模块级函数：api_server 手动平仓与本 mixin
+    共用同一实现，不再各写一份。
+    """
+    value = order.get('average') if isinstance(order, dict) else None
+    if isinstance(value, bool):
+        value = None
+    try:
+        value = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not math.isfinite(value) or value <= 0:
+        return fallback
+    return value
+
+
 class TradeExecutorMixin:
+
+    _safe_fill_price = staticmethod(safe_fill_price)
 
     @staticmethod
     def _order_ids(order):
@@ -56,25 +78,6 @@ class TradeExecutorMixin:
                 return None, None
             total += cost
         return total, 'USDT'
-
-    @staticmethod
-    def _safe_fill_price(order, fallback):
-        """从交易所结果读成交均价：读不出正有限数一律用调用方兜底价。
-
-        average 偶发为垃圾字符串/NaN 时绝不能裸抛——开仓路径崩在“已成交、
-        未挂止损”之间会留下裸仓窗口；NaN 滑过止损失效比较（NaN 比较恒 False）
-        会跳过本该立即执行的回滚。
-        """
-        value = order.get('average') if isinstance(order, dict) else None
-        if isinstance(value, bool):
-            value = None
-        try:
-            value = float(value) if value is not None else None
-        except (TypeError, ValueError):
-            value = None
-        if value is None or not math.isfinite(value) or value <= 0:
-            return fallback
-        return value
 
     @staticmethod
     def _order_actual_amount(order, fallback):
