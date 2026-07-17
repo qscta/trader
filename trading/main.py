@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import math
 import sys
@@ -832,26 +831,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
                         # 对同一磁盘故障重复通知。
                         continue
-                    # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
+                    # 启动发现仓位已被止损/人工平掉，与盘中守护、日检
                     # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
-                    if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
-                        pass
-                    else:
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and (pending.get('payload') or {}).get('side') ==
-                                open_positions[symbol].get('side')):
-                            self.trade_state.confirm_signal_execution(
-                                symbol, 'turtle', pending.get('signal_id'))
-                            candle = (pending.get('payload') or {}).get('candle_id')
-                            if candle:
-                                self.trade_state.mark_candle_processed(
-                                    symbol, 'turtle', candle)
                     self._clear_position_quarantine_after_reconcile(symbol)
                 else:
                     local_position = open_positions[symbol]
                     if self._verify_existing_position_or_quarantine(
                             symbol, local_position, position, clear_on_match=False):
-                        strategy_type = local_position.get('strategy') or 'turtle'
+                        strategy_type = local_position.get('strategy') or 'ma_cross'
                         strategy_name = self._get_strategy_display_name(strategy_type)
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position, strategy_name):
@@ -866,16 +853,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and pending.get('strategy') == 'turtle' and
-                                (pending.get('payload') or {}).get('side') == open_positions[symbol].get('side')):
-                            # 崩溃可能发生在“成交+止损+账本已落盘”之后、confirmed
-                            # 标记之前。既然此刻本地/交易所方向张数已完整匹配，可安全补确认。
-                            self.trade_state.confirm_signal_execution(
-                                symbol, 'turtle', pending.get('signal_id'))
-                            candle = (pending.get('payload') or {}).get('candle_id')
-                            if candle:
-                                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
                         logger.info(f"{symbol} 持仓方向与张数同步成功")
             except Exception as exc:
                 # 单品种启动对账异常绝不连累其余品种，也绝不让构造
@@ -885,9 +862,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self._quarantine_position_mismatch(
                     symbol, f'启动对账异常: {exc}')
 
-        # 本地/交易所都空仓的 pending 也必须主动裁决：不能只在
+        # 本地/交易所都空仓的 open intent 也必须主动裁决：不能只在
         # “交易所有孤儿仓”时才触发恢复。
-        self._reconcile_all_pending_turtle_executions('启动')
         self._reconcile_all_open_intents('启动')
 
         # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓）——
@@ -898,12 +874,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             orphans = sorted(exchange_symbols - local_symbols)
             if orphans:
                 for orphan in orphans:
-                    pending_getter = getattr(
-                        self.trade_state, 'get_pending_signal_execution', None)
-                    pending = pending_getter(orphan) if callable(pending_getter) else None
-                    if (pending and pending.get('strategy') == 'turtle' and
-                            self._resume_pending_turtle_execution(orphan, pending)):
-                        continue
                     self._quarantine_position_mismatch(
                         orphan, '交易所有仓但本地无账本记录（孤儿仓）')
             # 只有本轮完整反向查询成功才可解除已经实际双边空仓的旧隔离。
@@ -1033,91 +1003,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         except AttributeError:
             return str(value)
 
-    @staticmethod
-    def _turtle_client_order_id(symbol, candle_id, side):
-        digest = hashlib.sha256(
-            f'turtle|{symbol}|{candle_id}|{side}'.encode('utf-8')).hexdigest()
-        # OKX clOrdId 上限 32，仅接受 ASCII 字母数字。
-        return f'T{digest[:31]}'
 
-    def _prepare_turtle_signal_execution(self, symbol, signal, candle_id):
-        """为海龟突破建立 pending + 确定性 clOrdId；已确认信号直接拒绝重放。"""
-        side = signal.get('action')
-        if side not in ('long', 'short'):
-            return None
-        signal_id = f'{candle_id}|{side}'
-        client_order_id = self._turtle_client_order_id(symbol, candle_id, side)
-        payload = {
-            'side': side,
-            'candle_id': candle_id,
-            'entry_price': float(signal['current_close']),
-            'stop_loss_price': float(
-                signal['lower_line'] if side == 'long' else signal['upper_line']),
-        }
-        execution = self.trade_state.prepare_signal_execution(
-            symbol, 'turtle', signal_id, client_order_id, payload=payload)
-        if execution.get('status') == 'confirmed':
-            logger.warning(
-                f"{symbol} [海龟] 忽略已消费的同 K 线突破 {signal_id}，防止止损后重放")
-            signal['action'] = None
-            return None
-        # pending 重试必须复用账本中原 clOrdId，不可重新生成。
-        signal['_client_order_id'] = execution['client_order_id']
-        signal['_signal_id'] = signal_id
-        return signal_id
 
-    def _confirm_turtle_signal_if_reconciled(self, symbol, signal_id, side):
-        """只有主账本已经反映目标持仓方向时才确认消费。"""
-        if not signal_id:
-            return False
-        position = self.trade_state.get_open_position(symbol)
-        if not position or position.get('side') != side:
-            return False
-        self.trade_state.confirm_signal_execution(symbol, 'turtle', signal_id)
-        return True
 
-    def _finalize_rolled_back_turtle_signal(self, symbol, execution, outcome):
-        """把“旧开仓已确认、补偿平仓也已全平”原子收口为成交史+已消费信号。"""
-        if not isinstance(outcome, dict) or outcome.get('status') != 'rolled_back':
-            return False
-        close_order = outcome.get('close_order') or {}
-        if close_order.get('fully_closed') is not True:
-            return False
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        if side not in ('long', 'short'):
-            return False
-        recovered_entry = outcome.get('entry_price') or payload.get('entry_price')
-        recovered_exit = close_order.get('average')
-        if recovered_exit is None:
-            try:
-                recovered_exit = self.exchange_api.get_last_price(
-                    self.exchange_api.to_ccxt_symbol(symbol))
-            except Exception:
-                recovered_exit = recovered_entry
-        entry_fee, entry_fee_currency = self._extract_usdt_fee(
-            outcome.get('open_order'))
-        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
-        try:
-            self.trade_state.finalize_recovered_signal_round_trip(
-                symbol, 'turtle', execution.get('signal_id'), side,
-                recovered_entry, recovered_exit, outcome.get('position_size'),
-                payload.get('stop_loss_price'),
-                candle_id=payload.get('candle_id'),
-                entry_fee=entry_fee,
-                entry_fee_currency=entry_fee_currency,
-                entry_order_ids=self._order_ids(outcome.get('open_order')),
-                exit_fee=exit_fee,
-                exit_fee_currency=exit_fee_currency,
-                exit_order_ids=self._order_ids(close_order))
-        except Exception as exc:
-            logger.critical(
-                f'{symbol} 仓位已全平，但往返成交史/幂等状态无法原子落盘: {exc}')
-            return False
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.critical(
-            f'{symbol} [海龟] 开仓后已补偿全平，往返成交与信号状态已原子收口')
-        return True
 
     def _recovery_symbol_config(self, symbol, strategy):
         """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
@@ -1143,38 +1031,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             symbol_config['_retired_from_pool'] = True
         return symbol_config, retired
 
-    def _resume_pending_turtle_execution(self, symbol, execution):
-        """启动对账专用：用原 clOrdId 恢复“已成交、未挂止损/未记账”的中断交易。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        if side not in ('long', 'short'):
-            return False
-        try:
-            entry_price = float(payload['entry_price'])
-            stop_loss_price = float(payload['stop_loss_price'])
-        except (KeyError, TypeError, ValueError):
-            return False
-        symbol_config, _retired = self._recovery_symbol_config(
-            symbol, 'turtle')
-        outcome = self._execute_open(
-            symbol, side, entry_price, stop_loss_price, symbol_config,
-            buffer_notification=False,
-            client_order_id=execution.get('client_order_id'),
-            recover_pending_position=True)
-        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
-            return self._finalize_rolled_back_turtle_signal(
-                symbol, execution, outcome)
-        if isinstance(outcome, dict) and outcome.get('status') == 'rollback_incomplete':
-            logger.critical(
-                f'{symbol} [海龟] pending 恢复回滚后仍有余仓，保留 pending 并隔离人工处理')
-            return False
-        if not self._confirm_turtle_signal_if_reconciled(
-                symbol, execution.get('signal_id'), side):
-            return False
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.critical(
-            f"{symbol} [海龟] 已用原 clOrdId 恢复中断开仓，止损与账本已补齐")
-        return True
 
     @staticmethod
     def _finite_nonnegative(value):
@@ -1209,115 +1065,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             filled = amount
         return terminal, filled
 
-    def _consume_pending_without_trade(
-            self, symbol, execution, resolution, reason, order=None):
-        payload = execution.get('payload') or {}
-        self.trade_state.finalize_signal_without_trade(
-            symbol, 'turtle', execution.get('signal_id'),
-            candle_id=payload.get('candle_id'), resolution=resolution,
-            reason=reason, order=order)
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.warning(f'{symbol} [海龟] pending 已无成交原子收口: {reason}')
-        return True
 
-    def _finalize_flat_filled_pending(self, symbol, execution, order, filled_contracts):
-        """旧单有成交但当前已空仓：按保守退出价补记完整往返。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        try:
-            stop_price = float(payload['stop_loss_price'])
-            entry_price = float(
-                order.get('average') or order.get('price') or payload['entry_price'])
-            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
-            contract_size = float(self.exchange_api._get_contract_size(ccxt_symbol))
-            position_size = float(filled_contracts) * contract_size
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f'pending 旧成交的价格/数量无法安全还原: {exc}') from exc
-        if (side not in ('long', 'short') or
-                any(not math.isfinite(value) or value <= 0 for value in (
-                    stop_price, entry_price, position_size, contract_size))):
-            raise RuntimeError('pending 旧成交缺少有效方向/价格/数量')
 
-        close_evidence = None
-        try:
-            close_evidence = self._recover_flat_compensation_evidence(
-                ccxt_symbol, side, position_size,
-                execution.get('client_order_id'))
-        except Exception as exc:
-            logger.warning(
-                f'{symbol} pending 补偿平仓腿查询失败，退回保守退出价: {exc}')
-        if close_evidence and close_evidence.get('average') is not None:
-            exit_price = float(close_evidence['average'])
-            recovery_reason = 'pending 旧订单与确定性补偿腿均已找回'
-        else:
-            current_price = None
-            try:
-                current_price = float(self.exchange_api.get_last_price(ccxt_symbol))
-                if not math.isfinite(current_price) or current_price <= 0:
-                    current_price = None
-            except Exception:
-                current_price = None
-            # 真实退出价不可证明时：多单取止损/现价较低者，空单取较高者，
-            # 不用入场价伪造“无损退出”。
-            exit_candidates = [stop_price]
-            if current_price is not None:
-                exit_candidates.append(current_price)
-            exit_price = (
-                min(exit_candidates) if side == 'long'
-                else max(exit_candidates))
-            recovery_reason = 'pending 旧订单已成交但当前已空仓，按保守退出价补记'
-        entry_fee, entry_fee_currency = self._extract_usdt_fee(order)
-        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_evidence)
-        trade = self.trade_state.finalize_recovered_signal_round_trip(
-            symbol, 'turtle', execution.get('signal_id'), side,
-            entry_price, exit_price, position_size, stop_price,
-            candle_id=payload.get('candle_id'), entry_fee=entry_fee,
-            entry_fee_currency=entry_fee_currency,
-            entry_order_ids=self._order_ids(order),
-            exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
-            exit_order_ids=self._order_ids(close_evidence),
-            reason=recovery_reason)
-        self._clear_position_quarantine_after_reconcile(symbol)
-        msg = (
-            f'{symbol} [海龟] 发现 pending 旧订单已成交 {position_size}币，'
-            f'但交易所当前已空仓；已用'
-            f'{"确定性补偿腿真实" if close_evidence else "保守"}退出价 {exit_price} '
-            f'原子补记往返成交（PnL={trade.get("pnl")}）')
-        logger.critical(msg)
-        self.notifier.notify_error(msg)
-        return True
-
-    def _continue_unsubmitted_pending_turtle(self, symbol, execution):
-        """确认从未发单后，在原止损仍有效时复用原 clOrdId 开仓。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        symbol_config, retired = self._recovery_symbol_config(
-            symbol, 'turtle')
-        if retired:
-            return self._consume_pending_without_trade(
-                symbol, execution, 'unsubmitted_retired',
-                '确认从未发单，且品种已删除或禁用；只平不开，取消恢复开仓')
-        try:
-            entry_price = float(payload['entry_price'])
-            stop_loss_price = float(payload['stop_loss_price'])
-        except (KeyError, TypeError, ValueError):
-            return False
-        outcome = self._execute_open(
-            symbol, side, entry_price, stop_loss_price, symbol_config,
-            buffer_notification=False,
-            client_order_id=execution.get('client_order_id'))
-        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
-            return self._finalize_rolled_back_turtle_signal(symbol, execution, outcome)
-        if isinstance(outcome, dict) and outcome.get('status') == 'opened':
-            if not self._confirm_turtle_signal_if_reconciled(
-                    symbol, execution.get('signal_id'), side):
-                return False
-            candle = payload.get('candle_id')
-            if candle:
-                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
-            self._clear_position_quarantine_after_reconcile(symbol)
-            return True
-        return False
 
     @staticmethod
     def _pending_order_absence_is_conclusive(execution):
@@ -1430,38 +1179,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             symbol, 'pending 确认未发单，但复用原 clOrdId 开仓未能收口')
         return False
 
-    def _reconcile_all_pending_turtle_executions(self, context):
-        """主动枚举所有 pending，返回仍未收口的品种集合。"""
-        getter = getattr(self.trade_state, 'get_pending_signal_executions', None)
-        pending_by_symbol = getter() if callable(getter) else {}
-        unresolved = set()
-        for symbol, execution in sorted(pending_by_symbol.items()):
-            if execution.get('strategy') != 'turtle':
-                self._quarantine_position_mismatch(
-                    symbol, f'{context} pending 策略非 turtle，无法自动裁决')
-                unresolved.add(symbol)
-                continue
-            local_position = self.trade_state.get_open_position(symbol)
-            try:
-                exchange_position = self.exchange_api.get_position(
-                    self.exchange_api.to_ccxt_symbol(symbol))
-            except Exception as exc:
-                self._quarantine_position_mismatch(
-                    symbol, f'{context} pending 仓位查询不确定: {exc}')
-                unresolved.add(symbol)
-                continue
-            if local_position:
-                # 本地仓的常规对账/平仓链路负责收口，此处不抢跑外部动作。
-                continue
-            if exchange_position:
-                if not self._resume_pending_turtle_execution(symbol, execution):
-                    self._quarantine_position_mismatch(
-                        symbol, f'{context} pending 孤儿仓恢复未收口')
-                    unresolved.add(symbol)
-                continue
-            if not self._adjudicate_flat_pending_turtle(symbol, execution):
-                unresolved.add(symbol)
-        return unresolved
 
     def _finalize_open_intent_rollback(self, symbol, intent, outcome):
         close_order = (outcome or {}).get('close_order') or {}
@@ -1714,21 +1431,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         return current_state, current_id, int(current_state['action'] is not None)
 
-    @staticmethod
-    def _turtle_exit_still_pending(
-            signal, position_before, position_after, retired_from_pool=False):
-        """退出/退池反手信号只有在旧方向仓位确实归零后才能消费。"""
-        if not position_before or not position_after:
-            return False
-        action = signal.get('action') if isinstance(signal, dict) else None
-        old_side = position_before.get('side')
-        explicit_close = (
-            (action == 'close_long' and old_side == 'long') or
-            (action == 'close_short' and old_side == 'short'))
-        retired_reverse_exit = bool(
-            retired_from_pool and action in ('long', 'short') and
-            old_side != action)
-        return bool(explicit_close or retired_reverse_exit)
 
     def _history_requires_rebaseline(self, symbol, strategy_type, df,
                                      max_gap_candles=3):

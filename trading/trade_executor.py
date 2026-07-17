@@ -11,7 +11,7 @@
 _pending_stop_loss_updates / record_stop_loss / _cancel_stop_order_confirmed /
 _close_trade_state_with_runtime_fallback / _update_trade_state_stop_with_runtime_fallback /
 _buffer_trade_open_notification / _buffer_trade_close_notification /
-handle_open_signal_turtle。
+。
 """
 
 import logging

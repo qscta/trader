@@ -371,33 +371,6 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))
 
 
-class RetiredTurtleExitOnlyTest(unittest.TestCase):
-    def test_open_helper_refuses_retired_symbol(self):
-        system = TradingSystem.__new__(TradingSystem)
-        system._execute_open = lambda *a, **k: self.fail(
-            '退池品种不得调用开仓执行器')
-        outcome = system.handle_open_signal_turtle(
-            'BTCUSDT', 'long',
-            {'current_close': 100.0, 'lower_line': 90.0,
-             'upper_line': 110.0},
-            {'name': 'BTCUSDT', '_retired_from_pool': True})
-        self.assertEqual(outcome, {'status': 'retired_no_reopen'})
-
-    def test_partial_explicit_exit_remains_pending(self):
-        before = {'side': 'long', 'position_size': 10}
-        partial = {'side': 'long', 'position_size': 4}
-        self.assertTrue(TradingSystem._turtle_exit_still_pending(
-            {'action': 'close_long'}, before, partial))
-        self.assertFalse(TradingSystem._turtle_exit_still_pending(
-            {'action': 'close_long'}, before, None))
-
-    def test_partial_retired_reverse_exit_remains_pending(self):
-        before = {'side': 'short', 'position_size': 10}
-        partial = {'side': 'short', 'position_size': 3}
-        self.assertTrue(TradingSystem._turtle_exit_still_pending(
-            {'action': 'long'}, before, partial, retired_from_pool=True))
-        self.assertFalse(TradingSystem._turtle_exit_still_pending(
-            {'action': 'long'}, before, partial, retired_from_pool=False))
 
 
 class RetiredExternalFlatTest(unittest.TestCase):

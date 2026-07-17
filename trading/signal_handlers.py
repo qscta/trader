@@ -28,26 +28,6 @@ class SignalHandlersMixin:
         """
         self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
 
-    def handle_open_signal_turtle(self, symbol, side, signal, symbol_config):
-        """海龟策略：处理开仓信号"""
-        if symbol_config.get('_retired_from_pool'):
-            logger.info(f"{symbol} [海龟] 品种已退池，禁止开新腿")
-            return {'status': 'retired_no_reopen'}
-        if signal.get('bootstrap_direct_entry'):
-            logger.info(f"{symbol} [海龟] 触发新币启动期直通 {side} 信号，准备开仓...")
-        else:
-            logger.info(f"{symbol} [海龟] 触发 {side} 信号，准备开仓...")
-
-        entry_price = signal['current_close']
-        stop_loss_price = signal['lower_line'] if side == 'long' else signal['upper_line']
-
-        outcome = self._execute_open(
-            symbol, side, entry_price, stop_loss_price, symbol_config,
-            client_order_id=signal.get('_client_order_id'))
-        # 主调度在统一出口据此决定 confirmed/重试；嵌套的“平旧再开新”路径也
-        # 不会丢失成功回滚或部分回滚终态。
-        signal['_execution_outcome'] = outcome
-        return outcome
 
     # ========== 双均线策略处理 ==========
 
