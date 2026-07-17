@@ -209,7 +209,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.risk_manager = RiskManager(account_equity, self.config['strategy']['default_risk_per_trade'])
         logger.info(f"[{self.label}] 交易系统初始化完成，账户权益: {account_equity} USDT")
 
-        self.sync_positions_on_startup()
+        try:
+            self.sync_positions_on_startup()
+        except Exception as exc:
+            # 与启动权益失败同标准：进程拒绝带着未对账的账本运行，但退出前
+            # 必须大声告警——裸 traceback 静默死亡是最贵的故障模式。
+            logger.critical(f'[{self.label}] 启动持仓对账失败，拒绝启动: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 启动持仓对账失败，进程拒绝启动，'
+                    f'请立即人工检查: {exc}')
+            except Exception as notify_exc:
+                logger.debug('启动对账失败告警发送失败: %s', notify_exc)
+            raise
 
     def load_config(self, config_file):
         """加载欧易单所配置：{okx:{凭据...}, strategy, trading, scheduler, dingtalk}。
@@ -772,90 +784,98 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         open_positions = self.trade_state.get_all_open_positions()
 
         for symbol in list(open_positions.keys()):
-            close_recovery = self._resume_persisted_close_intent(
-                symbol, open_positions[symbol], '启动对账')
-            if close_recovery in ('closed', 'unresolved'):
-                continue
-            if close_recovery == 'partial':
-                refreshed = self.trade_state.get_open_position(symbol)
-                if not refreshed:
-                    continue
-                open_positions[symbol] = refreshed
-            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
             try:
-                position = self.exchange_api.get_position(ccxt_symbol)
-            except Exception as exc:
-                self._quarantine_position_mismatch(
-                    symbol, f'启动对账查询交易所持仓失败: {exc}')
-                continue
-
-            if position is None or position.get('contracts', 0) == 0:
-                logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
-                # 进程离线期间仓位消失时，重启后的当前市价与真实退出时刻没有
-                # 因果关系：止损后若已反弹/回落，用裸市价会把亏损记成盈利。
-                # 没有可归因 close intent 时，与盘中 guardian / 日检统一采用
-                # 账本保护止损价作为保守估值；仅兼容无止损字段的旧账本回退入场价。
-                exit_price = (
-                    open_positions[symbol].get('stop_loss_price') or
-                    open_positions[symbol]['entry_price'])
-                closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
-                    symbol, ccxt_symbol, open_positions[symbol], exit_price,
-                    "启动同步平仓",
-                    strategy_type=(open_positions[symbol].get('strategy') or 'turtle'))
-                if not closed_position:
-                    logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
-                    self._quarantine_position_mismatch(
-                        symbol, '交易所已空仓但本地平仓补偿失败')
+                close_recovery = self._resume_persisted_close_intent(
+                    symbol, open_positions[symbol], '启动对账')
+                if close_recovery in ('closed', 'unresolved'):
                     continue
-                if not _state_saved:
-                    # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
-                    # 对同一磁盘故障重复通知。
-                    continue
-                # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
-                # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
-                if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
-                    pass
-                else:
-                    pending = self.trade_state.get_pending_signal_execution(symbol)
-                    if (pending and (pending.get('payload') or {}).get('side') ==
-                            open_positions[symbol].get('side')):
-                        self.trade_state.confirm_signal_execution(
-                            symbol, 'turtle', pending.get('signal_id'))
-                        candle = (pending.get('payload') or {}).get('candle_id')
-                        if candle:
-                            self.trade_state.mark_candle_processed(
-                                symbol, 'turtle', candle)
-                self._clear_position_quarantine_after_reconcile(symbol)
-            else:
-                local_position = open_positions[symbol]
-                if self._verify_existing_position_or_quarantine(
-                        symbol, local_position, position, clear_on_match=False):
-                    strategy_type = local_position.get('strategy') or 'turtle'
-                    strategy_name = self._get_strategy_display_name(strategy_type)
-                    if not self._ensure_stop_order_alive(
-                            symbol, ccxt_symbol, local_position, strategy_name):
-                        self._quarantine_position_mismatch(
-                            symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
+                if close_recovery == 'partial':
+                    refreshed = self.trade_state.get_open_position(symbol)
+                    if not refreshed:
                         continue
+                    open_positions[symbol] = refreshed
+                ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+                try:
+                    position = self.exchange_api.get_position(ccxt_symbol)
+                except Exception as exc:
+                    self._quarantine_position_mismatch(
+                        symbol, f'启动对账查询交易所持仓失败: {exc}')
+                    continue
+
+                if position is None or position.get('contracts', 0) == 0:
+                    logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
+                    # 进程离线期间仓位消失时，重启后的当前市价与真实退出时刻没有
+                    # 因果关系：止损后若已反弹/回落，用裸市价会把亏损记成盈利。
+                    # 没有可归因 close intent 时，与盘中 guardian / 日检统一采用
+                    # 账本保护止损价作为保守估值；仅兼容无止损字段的旧账本回退入场价。
+                    exit_price = (
+                        open_positions[symbol].get('stop_loss_price') or
+                        open_positions[symbol]['entry_price'])
+                    closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
+                        symbol, ccxt_symbol, open_positions[symbol], exit_price,
+                        "启动同步平仓",
+                        strategy_type=(open_positions[symbol].get('strategy') or 'turtle'))
+                    if not closed_position:
+                        logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
+                        self._quarantine_position_mismatch(
+                            symbol, '交易所已空仓但本地平仓补偿失败')
+                        continue
+                    if not _state_saved:
+                        # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
+                        # 对同一磁盘故障重复通知。
+                        continue
+                    # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
+                    # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
+                    if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
+                        pass
+                    else:
+                        pending = self.trade_state.get_pending_signal_execution(symbol)
+                        if (pending and (pending.get('payload') or {}).get('side') ==
+                                open_positions[symbol].get('side')):
+                            self.trade_state.confirm_signal_execution(
+                                symbol, 'turtle', pending.get('signal_id'))
+                            candle = (pending.get('payload') or {}).get('candle_id')
+                            if candle:
+                                self.trade_state.mark_candle_processed(
+                                    symbol, 'turtle', candle)
                     self._clear_position_quarantine_after_reconcile(symbol)
-                    intent_getter = getattr(
-                        self.trade_state, 'get_open_intent', None)
-                    intent = (
-                        intent_getter(symbol) if callable(intent_getter) else None)
-                    if intent and intent.get('side') == local_position.get('side'):
-                        self.trade_state.resolve_open_intent(
-                            symbol, intent.get('client_order_id'))
-                    pending = self.trade_state.get_pending_signal_execution(symbol)
-                    if (pending and pending.get('strategy') == 'turtle' and
-                            (pending.get('payload') or {}).get('side') == open_positions[symbol].get('side')):
-                        # 崩溃可能发生在“成交+止损+账本已落盘”之后、confirmed
-                        # 标记之前。既然此刻本地/交易所方向张数已完整匹配，可安全补确认。
-                        self.trade_state.confirm_signal_execution(
-                            symbol, 'turtle', pending.get('signal_id'))
-                        candle = (pending.get('payload') or {}).get('candle_id')
-                        if candle:
-                            self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
-                    logger.info(f"{symbol} 持仓方向与张数同步成功")
+                else:
+                    local_position = open_positions[symbol]
+                    if self._verify_existing_position_or_quarantine(
+                            symbol, local_position, position, clear_on_match=False):
+                        strategy_type = local_position.get('strategy') or 'turtle'
+                        strategy_name = self._get_strategy_display_name(strategy_type)
+                        if not self._ensure_stop_order_alive(
+                                symbol, ccxt_symbol, local_position, strategy_name):
+                            self._quarantine_position_mismatch(
+                                symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
+                            continue
+                        self._clear_position_quarantine_after_reconcile(symbol)
+                        intent_getter = getattr(
+                            self.trade_state, 'get_open_intent', None)
+                        intent = (
+                            intent_getter(symbol) if callable(intent_getter) else None)
+                        if intent and intent.get('side') == local_position.get('side'):
+                            self.trade_state.resolve_open_intent(
+                                symbol, intent.get('client_order_id'))
+                        pending = self.trade_state.get_pending_signal_execution(symbol)
+                        if (pending and pending.get('strategy') == 'turtle' and
+                                (pending.get('payload') or {}).get('side') == open_positions[symbol].get('side')):
+                            # 崩溃可能发生在“成交+止损+账本已落盘”之后、confirmed
+                            # 标记之前。既然此刻本地/交易所方向张数已完整匹配，可安全补确认。
+                            self.trade_state.confirm_signal_execution(
+                                symbol, 'turtle', pending.get('signal_id'))
+                            candle = (pending.get('payload') or {}).get('candle_id')
+                            if candle:
+                                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
+                        logger.info(f"{symbol} 持仓方向与张数同步成功")
+            except Exception as exc:
+                # 单品种启动对账异常绝不连累其余品种，也绝不让构造
+                # 函数裸崩；隔离本身会持久化并告警，该品种交易被阻断。
+                logger.exception(
+                    f'{symbol} 启动对账异常，隔离后继续其余品种: {exc}')
+                self._quarantine_position_mismatch(
+                    symbol, f'启动对账异常: {exc}')
 
         # 本地/交易所都空仓的 pending 也必须主动裁决：不能只在
         # “交易所有孤儿仓”时才触发恢复。

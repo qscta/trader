@@ -1786,6 +1786,39 @@ class StartupSyncCompensationTests(unittest.TestCase):
                     system.exchange_api.get_last_price.assert_not_called()
 
 
+class StartupSyncIsolationTests(unittest.TestCase):
+    """启动对账：单品种异常必须隔离后继续，绝不连累其余品种或让构造裸崩。"""
+
+    def test_single_symbol_exception_is_quarantined_not_fatal(self):
+        system = StartupSyncCompensationTests().make_system()
+        system.trade_state.get_all_open_positions = Mock(return_value={
+            "AAAUSDT": {"entry_price": 100, "position_size": 2.0,
+                        "side": "long", "stop_loss_price": 90.0},
+            "BBBUSDT": {"entry_price": 100, "position_size": 2.0,
+                        "side": "long", "stop_loss_price": 90.0},
+        })
+        aaa_position = {"contracts": 2, "side": "long", "symbol": "AAA/USDT",
+                        "info": {"pos": "2", "posSide": "net"}}
+        system.exchange_api.get_position = Mock(
+            side_effect=lambda s: aaa_position if s.startswith("AAA") else None)
+        # 模拟张数换算等未被内层捕获的崩溃（如启动时市场缓存缺失）。
+        system._verify_existing_position_or_quarantine = Mock(
+            side_effect=RuntimeError("张数换算崩溃"))
+        system._quarantine_position_mismatch = Mock()
+
+        system.sync_positions_on_startup()  # 不得抛出
+
+        quarantined = [c.args for c in
+                       system._quarantine_position_mismatch.call_args_list]
+        self.assertTrue(any(
+            args[0] == "AAAUSDT" and "启动对账异常" in args[1]
+            for args in quarantined))
+        # BBBUSDT 仍被正常对账（交易所空仓 → 按止损估值补记平仓）。
+        system.trade_state.close_position.assert_called_once_with(
+            "BBBUSDT", 90.0, stop_cleanup_pending=True,
+            reset_turtle_signal=True)
+
+
 class LoginBackoffTests(unittest.TestCase):
     """登录防爆破：连续失败按 IP 锁定，成功登录清零计数。"""
 
