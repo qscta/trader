@@ -66,7 +66,7 @@ class ConcurrencyChaosTest(unittest.TestCase):
                 try:
                     for i in range(N_OPS):
                         sym = f'T{tid}S{i}USDT'
-                        ts.add_open_position(sym, 'long', 100.0, 1.0, 90.0, f'stop-{tid}-{i}', strategy='turtle')
+                        ts.add_open_position(sym, 'long', 100.0, 1.0, 90.0, f'stop-{tid}-{i}', strategy='ma_cross')
                         ts.update_stop_loss(sym, 95.0, f'stop2-{tid}-{i}')
                         if i % 2 == 0:
                             ts.close_position(sym, 110.0)
@@ -104,7 +104,7 @@ class DisasterRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             ts = TradeState(path)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='turtle')
+            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='ma_cross')
             ts.update_stop_loss('BTCUSDT', 56000.0, 'stop-2')  # 第二次保存 → .bak 含持仓
             with open(path, 'w') as f:
                 f.write('{“损坏的JSON')
@@ -120,7 +120,7 @@ class DisasterRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             ts = TradeState(path)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='turtle')
+            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='ma_cross')
             ts.update_stop_loss('BTCUSDT', 56000.0, 'stop-2')
             for p in (path, path + '.bak'):
                 with open(p, 'w') as f:
@@ -151,7 +151,7 @@ class DisasterRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             ts = TradeState(path)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='turtle')
+            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='ma_cross')
             ts.update_stop_loss('BTCUSDT', 56000.0, 'stop-2')  # 生成 .bak
             os.remove(path)
 
@@ -163,7 +163,7 @@ class DisasterRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             ts = TradeState(path)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='turtle')
+            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1', strategy='ma_cross')
             ts.update_stop_loss('BTCUSDT', 56000.0, 'stop-2')
             os.remove(path)
             os.remove(path + '.bak')
@@ -196,7 +196,7 @@ class DisasterRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy='turtle')
+            system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy='ma_cross')
             system._stop_anomalies = {}
             alerts = []
             system.notifier = SimpleNamespace(notify_error=lambda m: alerts.append(m) or True)

@@ -13,7 +13,6 @@
   },
 
   "strategy": {
-    "channel_period": 28,
     "ma_short_period": 7,
     "ma_long_period": 28,
     "ma_stop_period": 28,
@@ -22,7 +21,7 @@
 
   "trading": {
     "symbols": [
-      { "name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "turtle" },
+      { "name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "ma_cross" },
       { "name": "ETHUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "ma_cross" }
     ]
   },

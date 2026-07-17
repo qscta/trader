@@ -1,5 +1,4 @@
 import copy
-import hashlib
 import json
 import math
 import sys
@@ -13,7 +12,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import threading
 from okx_api import OkxApi
 from equity_tracker import EquityTracker
-from turtle_strategy import TurtleStrategy
 from ma_cross_strategy import MaCrossStrategy
 from risk_manager import RiskManager
 from dingtalk_notifier import DingTalkNotifier
@@ -87,8 +85,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
       - StopGuardianMixin（stop_guardian.py）：止损防线——验证式撤销确认、残留阻断、
         止损自愈巡检、「交易所已平」统一收尾、账本落盘失败的运行时补偿；
       - ReportingMixin（reporting.py）：通知缓冲/汇总、每日持仓汇总、周报、权益采样告警；
-      - SignalHandlersMixin（signal_handlers.py）：两策略的信号分派——无仓开仓判定、
-        有仓时的止损确认/平仓/翻转分派、海龟止损推进检查、双均线 T+1 重入；
+      - SignalHandlersMixin（signal_handlers.py）：双均线信号分派——无仓开仓判定、
+        有仓时的止损确认/翻转分派、T+1 重入；
       - TradeExecutorMixin（trade_executor.py）：下单执行——通用开仓（校验/回滚）、
         止损单更新、平仓执行、双均线翻转、开仓落盘失败的交易所侧回滚；
       - 本文件保留：装配与配置、状态迁移与归属护栏、启动同步、日检总指挥
@@ -111,7 +109,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         # 交易所适配层：只换成欧易，策略层输入输出语义不变
         self.exchange_api = OkxApi(self.config['okx'])
 
-        self.turtle_strategy = TurtleStrategy(self.config['strategy']['channel_period'])
         self.ma_cross_strategy = MaCrossStrategy(
             self.config['strategy'].get('ma_short_period', 7),
             self.config['strategy'].get('ma_long_period', 28),
@@ -309,20 +306,20 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def _validate_strategy_config(self, strategy):
         """启动前校验并**规范化**策略参数（就地写回 config，消除类型漂移）。
 
-        口径全部取自 config_validation（与前端/API 同一事实源）。channel_period /
-        default_risk_per_trade 在装配层是直接下标访问（非 .get 兜底），缺失或非法会在
-        运行中抛裸异常或产出危险仓位（channel_period=0 让通道计算崩溃、风险度<0 算出负仓位）。
-        校验后必须写回规范类型——否则 "28"/"0.01" 字符串能通过校验却仍是字符串，构造
-        TurtleStrategy("28")→盘中 `int < str` TypeError、RiskManager 权益×"0.01"→TypeError。
-        与凭据缺失同标准 fail-loud，绝不静默塞默认值（真钱系统默认策略参数比拒启更危险）。
+        口径全部取自 config_validation（与前端/API 同一事实源）。default_risk_per_trade
+        在装配层是直接下标访问（非 .get 兜底），缺失或非法会在运行中抛裸异常或产出
+        危险仓位（风险度<0 算出负仓位）。校验后必须写回规范类型——否则 "28"/"0.01"
+        字符串能通过校验却仍是字符串，构造 MaCrossStrategy("28")→盘中比较 TypeError、
+        RiskManager 权益×"0.01"→TypeError。与凭据缺失同标准 fail-loud，绝不静默塞
+        默认值（真钱系统默认策略参数比拒启更危险）。
         """
-        missing = [k for k in ('channel_period', 'default_risk_per_trade') if strategy.get(k) is None]
-        if missing:
+        if strategy.get('default_risk_per_trade') is None:
             raise ValueError(
-                f"config.strategy 缺少必需参数 {missing}，请对照 config.example.json 补全后再启动")
+                "config.strategy 缺少必需参数 ['default_risk_per_trade']，"
+                "请对照 config.example.json 补全后再启动")
 
-        # 周期类：channel_period 必校；ma_* 三键有 .get 默认值，仅当显式提供时校验。规范化写回 int
-        for key in ('channel_period', 'ma_short_period', 'ma_long_period', 'ma_stop_period'):
+        # 周期类：ma_* 三键有 .get 默认值，仅当显式提供时校验类型/范围。
+        for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
             if strategy.get(key) is None:
                 continue
             v = cfgv.strict_int(strategy[key], f'config.strategy.{key}')
@@ -346,7 +343,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         手写 config.json 的品种 risk_per_trade / strategy / name 此前无启动校验：
         risk_per_trade=1.0（100%）会直接进 _execute_open 的仓位计算放大到全仓风险；
-        非法策略名会在 get_strategy_for_symbol 静默落到海龟（错误托管）。补齐三校验，
+        非法策略名若不拒绝会被静默当作合法配置托管。补齐三校验，
         与增删品种的 API 入口一致，堵住"手写配置"这条绕过风控的入口。
         """
         seen = set()
@@ -363,8 +360,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
             if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
                 s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
-            if s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
-                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 turtle / ma_cross）")
+            if s.get('strategy') in cfgv.RETIRED_STRATEGIES:
+                # 海龟已下线：遗留品种不崩溃启动，改为强制禁用（只平不开）并
+                # 大声告警。fail-closed——禁用品种不会开新仓，配合“已无海龟仓”
+                # 前提等于安全空转；请人工从品种池删除或改配 ma_cross。
+                logger.critical(
+                    f"{name} 配置为已退役策略 {s['strategy']!r}，已强制禁用（只平不开）；"
+                    "请从品种池删除或改配 ma_cross")
+                s['enabled'] = False
+            elif s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
+                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 ma_cross）")
 
     @staticmethod
     def _state_has_lifecycle_data(state):
@@ -655,13 +660,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def reload_strategies(self):
         """重新加载策略参数"""
-        self.turtle_strategy = TurtleStrategy(self.config['strategy']['channel_period'])
         self.ma_cross_strategy = MaCrossStrategy(
             self.config['strategy'].get('ma_short_period', 7),
             self.config['strategy'].get('ma_long_period', 28),
             self.config['strategy'].get('ma_stop_period', 28)
         )
-        logger.info(f"策略参数已重新加载: 海龟周期={self.config['strategy']['channel_period']}, "
+        logger.info(f"策略参数已重新加载: "
                     f"EMA短期={self.config['strategy'].get('ma_short_period', 7)}, "
                     f"EMA长期={self.config['strategy'].get('ma_long_period', 28)}, "
                     f"EMA止损周期={self.config['strategy'].get('ma_stop_period', 28)}")
@@ -814,7 +818,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
                         symbol, ccxt_symbol, open_positions[symbol], exit_price,
                         "启动同步平仓",
-                        strategy_type=(open_positions[symbol].get('strategy') or 'turtle'))
+                        strategy_type=(open_positions[symbol].get('strategy') or 'ma_cross'))
                     if not closed_position:
                         logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
                         self._quarantine_position_mismatch(
@@ -824,26 +828,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
                         # 对同一磁盘故障重复通知。
                         continue
-                    # 启动发现双均线仓位已被止损/人工平掉，与盘中守护、日检
+                    # 启动发现仓位已被止损/人工平掉，与盘中守护、日检
                     # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
-                    if (open_positions[symbol].get('strategy') or 'turtle') == 'ma_cross':
-                        pass
-                    else:
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and (pending.get('payload') or {}).get('side') ==
-                                open_positions[symbol].get('side')):
-                            self.trade_state.confirm_signal_execution(
-                                symbol, 'turtle', pending.get('signal_id'))
-                            candle = (pending.get('payload') or {}).get('candle_id')
-                            if candle:
-                                self.trade_state.mark_candle_processed(
-                                    symbol, 'turtle', candle)
                     self._clear_position_quarantine_after_reconcile(symbol)
                 else:
                     local_position = open_positions[symbol]
                     if self._verify_existing_position_or_quarantine(
                             symbol, local_position, position, clear_on_match=False):
-                        strategy_type = local_position.get('strategy') or 'turtle'
+                        strategy_type = local_position.get('strategy') or 'ma_cross'
                         strategy_name = self._get_strategy_display_name(strategy_type)
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position, strategy_name):
@@ -858,16 +850,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and pending.get('strategy') == 'turtle' and
-                                (pending.get('payload') or {}).get('side') == open_positions[symbol].get('side')):
-                            # 崩溃可能发生在“成交+止损+账本已落盘”之后、confirmed
-                            # 标记之前。既然此刻本地/交易所方向张数已完整匹配，可安全补确认。
-                            self.trade_state.confirm_signal_execution(
-                                symbol, 'turtle', pending.get('signal_id'))
-                            candle = (pending.get('payload') or {}).get('candle_id')
-                            if candle:
-                                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
                         logger.info(f"{symbol} 持仓方向与张数同步成功")
             except Exception as exc:
                 # 单品种启动对账异常绝不连累其余品种，也绝不让构造
@@ -877,9 +859,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self._quarantine_position_mismatch(
                     symbol, f'启动对账异常: {exc}')
 
-        # 本地/交易所都空仓的 pending 也必须主动裁决：不能只在
+        # 本地/交易所都空仓的 open intent 也必须主动裁决：不能只在
         # “交易所有孤儿仓”时才触发恢复。
-        self._reconcile_all_pending_turtle_executions('启动')
         self._reconcile_all_open_intents('启动')
 
         # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓）——
@@ -890,12 +871,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             orphans = sorted(exchange_symbols - local_symbols)
             if orphans:
                 for orphan in orphans:
-                    pending_getter = getattr(
-                        self.trade_state, 'get_pending_signal_execution', None)
-                    pending = pending_getter(orphan) if callable(pending_getter) else None
-                    if (pending and pending.get('strategy') == 'turtle' and
-                            self._resume_pending_turtle_execution(orphan, pending)):
-                        continue
                     self._quarantine_position_mismatch(
                         orphan, '交易所有仓但本地无账本记录（孤儿仓）')
             # 只有本轮完整反向查询成功才可解除已经实际双边空仓的旧隔离。
@@ -918,12 +893,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         logger.info("持仓状态同步完成")
 
     def get_strategy_for_symbol(self, symbol_config):
-        """根据交易对配置获取对应策略"""
-        strategy_type = symbol_config.get('strategy', 'turtle')
-        if strategy_type == 'ma_cross':
-            return self.ma_cross_strategy, 'ma_cross'
-        else:
-            return self.turtle_strategy, 'turtle'
+        """唯一在役策略 ma_cross（海龟已彻底移除；遗留 turtle 持仓同样由
+        双均线语义托管退出——EMA 反向平仓 + N 日高低点止损推进）。"""
+        return self.ma_cross_strategy, 'ma_cross'
 
     def _load_stop_loss_dates(self):
         """从主账本加载 T+1；首次升级时严格迁移旧独立 JSON。"""
@@ -1025,91 +997,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         except AttributeError:
             return str(value)
 
-    @staticmethod
-    def _turtle_client_order_id(symbol, candle_id, side):
-        digest = hashlib.sha256(
-            f'turtle|{symbol}|{candle_id}|{side}'.encode('utf-8')).hexdigest()
-        # OKX clOrdId 上限 32，仅接受 ASCII 字母数字。
-        return f'T{digest[:31]}'
 
-    def _prepare_turtle_signal_execution(self, symbol, signal, candle_id):
-        """为海龟突破建立 pending + 确定性 clOrdId；已确认信号直接拒绝重放。"""
-        side = signal.get('action')
-        if side not in ('long', 'short'):
-            return None
-        signal_id = f'{candle_id}|{side}'
-        client_order_id = self._turtle_client_order_id(symbol, candle_id, side)
-        payload = {
-            'side': side,
-            'candle_id': candle_id,
-            'entry_price': float(signal['current_close']),
-            'stop_loss_price': float(
-                signal['lower_line'] if side == 'long' else signal['upper_line']),
-        }
-        execution = self.trade_state.prepare_signal_execution(
-            symbol, 'turtle', signal_id, client_order_id, payload=payload)
-        if execution.get('status') == 'confirmed':
-            logger.warning(
-                f"{symbol} [海龟] 忽略已消费的同 K 线突破 {signal_id}，防止止损后重放")
-            signal['action'] = None
-            return None
-        # pending 重试必须复用账本中原 clOrdId，不可重新生成。
-        signal['_client_order_id'] = execution['client_order_id']
-        signal['_signal_id'] = signal_id
-        return signal_id
 
-    def _confirm_turtle_signal_if_reconciled(self, symbol, signal_id, side):
-        """只有主账本已经反映目标持仓方向时才确认消费。"""
-        if not signal_id:
-            return False
-        position = self.trade_state.get_open_position(symbol)
-        if not position or position.get('side') != side:
-            return False
-        self.trade_state.confirm_signal_execution(symbol, 'turtle', signal_id)
-        return True
 
-    def _finalize_rolled_back_turtle_signal(self, symbol, execution, outcome):
-        """把“旧开仓已确认、补偿平仓也已全平”原子收口为成交史+已消费信号。"""
-        if not isinstance(outcome, dict) or outcome.get('status') != 'rolled_back':
-            return False
-        close_order = outcome.get('close_order') or {}
-        if close_order.get('fully_closed') is not True:
-            return False
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        if side not in ('long', 'short'):
-            return False
-        recovered_entry = outcome.get('entry_price') or payload.get('entry_price')
-        recovered_exit = close_order.get('average')
-        if recovered_exit is None:
-            try:
-                recovered_exit = self.exchange_api.get_last_price(
-                    self.exchange_api.to_ccxt_symbol(symbol))
-            except Exception:
-                recovered_exit = recovered_entry
-        entry_fee, entry_fee_currency = self._extract_usdt_fee(
-            outcome.get('open_order'))
-        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
-        try:
-            self.trade_state.finalize_recovered_signal_round_trip(
-                symbol, 'turtle', execution.get('signal_id'), side,
-                recovered_entry, recovered_exit, outcome.get('position_size'),
-                payload.get('stop_loss_price'),
-                candle_id=payload.get('candle_id'),
-                entry_fee=entry_fee,
-                entry_fee_currency=entry_fee_currency,
-                entry_order_ids=self._order_ids(outcome.get('open_order')),
-                exit_fee=exit_fee,
-                exit_fee_currency=exit_fee_currency,
-                exit_order_ids=self._order_ids(close_order))
-        except Exception as exc:
-            logger.critical(
-                f'{symbol} 仓位已全平，但往返成交史/幂等状态无法原子落盘: {exc}')
-            return False
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.critical(
-            f'{symbol} [海龟] 开仓后已补偿全平，往返成交与信号状态已原子收口')
-        return True
 
     def _recovery_symbol_config(self, symbol, strategy):
         """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
@@ -1135,38 +1025,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             symbol_config['_retired_from_pool'] = True
         return symbol_config, retired
 
-    def _resume_pending_turtle_execution(self, symbol, execution):
-        """启动对账专用：用原 clOrdId 恢复“已成交、未挂止损/未记账”的中断交易。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        if side not in ('long', 'short'):
-            return False
-        try:
-            entry_price = float(payload['entry_price'])
-            stop_loss_price = float(payload['stop_loss_price'])
-        except (KeyError, TypeError, ValueError):
-            return False
-        symbol_config, _retired = self._recovery_symbol_config(
-            symbol, 'turtle')
-        outcome = self._execute_open(
-            symbol, side, entry_price, stop_loss_price, symbol_config,
-            buffer_notification=False,
-            client_order_id=execution.get('client_order_id'),
-            recover_pending_position=True)
-        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
-            return self._finalize_rolled_back_turtle_signal(
-                symbol, execution, outcome)
-        if isinstance(outcome, dict) and outcome.get('status') == 'rollback_incomplete':
-            logger.critical(
-                f'{symbol} [海龟] pending 恢复回滚后仍有余仓，保留 pending 并隔离人工处理')
-            return False
-        if not self._confirm_turtle_signal_if_reconciled(
-                symbol, execution.get('signal_id'), side):
-            return False
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.critical(
-            f"{symbol} [海龟] 已用原 clOrdId 恢复中断开仓，止损与账本已补齐")
-        return True
 
     @staticmethod
     def _finite_nonnegative(value):
@@ -1201,115 +1059,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             filled = amount
         return terminal, filled
 
-    def _consume_pending_without_trade(
-            self, symbol, execution, resolution, reason, order=None):
-        payload = execution.get('payload') or {}
-        self.trade_state.finalize_signal_without_trade(
-            symbol, 'turtle', execution.get('signal_id'),
-            candle_id=payload.get('candle_id'), resolution=resolution,
-            reason=reason, order=order)
-        self._clear_position_quarantine_after_reconcile(symbol)
-        logger.warning(f'{symbol} [海龟] pending 已无成交原子收口: {reason}')
-        return True
 
-    def _finalize_flat_filled_pending(self, symbol, execution, order, filled_contracts):
-        """旧单有成交但当前已空仓：按保守退出价补记完整往返。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        try:
-            stop_price = float(payload['stop_loss_price'])
-            entry_price = float(
-                order.get('average') or order.get('price') or payload['entry_price'])
-            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
-            contract_size = float(self.exchange_api._get_contract_size(ccxt_symbol))
-            position_size = float(filled_contracts) * contract_size
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(f'pending 旧成交的价格/数量无法安全还原: {exc}') from exc
-        if (side not in ('long', 'short') or
-                any(not math.isfinite(value) or value <= 0 for value in (
-                    stop_price, entry_price, position_size, contract_size))):
-            raise RuntimeError('pending 旧成交缺少有效方向/价格/数量')
 
-        close_evidence = None
-        try:
-            close_evidence = self._recover_flat_compensation_evidence(
-                ccxt_symbol, side, position_size,
-                execution.get('client_order_id'))
-        except Exception as exc:
-            logger.warning(
-                f'{symbol} pending 补偿平仓腿查询失败，退回保守退出价: {exc}')
-        if close_evidence and close_evidence.get('average') is not None:
-            exit_price = float(close_evidence['average'])
-            recovery_reason = 'pending 旧订单与确定性补偿腿均已找回'
-        else:
-            current_price = None
-            try:
-                current_price = float(self.exchange_api.get_last_price(ccxt_symbol))
-                if not math.isfinite(current_price) or current_price <= 0:
-                    current_price = None
-            except Exception:
-                current_price = None
-            # 真实退出价不可证明时：多单取止损/现价较低者，空单取较高者，
-            # 不用入场价伪造“无损退出”。
-            exit_candidates = [stop_price]
-            if current_price is not None:
-                exit_candidates.append(current_price)
-            exit_price = (
-                min(exit_candidates) if side == 'long'
-                else max(exit_candidates))
-            recovery_reason = 'pending 旧订单已成交但当前已空仓，按保守退出价补记'
-        entry_fee, entry_fee_currency = self._extract_usdt_fee(order)
-        exit_fee, exit_fee_currency = self._extract_usdt_fee(close_evidence)
-        trade = self.trade_state.finalize_recovered_signal_round_trip(
-            symbol, 'turtle', execution.get('signal_id'), side,
-            entry_price, exit_price, position_size, stop_price,
-            candle_id=payload.get('candle_id'), entry_fee=entry_fee,
-            entry_fee_currency=entry_fee_currency,
-            entry_order_ids=self._order_ids(order),
-            exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
-            exit_order_ids=self._order_ids(close_evidence),
-            reason=recovery_reason)
-        self._clear_position_quarantine_after_reconcile(symbol)
-        msg = (
-            f'{symbol} [海龟] 发现 pending 旧订单已成交 {position_size}币，'
-            f'但交易所当前已空仓；已用'
-            f'{"确定性补偿腿真实" if close_evidence else "保守"}退出价 {exit_price} '
-            f'原子补记往返成交（PnL={trade.get("pnl")}）')
-        logger.critical(msg)
-        self.notifier.notify_error(msg)
-        return True
-
-    def _continue_unsubmitted_pending_turtle(self, symbol, execution):
-        """确认从未发单后，在原止损仍有效时复用原 clOrdId 开仓。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        symbol_config, retired = self._recovery_symbol_config(
-            symbol, 'turtle')
-        if retired:
-            return self._consume_pending_without_trade(
-                symbol, execution, 'unsubmitted_retired',
-                '确认从未发单，且品种已删除或禁用；只平不开，取消恢复开仓')
-        try:
-            entry_price = float(payload['entry_price'])
-            stop_loss_price = float(payload['stop_loss_price'])
-        except (KeyError, TypeError, ValueError):
-            return False
-        outcome = self._execute_open(
-            symbol, side, entry_price, stop_loss_price, symbol_config,
-            buffer_notification=False,
-            client_order_id=execution.get('client_order_id'))
-        if isinstance(outcome, dict) and outcome.get('status') == 'rolled_back':
-            return self._finalize_rolled_back_turtle_signal(symbol, execution, outcome)
-        if isinstance(outcome, dict) and outcome.get('status') == 'opened':
-            if not self._confirm_turtle_signal_if_reconciled(
-                    symbol, execution.get('signal_id'), side):
-                return False
-            candle = payload.get('candle_id')
-            if candle:
-                self.trade_state.mark_candle_processed(symbol, 'turtle', candle)
-            self._clear_position_quarantine_after_reconcile(symbol)
-            return True
-        return False
 
     @staticmethod
     def _pending_order_absence_is_conclusive(execution):
@@ -1329,131 +1080,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return False, f'pending 已超过交易所可证明未发单的 2 小时窗口（{age}）'
         return True, None
 
-    def _adjudicate_flat_pending_turtle(self, symbol, execution):
-        """裁决“本地空仓 + 交易所空仓”的 pending。"""
-        payload = execution.get('payload') or {}
-        side = payload.get('side')
-        if side not in ('long', 'short'):
-            self._quarantine_position_mismatch(
-                symbol, f'pending payload 方向非法: {side!r}')
-            return False
-        planned = execution.get('planned_position_size')
-        order = None
-        if planned is not None:
-            try:
-                planned_value = float(planned)
-                if not math.isfinite(planned_value) or planned_value <= 0:
-                    raise ValueError(f'非法 planned_position_size={planned!r}')
-                finder = getattr(self.exchange_api, 'find_existing_open_order', None)
-                if not callable(finder):
-                    raise RuntimeError('交易所适配层缺少旧 clOrdId 只读查询')
-                order = finder(
-                    self.exchange_api.to_ccxt_symbol(symbol), side,
-                    planned_value, execution.get('client_order_id'))
-            except Exception as exc:
-                self._quarantine_position_mismatch(
-                    symbol, f'pending 旧 clOrdId 查询不确定: {exc}',
-                    {'client_order_id': execution.get('client_order_id')})
-                return False
 
-        if order is not None:
-            terminal, filled_contracts = self._pending_order_resolution(order)
-            if not terminal or filled_contracts is None:
-                self._quarantine_position_mismatch(
-                    symbol, 'pending 旧订单尚未终态或成交量不确定',
-                    {'client_order_id': execution.get('client_order_id'),
-                     'order_id': order.get('id'), 'status': order.get('status')})
-                return False
-            if filled_contracts <= 1e-12:
-                return self._consume_pending_without_trade(
-                    symbol, execution, 'terminal_zero_fill',
-                    '旧 clOrdId 订单已终态且零成交', order=order)
-            try:
-                return self._finalize_flat_filled_pending(
-                    symbol, execution, order, filled_contracts)
-            except Exception as exc:
-                self._quarantine_position_mismatch(
-                    symbol, f'pending 旧成交无法补记: {exc}',
-                    {'client_order_id': execution.get('client_order_id'),
-                     'order_id': order.get('id')})
-                return False
-
-        if planned is not None:
-            conclusive, reason = self._pending_order_absence_is_conclusive(execution)
-            if not conclusive:
-                self._quarantine_position_mismatch(
-                    symbol,
-                    f'{reason}；旧 clOrdId 查无订单不能再证明请求从未送达，禁止自动重开',
-                    {'client_order_id': execution.get('client_order_id'),
-                     'updated_at': execution.get('updated_at')})
-                return False
-
-        _symbol_config, retired = self._recovery_symbol_config(
-            symbol, 'turtle')
-        if retired:
-            return self._consume_pending_without_trade(
-                symbol, execution, 'unsubmitted_retired',
-                '确认从未发单，且品种已删除或禁用；只平不开，取消恢复开仓')
-
-        # planned 缺失，或按 clOrdId 明确 OrderNotFound：根据发单前事务顺序，
-        # 且仍在交易所可查询窗口内，才可确认这笔从未发出。只有当前止损仍能
-        # 保护新仓时才可继续。
-        try:
-            stop_price = float(payload['stop_loss_price'])
-            current_price = float(self.exchange_api.get_last_price(
-                self.exchange_api.to_ccxt_symbol(symbol)))
-            if any(not math.isfinite(value) or value <= 0 for value in (
-                    stop_price, current_price)):
-                raise ValueError('当前价/止损价非法')
-        except Exception as exc:
-            self._quarantine_position_mismatch(
-                symbol, f'pending 未发单的当前止损有效性无法确认: {exc}')
-            return False
-        stop_valid = (
-            (side == 'long' and stop_price < current_price) or
-            (side == 'short' and stop_price > current_price))
-        if not stop_valid:
-            return self._consume_pending_without_trade(
-                symbol, execution, 'unsubmitted_expired',
-                f'从未发单，且当前价 {current_price} 已越过原止损 {stop_price}')
-        if self._continue_unsubmitted_pending_turtle(symbol, execution):
-            return True
-        self._quarantine_position_mismatch(
-            symbol, 'pending 确认未发单，但复用原 clOrdId 开仓未能收口')
-        return False
-
-    def _reconcile_all_pending_turtle_executions(self, context):
-        """主动枚举所有 pending，返回仍未收口的品种集合。"""
-        getter = getattr(self.trade_state, 'get_pending_signal_executions', None)
-        pending_by_symbol = getter() if callable(getter) else {}
-        unresolved = set()
-        for symbol, execution in sorted(pending_by_symbol.items()):
-            if execution.get('strategy') != 'turtle':
-                self._quarantine_position_mismatch(
-                    symbol, f'{context} pending 策略非 turtle，无法自动裁决')
-                unresolved.add(symbol)
-                continue
-            local_position = self.trade_state.get_open_position(symbol)
-            try:
-                exchange_position = self.exchange_api.get_position(
-                    self.exchange_api.to_ccxt_symbol(symbol))
-            except Exception as exc:
-                self._quarantine_position_mismatch(
-                    symbol, f'{context} pending 仓位查询不确定: {exc}')
-                unresolved.add(symbol)
-                continue
-            if local_position:
-                # 本地仓的常规对账/平仓链路负责收口，此处不抢跑外部动作。
-                continue
-            if exchange_position:
-                if not self._resume_pending_turtle_execution(symbol, execution):
-                    self._quarantine_position_mismatch(
-                        symbol, f'{context} pending 孤儿仓恢复未收口')
-                    unresolved.add(symbol)
-                continue
-            if not self._adjudicate_flat_pending_turtle(symbol, execution):
-                unresolved.add(symbol)
-        return unresolved
 
     def _finalize_open_intent_rollback(self, symbol, intent, outcome):
         close_order = (outcome or {}).get('close_order') or {}
@@ -1492,7 +1119,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         except (KeyError, TypeError, ValueError):
             return False
         symbol_config, _retired = self._recovery_symbol_config(
-            symbol, intent.get('strategy') or 'turtle')
+            symbol, intent.get('strategy') or 'ma_cross')
         outcome = self._execute_open(
             symbol, side, entry_price, stop_price, symbol_config,
             buffer_notification=False,
@@ -1600,7 +1227,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 symbol, f'{reason}；open intent 查无订单不能证明从未送达')
             return False
         symbol_config, retired = self._recovery_symbol_config(
-            symbol, intent.get('strategy') or 'turtle')
+            symbol, intent.get('strategy') or 'ma_cross')
         if retired:
             self.trade_state.resolve_open_intent(
                 symbol, intent.get('client_order_id'))
@@ -1706,21 +1333,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         return current_state, current_id, int(current_state['action'] is not None)
 
-    @staticmethod
-    def _turtle_exit_still_pending(
-            signal, position_before, position_after, retired_from_pool=False):
-        """退出/退池反手信号只有在旧方向仓位确实归零后才能消费。"""
-        if not position_before or not position_after:
-            return False
-        action = signal.get('action') if isinstance(signal, dict) else None
-        old_side = position_before.get('side')
-        explicit_close = (
-            (action == 'close_long' and old_side == 'long') or
-            (action == 'close_short' and old_side == 'short'))
-        retired_reverse_exit = bool(
-            retired_from_pool and action in ('long', 'short') and
-            old_side != action)
-        return bool(explicit_close or retired_reverse_exit)
 
     def _history_requires_rebaseline(self, symbol, strategy_type, df,
                                      max_gap_candles=3):
@@ -1807,25 +1419,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._pending_trade_close_notifications = []
             self._pending_stop_loss_updates = []
 
-            unresolved_pending = self._reconcile_all_pending_turtle_executions('日检')
-            unresolved_pending.update(self._reconcile_all_open_intents('日检'))
+            unresolved_pending = self._reconcile_all_open_intents('日检')
 
             # 本轮监控集合 = 手动池启用品种 ∪ 有持仓品种 ∪ pending 品种。
             # 品种即使已从配置删除，未收口 clOrdId 也不得被遗忘/剪枝。
             # 快照视图（与盘中巡检同一模式）：循环中途 API 增删品种不影响本轮的
             # 一致性，也免去逐品种重扫池子
             all_open_positions = self.trade_state.get_all_open_positions()
-            pending_getter = getattr(
-                self.trade_state, 'get_pending_signal_executions', None)
-            pending_after_reconcile = (
-                pending_getter() if callable(pending_getter) else {})
             intent_getter = getattr(self.trade_state, 'get_open_intents', None)
             intents_after_reconcile = (
                 intent_getter() if callable(intent_getter) else {})
             symbol_config_map = {s['name']: s for s in self.config['trading']['symbols']}
             symbols_to_check = {name for name, s in symbol_config_map.items() if s.get('enabled', True)}
             symbols_to_check.update(all_open_positions.keys())
-            symbols_to_check.update(pending_after_reconcile.keys())
             symbols_to_check.update(intents_after_reconcile.keys())
 
             logger.info(f"本轮检查交易对数: {len(symbols_to_check)}")
@@ -1847,9 +1453,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 try:
                     symbol_config = symbol_config_map.get(symbol)
                     if symbol_config is None:
-                        # 品种已从手动池删除但仍有持仓：优先用「持仓记录的策略」，避免错按 turtle 退出
+                        # 品种已从手动池删除但仍有持仓：用持仓记录的策略托管退出
                         held = all_open_positions.get(symbol) or {}
-                        held_strategy = held.get('strategy') or 'turtle'
+                        held_strategy = held.get('strategy') or 'ma_cross'
                         symbol_config = {
                             'name': symbol,
                             'enabled': True,
@@ -1915,16 +1521,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and pending.get('strategy') == 'turtle' and
-                                (pending.get('payload') or {}).get('side') ==
-                                local_position.get('side')):
-                            self.trade_state.confirm_signal_execution(
-                                symbol, 'turtle', pending.get('signal_id'))
-                            pending_candle = (pending.get('payload') or {}).get('candle_id')
-                            if pending_candle:
-                                self.trade_state.mark_candle_processed(
-                                    symbol, 'turtle', pending_candle)
                     elif local_position and not exchange_position:
                         exit_price = (
                             local_position.get('stop_loss_price') or
@@ -1943,34 +1539,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             # 运行时隔离，不重复轰炸。
                             failed_symbols.append(symbol)
                             continue
-                        if strategy_type == 'ma_cross':
-                            logger.info(
-                                f'{symbol} [双均线] 日检记平与 T+1 已同事务落盘')
-                        else:
-                            # 仅重置 armed 布尔，set_signal_state 会保留已处理 candle /
-                            # confirmed signal ID，同一根突破不可重放。
-                            self.trade_state.set_signal_state(symbol, False)
-                            pending = self.trade_state.get_pending_signal_execution(symbol)
-                            if (pending and (pending.get('payload') or {}).get('side') ==
-                                    local_position.get('side')):
-                                self.trade_state.confirm_signal_execution(
-                                    symbol, 'turtle', pending.get('signal_id'))
-                                pending_candle = (pending.get('payload') or {}).get('candle_id')
-                                if pending_candle:
-                                    self.trade_state.mark_candle_processed(
-                                        symbol, 'turtle', pending_candle)
+                        logger.info(
+                            f'{symbol} [双均线] 日检记平与 T+1 已同事务落盘')
                         self._clear_position_quarantine_after_reconcile(symbol)
                         local_position = None
                     elif not local_position and exchange_position:
-                        pending = self.trade_state.get_pending_signal_execution(symbol)
-                        if (pending and pending.get('strategy') == 'turtle' and
-                                self._resume_pending_turtle_execution(symbol, pending)):
-                            local_position = self.trade_state.get_open_position(symbol)
-                        else:
-                            self._quarantine_position_mismatch(
-                                symbol, '交易所有仓但本地无记录（日检发现孤儿仓）')
-                            failed_symbols.append(symbol)
-                            continue
+                        self._quarantine_position_mismatch(
+                            symbol, '交易所有仓但本地无记录（日检发现孤儿仓）')
+                        failed_symbols.append(symbol)
+                        continue
                     elif not local_position and not exchange_position:
                         self._clear_position_quarantine_after_reconcile(symbol)
 
@@ -2015,70 +1592,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         failed_symbols.append(symbol)
                         continue
 
-                    turtle_signal_id = None
-                    turtle_signal_side = None
-                    candle_id = self._closed_candle_id(df)
-                    if strategy_type == 'turtle':
-                        turtle_metadata = self.trade_state.get_signal_metadata(symbol)
-                        mid_line_crossed = self.trade_state.get_signal_state(symbol)
-                        execution = turtle_metadata.get('signal_execution') or {}
-                        execution_same_candle = str(execution.get('signal_id') or '').startswith(
-                            f'{candle_id}|')
-                        already_processed = (
-                            turtle_metadata.get('strategy') == 'turtle' and
-                            turtle_metadata.get('last_processed_candle') == candle_id)
-                        rebaseline, previous_candle, _, gap_candles = (
-                            self._history_requires_rebaseline(
-                                symbol, 'turtle', df))
-                        armed_state_ready = True
-                        try:
-                            # 这里只回填“截至上一根K线”的可开仓状态，不能把今天刚发生的
-                            # 首次突破提前算成已消耗，否则会吞掉本轮本该执行的开仓信号。
-                            # 断档时同样只重算资格状态、绝不回放旧交易；随后仍应检查
-                            # 最新两根 K 线本身是否刚产生突破/中轨穿越。
-                            if not already_processed and not execution_same_candle:
-                                armed = self.turtle_strategy.is_first_breakout_armed(
-                                    df, include_latest_bar=False)
-                                if armed != mid_line_crossed:
-                                    self.trade_state.set_signal_state(symbol, armed)
-                                    mid_line_crossed = armed
-                                    if armed:
-                                        logger.info(f"{symbol} [海龟] 历史回溯判定为可开仓状态（中轨后尚未突破），已激活")
-                                    else:
-                                        logger.info(f"{symbol} [海龟] 历史回溯判定为未激活状态（首次突破资格已消耗或尚未有效穿越中轨），已重置")
-                        except Exception as e:
-                            armed_state_ready = False
-                            logger.warning(f"{symbol} [海龟] 历史回溯开仓状态失败: {e}")
-
-                        signal = strategy.check_signal(
-                            df, mid_line_crossed=mid_line_crossed)
-                        if rebaseline and not execution_same_candle and signal:
-                            signal['_history_discontinuity'] = True
-                            signal['_history_gap_candles'] = gap_candles
-                            if armed_state_ready:
-                                logger.warning(
-                                    f"{symbol} [海龟] 信号历史不可安全连续："
-                                    f"上次处理={previous_candle}，当前={candle_id}，"
-                                    f"间隔={gap_candles}；忽略间隔内历史事件，"
-                                    f"仅检查最新一根，信号={signal.get('action')}")
-                            else:
-                                # 无法证明截至上一根的“首次突破资格”，开仓信号不能执行；
-                                # close_long/close_short 只依赖最新中轨穿越，仍可安全保留。
-                                if signal.get('action') in ('long', 'short'):
-                                    signal['action'] = None
-                                logger.critical(
-                                    f"{symbol} [海龟] 断档且开仓资格重建失败；"
-                                    "禁止最新突破开仓，最新中轨平仓信号仍按事实处理")
-                        if signal and signal.get('mid_line_crossed'):
-                            self.trade_state.set_signal_state(symbol, True)
-                        if (signal and signal.get('action') in ('long', 'short') and
-                                not symbol_config.get('_retired_from_pool')):
-                            turtle_signal_side = signal['action']
-                            turtle_signal_id = self._prepare_turtle_signal_execution(
-                                symbol, signal, candle_id)
-                    else:
-                        signal, candle_id, _missed_crosses = self._ma_signal_with_catchup(
-                            symbol, strategy, df)
+                    signal, candle_id, _missed_crosses = self._ma_signal_with_catchup(
+                        symbol, strategy, df)
 
                     if not signal:
                         logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
@@ -2086,108 +1601,44 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
                     current_close = float(df['close'].iloc[-1])
                     fmt_price = self._format_indicator_price
-                    if strategy_type == 'turtle':
-                        upper = signal.get('upper_line')
-                        lower = signal.get('lower_line')
-                        mid = signal.get('mid_line')
-                        if upper and lower:
-                            dist_upper = (upper - current_close) / current_close * 100
-                            dist_lower = (current_close - lower) / current_close * 100
-                            signal_label = self._get_turtle_signal_label(signal)
-                            logger.info(
-                                f"{symbol} [海龟指标] 收盘价={fmt_price(current_close)}, "
-                                f"上轨={fmt_price(upper)}(距{dist_upper:+.2f}%), "
-                                f"下轨={fmt_price(lower)}(距{dist_lower:+.2f}%), "
-                                f"中轨={fmt_price(mid)}, 信号={signal_label}")
-                    elif strategy_type == 'ma_cross':
-                        ema_s = signal.get('ema_short')
-                        ema_l = signal.get('ema_long')
-                        upper_stop = signal.get('upper_stop')
-                        lower_stop = signal.get('lower_stop')
-                        logger.info(
-                            f"{symbol} [双均线指标] 收盘价={fmt_price(current_close)}, "
-                            f"EMA短={fmt_price(ema_s)}, EMA长={fmt_price(ema_l)}, "
-                            f"N日高={fmt_price(upper_stop)}, "
-                            f"N日低={fmt_price(lower_stop)}, "
-                            f"信号={signal.get('action', '无')}")
+                    logger.info(
+                        f"{symbol} [双均线指标] 收盘价={fmt_price(current_close)}, "
+                        f"EMA短={fmt_price(signal.get('ema_short'))}, "
+                        f"EMA长={fmt_price(signal.get('ema_long'))}, "
+                        f"N日高={fmt_price(signal.get('upper_stop'))}, "
+                        f"N日低={fmt_price(signal.get('lower_stop'))}, "
+                        f"信号={signal.get('action', '无')}")
 
                     position = self.trade_state.get_open_position(symbol)
 
                     if position:
-                        if strategy_type == 'turtle':
-                            self.handle_open_position_turtle(symbol, signal, position, symbol_config)
-                        elif strategy_type == 'ma_cross':
-                            self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
+                        self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
+                    elif symbol_config.get('_retired_from_pool'):
+                        logger.info(
+                            f"{symbol} 已退池且当前仓位已结束；禁止新开仓并完成生命周期清理")
                     else:
-                        if symbol_config.get('_retired_from_pool'):
-                            logger.info(
-                                f"{symbol} 已退池且当前仓位已结束；禁止新开仓并完成生命周期清理")
-                        elif strategy_type == 'turtle':
-                            self.handle_no_position_turtle(symbol, signal, symbol_config, df)
-                        elif strategy_type == 'ma_cross':
-                            self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
+                        self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
 
-                    if strategy_type == 'turtle':
-                        if turtle_signal_id:
-                            outcome = signal.get('_execution_outcome')
-                            reconciled = False
-                            candle_already_marked = False
-                            if (isinstance(outcome, dict) and
-                                    outcome.get('status') == 'rolled_back'):
-                                pending = self.trade_state.get_pending_signal_execution(
-                                    symbol, signal.get('_client_order_id'))
-                                reconciled = bool(pending) and self._finalize_rolled_back_turtle_signal(
-                                    symbol, pending, outcome)
-                                candle_already_marked = reconciled
-                            elif (isinstance(outcome, dict) and
-                                  outcome.get('status') == 'rollback_incomplete'):
-                                reconciled = False
-                            else:
-                                reconciled = self._confirm_turtle_signal_if_reconciled(
-                                    symbol, turtle_signal_id, turtle_signal_side)
-                            if not reconciled:
-                                logger.error(
-                                    f'{symbol} [海龟] 信号交易尚未与账本/交易所收口；'
-                                    '不推进 K 线幂等标记，交由日内重试')
-                                failed_symbols.append(symbol)
-                                continue
-                            if not candle_already_marked:
-                                self.trade_state.mark_candle_processed(
-                                    symbol, 'turtle', candle_id)
-                        else:
-                            post_position = self.trade_state.get_open_position(symbol)
-                            if self._turtle_exit_still_pending(
-                                    signal, position, post_position,
-                                    retired_from_pool=bool(
-                                        symbol_config.get('_retired_from_pool'))):
-                                logger.error(
-                                    f'{symbol} [海龟] 退出目标尚未归零；'
-                                    '不推进 K 线幂等标记，等待日内重试')
-                                failed_symbols.append(symbol)
-                                continue
-                            self.trade_state.mark_candle_processed(
-                                symbol, 'turtle', candle_id)
-                    else:
-                        # EMA 交叉只有在目标方向已经真实落到账本后才可消费。
-                        # 平仓失败/部分成交/反手开仓失败时保留旧 marker，让 08:01
-                        # 及 30 分钟兜底按同一根交叉再次收敛，而不是永久吞信号。
-                        target_side = signal.get('action')
-                        if target_side in ('long', 'short'):
-                            post_position = self.trade_state.get_open_position(symbol)
-                            retired_exit_complete = bool(
-                                symbol_config.get('_retired_from_pool') and
-                                position and position.get('side') != target_side and
-                                not post_position)
-                            if (not retired_exit_complete and
-                                    (not post_position or
-                                     post_position.get('side') != target_side)):
-                                logger.error(
-                                    f'{symbol} [双均线] 目标仓位 {target_side} 尚未对齐；'
-                                    '不推进 K 线幂等标记，等待日内重试')
-                                failed_symbols.append(symbol)
-                                continue
-                        self.trade_state.mark_candle_processed(
-                            symbol, 'ma_cross', candle_id)
+                    # EMA 交叉只有在目标方向已经真实落到账本后才可消费。
+                    # 平仓失败/部分成交/反手开仓失败时保留旧 marker，让 08:01
+                    # 及 30 分钟兜底按同一根交叉再次收敛，而不是永久吞信号。
+                    target_side = signal.get('action')
+                    if target_side in ('long', 'short'):
+                        post_position = self.trade_state.get_open_position(symbol)
+                        retired_exit_complete = bool(
+                            symbol_config.get('_retired_from_pool') and
+                            position and position.get('side') != target_side and
+                            not post_position)
+                        if (not retired_exit_complete and
+                                (not post_position or
+                                 post_position.get('side') != target_side)):
+                            logger.error(
+                                f'{symbol} [双均线] 目标仓位 {target_side} 尚未对齐；'
+                                '不推进 K 线幂等标记，等待日内重试')
+                            failed_symbols.append(symbol)
+                            continue
+                    self.trade_state.mark_candle_processed(
+                        symbol, 'ma_cross', candle_id)
 
                 except Exception as sym_e:
                     logger.exception(f"{symbol} 本轮检查异常，跳过该品种继续: {sym_e}")

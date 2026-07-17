@@ -111,204 +111,6 @@ class OhlcvBoundaryValidationTests(unittest.TestCase):
                 exchange_base.ExchangeApi.validate_ohlcv(bad, "BTC")
 
 
-class TurtleStopLossFollowupTests(unittest.TestCase):
-    def make_system(self):
-        system = object.__new__(main.TradingSystem)
-        system._stop_anomalies = {}
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=_fake_to_ccxt,
-            get_position=Mock(return_value=None),
-            cancel_order=Mock(return_value=True),
-            cancel_all_orders=Mock(return_value=True),
-        )
-        system.notifier = SimpleNamespace(
-            send_message=Mock(), notify_error=Mock(), notify_stop_loss_triggered=Mock())
-        system.handle_open_signal_turtle = Mock()
-
-        class FakeTradeState:
-            def __init__(self):
-                self.signal_state = {}
-                self.closed = None
-
-            def get_open_position(self, symbol):
-                return {"symbol": symbol}
-
-            def close_position(self, symbol, exit_price, **kwargs):
-                self.closed = (symbol, exit_price)
-                if kwargs.get('stop_cleanup_pending'):
-                    self.residue = symbol
-                if kwargs.get('reset_turtle_signal'):
-                    self.signal_state[symbol] = False
-                return {"symbol": symbol, "exit_price": exit_price}
-
-            def set_signal_state(self, symbol, value):
-                self.signal_state[symbol] = value
-
-            def get_signal_state(self, symbol):
-                return self.signal_state.get(symbol, False)
-
-            def mark_stop_residue(self, symbol):
-                self.residue = symbol
-
-            def clear_stop_residue(self, symbol):
-                self.residue = None
-
-            def has_stop_residue(self, symbol):
-                return self.residue == symbol
-
-        system.trade_state = FakeTradeState()
-        system.trade_state.residue = None
-        return system
-
-    def test_stop_loss_recovers_arm_but_does_not_reopen_when_signal_is_none(self):
-        system = self.make_system()
-        signal = {
-            "action": None,
-            "current_close": 72,
-            "mid_line": 55,
-        }
-        position = {"side": "long", "stop_loss_price": 40, "position_size": 1}
-
-        system.handle_open_position_turtle("BTCUSDT", signal, position, {"name": "BTCUSDT"})
-
-        self.assertTrue(system.trade_state.signal_state["BTCUSDT"])
-        system.handle_open_signal_turtle.assert_not_called()
-        self.assertEqual(system.trade_state.closed, ("BTCUSDT", 40))
-
-    def test_stop_loss_reverses_when_standard_signal_exists(self):
-        system = self.make_system()
-        signal = {
-            "action": "short",
-            "mid_line_crossed": True,
-            "current_close": 38,
-            "mid_line": 56,
-        }
-        position = {"side": "long", "stop_loss_price": 40, "position_size": 1}
-
-        system.handle_open_position_turtle("BTCUSDT", signal, position, {"name": "BTCUSDT"})
-
-        self.assertTrue(system.trade_state.signal_state["BTCUSDT"])
-        system.handle_open_signal_turtle.assert_called_once_with(
-            "BTCUSDT", "short", signal, {"name": "BTCUSDT"}
-        )
-
-    def test_stop_loss_branch_aborts_reverse_when_cancel_unconfirmed(self):
-        """交易所无仓记平后旧止损撤销不可确认：标记残留，且不进行止损后反手开仓（P1）。"""
-        system = self.make_system()
-        system.exchange_api.cancel_order.return_value = False
-        system.exchange_api.cancel_all_orders.return_value = None
-        signal = {
-            "action": "short",
-            "mid_line_crossed": True,
-            "current_close": 38,
-            "mid_line": 56,
-        }
-        position = {"side": "long", "stop_loss_price": 40, "position_size": 1, "stop_order_id": "stop-1"}
-
-        system.handle_open_position_turtle("BTCUSDT", signal, position, {"name": "BTCUSDT"})
-
-        self.assertEqual(system.trade_state.closed, ("BTCUSDT", 40))  # 记平照常
-        self.assertEqual(system.trade_state.residue, "BTCUSDT")       # 残留已标记
-        system.handle_open_signal_turtle.assert_not_called()          # 不反手
-
-    def test_history_gap_does_not_compensate_from_current_mid_state(self):
-        """断档且最新无穿越时，不能因当前已在中轨另一侧补做历史平仓。"""
-        system = self.make_system()
-        system.exchange_api.get_position.return_value = {'contracts': 1}
-        system.handle_close_signal = Mock()
-        system.check_and_update_stop_loss_turtle = Mock()
-        signal = {
-            'action': None,
-            'current_close': 72,
-            'mid_line': 55,
-            'lower_line': 40,
-            'upper_line': 80,
-            '_history_discontinuity': True,
-        }
-        position = {
-            'side': 'short', 'stop_loss_price': 80,
-            'position_size': 1,
-        }
-
-        system.handle_open_position_turtle(
-            'BTCUSDT', signal, position, {'name': 'BTCUSDT'})
-
-        system.handle_close_signal.assert_not_called()
-        system.check_and_update_stop_loss_turtle.assert_called_once_with(
-            'BTCUSDT', signal, position)
-
-
-class TurtleLatestSignalAfterGapTests(unittest.TestCase):
-    def test_missing_marker_ignores_old_events_but_executes_latest_breakout(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system = object.__new__(main.TradingSystem)
-            system.trade_state = trade_state.TradeState(
-                os.path.join(tmp, 'trade_state.json'))
-            system.config = {
-                'trading': {'symbols': [{
-                    'name': 'BTCUSDT', 'enabled': True,
-                    'strategy': 'turtle', 'risk_per_trade': 0.01,
-                }]},
-                'strategy': {
-                    'channel_period': 2, 'ma_short_period': 2,
-                    'ma_long_period': 3, 'ma_stop_period': 2,
-                    'default_risk_per_trade': 0.01,
-                },
-            }
-            system.turtle_strategy = main.TurtleStrategy(2)
-            system.ma_cross_strategy = SimpleNamespace()
-            system._trade_lock = threading.Lock()
-            system._stop_anomalies = {}
-            system._last_check_date = None
-            system._last_failure_notify_ts = 0
-            system._pending_trade_open_notifications = []
-            system._pending_trade_close_notifications = []
-            system._pending_stop_loss_updates = []
-            system.stop_loss_dates = {}
-            system.equity_tracker = SimpleNamespace(
-                record_daily_equity_snapshot=lambda: None,
-                refresh_account_stats_state=lambda: None)
-            system.notifier = SimpleNamespace(
-                send_message=Mock(return_value=True), notify_error=Mock(),
-                notify_stop_loss_updates_summary=Mock(),
-                notify_signal_missed=Mock(),
-                notify_trade_opened_summary=Mock(),
-                notify_trade_closed_summary=Mock())
-            system.send_daily_position_summary_if_due = Mock(return_value=True)
-
-            # channel=2：7月9日先上穿中轨完成武装；7月11日才首次向上突破。
-            frame = pd.DataFrame({
-                'timestamp': pd.to_datetime([
-                    '2026-07-06', '2026-07-07', '2026-07-08',
-                    '2026-07-09', '2026-07-10', '2026-07-11']),
-                'close': [10, 10, 9, 11, 10, 12],
-            })
-            system.exchange_api = SimpleNamespace(
-                to_ccxt_symbol=lambda symbol: symbol,
-                get_position=lambda _symbol: None,
-                fetch_ohlcv=lambda *args, **kwargs: [[1]],
-                ohlcv_to_dataframe=lambda _rows: frame,
-                filter_closed_candles=lambda df, timeframe: df)
-            system._daily_candle_is_fresh = lambda *args: (True, None, None)
-
-            def execute_open(symbol, side, entry, stop, config,
-                             client_order_id=None, **kwargs):
-                system.trade_state.add_open_position(
-                    symbol, side, float(entry), 1.0, float(stop), 'stop-1',
-                    strategy=config['strategy'])
-                return {'status': 'opened'}
-
-            system._execute_open = execute_open
-            system.check_and_execute_trades(manual_run=True)
-
-            position = system.trade_state.get_open_position('BTCUSDT')
-            self.assertEqual('long', position['side'])
-            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
-            self.assertEqual(
-                '2026-07-11T00:00:00', metadata['last_processed_candle'])
-            self.assertEqual('confirmed', metadata['signal_execution']['status'])
-
-
 class MaCrossTPlusOneTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
@@ -394,7 +196,7 @@ class InstantOpenApiTests(unittest.TestCase):
 
         trade_state.get_open_position = get_open_position
 
-        df_marker = [None] * 30
+        df_marker = [None] * 60
         filter_mock = Mock(return_value=df_marker)
         execute_calls = []
 
@@ -416,23 +218,21 @@ class InstantOpenApiTests(unittest.TestCase):
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
                 to_ccxt_symbol=_fake_to_ccxt,
-                fetch_ohlcv=Mock(return_value=[[1]] * 120),
+                fetch_ohlcv=Mock(return_value=[[1]] * 200),
                 ohlcv_to_dataframe=Mock(return_value=df_marker),
                 filter_closed_candles=filter_mock,
                 exchange=exchange_stub,
                 get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
-            turtle_strategy=SimpleNamespace(
+            ma_cross_strategy=SimpleNamespace(
                 check_current_state=Mock(
                     return_value={
                         "action": "long",
-                        "upper_line": 130,
-                        "lower_line": 100,
-                        "mid_line": 115,
+                        "upper_stop": 130,
+                        "lower_stop": 100,
                     }
                 )
             ),
-            ma_cross_strategy=SimpleNamespace(check_current_state=Mock()),
             _execute_open=execute_open,
             _daily_candle_is_fresh=lambda _df, _day: (True, 'today', 'minimum'),
             config={"trading": {"symbols": []}},
@@ -456,7 +256,7 @@ class InstantOpenApiTests(unittest.TestCase):
             resp = self.client.post(
                 "/api/instant_open",
                 json={"name": "BTCUSDT", "risk_per_trade": 0.01,
-                      "strategy": "turtle"},
+                      "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 409)
@@ -474,7 +274,7 @@ class InstantOpenApiTests(unittest.TestCase):
             resp = self.client.post(
                 "/api/instant_open",
                 json={"name": "BTCUSDT", "risk_per_trade": 0.01,
-                      "strategy": "turtle"},
+                      "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 503)
@@ -489,7 +289,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 400)
@@ -504,7 +304,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 200)
@@ -515,14 +315,14 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(side, "long")
         self.assertEqual(entry_price, 123.45)
         self.assertEqual(stop_loss_price, 100)
-        self.assertEqual(symbol_config["strategy"], "turtle")
+        self.assertEqual(symbol_config["strategy"], "ma_cross")
         fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=300)
 
     def test_instant_open_uses_single_page_at_capacity_boundary(self):
         self.authenticate()
         fake_system = self.make_system()
         fake_system.config = {
-            "strategy": {"channel_period": 297},
+            "strategy": {"ma_long_period": 149, "ma_stop_period": 298},
             "trading": {"symbols": []},
         }
         df_marker = [None] * 299
@@ -534,7 +334,7 @@ class InstantOpenApiTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 200)
@@ -561,15 +361,16 @@ class InstantOpenApiTests(unittest.TestCase):
         止损/出场逻辑与请求的策略不一致（与「有持仓禁改策略」同一护栏）。"""
         self.authenticate()
         fake_system = self.make_system()
+        # 遗留 turtle 品种（已强制禁用，仍在池中）vs 请求 ma_cross：策略不一致必拒。
         fake_system.config = {"trading": {"symbols": [
-            {"name": "BTCUSDT", "enabled": True, "risk_per_trade": 0.01, "strategy": "ma_cross"}]}}
+            {"name": "BTCUSDT", "enabled": False, "risk_per_trade": 0.01, "strategy": "turtle"}]}}
 
         with patch.object(api_server, "trading_system", _prep_system(fake_system)), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 400)
@@ -595,7 +396,7 @@ class InstantOpenApiTests(unittest.TestCase):
                 api_server, 'send_dingtalk', dingtalk):
             resp = self.client.post('/api/instant_open', json={
                 'name': 'BTCUSDT', 'risk_per_trade': 0.01,
-                'strategy': 'turtle'})
+                'strategy': 'ma_cross'})
 
         self.assertEqual(409, resp.status_code)
         self.assertEqual('quarantined', resp.get_json()['status'])
@@ -663,13 +464,13 @@ class SymbolInputValidationTests(unittest.TestCase):
     def test_validate_symbol_input_normalizes(self):
         """API 归一化契约：返回规范化 clean——name 大写、risk→float、enabled→真 bool。
         杜绝 "0.01"/"false" 字符串混入下单/开仓资格路径（否则盘中 TypeError 或被当启用）。"""
-        clean, err = api_server._validate_symbol_input("btcusdt", "0.01", "turtle", "false")
+        clean, err = api_server._validate_symbol_input("btcusdt", "0.01", "ma_cross", "false")
         self.assertIsNone(err)
         self.assertEqual(clean["name"], "BTCUSDT")
         self.assertIsInstance(clean["risk_per_trade"], float)
         self.assertEqual(clean["risk_per_trade"], 0.01)
         self.assertIs(clean["enabled"], False)   # "false" 解析为 False，而非 Python 真值陷阱
-        self.assertEqual(clean["strategy"], "turtle")
+        self.assertEqual(clean["strategy"], "ma_cross")
 
     def test_validate_symbol_input_rejects_non_string_name(self):
         clean, err = api_server._validate_symbol_input(123)
@@ -723,14 +524,14 @@ class SymbolInputValidationTests(unittest.TestCase):
 
     def test_update_symbol_rejects_strategy_change_while_holding(self):
         """有持仓时禁止改策略：现有仓位的止损/出场逻辑不能被换掉。"""
-        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "strategy": "turtle"}]}}
+        self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "strategy": "ma_cross"}]}}
         self.system.trade_state = SimpleNamespace(get_open_position=Mock(return_value={"symbol": "BTCUSDT"}))
         with patch.object(api_server, "trading_system", self.system), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
             resp = self.client.put("/api/symbols/BTCUSDT", json={"strategy": "ma_cross"})
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "turtle")
+        self.assertEqual(self.system.config["trading"]["symbols"][0]["strategy"], "ma_cross")
 
     def test_strategy_params_rejects_short_not_less_than_long(self):
         self.system.config = {"strategy": {"ma_short_period": 6, "ma_long_period": 28}}
@@ -761,13 +562,13 @@ class SymbolInputValidationTests(unittest.TestCase):
 
     def test_strategy_params_rejects_fractional_period(self):
         """API 与启动校验同源 strict_int：小数周期 28.9 拒绝而非截断为 28（三入口口径一致）。"""
-        self.system.config = {"strategy": {"channel_period": 28}}
+        self.system.config = {"strategy": {"ma_long_period": 28}}
         with patch.object(api_server, "trading_system", self.system), patch.object(
             api_server, "send_dingtalk", Mock()
         ):
-            resp = self.client.put("/api/strategy_params", json={"channel_period": 28.9})
+            resp = self.client.put("/api/strategy_params", json={"ma_long_period": 28.9})
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(self.system.config["strategy"]["channel_period"], 28)  # 未写入截断值
+        self.assertEqual(self.system.config["strategy"]["ma_long_period"], 28)  # 未写入截断值
 
     def test_update_symbol_rejects_out_of_range_risk(self):
         self.system.config = {"trading": {"symbols": [{"name": "BTCUSDT", "risk_per_trade": 0.01}]}}
@@ -797,7 +598,6 @@ class SymbolInputValidationTests(unittest.TestCase):
             to_ccxt_symbol=lambda symbol: symbol,
             fetch_ohlcv=Mock(return_value=[[1, 1, 1, 1, 1, 1]]))
         self.system.trade_state = SimpleNamespace(
-            get_pending_signal_execution=Mock(return_value=None),
             get_open_intent=Mock(return_value={
                 'status': 'pending', 'client_order_id': 'IOLD'}))
         with patch.object(api_server, 'trading_system', self.system), patch.object(
@@ -815,7 +615,6 @@ class SymbolInputValidationTests(unittest.TestCase):
         self.system.label = '欧易'
         self.system.reload_strategies = Mock()
         self.system.trade_state = SimpleNamespace(
-            get_pending_signal_execution=Mock(return_value=None),
             get_open_intent=Mock(return_value={
                 'status': 'pending', 'client_order_id': 'IOLD'}),
             get_open_position=Mock(return_value=None))
@@ -827,26 +626,6 @@ class SymbolInputValidationTests(unittest.TestCase):
                 '/api/symbols/BTCUSDT', json={'enabled': False})
 
         self.assertEqual(409, rejected.status_code)
-        self.assertEqual(200, disabled.status_code)
-        self.assertIs(
-            False, self.system.config['trading']['symbols'][0]['enabled'])
-
-    def test_turtle_pending_also_allows_emergency_disable(self):
-        self.system.config = {'trading': {'symbols': [{
-            'name': 'BTCUSDT', 'enabled': True,
-            'risk_per_trade': 0.01, 'strategy': 'turtle'}]}}
-        self.system.label = '欧易'
-        self.system.reload_strategies = Mock()
-        self.system.trade_state = SimpleNamespace(
-            get_pending_signal_execution=Mock(return_value={
-                'status': 'pending', 'client_order_id': 'TOLD'}),
-            get_open_intent=Mock(return_value=None),
-            get_open_position=Mock(return_value=None))
-        with patch.object(api_server, 'trading_system', self.system), patch.object(
-                api_server, 'send_dingtalk', Mock()):
-            disabled = self.client.put(
-                '/api/symbols/BTCUSDT', json={'enabled': False})
-
         self.assertEqual(200, disabled.status_code)
         self.assertIs(
             False, self.system.config['trading']['symbols'][0]['enabled'])
@@ -1303,23 +1082,21 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
             trade_state=trade_state,
             exchange_api=SimpleNamespace(
                 to_ccxt_symbol=_fake_to_ccxt,
-                fetch_ohlcv=Mock(return_value=[[1]] * 120),
-                ohlcv_to_dataframe=Mock(return_value=[None] * 30),
-                filter_closed_candles=Mock(return_value=[None] * 30),
+                fetch_ohlcv=Mock(return_value=[[1]] * 200),
+                ohlcv_to_dataframe=Mock(return_value=[None] * 60),
+                filter_closed_candles=Mock(return_value=[None] * 60),
                 exchange=exchange_stub,
                 get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
             ),
-            turtle_strategy=SimpleNamespace(
+            ma_cross_strategy=SimpleNamespace(
                 check_current_state=Mock(
                     return_value={
                         "action": "long",
-                        "upper_line": 130,
-                        "lower_line": 100,
-                        "mid_line": 115,
+                        "upper_stop": 130,
+                        "lower_stop": 100,
                     }
                 )
             ),
-            ma_cross_strategy=SimpleNamespace(check_current_state=Mock()),
             _execute_open=execute_open,
             config={"trading": {"symbols": []}},
             config_file="config.json",
@@ -1333,7 +1110,7 @@ class InstantOpenConfigRollbackTests(unittest.TestCase):
         ):
             resp = self.client.post(
                 "/api/instant_open",
-                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "turtle"},
+                json={"name": "BTCUSDT", "risk_per_trade": 0.01, "strategy": "ma_cross"},
             )
 
         self.assertEqual(resp.status_code, 500)
@@ -1420,94 +1197,6 @@ class TradeStateIsolationTests(unittest.TestCase):
             fresh = ts.get_open_position("BTCUSDT")
             self.assertEqual(fresh["entry_price"], 100)
 
-
-
-class HandleCloseSignalTests(unittest.TestCase):
-    def make_system(self):
-        system = object.__new__(main.TradingSystem)
-        system._stop_anomalies = {}
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=_fake_to_ccxt,
-            close_position=Mock(return_value={"average": 123.45}),
-            cancel_order=Mock(return_value=True),
-            cancel_all_orders=Mock(),
-        )
-        system.trade_state = SimpleNamespace(
-            close_position=Mock(return_value={"pnl": 10.5, "pnl_percent": 5.25}),
-            force_runtime_close_position=Mock(return_value={"pnl": 10.5, "pnl_percent": 5.25}),
-            has_stop_residue=Mock(return_value=False),
-            clear_stop_residue=Mock(),
-            mark_stop_residue=Mock(),
-        )
-        system.notifier = SimpleNamespace(
-            notify_error=Mock(),
-        )
-        system._pending_trade_close_notifications = []
-        system.handle_open_signal_turtle = Mock()
-        return system
-
-    def test_handle_close_signal_uses_actual_fill_price_and_skips_reopen(self):
-        system = self.make_system()
-        signal = {"current_close": 120, "action": None}
-        position = {"side": "long", "position_size": 2.0, "stop_order_id": "stop-1"}
-
-        result = system.handle_close_signal(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, skip_reopen=True
-        )
-
-        self.assertTrue(result)
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 123.45)
-        self.assertEqual(len(system._pending_trade_close_notifications), 1)  # 现行为：缓冲汇总
-        self.assertEqual(system._pending_trade_close_notifications[0]["exit_price"], 123.45)
-        system.handle_open_signal_turtle.assert_not_called()
-
-    def test_handle_close_signal_reopens_when_new_signal_exists(self):
-        system = self.make_system()
-        signal = {"current_close": 120, "action": "short"}
-        position = {"side": "long", "position_size": 2.0, "stop_order_id": "stop-1"}
-
-        result = system.handle_close_signal(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, skip_reopen=False
-        )
-
-        self.assertTrue(result)
-        system.handle_open_signal_turtle.assert_called_once_with(
-            "BTCUSDT", "short", signal, {"name": "BTCUSDT"}
-        )
-
-    def test_close_still_books_trade_when_stop_cancel_unconfirmed(self):
-        """平仓后撤止损不可确认：仓位记账照常完成（仓确实平了），但标记残留阻断后续开仓。"""
-        system = self.make_system()
-        system.exchange_api.cancel_order.return_value = False
-        system.exchange_api.cancel_all_orders.return_value = None
-        signal = {"current_close": 120, "action": None}
-        position = {"side": "long", "position_size": 2.0, "stop_order_id": "stop-1"}
-
-        result = system.handle_close_signal(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, skip_reopen=True
-        )
-
-        # 平仓已记账，但返回 False：本函数与调用方都不得进入任何再开仓流程
-        self.assertFalse(result)
-        system.trade_state.close_position.assert_called_once_with("BTCUSDT", 123.45)
-        system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
-        system.handle_open_signal_turtle.assert_not_called()
-
-    def test_partial_close_keeps_full_ledger_and_protective_stop(self):
-        system = self.make_system()
-        system.exchange_api.close_position.return_value = {
-            "id": "partial", "amount": 0.5, "fully_closed": False,
-        }
-        signal = {"current_close": 120, "action": "short"}
-        position = {"side": "long", "position_size": 2.0, "stop_order_id": "stop-1"}
-
-        result = system.handle_close_signal(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, skip_reopen=False)
-
-        self.assertFalse(result)
-        system.trade_state.close_position.assert_not_called()
-        system.exchange_api.cancel_order.assert_not_called()
-        system.handle_open_signal_turtle.assert_not_called()
 
 
 class MaCrossFlipTests(unittest.TestCase):
@@ -1691,21 +1380,6 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
         system.notifier.notify_error.assert_called_once()
         system.notifier.send_message.assert_not_called()
 
-    def test_handle_close_signal_skips_reopen_when_persist_fails(self):
-        system = HandleCloseSignalTests().make_system()
-        system.trade_state.close_position.side_effect = trade_state.TradeStatePersistenceError("disk full")
-        signal = {"current_close": 120, "action": "short"}
-        position = {"side": "long", "position_size": 2.0, "stop_order_id": "stop-1"}
-
-        result = system.handle_close_signal(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, skip_reopen=False
-        )
-
-        self.assertFalse(result)
-        system.trade_state.force_runtime_close_position.assert_called_once_with(
-            "BTCUSDT", 123.45)
-        system.handle_open_signal_turtle.assert_not_called()
-
     def test_flip_position_stops_when_persist_fails(self):
         system = MaCrossFlipTests().make_system()
         system.trade_state.close_position.side_effect = trade_state.TradeStatePersistenceError("disk full")
@@ -1745,7 +1419,6 @@ class StartupSyncCompensationTests(unittest.TestCase):
             ),
             force_runtime_close_position=Mock(return_value={"pnl": -20.0, "pnl_percent": -10.0}),
             close_position=Mock(return_value={"pnl": -20.0, "pnl_percent": -10.0}),
-            get_pending_signal_execution=Mock(return_value=None),
             mark_stop_residue=Mock(),
             clear_stop_residue=Mock(),
         )
@@ -1772,13 +1445,16 @@ class StartupSyncCompensationTests(unittest.TestCase):
 
                     system.sync_positions_on_startup()
 
+                    # 已停过的 ma_cross 仓在启动同步平仓时同事务记 T+1（今日），
+                    # 防止当日 EMA 方向仍成立就立刻反手重入。
+                    today = date.today().strftime('%Y-%m-%d')
                     system.trade_state.close_position.assert_called_once_with(
-                        "BTCUSDT", expected_exit, stop_cleanup_pending=True,
-                        reset_turtle_signal=True)
+                        "BTCUSDT", expected_exit,
+                        stop_loss_date=today, stop_cleanup_pending=True)
                     if persist_fails:
                         system.trade_state.force_runtime_close_position.assert_called_once_with(
-                            "BTCUSDT", expected_exit, stop_cleanup_pending=True,
-                            reset_turtle_signal=True)
+                            "BTCUSDT", expected_exit,
+                            stop_loss_date=today, stop_cleanup_pending=True)
                         system.notifier.notify_error.assert_called_once()
                     else:
                         system.trade_state.force_runtime_close_position.assert_not_called()
@@ -1813,10 +1489,11 @@ class StartupSyncIsolationTests(unittest.TestCase):
         self.assertTrue(any(
             args[0] == "AAAUSDT" and "启动对账异常" in args[1]
             for args in quarantined))
-        # BBBUSDT 仍被正常对账（交易所空仓 → 按止损估值补记平仓）。
+        # BBBUSDT 仍被正常对账（交易所空仓 → 按止损估值补记平仓，同事务记 T+1）。
         system.trade_state.close_position.assert_called_once_with(
-            "BBBUSDT", 90.0, stop_cleanup_pending=True,
-            reset_turtle_signal=True)
+            "BBBUSDT", 90.0,
+            stop_loss_date=date.today().strftime('%Y-%m-%d'),
+            stop_cleanup_pending=True)
 
 
 class LoginBackoffTests(unittest.TestCase):
@@ -1941,7 +1618,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
 
             def acquire(self, blocking=False):
                 self.held = True
-                holder.position = {"symbol": "BTCUSDT", "strategy": "turtle"}
+                holder.position = {"symbol": "BTCUSDT", "strategy": "ma_cross"}
                 return True
 
             def release(self):
@@ -1961,7 +1638,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
             _config_lock=CheckedConfigLock(),
             trade_state=SimpleNamespace(get_open_position=lambda _s: holder.position),
             config={"trading": {"symbols": [
-                {"name": "BTCUSDT", "strategy": "turtle", "risk_per_trade": 0.01, "enabled": True}
+                {"name": "BTCUSDT", "strategy": "ma_cross", "risk_per_trade": 0.01, "enabled": True}
             ]}},
             persist_config=lambda: True,
             reload_strategies=Mock(),
@@ -1970,7 +1647,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
         with patch.object(api_server, "trading_system", system):
             resp = self.client.put("/api/symbols/BTCUSDT", json={"strategy": "ma_cross"})
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(system.config["trading"]["symbols"][0]["strategy"], "turtle")
+        self.assertEqual(system.config["trading"]["symbols"][0]["strategy"], "ma_cross")
 
     def test_status_is_503_when_scheduler_stopped(self):
         system = SimpleNamespace(
@@ -2043,7 +1720,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
     def test_delete_cleans_metadata_inside_trade_lock_after_exchange_flat(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = trade_state.TradeState(str(Path(tmp) / "trade_state.json"))
-            state.set_signal_state("BTCUSDT", True)
+            state.mark_candle_processed("BTCUSDT", "ma_cross", "c1")
             state.replace_stop_loss_dates({"BTCUSDT": "2026-07-10"})
             state.mark_position_quarantine("BTCUSDT", "old mismatch")
             trade_lock = threading.Lock()
@@ -2064,7 +1741,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
                 ),
                 config={"trading": {"symbols": [{
                     "name": "BTCUSDT", "enabled": True, "risk_per_trade": 0.01,
-                    "strategy": "turtle",
+                    "strategy": "ma_cross",
                 }]}},
                 persist_config=lambda: True,
                 reload_strategies=Mock(), label="欧易",
@@ -2101,16 +1778,15 @@ class ApiProcessSafetyTests(unittest.TestCase):
             _trade_lock=trade_lock,
             _config_lock=threading.RLock(),
             trade_state=SimpleNamespace(
-                get_pending_signal_execution=lambda _s: None,
                 get_open_position=lambda _s: None,
             ),
             config={
                 "trading": {"symbols": [{
                     "name": "BTCUSDT", "enabled": True,
-                    "risk_per_trade": 0.01, "strategy": "turtle",
+                    "risk_per_trade": 0.01, "strategy": "ma_cross",
                 }]},
                 "strategy": {
-                    "channel_period": 28, "ma_short_period": 7,
+                    "ma_short_period": 7,
                     "ma_long_period": 28, "default_risk_per_trade": 0.01,
                 },
             },
@@ -2123,7 +1799,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
             symbol_resp = self.client.put(
                 "/api/symbols/BTCUSDT", json={"risk_per_trade": 0.02})
             strategy_resp = self.client.put(
-                "/api/strategy_params", json={"channel_period": 30})
+                "/api/strategy_params", json={"ma_short_period": 6})
         self.assertEqual(symbol_resp.status_code, 200)
         self.assertEqual(strategy_resp.status_code, 200)
 

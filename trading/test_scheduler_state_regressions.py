@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -23,7 +23,7 @@ class SignalExecutionStateTest(unittest.TestCase):
             state = TradeState(path)
             state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1',
-                strategy='turtle')
+                strategy='ma_cross')
             first = state.prepare_close_intent(
                 'BTCUSDT', 'CloseIntent123', '信号平仓')
             retry = TradeState(path).prepare_close_intent(
@@ -48,7 +48,7 @@ class SignalExecutionStateTest(unittest.TestCase):
             state = TradeState(path)
             state.add_open_position(
                 'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1',
-                strategy='turtle')
+                strategy='ma_cross')
             state.prepare_close_intent(
                 'BTCUSDT', 'ClosePartial123', '手动平仓')
 
@@ -64,135 +64,6 @@ class SignalExecutionStateTest(unittest.TestCase):
             self.assertEqual(
                 'ClosePartial123', position['last_close_client_order_id'])
 
-    def test_confirmed_signal_and_candle_survive_armed_reset_and_restart(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'trade_state.json')
-            state = TradeState(path)
-            execution = state.prepare_signal_execution(
-                'BTCUSDT', 'turtle', '2026-07-10T00:00:00|short',
-                'T1234567890',
-                payload={'side': 'short', 'entry_price': 90, 'stop_loss_price': 100})
-            self.assertEqual('pending', execution['status'])
-            state.set_pending_signal_order_amount('BTCUSDT', 'T1234567890', 2.5)
-            state.confirm_signal_execution(
-                'BTCUSDT', 'turtle', '2026-07-10T00:00:00|short')
-            state.mark_candle_processed('BTCUSDT', 'turtle', '2026-07-10T00:00:00')
-
-            # 盘中止损只能重置 armed，不能擦掉 candle/signal 幂等键。
-            state.set_signal_state('BTCUSDT', False)
-            reloaded = TradeState(path)
-            metadata = reloaded.get_signal_metadata('BTCUSDT')
-            self.assertFalse(metadata['mid_line_crossed'])
-            self.assertEqual('2026-07-10T00:00:00', metadata['last_processed_candle'])
-            self.assertEqual('confirmed', metadata['signal_execution']['status'])
-            self.assertEqual(2.5, metadata['signal_execution']['planned_position_size'])
-
-    def test_pending_retry_reuses_original_client_id_and_amount(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'trade_state.json')
-            state = TradeState(path)
-            first = state.prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle|long', 'TABC123', payload={'side': 'long'})
-            state.set_pending_signal_order_amount('ETHUSDT', 'TABC123', 1.25)
-            second = TradeState(path).prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle|long', 'TDIFFERENT')
-            self.assertEqual(first['client_order_id'], second['client_order_id'])
-            self.assertEqual(1.25, second['planned_position_size'])
-
-    def test_different_signal_cannot_overwrite_unreconciled_pending_order(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            state.prepare_signal_execution(
-                'ETHUSDT', 'turtle', 'candle-1|long', 'TABC123',
-                payload={'side': 'long'})
-
-            with self.assertRaises(TradeStatePersistenceError):
-                state.prepare_signal_execution(
-                    'ETHUSDT', 'turtle', 'candle-2|short', 'TNEW456',
-                    payload={'side': 'short'})
-
-            pending = state.get_pending_signal_execution('ETHUSDT')
-            self.assertEqual('candle-1|long', pending['signal_id'])
-            self.assertEqual('TABC123', pending['client_order_id'])
-
-    def test_round_trip_deduplication_is_scoped_to_symbol(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            for symbol, client_id in (
-                    ('ETHUSDT', 'TETH123'), ('BTCUSDT', 'TBTC123')):
-                state.prepare_signal_execution(
-                    symbol, 'turtle', 'same-candle|long', client_id,
-                    payload={'side': 'long'})
-                state.finalize_recovered_signal_round_trip(
-                    symbol, 'turtle', 'same-candle|long', 'long',
-                    100.0, 90.0, 1.0, 95.0,
-                    entry_order_ids=[f'open-{symbol}'],
-                    exit_order_ids=[f'close-{symbol}'])
-
-            trades = state.get_closed_trades()
-            self.assertEqual(2, len(trades))
-            self.assertEqual({'BTCUSDT', 'ETHUSDT'}, {
-                trade['symbol'] for trade in trades})
-
-    def test_orphan_pending_recovery_bypasses_stale_risk_inputs_and_records_round_trip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system = TradingSystem.__new__(TradingSystem)
-            system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            execution = system.trade_state.prepare_signal_execution(
-                'BTCUSDT', 'turtle', 'candle-1|long', 'TRECOVER123',
-                payload={
-                    'side': 'long', 'candle_id': 'candle-1',
-                    'entry_price': 100.0, 'stop_loss_price': 90.0,
-                })
-            system.trade_state.set_pending_signal_order_amount(
-                'BTCUSDT', 'TRECOVER123', 1.0)
-            execution = system.trade_state.get_pending_signal_execution('BTCUSDT')
-            no_balance = Mock(side_effect=AssertionError('恢复旧单不得查询余额'))
-            no_rounding = Mock(side_effect=AssertionError('恢复旧单不得重算数量'))
-            system.exchange_api = SimpleNamespace(
-                to_ccxt_symbol=lambda symbol: symbol,
-                get_last_price=lambda _symbol: 80.0,  # 已跌穿原止损
-                get_balance=no_balance,
-                round_quantity=no_rounding,
-                get_quantity_precision=no_rounding,
-                open_position=Mock(return_value={
-                    'id': 'open-old', 'average': 100.0, 'amount': 1.0,
-                    'confirmed': True,
-                    'fee': {'cost': 0.04, 'currency': 'USDT'},
-                }),
-                close_position=Mock(return_value={
-                    'id': 'close-recovery', 'average': 80.0, 'amount': 1.0,
-                    'remaining_amount': 0.0, 'fully_closed': True,
-                    'fee': {'cost': 0.03, 'currency': 'USDT'},
-                }),
-                create_stop_loss_order=Mock(),
-            )
-            system.config = {
-                'strategy': {'default_risk_per_trade': 0.01},
-                'trading': {'symbols': [{
-                    'name': 'BTCUSDT', 'enabled': True,
-                    'strategy': 'turtle', 'risk_per_trade': 0.01,
-                }]},
-            }
-            system.risk_manager = SimpleNamespace(
-                account_equity=1000.0, risk_per_trade=0.01,
-                calculate_position_size=Mock(
-                    side_effect=AssertionError('恢复旧单不得重算风险')))
-            system.notifier = SimpleNamespace(notify_error=Mock())
-            system._pending_trade_open_notifications = []
-
-            self.assertTrue(system._resume_pending_turtle_execution(
-                'BTCUSDT', execution))
-
-            self.assertIsNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
-            self.assertIsNone(system.trade_state.get_open_position('BTCUSDT'))
-            closed = system.trade_state.get_closed_trades()
-            self.assertEqual(1, len(closed))
-            self.assertTrue(closed[0]['recovered_round_trip'])
-            self.assertEqual('actual', closed[0]['fee_source'])
-            system.exchange_api.create_stop_loss_order.assert_not_called()
-            no_balance.assert_not_called()
-            no_rounding.assert_not_called()
 
 
 class OpenIntentStateTest(unittest.TestCase):
@@ -472,234 +343,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertEqual(1, len(system.trade_state.get_closed_trades()))
 
 
-class FlatPendingAdjudicationTest(unittest.TestCase):
-    def _system(self, tmp, *, current_price=100.0, finder_result=None,
-                finder_error=None, contract_size=0.1):
-        system = TradingSystem.__new__(TradingSystem)
-        system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-        finder = Mock(return_value=finder_result)
-        if finder_error is not None:
-            finder.side_effect = finder_error
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=lambda symbol: symbol,
-            get_position=Mock(return_value=None),
-            get_last_price=Mock(return_value=current_price),
-            find_existing_open_order=finder,
-            _get_contract_size=lambda _symbol: contract_size,
-        )
-        system.config = {
-            'strategy': {'default_risk_per_trade': 0.01},
-            'trading': {'symbols': [{
-                'name': 'BTCUSDT', 'enabled': True,
-                'strategy': 'turtle', 'risk_per_trade': 0.01,
-            }]},
-        }
-        system.notifier = SimpleNamespace(notify_error=Mock())
-        return system, finder
-
-    @staticmethod
-    def _prepare(system, *, planned=None, side='long', stop=90.0):
-        system.trade_state.prepare_signal_execution(
-            'BTCUSDT', 'turtle', 'candle-1|long', 'TPENDING1',
-            payload={
-                'side': side, 'candle_id': 'candle-1',
-                'entry_price': 100.0, 'stop_loss_price': stop,
-            })
-        if planned is not None:
-            system.trade_state.set_pending_signal_order_amount(
-                'BTCUSDT', 'TPENDING1', planned)
-        return system.trade_state.get_pending_signal_execution('BTCUSDT')
-
-    def test_missing_planned_and_expired_stop_atomically_consumes_without_order_query(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, finder = self._system(tmp, current_price=80.0)
-            self._prepare(system, planned=None, stop=90.0)
-
-            self.assertEqual(set(), system._reconcile_all_pending_turtle_executions('test'))
-
-            finder.assert_not_called()  # planned 不存在证明尚未进入发单步骤
-            self.assertIsNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
-            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
-            self.assertEqual('unsubmitted_expired',
-                             metadata['signal_execution']['resolution'])
-            self.assertEqual('candle-1', metadata['last_processed_candle'])
-            self.assertFalse(metadata['mid_line_crossed'])
-
-    def test_explicit_order_not_found_and_valid_stop_reuses_original_client_id(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, finder = self._system(tmp, current_price=110.0, finder_result=None)
-            execution = self._prepare(system, planned=1.0, stop=90.0)
-            calls = []
-
-            def execute(symbol, side, entry, stop, config, **kwargs):
-                calls.append(kwargs.get('client_order_id'))
-                system.trade_state.add_open_position(
-                    symbol, side, 110.0, 1.0, stop, 'stop-1', strategy='turtle')
-                return {'status': 'opened'}
-
-            system._execute_open = execute
-            self.assertTrue(system._adjudicate_flat_pending_turtle('BTCUSDT', execution))
-
-            finder.assert_called_once_with('BTCUSDT', 'long', 1.0, 'TPENDING1')
-            self.assertEqual(['TPENDING1'], calls)
-            self.assertIsNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
-            self.assertEqual('candle-1',
-                             system.trade_state.get_signal_metadata('BTCUSDT')['last_processed_candle'])
-
-    def test_unsubmitted_pending_is_consumed_when_symbol_retired(self):
-        retired_configs = (
-            [],
-            [{'name': 'BTCUSDT', 'enabled': False,
-              'strategy': 'turtle', 'risk_per_trade': 0.01}],
-        )
-        for symbols in retired_configs:
-            with self.subTest(symbols=symbols), tempfile.TemporaryDirectory() as tmp:
-                system, finder = self._system(
-                    tmp, current_price=110.0, finder_result=None)
-                execution = self._prepare(system, planned=1.0, stop=90.0)
-                system.config['trading']['symbols'] = symbols
-                system._execute_open = Mock(
-                    side_effect=AssertionError('退池品种不得恢复开仓'))
-
-                self.assertTrue(system._adjudicate_flat_pending_turtle(
-                    'BTCUSDT', execution))
-
-                finder.assert_called_once_with(
-                    'BTCUSDT', 'long', 1.0, 'TPENDING1')
-                system._execute_open.assert_not_called()
-                system.exchange_api.get_last_price.assert_not_called()
-                self.assertIsNone(
-                    system.trade_state.get_pending_signal_execution('BTCUSDT'))
-                metadata = system.trade_state.get_signal_metadata('BTCUSDT')
-                self.assertEqual(
-                    'unsubmitted_retired',
-                    metadata['signal_execution']['resolution'])
-
-    def test_stale_order_not_found_never_reopens_an_ambiguous_old_signal(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, finder = self._system(tmp, current_price=110.0, finder_result=None)
-            execution = self._prepare(system, planned=1.0, stop=90.0)
-            execution['updated_at'] = (datetime.now() - timedelta(
-                hours=2, seconds=1)).isoformat()
-            system._execute_open = Mock(
-                side_effect=AssertionError('过期 OrderNotFound 不能证明从未发单'))
-
-            self.assertFalse(system._adjudicate_flat_pending_turtle(
-                'BTCUSDT', execution))
-
-            finder.assert_called_once_with('BTCUSDT', 'long', 1.0, 'TPENDING1')
-            system._execute_open.assert_not_called()
-            self.assertIsNotNone(
-                system.trade_state.get_pending_signal_execution('BTCUSDT'))
-            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
-
-    def test_terminal_zero_fill_is_consumed_without_reopening(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            order = {'id': 'old-1', 'status': 'canceled', 'filled': 0.0,
-                     'amount': 10.0, 'remaining': 10.0}
-            system, _finder = self._system(tmp, finder_result=order)
-            execution = self._prepare(system, planned=1.0)
-            system._execute_open = Mock(side_effect=AssertionError('terminal 零成交不得重开'))
-
-            self.assertTrue(system._adjudicate_flat_pending_turtle('BTCUSDT', execution))
-
-            system._execute_open.assert_not_called()
-            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
-            self.assertEqual('terminal_zero_fill',
-                             metadata['signal_execution']['resolution'])
-
-    def test_terminal_fill_with_flat_exchange_records_conservative_round_trip(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            order = {
-                'id': 'old-fill', 'status': 'closed', 'filled': 4.0,
-                'amount': 10.0, 'remaining': 0.0, 'average': 100.0,
-                'fee': {'cost': 0.04, 'currency': 'USDT'},
-            }
-            system, _finder = self._system(
-                tmp, current_price=80.0, finder_result=order, contract_size=0.1)
-            execution = self._prepare(system, planned=1.0, stop=90.0)
-
-            self.assertTrue(system._adjudicate_flat_pending_turtle('BTCUSDT', execution))
-
-            closed = system.trade_state.get_closed_trades()
-            self.assertEqual(1, len(closed))
-            self.assertEqual(0.4, closed[0]['position_size'])
-            self.assertEqual(80.0, closed[0]['exit_price'])  # long 取 stop/current 较低者
-            self.assertTrue(closed[0]['recovered_round_trip'])
-            system.notifier.notify_error.assert_called_once()
-
-    def test_terminal_fill_recovers_deterministic_compensation_vwap_and_fee(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            order = {
-                'id': 'old-fill', 'status': 'closed', 'filled': 4.0,
-                'amount': 4.0, 'remaining': 0.0, 'average': 100.0,
-                'fee': {'cost': 0.04, 'currency': 'USDT'},
-            }
-            system, _finder = self._system(
-                tmp, current_price=80.0, finder_result=order,
-                contract_size=0.1)
-            execution = self._prepare(system, planned=0.4, stop=90.0)
-            system._recover_flat_compensation_evidence = Mock(return_value={
-                'id': 'rollback-real', 'ids': ['rollback-real'],
-                'average': 97.0, 'fully_closed': True,
-                'fee': {'cost': 0.03, 'currency': 'USDT'},
-            })
-
-            self.assertTrue(system._adjudicate_flat_pending_turtle(
-                'BTCUSDT', execution))
-
-            closed = system.trade_state.get_closed_trades()[-1]
-            self.assertEqual(97.0, closed['exit_price'])
-            self.assertEqual(0.03, closed['exit_fee'])
-            self.assertEqual(['rollback-real'], closed['exit_order_ids'])
-            self.assertEqual('actual', closed['fee_source'])
-
-    def test_recovered_round_trip_already_in_archive_is_not_duplicated(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            order = {
-                'id': 'old-fill', 'status': 'closed', 'filled': 4.0,
-                'amount': 10.0, 'remaining': 0.0, 'average': 100.0,
-            }
-            system, _finder = self._system(
-                tmp, current_price=80.0, finder_result=order,
-                contract_size=0.1)
-            execution = self._prepare(system, planned=1.0, stop=90.0)
-            archived = {
-                'symbol': 'BTCUSDT', 'side': 'long', 'strategy': 'turtle',
-                'entry_price': 100.0, 'exit_price': 80.0,
-                'position_size': 0.4, 'stop_loss_price': 90.0,
-                'signal_id': execution['signal_id'],
-                'client_order_id': execution['client_order_id'],
-                'recovered_round_trip': True,
-            }
-            with open(system.trade_state.archive_file, 'w', encoding='utf-8') as handle:
-                json.dump([archived], handle)
-
-            self.assertTrue(system._adjudicate_flat_pending_turtle(
-                'BTCUSDT', execution))
-
-            self.assertEqual(1, len(system.trade_state.get_closed_trades()))
-            self.assertIsNone(
-                system.trade_state.get_pending_signal_execution('BTCUSDT'))
-
-    def test_uncertain_old_order_query_keeps_pending_and_quarantines(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, _finder = self._system(
-                tmp, finder_error=RuntimeError('network unknown'))
-            self._prepare(system, planned=1.0)
-
-            self.assertEqual(
-                {'BTCUSDT'}, system._reconcile_all_pending_turtle_executions('test'))
-
-            self.assertIsNotNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
-            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
-
-    def test_pending_metadata_is_not_pruned_after_symbol_removed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, _finder = self._system(tmp)
-            self._prepare(system)
-            self.assertEqual([], system.trade_state.prune_inactive_symbol_metadata([]))
-            self.assertIsNotNone(system.trade_state.get_pending_signal_execution('BTCUSDT'))
 
 
 class PositionReconciliationStateTest(unittest.TestCase):
@@ -871,35 +514,35 @@ class MaCatchupStateTest(unittest.TestCase):
             self.assertEqual('long', signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
 
-    def test_turtle_missing_marker_requires_rebaseline(self):
+    def test_missing_marker_requires_rebaseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
             rebaseline, previous, current, gap = (
-                system._history_requires_rebaseline('BTCUSDT', 'turtle', frame))
+                system._history_requires_rebaseline('BTCUSDT', 'ma_cross', frame))
 
             self.assertTrue(rebaseline)
             self.assertIsNone(previous)
             self.assertEqual('t5', current)
             self.assertIsNone(gap)
 
-    def test_turtle_large_gap_requires_rebaseline_but_short_gap_does_not(self):
+    def test_large_gap_requires_rebaseline_but_short_gap_does_not(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
-            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't1')
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
 
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'turtle', frame)
+                'BTCUSDT', 'ma_cross', frame)
             self.assertTrue(rebaseline)
             self.assertEqual(4, gap)
 
-            system.trade_state.mark_candle_processed('BTCUSDT', 'turtle', 't2')
+            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't2')
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'turtle', frame)
+                'BTCUSDT', 'ma_cross', frame)
             self.assertFalse(rebaseline)
             self.assertEqual(3, gap)
 
@@ -1013,7 +656,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't3')
         system.config = {
             'strategy': {
-                'default_risk_per_trade': 0.01, 'channel_period': 2,
+                'default_risk_per_trade': 0.01,
                 'ma_short_period': 2, 'ma_long_period': 2, 'ma_stop_period': 2,
             },
             'trading': {'symbols': [{
@@ -1220,7 +863,7 @@ class ConfigSecretPersistenceTest(unittest.TestCase):
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump({
                     'okx': {'sandbox': True},
-                    'strategy': {'channel_period': 28, 'default_risk_per_trade': 0.01},
+                    'strategy': {'default_risk_per_trade': 0.01},
                     'trading': {'symbols': []},
                 }, handle)
             system = TradingSystem.__new__(TradingSystem)
@@ -1251,7 +894,7 @@ class ConfigSecretPersistenceTest(unittest.TestCase):
                         'password': 'disk-pass',
                     },
                     'strategy': {
-                        'channel_period': 28, 'default_risk_per_trade': 0.01,
+                        'default_risk_per_trade': 0.01,
                     },
                     'trading': {'symbols': []},
                 }, handle)

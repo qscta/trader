@@ -28,7 +28,6 @@ _STUB_SPECS = (
     ('apscheduler', {}),
     ('apscheduler.schedulers', {}),
     ('apscheduler.schedulers.background', {'BackgroundScheduler': Dummy}),
-    ('turtle_strategy', {'TurtleStrategy': Dummy}),
     ('ma_cross_strategy', {'MaCrossStrategy': Dummy}),
     ('risk_manager', {'RiskManager': Dummy}),
     ('dingtalk_notifier', {'DingTalkNotifier': Dummy}),  # 避免 requests

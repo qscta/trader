@@ -28,7 +28,7 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
     def _state(self, temp_dir):
         state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
         state.add_open_position(
-            'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='turtle')
+            'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='ma_cross')
         return state
 
     def test_partial_close_rolls_back_memory_when_intent_check_fails(self):
@@ -133,11 +133,11 @@ class AddOpenPositionGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
             state.add_open_position(
-                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1', strategy='turtle')
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-1', strategy='ma_cross')
             with self.assertRaises(TradeStatePersistenceError):
                 state.add_open_position(
                     'BTCUSDT', 'short', 200.0, 2.0, 210.0, 'stop-2',
-                    strategy='turtle')
+                    strategy='ma_cross')
             position = state.get_open_position('BTCUSDT')
             self.assertEqual('long', position['side'])
             self.assertEqual(100.0, position['entry_price'])
@@ -178,7 +178,7 @@ class ForceRuntimeInputBoundaryTest(unittest.TestCase):
     def _state(self, temp_dir):
         state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
         state.add_open_position(
-            'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='turtle')
+            'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='ma_cross')
         return state
 
     def test_force_runtime_stop_update_rejects_nan_and_bad_types(self):

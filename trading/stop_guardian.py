@@ -84,12 +84,6 @@ class StopGuardianMixin:
             resume_intent = getattr(self, '_resume_open_intent_position', None)
             if intent and callable(resume_intent) and resume_intent(symbol, intent):
                 continue
-            pending_getter = getattr(
-                self.trade_state, 'get_pending_signal_execution', None)
-            pending = pending_getter(symbol) if callable(pending_getter) else None
-            if (pending and pending.get('strategy') == 'turtle' and
-                    self._resume_pending_turtle_execution(symbol, pending)):
-                continue
             self._quarantine_position_mismatch(
                 symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
 
@@ -113,9 +107,8 @@ class StopGuardianMixin:
             'name': symbol,
             'enabled': True,
             'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-            # 品种已删但仍有持仓时，与日线主检查保持一致：优先用持仓记录的策略，
-            # 否则 ma_cross 持仓会被错当 turtle，漏记 T+1 止损限制
-            'strategy': position.get('strategy') or 'turtle'
+            # 品种已删但仍有持仓时，与日线主检查保持一致：用持仓记录的策略托管
+            'strategy': position.get('strategy') or 'ma_cross'
         })
         _strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
         strategy_name = self._get_strategy_display_name(strategy_type)
@@ -160,11 +153,7 @@ class StopGuardianMixin:
             logger.warning(f"{symbol} [{strategy_name}] 盘中止损巡检已发通知，但本地状态落盘失败，跳过后续状态修正")
             return
 
-        if strategy_type == 'turtle':
-            self.trade_state.set_signal_state(symbol, False)
-            logger.info(f"{symbol} [海龟] 盘中止损巡检已将开仓资格重置，等待下次日检按已收盘日线重新判定")
-        else:
-            logger.info(f"{symbol} [双均线] 盘中止损巡检已与平仓同事务记录 T+1 限制")
+        logger.info(f"{symbol} [双均线] 盘中止损巡检已与平仓同事务记录 T+1 限制")
 
     def _ensure_stop_order_alive(self, symbol, ccxt_symbol, position, strategy_name):
         """止损自愈：本地与交易所都有仓时，确认止损单仍挂在交易所；丢失则按本地止损价补挂。
@@ -481,7 +470,7 @@ class StopGuardianMixin:
         会错杀未来新仓，不可确认则标记残留阻断该品种开仓。
         返回 (closed_position, state_saved, stop_cleared)；closed 为 None 时调用方直接放弃。
         """
-        effective_strategy = strategy_type or position.get('strategy') or 'turtle'
+        effective_strategy = strategy_type or position.get('strategy') or 'ma_cross'
         config = getattr(self, 'config', None)
         pool = (config.get('trading', {}).get('symbols', [])
                 if isinstance(config, dict) else [])
@@ -504,8 +493,7 @@ class StopGuardianMixin:
             if effective_strategy == 'ma_cross' and not retired_from_pool else None)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, exit_price, context, stop_loss_date=stop_loss_date,
-            stop_cleanup_pending=True,
-            reset_turtle_signal=(effective_strategy == 'turtle'))
+            stop_cleanup_pending=True)
         if not closed_position:
             return None, False, False
         if stop_loss_date is not None:
@@ -526,7 +514,6 @@ class StopGuardianMixin:
                                                  exit_order_ids=None,
                                                  stop_loss_date=None,
                                                  stop_cleanup_pending=False,
-                                                 reset_turtle_signal=False,
                                                  close_intent_client_id=None):
         close_kwargs = {}
         if exit_fee is not None or exit_order_ids:
@@ -538,8 +525,6 @@ class StopGuardianMixin:
             close_kwargs['stop_loss_date'] = stop_loss_date
         if stop_cleanup_pending:
             close_kwargs['stop_cleanup_pending'] = True
-        if reset_turtle_signal:
-            close_kwargs['reset_turtle_signal'] = True
         if close_intent_client_id is not None:
             close_kwargs['close_intent_client_id'] = close_intent_client_id
         try:
