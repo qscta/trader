@@ -347,6 +347,25 @@ class StartupSmokeTest(unittest.TestCase):
                     system.config['scheduler']['stop_loss_scan_interval_minutes'], interval)
 
 
+class StartupSyncFailureAlertTest(unittest.TestCase):
+    """启动对账失败：拒绝启动前必须发出钉钉告警——裸 traceback 静默死亡
+    是本仓库定义的最贵故障模式，构造三阶段（配置/权益/对账）须同标准。"""
+
+    def test_sync_failure_alerts_before_refusing_to_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    patch.object(main.TradingSystem, 'sync_positions_on_startup',
+                                 side_effect=RuntimeError('sync boom')), \
+                    patch.object(main, 'DingTalkNotifier') as notifier_cls:
+                with self.assertRaises(RuntimeError):
+                    TradingSystem(config_file=path)
+        # 非 UTC+8 环境跑测试时还会有时区自检告警，故按内容匹配而非次数。
+        messages = [c.args[0] for c in
+                    notifier_cls.return_value.notify_error.call_args_list]
+        self.assertTrue(any('启动持仓对账失败' in m for m in messages))
+
+
 class StartupEquityParsingTest(unittest.TestCase):
     """启动权益必须是有限非负数：NaN 住进 RiskManager 会静默禁用
     pending 恢复分支的成交后风险校验（NaN 与 0 比较恒 False）。"""
