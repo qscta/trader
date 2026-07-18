@@ -33,8 +33,8 @@ def private_file_exists(filepath):
     return os.path.lexists(filepath)
 
 
-def open_private_text_file(filepath):
-    """安全打开已有敏感 JSON，并把权限收紧为 0600。
+def open_private_text_file(filepath, adjust_permissions=True):
+    """安全打开已有敏感 JSON；运行时可把权限收紧为 0600。
 
     lstat + O_NOFOLLOW + fstat inode 复核同时挡住符号链接与检查/打开
     窗口的替换；所有者不是当前用户时拒绝读取，不对别人的文件
@@ -57,7 +57,11 @@ def open_private_text_file(filepath):
         current_uid = os.geteuid() if hasattr(os, 'geteuid') else os.getuid()
         if info.st_uid != current_uid:
             raise PermissionError(f'敏感状态不属于当前用户，拒绝读取: {path}')
-        if stat.S_IMODE(info.st_mode) != 0o600:
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != 0o600:
+            if not adjust_permissions:
+                raise PermissionError(
+                    f'敏感状态权限必须为 0600（当前 {mode:04o}）: {path}')
             os.fchmod(fd, 0o600)
         stream = os.fdopen(fd, 'r', encoding='utf-8')
         fd = None

@@ -443,7 +443,7 @@ async function addSymbol() {
 }
 
 async function deleteSymbol(symbol) {
-    if (!confirm(`确认从【欧易】删除交易对 ${symbol}？\n删除后将从品种池移除，不再新开仓；如已有持仓，系统会继续按持仓记录的策略跟踪、更新止损并等待平仓。`)) return;
+    if (!confirm(`确认从【欧易】删除交易对 ${symbol}？\n删除后将从品种池移除，不再新开仓；如已有持仓，系统会继续按双均线规则保护并等待平仓。`)) return;
     try {
         const res = await authFetch('/api/symbols/' + symbol, { method: 'DELETE' });
         const data = await res.json();

@@ -95,7 +95,7 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
 | 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
 | 当前提交在模拟盘跑通上述普通全链路 + long/short 两个 `--fire` | 张数换算 / 止损触发 / 撤单 / 单向模式只能真连交易所自证；超时未触发属“不确定”，必须调参重试 |
-| 停服务后运行 `migrate_single_strategy.py` 干跑及 `--apply`，再次干跑显示通过 | 移除品种级冗余分派字段、收敛信号元数据；未收口意图或不兼容持仓会阻断部署 |
+| 停服务后运行 `migrate_single_strategy.py` 干跑及 `--apply`，再次干跑显示通过 | 移除品种级冗余分派字段、收敛信号元数据；未收口意图、旧版 pending 执行或不兼容持仓会阻断部署；中断事务存在时 runner 拒启，干跑只报告，显式 `--apply` 才整组恢复并重迁移 |
 
 `FLASK_SECRET_KEY` 可用 `python3 -c 'import secrets; print(secrets.token_hex(32))'`
 生成；生成后仅放在部署环境的 secret manager / 环境变量中。

@@ -143,27 +143,17 @@ class StopIdReuseDecisionLogicTest(unittest.TestCase):
 
 class StopIdReuseCliGuardTest(unittest.TestCase):
     def test_stop_id_reuse_requires_explicit_side(self):
-        """--stop-id-reuse 与 --side both 组合：main() 必须在下单前拒绝。"""
-        import argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('symbol', nargs='?', default='BTCUSDT')
-        ap.add_argument('coin', nargs='?', type=float, default=0.0)
-        ap.add_argument('--side', choices=['long', 'short', 'both'], default='both')
-        ap.add_argument('--stop-id-reuse', action='store_true')
-        args = ap.parse_args(['BTCUSDT', '0.1', '--stop-id-reuse'])
-        self.assertTrue(args.stop_id_reuse and args.side == 'both')  # 复现 main() 里被拒绝的组合
+        """--stop-id-reuse 与 --side both 组合必须返回非零。"""
+        with patch.object(sys, 'argv', [
+                'verify_okx.py', 'BTCUSDT', '0.1', '--stop-id-reuse']):
+            self.assertEqual(2, verify_okx.main())
 
     def test_fire_and_stop_id_reuse_are_mutually_exclusive(self):
-        """--fire 与 --stop-id-reuse 同时给出：main() 必须拒绝（两个独立试验）。"""
-        import argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('symbol', nargs='?', default='BTCUSDT')
-        ap.add_argument('coin', nargs='?', type=float, default=0.0)
-        ap.add_argument('--side', choices=['long', 'short', 'both'], default='both')
-        ap.add_argument('--fire', action='store_true')
-        ap.add_argument('--stop-id-reuse', action='store_true')
-        args = ap.parse_args(['BTCUSDT', '0.1', '--side', 'long', '--fire', '--stop-id-reuse'])
-        self.assertTrue(args.fire and args.stop_id_reuse)  # 复现 main() 里被拒绝的组合
+        """--fire 与 --stop-id-reuse 同时给出必须返回非零。"""
+        with patch.object(sys, 'argv', [
+                'verify_okx.py', 'BTCUSDT', '0.1', '--side', 'long',
+                '--fire', '--stop-id-reuse']):
+            self.assertEqual(2, verify_okx.main())
 
 
 if __name__ == '__main__':

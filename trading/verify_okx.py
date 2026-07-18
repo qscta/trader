@@ -42,6 +42,7 @@
     约束通常不区分两者，但如需完全确证，可在同参数 --fire 触发后手工加测。
 """
 import os
+import sys
 import time
 import argparse
 import math
@@ -491,24 +492,24 @@ def main():
 
     if args.fire and args.stop_id_reuse:
         print('❌ --fire 与 --stop-id-reuse 是两个独立试验，一次只能跑一个')
-        return
+        return 2
     if args.fire and args.side == 'both':
         print('❌ --fire 模式需要显式指定单一方向：--side long 或 --side short')
-        return
+        return 2
     if args.stop_id_reuse and args.side == 'both':
         print('❌ --stop-id-reuse 模式需要显式指定单一方向：--side long 或 --side short')
-        return
+        return 2
 
     cfg = load_cfg()
     if not (cfg['apiKey'] and cfg['secret'] and cfg['password']):
         print('请先设置 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE（或写进 config.json）')
-        return
+        return 2
 
     print(f"== OKX 验证 {'[模拟盘 DEMO]' if cfg['sandbox'] else '[!! 实盘 LIVE !!]'} "
           f"symbol={args.symbol} coin={args.coin} side={args.side} "
           f"margin={cfg['margin_mode']} lev={cfg['leverage']} ==")
     if not cfg['sandbox'] and input("当前是实盘，确认继续？输入 yes：").strip() != 'yes':
-        return
+        return 1
 
     api = OkxApi(cfg)
     ccxt_symbol = api.to_ccxt_symbol(args.symbol)
@@ -518,14 +519,24 @@ def main():
     mode_ok = check_position_mode(api)
     if mode_ok is not True:
         print("❌ 无法确认账户处于 net_mode，验证脚本拒绝继续。请先修正/确认持仓模式。")
-        return
+        return 1
 
     bal = api.get_balance()
-    print("USDT 总额:", (bal or {}).get('total', {}).get('USDT'))
+    total = (bal or {}).get('total')
+    usdt_total = total.get('USDT') if isinstance(total, dict) else None
+    try:
+        usdt_total = float(usdt_total)
+    except (TypeError, ValueError):
+        usdt_total = None
+    if (usdt_total is None or not math.isfinite(usdt_total) or
+            usdt_total < 0):
+        print('❌ 无法确认有限非负的 USDT 余额，验证门禁拒绝继续')
+        return 1
+    print("USDT 总额:", usdt_total)
 
     if args.coin <= 0:
         print("\n未指定开仓币数，仅做只读检查，结束。")
-        return
+        return 0
 
     if args.fire:
         result = run_fire_test(api, ccxt_symbol, args.coin, args.side,
@@ -536,8 +547,8 @@ def main():
         elif result is False:
             print("⚠️ 实弹触发验证发现问题，回看上面日志，请立即人工核查交易所仓位")
         else:
-            print("⏱️ 本次未获得触发证据（超时或前置步骤失败），非失败，可调参数重试")
-        return
+            print("⏱️ 本次未获得触发证据（超时或前置步骤失败），门禁未通过，可调参数重试")
+        return 0 if result is True else 1
 
     if args.stop_id_reuse:
         result = run_stop_id_reuse_test(api, ccxt_symbol, args.coin, args.side)
@@ -548,8 +559,8 @@ def main():
             print("🔴 复用验证未通过：OKX 拒绝终态后复用同一 algoClOrdId。系统在该场景会大声失败"
                   "（回滚/告警+隔离，不丢钱），但请知悉：撤销后按相同参数补挂会需要人工介入")
         else:
-            print("⏱️ 本次未获得复用证据（前置步骤未走通），非失败，可重试")
-        return
+            print("⏱️ 本次未获得复用证据（前置步骤未走通），门禁未通过，可重试")
+        return 0 if result is True else 1
 
     sides = ['long', 'short'] if args.side == 'both' else [args.side]
     results = {}
@@ -561,7 +572,8 @@ def main():
     for s, r in results.items():
         print(f"  {s}: {'✓ 通过' if r else '⚠️ 有问题，回看上面日志'}")
     print("「触发后是否只减仓不反向」可用 --fire 模式实测（见文件顶部说明）。")
+    return 0 if all(result is True for result in results.values()) else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

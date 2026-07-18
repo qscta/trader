@@ -119,7 +119,8 @@ class MaCrossTPlusOneTests(unittest.TestCase):
         system._save_stop_loss_dates = Mock()
         system._execute_open = Mock()
         # _execute_open 后主流程会确认持仓已形成，返回非 None 避免触发 missing-position 告警
-        system.trade_state = SimpleNamespace(get_open_position=Mock(return_value={"symbol": "ETHUSDT"}))
+        system.trade_state = SimpleNamespace(get_open_position=Mock(
+            return_value={"symbol": "ETHUSDT", "side": "long"}))
         system.notifier = SimpleNamespace(notify_signal_missed=Mock(), notify_error=Mock())
         system.ma_cross_strategy = SimpleNamespace(check_reentry_condition=Mock())
         return system
@@ -166,6 +167,22 @@ class MaCrossTPlusOneTests(unittest.TestCase):
 
         system._execute_open.assert_called_once()
         self.assertIn("ETHUSDT", system.stop_loss_dates)          # 标记保留
+        system.notifier.notify_signal_missed.assert_called_once()
+
+    def test_next_day_reentry_rejects_wrong_side_position(self):
+        system = self.make_system()
+        system.trade_state.get_open_position = Mock(
+            return_value={'symbol': 'ETHUSDT', 'side': 'short'})
+        system.stop_loss_dates['ETHUSDT'] = '2000-01-01'
+        system.ma_cross_strategy.check_reentry_condition.return_value = (
+            True, 'long', {
+                'current_close': 100, 'lower_stop': 90, 'upper_stop': 110})
+
+        outcome = system.handle_no_position_ma_cross(
+            'ETHUSDT', {'action': None}, {'name': 'ETHUSDT'}, df=object())
+
+        self.assertEqual('t1_reentry_failed', outcome)
+        self.assertIn('ETHUSDT', system.stop_loss_dates)
         system.notifier.notify_signal_missed.assert_called_once()
 
     def test_initial_open_failure_does_not_fake_tplus1_stop(self):

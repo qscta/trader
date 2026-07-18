@@ -18,6 +18,7 @@ from datetime import date
 logger = logging.getLogger(__name__)
 
 NO_POSITION_T1_BLOCKED = 't1_blocked'
+NO_POSITION_T1_REENTRY_FAILED = 't1_reentry_failed'
 
 
 class SignalHandlersMixin:
@@ -84,7 +85,8 @@ class SignalHandlersMixin:
                         stop_loss_price = reentry_signal['upper_stop']
                     logger.info(f"{symbol} [双均线] T+1重入: 方向={side}, EMA仍然{'看多' if side == 'long' else '看空'}")
                     self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
-                    if self.trade_state.get_open_position(symbol):
+                    post_position = self.trade_state.get_open_position(symbol)
+                    if post_position and post_position.get('side') == side:
                         # 重入成功：解除 T+1 标记，回归常规「永远在市」
                         self.clear_stop_loss(symbol)
                         return
@@ -98,7 +100,7 @@ class SignalHandlersMixin:
                             '双均线 T+1 重入开仓未成功，已保留标记次日按 EMA 方向重试，请复核交易所与日志'
                         )
                         logger.warning(f"{symbol} [双均线] T+1 重入开仓未成功，保留标记次日重试")
-                        return
+                        return NO_POSITION_T1_REENTRY_FAILED
                 else:
                     # 只有两条 EMA 精确相等时才会进入此分支；方向并未“改变”。
                     # 保留 T+1 标记，下一根已收盘 K 线再按明确 EMA 方向重试。

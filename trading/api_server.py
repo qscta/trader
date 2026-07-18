@@ -1074,17 +1074,17 @@ def instant_open():
                 return jsonify({'error': f'{symbol_name} K线数据不足：双均线至少需要 '
                                          f'{required_closed} 根已收盘K线，当前仅 {len(df)} 根'}), 400
 
-            fresh, latest_candle_date, minimum_candle_date = (
+            fresh, latest_candle_date, expected_candle_date = (
                 system._daily_candle_is_fresh(
                     df, datetime.now().date().isoformat()))
             if not fresh:
                 logger.critical(
                     f'{symbol_name} 即时开仓拒绝陈旧日 K: latest={latest_candle_date}, '
-                    f'minimum={minimum_candle_date}')
+                    f'expected={expected_candle_date}')
                 return jsonify({
                     'error': f'{symbol_name} 最新已收盘日K陈旧，禁止即时开仓',
                     'latest_candle_date': str(latest_candle_date),
-                    'minimum_candle_date': str(minimum_candle_date),
+                    'expected_candle_date': str(expected_candle_date),
                 }), 409
 
             try:

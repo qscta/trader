@@ -171,7 +171,7 @@ class ExchangeApi:
         return 3
 
     @staticmethod
-    def validate_ohlcv(ohlcv, symbol=''):
+    def validate_ohlcv(ohlcv, symbol='', timeframe=None):
         """统一 K 线边界校验：任何一根坏蜡烛都整批拒绝（抛 ValueError）。
 
         服务所有行情入口（日检、即时开仓、API 展示）：时间戳必须严格递增
@@ -199,6 +199,11 @@ class ExchangeApi:
                 raise ValueError(
                     f'{symbol} 第{index}根 K 线时间戳未严格递增: '
                     f'{prev_ts} -> {ts}（重复或乱序）')
+            if (prev_ts is not None and timeframe == '1d' and
+                    ts - prev_ts != 86_400_000):
+                raise ValueError(
+                    f'{symbol} 第{index}根日 K 与前一根不连续: '
+                    f'{prev_ts} -> {ts}（必须恰好相隔 86400000ms）')
             prev_ts = ts
             prices = {}
             for name, value in (('open', open_), ('high', high),
@@ -273,7 +278,7 @@ class ExchangeApi:
         # 一律在适配层拒绝，绝不让 EMA 在污染数据上算出“有效”信号。
         return self.validate_ohlcv(
             self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested),
-            symbol)
+            symbol, timeframe=timeframe)
 
     @retry_on_network_error(max_retries=3)
     def get_balance(self):

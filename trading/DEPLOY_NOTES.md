@@ -34,9 +34,20 @@ python3 migrate_single_strategy.py --data-dir .
 
 - 缺少 `config.json` 或 `trade_state.json`；
 - JSON 损坏、权限/符号链接不安全或规范化后 schema 非法；
-- 存在未收口 `open_intent`；
+- 存在未收口 `open_intent` 或旧版 `signal_execution=pending`；
 - 配置带不兼容标签，或在途持仓无法证明属于双均线；平仓史书格式损坏；
 - 备份、写入或失败回滚任一步骤不能确认完成。
+
+脚本要求 `config.json` 与账本位于同一目录；`--data-dir` 最后一级目录条目不得是
+符号链接或允许组/其他用户写入，敏感 JSON 必须预先为 `0600`；干跑只观察，绝不
+代为修改权限。脚本不证明所有祖先目录均非符号链接，部署时必须先用 `pwd -P` 进入
+受信、不可由其他用户改写的物理父目录，再传 `--data-dir .`。`--apply`
+会覆盖全部运行时平仓史书（包括 `closed_trades_archive_undated.json`），并在首个正式
+写入前建立 `.single_strategy_migration_journal.json`。若进程在多文件写入之间死亡，
+runner 会拒绝启动；普通干跑只报告并保持现场不变，显式加 `--apply` 后迁移器才会
+先从整组 `.premigrate.*` 备份恢复，再重新预检和迁移。
+事务日志和备份均已被 Git 忽略且由仓库卫生测试二次阻断，但它们仍含凭据/真钱状态，
+只能留在受控部署目录。
 
 禁止手改脚本退出码或清空账本绕过阻断。先核对交易所现实，收口生命周期，再重跑。
 

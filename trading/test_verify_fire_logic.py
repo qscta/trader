@@ -243,16 +243,56 @@ class FireTestDecisionLogicTest(unittest.TestCase):
 
 
 class FireModeCliGuardTest(unittest.TestCase):
+    def test_module_entrypoint_has_sys_for_nonzero_exit(self):
+        self.assertIs(verify_okx.sys, sys)
+
     def test_fire_requires_explicit_side(self):
-        """--fire 与 --side both 组合：main() 必须在下单前拒绝，不允许模糊方向下的实弹测试。"""
-        import argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('symbol', nargs='?', default='BTCUSDT')
-        ap.add_argument('coin', nargs='?', type=float, default=0.0)
-        ap.add_argument('--side', choices=['long', 'short', 'both'], default='both')
-        ap.add_argument('--fire', action='store_true')
-        args = ap.parse_args(['BTCUSDT', '0.1', '--fire'])
-        self.assertTrue(args.fire and args.side == 'both')  # 复现 main() 里被拒绝的组合
+        """--fire 与 --side both 组合必须返回非零。"""
+        with patch.object(sys, 'argv', [
+                'verify_okx.py', 'BTCUSDT', '0.1', '--fire']):
+            self.assertEqual(2, verify_okx.main())
+
+    @staticmethod
+    def _cli_fixture():
+        cfg = {
+            'apiKey': 'k', 'secret': 's', 'password': 'p',
+            'sandbox': True, 'margin_mode': 'cross', 'leverage': 1,
+        }
+        api = Mock()
+        api.to_ccxt_symbol.return_value = 'BTC/USDT:USDT'
+        api._get_contract_size.return_value = 0.01
+        api.get_balance.return_value = {'total': {'USDT': 1}}
+        return cfg, api
+
+    def test_fire_failure_and_inconclusive_are_nonzero(self):
+        for result in (False, None):
+            cfg, api = self._cli_fixture()
+            with self.subTest(result=result), \
+                    patch.object(sys, 'argv', [
+                        'verify_okx.py', 'BTCUSDT', '0.1',
+                        '--fire', '--side', 'long']), \
+                    patch.object(verify_okx, 'load_cfg', return_value=cfg), \
+                    patch.object(verify_okx, 'OkxApi', return_value=api), \
+                    patch.object(verify_okx, 'check_position_mode', return_value=True), \
+                    patch.object(verify_okx, 'run_fire_test', return_value=result):
+                self.assertEqual(1, verify_okx.main())
+
+    def test_read_only_success_is_zero(self):
+        cfg, api = self._cli_fixture()
+        with patch.object(sys, 'argv', ['verify_okx.py']), \
+                patch.object(verify_okx, 'load_cfg', return_value=cfg), \
+                patch.object(verify_okx, 'OkxApi', return_value=api), \
+                patch.object(verify_okx, 'check_position_mode', return_value=True):
+            self.assertEqual(0, verify_okx.main())
+
+    def test_missing_balance_is_nonzero(self):
+        cfg, api = self._cli_fixture()
+        api.get_balance.return_value = {'total': {}}
+        with patch.object(sys, 'argv', ['verify_okx.py']), \
+                patch.object(verify_okx, 'load_cfg', return_value=cfg), \
+                patch.object(verify_okx, 'OkxApi', return_value=api), \
+                patch.object(verify_okx, 'check_position_mode', return_value=True):
+            self.assertEqual(1, verify_okx.main())
 
 
 if __name__ == '__main__':

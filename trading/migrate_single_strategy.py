@@ -10,17 +10,18 @@ import copy
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trade_state import (TradeState, atomic_write_json, open_private_text_file,
                          private_file_exists)
-from config_validation import MA_PARAMETER_FIELDS, SYMBOL_CONFIG_FIELDS
+import config_validation as cfgv
 
 STRATEGY_ID = 'ma_cross'
 SIGNAL_FIELDS = frozenset({'last_processed_candle', 'last_update'})
-ARCHIVE_NAME_RE = re.compile(r'^closed_trades_archive(?:_\d{4})?\.json$')
+ARCHIVE_NAME_RE = re.compile(r'^closed_trades_archive(?:_.+)?\.json$')
 
 EXIT_OK = 0
 EXIT_UNSAFE = 2
@@ -30,7 +31,8 @@ EXIT_RESTORE_FAILED = 5
 
 
 def _load_json(path):
-    with open_private_text_file(path) as handle:
+    # 部署预检必须是观察者：权限异常直接阻断，不得在“干跑”中偷偷 chmod。
+    with open_private_text_file(path, adjust_permissions=False) as handle:
         return json.load(
             handle,
             parse_constant=lambda value: (_ for _ in ()).throw(
@@ -48,23 +50,10 @@ def normalize_config(config):
     symbols = trading.get('symbols') if isinstance(trading, dict) else None
     if not isinstance(symbols, list):
         return cleaned, report, ['config.trading.symbols 必须是数组']
-    params = cleaned.get('strategy')
-    if not isinstance(params, dict):
-        blockers.append('config.strategy 必须是对象')
-    else:
-        unknown_params = sorted(set(params) - MA_PARAMETER_FIELDS)
-        if unknown_params:
-            blockers.append(
-                f'config.strategy 含未知字段: {unknown_params}；请人工核对并删除')
     for index, symbol in enumerate(symbols):
         if not isinstance(symbol, dict):
             blockers.append(f'config.trading.symbols[{index}] 必须是对象')
             continue
-        unknown_fields = sorted(
-            set(symbol) - SYMBOL_CONFIG_FIELDS - {'strategy'})
-        if unknown_fields:
-            blockers.append(
-                f'config.trading.symbols[{index}] 含未知字段: {unknown_fields}')
         if 'strategy' not in symbol:
             continue
         label = symbol.get('strategy')
@@ -72,9 +61,13 @@ def normalize_config(config):
         if label not in (None, STRATEGY_ID):
             blockers.append(
                 f'{name} 含不兼容策略标签；请人工确认该品种已无未结束生命周期')
-            continue
         del symbol['strategy']
         report.append(f'{name}: 删除冗余 strategy 配置字段')
+    try:
+        cfgv.validate_and_normalize_strategy_config(cleaned.get('strategy'))
+        cfgv.validate_and_normalize_symbol_configs(symbols)
+    except (TypeError, ValueError) as exc:
+        blockers.append(str(exc))
     return cleaned, report, blockers
 
 
@@ -117,6 +110,26 @@ def normalize_ledger(state):
                 blockers.append(f'{symbol}: signal_states 记录必须是对象')
                 continue
             label = record.get('strategy')
+            execution = record.get('signal_execution')
+            preserve_record = False
+            if execution is not None:
+                if not isinstance(execution, dict):
+                    blockers.append(
+                        f'{symbol}: signal_execution 结构异常，禁止自动删除')
+                    preserve_record = True
+                elif execution.get('status') == 'pending':
+                    blockers.append(
+                        f'{symbol}: 存在未收口 signal_execution pending，'
+                        '禁止迁移和部署')
+                    preserve_record = True
+                elif execution.get('status') != 'confirmed':
+                    blockers.append(
+                        f'{symbol}: signal_execution 状态 '
+                        f'{execution.get("status")!r} 无法证明已收口，禁止自动删除')
+                    preserve_record = True
+            if preserve_record:
+                normalized_signals[symbol] = copy.deepcopy(record)
+                continue
             if label not in (None, STRATEGY_ID):
                 report.append(f'{symbol}: 丢弃不兼容信号标记并在下次日检重建基线')
                 continue
@@ -179,8 +192,102 @@ def _targets(data_dir, config_path):
     return paths
 
 
+def _fsync_directory(path):
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        os.fsync(fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _remove_journal(path):
+    os.unlink(path)
+    _fsync_directory(os.path.dirname(path))
+
+
+def _validate_data_dir(data_dir, config_path):
+    try:
+        info = os.lstat(data_dir)
+    except OSError as exc:
+        return f'数据目录不可访问: {data_dir}: {exc}'
+    if not stat.S_ISDIR(info.st_mode):
+        return f'数据目录必须是真实目录（拒绝符号链接）: {data_dir}'
+    current_uid = os.geteuid() if hasattr(os, 'geteuid') else os.getuid()
+    if info.st_uid != current_uid:
+        return f'数据目录不属于当前用户，拒绝迁移: {data_dir}'
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        return f'数据目录不得允许组/其他用户写入: {data_dir}'
+    if os.path.dirname(config_path) != data_dir:
+        return 'config.json 必须与 trade_state.json 位于同一真实数据目录'
+    return None
+
+
+def _validate_journal_items(data_dir, journal):
+    if not isinstance(journal, dict) or journal.get('version') != 1:
+        raise ValueError('迁移事务日志版本或结构无效')
+    items = journal.get('items')
+    if not isinstance(items, list) or not items:
+        raise ValueError('迁移事务日志缺少恢复条目')
+    validated = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f'迁移事务日志第 {index} 项不是对象')
+        target = os.path.abspath(str(item.get('target') or ''))
+        backup = os.path.abspath(str(item.get('backup') or ''))
+        if (os.path.dirname(target) != data_dir or
+                os.path.dirname(backup) != data_dir or
+                not backup.startswith(target + '.premigrate.')):
+            raise ValueError(f'迁移事务日志第 {index} 项路径越界')
+        validated.append((target, backup))
+    return validated
+
+
+def _recover_interrupted_migration(data_dir):
+    """存在事务日志时从全套备份幂等恢复；成功后才删除日志。"""
+    journal_path = os.path.join(
+        data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+    if not private_file_exists(journal_path):
+        return True
+    try:
+        journal = _load_json(journal_path)
+        items = _validate_journal_items(data_dir, journal)
+        # 先读完全部备份，避免读到一半才发现备份损坏并开始制造新混合态。
+        restore_payloads = [
+            (target, _load_json(backup)) for target, backup in items]
+        for target, payload in restore_payloads:
+            if not atomic_write_json(target, payload):
+                raise RuntimeError(f'恢复写入失败: {target}')
+        _remove_journal(journal_path)
+        print(f'[恢复] 已从 {len(items)} 份备份恢复上次中断的迁移事务。')
+        return True
+    except BaseException as exc:
+        # KeyboardInterrupt/SystemExit 同样不得删除恢复凭据；下次运行仍可重试。
+        print(f'[失败] 未完成迁移事务恢复失败，日志已保留: {exc}')
+        return False
+
+
 def run(data_dir, apply=False, config_path=None):
-    targets = _targets(os.path.abspath(data_dir), config_path)
+    data_dir = os.path.abspath(data_dir)
+    config_path = os.path.abspath(
+        config_path or os.path.join(data_dir, 'config.json'))
+    directory_error = _validate_data_dir(data_dir, config_path)
+    if directory_error:
+        print(f'[阻断] {directory_error}')
+        return EXIT_UNSAFE
+    journal_path = os.path.join(
+        data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+    if private_file_exists(journal_path):
+        if not apply:
+            print(
+                f'[阻断] 检测到未完成迁移事务: {journal_path}；'
+                '干跑保持只读，请加 --apply 执行整组恢复后重新迁移')
+            return EXIT_UNSAFE
+        if not _recover_interrupted_migration(data_dir):
+            return EXIT_RESTORE_FAILED
+
+    targets = _targets(data_dir, config_path)
     required_missing = [path for _kind, path in targets[:2]
                         if not private_file_exists(path)]
     if required_missing:
@@ -228,23 +335,36 @@ def run(data_dir, apply=False, config_path=None):
         return EXIT_OK
 
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    backups = {}
     for path in changed:
         backup = f'{path}.premigrate.{stamp}'
         if not atomic_write_json(backup, originals[path]):
             print(f'[失败] 备份失败，所有原文件均未改动: {backup}')
             return EXIT_BACKUP_FAILED
+        backups[path] = backup
 
-    written = []
+    journal = {
+        'version': 1,
+        'created_at': datetime.now().isoformat(),
+        'items': [
+            {'target': path, 'backup': backups[path]} for path in changed],
+    }
+    if not atomic_write_json(journal_path, journal):
+        print('[失败] 无法建立迁移事务日志；所有原文件均未改动。')
+        return EXIT_BACKUP_FAILED
+
     for path in changed:
         if atomic_write_json(path, normalized[path]):
-            written.append(path)
             continue
         print(f'[失败] 写入失败，开始恢复已写文件: {path}')
-        restore_ok = True
-        for written_path in reversed(written):
-            restore_ok = atomic_write_json(
-                written_path, originals[written_path]) and restore_ok
+        restore_ok = _recover_interrupted_migration(data_dir)
         return EXIT_WRITE_FAILED if restore_ok else EXIT_RESTORE_FAILED
+
+    try:
+        _remove_journal(journal_path)
+    except OSError as exc:
+        print(f'[失败] 迁移内容已写入但无法提交事务日志: {exc}')
+        return EXIT_WRITE_FAILED
 
     print(f'[完成] 已原子规范化 {len(changed)} 个文件；再次运行应显示已通过。')
     return EXIT_OK

@@ -123,16 +123,8 @@ class MaCrossStrategy:
 
         return signal
 
-    def check_current_state(self, df):
-        """
-        回溯历史判断当前多空状态（用于即时开仓）
-
-        逻辑：
-        1. 计算当前EMA短期和长期的关系
-        2. 如果EMA短期 > EMA长期（金叉状态）→ 应该做多
-        3. 如果EMA短期 < EMA长期（死叉状态）→ 应该做空
-        4. 止损价使用最新的N天收盘价高低点
-        """
+    def _current_state(self, df):
+        """计算当前 EMA 方向与止损；即时开仓和 T+1 重入共用。"""
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
         if len(df) < min_required or not self._has_valid_closes(df, len(df)):
             return None
@@ -147,7 +139,6 @@ class MaCrossStrategy:
         if upper_stop is None:
             return None
 
-        # 判断当前状态
         if current_ema_short > current_ema_long:
             action = 'long'
         elif current_ema_short < current_ema_long:
@@ -165,6 +156,10 @@ class MaCrossStrategy:
             'ema_bullish': current_ema_short > current_ema_long
         }
 
+    def check_current_state(self, df):
+        """回溯历史判断当前多空状态（用于即时开仓）。"""
+        return self._current_state(df)
+
     def check_reentry_condition(self, df):
         """
         检查止损后重入条件
@@ -173,32 +168,9 @@ class MaCrossStrategy:
 
         返回: (should_reenter, side, signal)
         """
-        min_required = max(self.long_period * 2, self.stop_loss_period + 1)
-        if len(df) < min_required or not self._has_valid_closes(df, len(df)):
+        signal = self._current_state(df)
+        if signal is None:
             return False, None, None
-
-        df = self.calculate_ema(df)
-
-        current_ema_short = df['ema_short'].iloc[-1]
-        current_ema_long = df['ema_long'].iloc[-1]
-        current_close = df['close'].iloc[-1]
-
-        upper_stop, lower_stop = self.calculate_stop_levels(df)
-        if upper_stop is None:
-            return False, None, None
-
-        signal = {
-            'ema_short': current_ema_short,
-            'ema_long': current_ema_long,
-            'upper_stop': upper_stop,
-            'lower_stop': lower_stop,
-            'current_close': current_close,
-            'ema_bullish': current_ema_short > current_ema_long
-        }
-
-        if current_ema_short > current_ema_long:
-            return True, 'long', signal
-        elif current_ema_short < current_ema_long:
-            return True, 'short', signal
-
+        if signal['action'] in ('long', 'short'):
+            return True, signal['action'], signal
         return False, None, signal

@@ -88,7 +88,7 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
   若用 `TRADING_RUNNER_LOCK_FILE` 改锁路径，锁必须位于当前用户所有的专用 0700 目录，
   不能直接放在 `/tmp` 等共享目录。
 - **一次性 legacy 迁移**：`data/okx/` 只在无 `.okx_legacy_migration_complete.json` 时参与裁决；迁移成功后原子写 marker，后续重启绝不再用永久旧快照复活主账本。根主账本/.bak 缺失冲突、两边存在不同生命周期数据、任一 schema/权限/符号链接异常均拒启；只在内容同源或安全空状态下迁移。
-- **单策略部署预检**：停 runner 后执行 `python3 migrate_single_strategy.py --data-dir .`；确认报告后加 `--apply`，再干跑一次必须显示通过。未收口开仓意图或不兼容在途持仓会返回非零并阻断部署。
+- **单策略部署预检**：停 runner 后执行 `python3 migrate_single_strategy.py --data-dir .`；确认报告后加 `--apply`，再干跑一次必须显示通过。未收口开仓意图、旧版 `signal_execution=pending`、无法证明终态的旧执行状态或不兼容在途持仓都会返回非零并阻断部署。
 - **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
 - **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。部分平仓后的止损缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
 - **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
@@ -119,13 +119,14 @@ OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
 
 当前聚合测试矩阵以仓库内两条 unittest 命令的实时结果为准。策略行情固定读取
 最新单页 300 根；配置若无法在过滤未收盘 K 线后满足最低窗口，启动/API 修改时即拒绝。
-日 K 陈旧时 fail-closed；历史出现大跨度断层时不回放旧交易，但仍只检查最新两根
-已收盘 K 线本身是否刚产生（双均线）交叉。
+日 K 必须逐日连续，且最新已收盘 K 必须严格等于调度日 D-1；任何内部缺日、D-2
+陈旧或未来错标都会 fail-closed。通过完整窗口校验后，策略仍只用最新两根判断本次
+双均线交叉，不回放旧交易。
 以聚合命令为准，避免模块新增后文档逐项计数漂移：
 
 ```bash
 python3 -m unittest discover -s . -p 'test_*.py'
-python3 -m unittest tests.test_trading_logic_unittest -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。

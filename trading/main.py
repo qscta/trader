@@ -21,7 +21,10 @@ from trade_state import (
 )
 from stop_guardian import StopGuardianMixin
 from reporting import ReportingMixin
-from signal_handlers import NO_POSITION_T1_BLOCKED, SignalHandlersMixin
+from signal_handlers import (
+    NO_POSITION_T1_BLOCKED, NO_POSITION_T1_REENTRY_FAILED,
+    SignalHandlersMixin,
+)
 from trade_executor import TradeExecutorMixin
 from runtime_guard import acquire_runner_lock
 import config_validation as cfgv
@@ -96,11 +99,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def __init__(self, config_file='config.json'):
         """初始化欧易单交易所交易系统。状态文件落项目根目录（与原单所版一致）。"""
         self.config_file = config_file
+        self.base_dir = os.path.dirname(os.path.abspath(config_file))
+        self.data_dir = self.base_dir
+        migration_journal = os.path.join(
+            self.data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+        if private_file_exists(migration_journal):
+            raise RuntimeError(
+                f'检测到未完成的单策略迁移事务，拒绝启动: {migration_journal}；'
+                '请先停机运行 migrate_single_strategy.py '
+                f'--data-dir {self.data_dir} --apply 完成自动恢复')
         self.config = self.load_config(config_file)
         self.exchange_id = 'okx'
         self.label = self.config.get('okx', {}).get('label') or '欧易'
-        self.base_dir = os.path.dirname(os.path.abspath(config_file))
-        self.data_dir = self.base_dir
         self._config_lock = threading.RLock()
 
         # 旧多所版若把欧易状态存在 data/okx/，收敛单所时迁回根目录（仅当根目录尚无状态）
@@ -312,35 +322,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         RiskManager 权益×"0.01"→TypeError。与凭据缺失同标准 fail-loud，绝不静默塞
         默认值（真钱系统默认策略参数比拒启更危险）。
         """
-        if not isinstance(strategy, dict):
-            raise ValueError('config.strategy 必须是对象')
-        unknown = sorted(set(strategy) - cfgv.MA_PARAMETER_FIELDS)
-        if unknown:
-            raise ValueError(f'config.strategy 含未知字段: {unknown}')
-        if strategy.get('default_risk_per_trade') is None:
-            raise ValueError(
-                "config.strategy 缺少必需参数 ['default_risk_per_trade']，"
-                "请对照 config.example.json 补全后再启动")
-
-        # 周期类：ma_* 三键有 .get 默认值，仅当显式提供时校验类型/范围。
-        for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
-            if strategy.get(key) is None:
-                continue
-            v = cfgv.strict_int(strategy[key], f'config.strategy.{key}')
-            if not (cfgv.PERIOD_MIN <= v <= cfgv.PERIOD_MAX):
-                raise ValueError(
-                    f"config.strategy.{key} 超出允许范围 [{cfgv.PERIOD_MIN}, {cfgv.PERIOD_MAX}]: {v}")
-            strategy[key] = v
-
-        strategy['default_risk_per_trade'] = cfgv.strict_risk_per_trade(
-            strategy['default_risk_per_trade'], 'config.strategy.default_risk_per_trade')
-
-        # EMA 短期必须小于长期（用生效值判定：缺省短 7 / 长 28，与构造处默认一致）
-        eff_short = strategy.get('ma_short_period', 7)
-        eff_long = strategy.get('ma_long_period', 28)
-        if eff_short >= eff_long:
-            raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
-        cfgv.validate_ohlcv_capacity(strategy)
+        cfgv.validate_and_normalize_strategy_config(strategy)
 
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
@@ -350,25 +332,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         冗余策略字段若继续存在会制造已经删除的分派轴。补齐校验与规范化，
         与增删品种的 API 入口一致，堵住"手写配置"这条绕过风控的入口。
         """
-        seen = set()
-        for i, s in enumerate(symbols):
-            if not isinstance(s, dict):
-                raise ValueError(f"config.trading.symbols[{i}] 不是对象: {s!r}")
-            unknown = sorted(set(s) - cfgv.SYMBOL_CONFIG_FIELDS)
-            if unknown:
-                raise ValueError(
-                    f"config.trading.symbols[{i}] 含未知字段: {unknown}；"
-                    "请先执行部署预检")
-            name = cfgv.normalize_symbol_name(s.get('name'), f"config.trading.symbols[{i}] 交易对名")
-            if name in seen:
-                raise ValueError(f"config.trading.symbols 存在重复交易对: {name}")
-            seen.add(name)
-            s['name'] = name  # 规范化写回（去空格/转大写）
-
-            if s.get('risk_per_trade') is not None:  # 缺省时由 default_risk_per_trade 兜底（既有行为）
-                s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
-            if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
-                s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
+        cfgv.validate_and_normalize_symbol_configs(symbols)
 
     @staticmethod
     def _state_has_lifecycle_data(state):
@@ -1332,12 +1296,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return gap > max_gap_candles, last_id, current_id, gap
 
     @staticmethod
-    def _daily_candle_is_fresh(df, scheduled_date, max_lag_days=1):
+    def _daily_candle_is_fresh(df, scheduled_date):
         """验证最新日 K 足以代表本次调度日，拒绝陈旧行情进入真钱策略。
 
-        北京时间 08:00 对应 UTC 日线刚收盘；调度日 D 正常应至少拿到时间戳
-        为 D-1 的日 K。允许额外落后 1 天，兼容周末/节假日不连续的传统资产
-        映射合约；超过该窗口一律 fail-closed。
+        北京时间 08:00 对应 UTC 日线刚收盘；本系统只交易 24x7 的 OKX
+        U 本位加密永续，因此调度日 D 必须恰好拿到 D-1。D-2 陈旧数据与
+        D 当日/未来错标数据都 fail-closed，避免吞掉真正的下一根交叉。
         """
         try:
             values = df['timestamp'].tolist()
@@ -1351,8 +1315,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 scheduled_date.date() if isinstance(scheduled_date, datetime)
                 else scheduled_date if isinstance(scheduled_date, date)
                 else date.fromisoformat(str(scheduled_date)))
-            minimum_date = check_date - timedelta(days=1 + int(max_lag_days))
-            return latest_date >= minimum_date, latest_date, minimum_date
+            expected_date = check_date - timedelta(days=1)
+            return latest_date == expected_date, latest_date, expected_date
         except Exception as exc:
             logger.error(f'无法验证最新日 K 时间戳，按陈旧数据拒绝交易: {exc}')
             return False, None, None
@@ -1541,12 +1505,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             data_unready_symbols.append(symbol)
                         continue
 
-                    fresh, latest_candle_date, minimum_candle_date = (
+                    fresh, latest_candle_date, expected_candle_date = (
                         self._daily_candle_is_fresh(df, today))
                     if not fresh:
                         logger.critical(
                             f"{symbol} 最新已收盘日 K 陈旧：latest={latest_candle_date}，"
-                            f"本次调度日={today}，最低允许={minimum_candle_date}；"
+                            f"本次调度日={today}，必须等于={expected_candle_date}；"
                             "禁止本品种开仓、平仓及反手")
                         failed_symbols.append(symbol)
                         continue
@@ -1584,6 +1548,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     else:
                         no_position_outcome = self.handle_no_position_ma_cross(
                             symbol, signal, symbol_config, df)
+
+                    if no_position_outcome == NO_POSITION_T1_REENTRY_FAILED:
+                        logger.error(
+                            f'{symbol} [双均线] T+1 重入尚未形成真实持仓；'
+                            '不推进 K 线或当日完成标记，等待日内调度重试')
+                        failed_symbols.append(symbol)
+                        continue
 
                     # EMA 交叉只有在目标方向已经真实落到账本后才可消费。
                     # 平仓失败/部分成交/反手开仓失败时保留旧 marker，让 08:01

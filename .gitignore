@@ -18,6 +18,7 @@ trading/qiusuo_index.json
 trading/.trading_data_owner.json
 trading/.okx_legacy_migration_complete.json
 trading/.equity_sync_journal.json
+trading/.single_strategy_migration_journal.json
 trading/data/
 trading/.runtime/
 
@@ -34,6 +35,7 @@ trading/backups/
 .DS_Store
 *.bak
 *.bak.*
+*.premigrate.*
 *.tmp
 *~
 

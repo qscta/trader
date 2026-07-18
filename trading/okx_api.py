@@ -2,6 +2,7 @@ import ccxt
 import hashlib
 import logging
 import math
+import re
 import time
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -303,6 +304,47 @@ class OkxApi(ExchangeApi):
                 f"{ccxt_symbol} 持仓 {field} 字段非有限数: {value!r}")
         return parsed
 
+    def _position_entry_is_nonzero(self, entry, info, ccxt_symbol):
+        """统一裁决持仓条目的数量与方向；单仓查询/全仓清单共用。"""
+        contracts_signed = self._parse_signed_size(
+            entry.get('contracts'), 'contracts', ccxt_symbol)
+        raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
+        if contracts_signed is None:
+            if raw_pos is None:
+                raise PositionModeError(
+                    f'{ccxt_symbol} contracts 与原始 pos 同时缺失，'
+                    '无法证明空仓')
+            if raw_pos == 0:
+                return False
+            raise PositionModeError(
+                f'{ccxt_symbol} contracts 缺失但原始 pos={info.get("pos")!r} '
+                '非零，拒绝当空仓')
+
+        contracts = abs(contracts_signed)
+        if contracts <= 0:
+            if raw_pos is not None and raw_pos != 0:
+                raise PositionModeError(
+                    f'{ccxt_symbol} contracts=0 与原始 pos={info.get("pos")!r} 矛盾')
+            return False
+        if raw_pos is not None and raw_pos == 0:
+            raise PositionModeError(
+                f'{ccxt_symbol} contracts={entry.get("contracts")!r} 与原始 pos=0 矛盾')
+        if entry.get('hedged') is True or info.get('posSide') in ('long', 'short'):
+            raise PositionModeError(
+                f'{ccxt_symbol} 检测到双向持仓腿(posSide={info.get("posSide")})，'
+                '拒绝裁剪为单腿')
+        side = self._position_side(entry)
+        if side not in ('long', 'short'):
+            raise PositionModeError(
+                f'{ccxt_symbol} 非零持仓方向不可判定，拒绝继续交易')
+        if raw_pos is not None and raw_pos != 0:
+            raw_side = 'long' if raw_pos > 0 else 'short'
+            if raw_side != side:
+                raise PositionModeError(
+                    f'{ccxt_symbol} 标准 side={side} 与原始 pos={info.get("pos")!r} '
+                    '符号矛盾，拒绝裁决')
+        return True
+
     @retry_on_network_error(max_retries=3)
     def get_position(self, symbol):
         """获取特定交易对的持仓（单向模式下只有一条）。
@@ -325,45 +367,15 @@ class OkxApi(ExchangeApi):
         nonzero = []
         for p in positions:
             if p is None:
-                continue
+                raise PositionModeError(
+                    f'{ccxt_symbol} 持仓条目为 None，无法证明空仓')
             if not isinstance(p, dict):
                 raise PositionModeError(
                     f"{ccxt_symbol} 持仓条目结构异常: {type(p).__name__}")
             info = p.get('info') or {}
             self._assert_position_entry_symbol(p, info, ccxt_symbol)
-            contracts_signed = self._parse_signed_size(
-                p.get('contracts'), 'contracts', ccxt_symbol)
-            raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
-            if contracts_signed is None:
-                if raw_pos is None:
-                    # 两个来源都明确为空才是可证明的空仓条目。
-                    continue
-                if raw_pos != 0:
-                    raise PositionModeError(
-                        f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
-                        "非零，拒绝当空仓")
-                continue
-            contracts = abs(contracts_signed)
-            if contracts <= 0:
-                if raw_pos is not None and raw_pos != 0:
-                    raise PositionModeError(
-                        f"{ccxt_symbol} contracts=0 与原始 pos={info.get('pos')!r} 矛盾")
-                continue
-            if raw_pos is not None and raw_pos == 0:
-                raise PositionModeError(
-                    f"{ccxt_symbol} contracts={p.get('contracts')!r} 与原始 pos=0 矛盾")
-            if p.get('hedged') is True or info.get('posSide') in ('long', 'short'):
-                raise PositionModeError(f"{ccxt_symbol} 检测到双向持仓腿(posSide={info.get('posSide')})，拒绝裁剪为单腿")
-            side = self._position_side(p)
-            if side not in ('long', 'short'):
-                raise PositionModeError(f"{ccxt_symbol} 非零持仓方向不可判定，拒绝继续交易")
-            if raw_pos is not None and raw_pos != 0:
-                raw_side = 'long' if raw_pos > 0 else 'short'
-                if raw_side != side:
-                    raise PositionModeError(
-                        f"{ccxt_symbol} 标准 side={side} 与原始 pos={info.get('pos')!r} "
-                        "符号矛盾，拒绝裁决")
-            nonzero.append(p)
+            if self._position_entry_is_nonzero(p, info, ccxt_symbol):
+                nonzero.append(p)
         if len(nonzero) > 1:
             raise PositionModeError(f"{ccxt_symbol} 同时存在 {len(nonzero)} 条非零持仓，拒绝隐藏任何一腿")
         return nonzero[0] if nonzero else None
@@ -1602,28 +1614,60 @@ class OkxApi(ExchangeApi):
         symbols = []
         for p in positions:
             if p is None:
-                continue
+                raise PositionModeError(
+                    '持仓清单包含 None 条目，完整性不确定')
             if not isinstance(p, dict):
                 raise PositionModeError(
                     f"持仓清单条目结构异常: {type(p).__name__}")
             info = p.get('info') or {}
-            ccxt_symbol = p.get('symbol') or info.get('instId') or ''
-            if not ccxt_symbol:
+            observed_symbol = p.get('symbol')
+            observed_inst = info.get('instId')
+            if not observed_symbol and not observed_inst:
                 raise PositionModeError(
                     f"持仓清单条目缺少品种标识，拒绝裁决: {str(p)[:120]}")
-            contracts = self._parse_signed_size(
-                p.get('contracts'), 'contracts', ccxt_symbol)
-            raw_pos = self._parse_signed_size(info.get('pos'), 'pos', ccxt_symbol)
-            if contracts is None:
-                if raw_pos is not None and raw_pos != 0:
+
+            ccxt_symbol = None
+            standard_usdt = (
+                isinstance(observed_symbol, str) and
+                re.fullmatch(r'[A-Z0-9]{1,20}/USDT:USDT', observed_symbol))
+            raw_symbol_usdt = (
+                isinstance(observed_symbol, str) and
+                re.fullmatch(r'[A-Z0-9]{1,20}-USDT-SWAP', observed_symbol))
+            raw_inst_usdt = (
+                isinstance(observed_inst, str) and
+                re.fullmatch(r'[A-Z0-9]{1,20}-USDT-SWAP', observed_inst))
+            if standard_usdt:
+                ccxt_symbol = str(observed_symbol)
+                if (observed_inst is not None and
+                        str(observed_inst) != self._to_inst_id(ccxt_symbol)):
                     raise PositionModeError(
-                        f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
-                        "非零，孤儿仓核对拒绝跳过")
+                        f'{ccxt_symbol} 标准 symbol 与 instId={observed_inst!r} 矛盾')
+            elif raw_inst_usdt or raw_symbol_usdt:
+                raw_id = observed_inst if raw_inst_usdt else observed_symbol
+                if (observed_inst is not None and observed_symbol is not None and
+                        str(observed_inst) != str(observed_symbol)):
+                    raise PositionModeError(
+                        f'持仓清单原生标识冲突: symbol={observed_symbol!r}, '
+                        f'instId={observed_inst!r}')
+                base = raw_id[:-len('-USDT-SWAP')]
+                ccxt_symbol = f'{base}/USDT:USDT'
+            elif (str(observed_inst or '').endswith('-USDT-SWAP') or
+                  str(observed_symbol or '').endswith(':USDT') or
+                  str(observed_symbol or '').endswith('-USDT-SWAP')):
+                raise PositionModeError(
+                    f'持仓清单 U 本位条目标识不可一致解析: '
+                    f'symbol={observed_symbol!r}, instId={observed_inst!r}')
+            else:
+                # 非 U 本位永续不属于系统资金边界。
                 continue
-            # BTC/USD:BTC 若被 to_internal_symbol 会错映成 BTCUSDT，导致把
-            # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓。
-            if abs(contracts) > 0 and str(p.get('symbol') or '').endswith(':USDT'):
-                symbols.append(self.to_internal_symbol(p['symbol']))
+
+            if not self._position_entry_is_nonzero(p, info, ccxt_symbol):
+                continue
+            internal = self.to_internal_symbol(ccxt_symbol)
+            if internal in symbols:
+                raise PositionModeError(
+                    f'{ccxt_symbol} 出现多条非零持仓，拒绝隐藏任何一腿')
+            symbols.append(internal)
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):

@@ -20,6 +20,8 @@ SENSITIVE_RUNTIME_PATHS = {
 
 def _is_forbidden_tracked_path(path):
     name = Path(path).name
+    if '.premigrate.' in name:
+        return True
     if (path.startswith('trading/closed_trades_archive_') and
             (path.endswith('.json') or '.json.bak' in path)):
         return True
@@ -32,6 +34,8 @@ def _is_forbidden_tracked_path(path):
     if path.startswith(('trading/backups/', 'trading/data/')):
         return True
     if name == '.env' or (name.startswith('.env.') and name != '.env.example'):
+        return True
+    if name == '.single_strategy_migration_journal.json':
         return True
     return name.endswith(('.save', '.tgz', '.tar', '.tar.gz', '.zip'))
 
@@ -92,7 +96,9 @@ class RepositoryHygieneTest(unittest.TestCase):
                 'trading/trade_state.json.bak.empty.20260711',
                 'trading/closed_trades_archive_2026.json',
                 'trading/closed_trades_archive_2026.json.bak',
-                'trading/qiusuo_index.json.bak'):
+                'trading/qiusuo_index.json.bak',
+                'trading/config.json.premigrate.20260718_080000',
+                'trading/.single_strategy_migration_journal.json'):
             self.assertTrue(_is_forbidden_tracked_path(path), path)
         self.assertFalse(_is_forbidden_tracked_path('trading/config.example.json'))
         self.assertFalse(_is_forbidden_tracked_path('.env.example'))

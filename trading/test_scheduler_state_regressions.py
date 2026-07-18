@@ -576,13 +576,22 @@ class DailyCandleFreshnessTest(unittest.TestCase):
             frame, '2026-07-11')
         self.assertTrue(fresh)
         self.assertEqual(date(2026, 7, 10), latest)
-        self.assertEqual(date(2026, 7, 9), minimum)
+        self.assertEqual(date(2026, 7, 10), minimum)
 
-    def test_one_extra_missing_day_is_tolerated_for_market_holidays(self):
+    def test_d_minus_two_is_rejected_for_24x7_crypto(self):
         frame = self._Frame([datetime(2026, 7, 9)])
         fresh, _, _ = TradingSystem._daily_candle_is_fresh(
             frame, '2026-07-11')
-        self.assertTrue(fresh)
+        self.assertFalse(fresh)
+
+    def test_current_or_future_dated_candle_is_rejected(self):
+        for value in (datetime(2026, 7, 11), datetime(2026, 7, 12)):
+            with self.subTest(value=value):
+                frame = self._Frame([value])
+                fresh, _, expected = TradingSystem._daily_candle_is_fresh(
+                    frame, '2026-07-11')
+                self.assertFalse(fresh)
+                self.assertEqual(date(2026, 7, 10), expected)
 
     def test_multiweek_stale_candle_is_rejected(self):
         frame = self._Frame([datetime(2026, 5, 5)])
@@ -590,7 +599,7 @@ class DailyCandleFreshnessTest(unittest.TestCase):
             frame, '2026-07-11')
         self.assertFalse(fresh)
         self.assertEqual(date(2026, 5, 5), latest)
-        self.assertEqual(date(2026, 7, 9), minimum)
+        self.assertEqual(date(2026, 7, 10), minimum)
 
     def test_unparseable_timestamp_fails_closed(self):
         frame = self._Frame(['not-a-timestamp'])
@@ -723,6 +732,24 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             self.assertEqual(date.today().isoformat(), system._last_check_date)
             system._execute_open.assert_not_called()
             system.notifier.notify_signal_missed.assert_not_called()
+
+    def test_failed_t1_reentry_keeps_candle_and_day_pending_for_intraday_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.stop_loss_dates['BTCUSDT'] = '2000-01-01'
+            system.ma_cross_strategy.check_reentry_condition = Mock(
+                return_value=(True, 'long', self._signal(action=None)))
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(action=None), 't5'))
+            system._execute_open = Mock(return_value=None)
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t3', metadata['last_processed_candle'])
+            self.assertIsNone(system._last_check_date)
+            self.assertEqual('2000-01-01', system.stop_loss_dates['BTCUSDT'])
+            system.notifier.notify_signal_missed.assert_called_once()
 
     def test_invalid_ma_state_keeps_day_incomplete_for_retry(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -180,11 +180,10 @@ class ContractSizeFailClosedTest(unittest.TestCase):
     def test_position_symbol_listing_filters_coin_margined_contracts(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'contracts': 10, 'symbol': 'BTC/USDT:USDT'},
+            {'contracts': 10, 'symbol': 'BTC/USDT:USDT', 'side': 'long'},
             {'contracts': 5, 'symbol': 'BTC/USD:BTC'},
             {'contracts': 0, 'symbol': 'ETH/USDT:USDT'},
-            {'contracts': 2, 'symbol': 'DOGE/USDT:USDT'},
-            None,
+            {'contracts': 2, 'symbol': 'DOGE/USDT:USDT', 'side': 'short'},
         ]
         self.assertEqual(
             ['BTCUSDT', 'DOGEUSDT'], sorted(api.list_position_symbols()))
@@ -1528,7 +1527,7 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         api.exchange.fetch_positions.return_value = []
         self.assertIsNone(api.get_position('BTC/USDT:USDT'))
         api.exchange.fetch_positions.return_value = [
-            {'symbol': 'BTC/USDT:USDT', 'contracts': None, 'info': {}}]
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 0, 'info': {'pos': '0'}}]
         self.assertIsNone(api.get_position('BTC/USDT:USDT'))
         good = {'contracts': '5', 'side': 'long', 'symbol': 'BTC/USDT:USDT',
                 'info': {'pos': '5', 'posSide': 'net'}}
@@ -1540,6 +1539,17 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         for malformed in ({}, {'contracts': None, 'info': {}},
                           {'contracts': 5.0, 'side': 'long', 'info': {}}):
             api = _bare_api()
+            api.exchange.fetch_positions.return_value = [malformed]
+            with self.subTest(malformed=malformed), \
+                    self.assertRaises(PositionModeError):
+                api.get_position('BTC/USDT:USDT')
+
+    def test_none_or_missing_both_sizes_is_not_flat(self):
+        api = _bare_api()
+        for malformed in (
+                None,
+                {'symbol': 'BTC/USDT:USDT', 'contracts': None, 'info': {}},
+                {'info': {'instId': 'BTC-USDT-SWAP'}}):
             api.exchange.fetch_positions.return_value = [malformed]
             with self.subTest(malformed=malformed), \
                     self.assertRaises(PositionModeError):
@@ -1570,6 +1580,41 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         api.exchange.fetch_positions.return_value = None
         with self.assertRaises(PositionModeError):
             api.list_position_symbols()
+        for malformed in (
+                None,
+                {'symbol': 'BTC/USDT:USDT', 'contracts': None, 'info': {}},
+                {'info': {'instId': 'BTC-USDT-SWAP'}}):
+            api.exchange.fetch_positions.return_value = [malformed]
+            with self.subTest(malformed=malformed), \
+                    self.assertRaises(PositionModeError):
+                api.list_position_symbols()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 0,
+             'side': 'long', 'info': {'pos': '3'}}]
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
+
+    def test_list_position_symbols_recovers_usdt_swap_from_inst_id(self):
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [{
+            'contracts': 2.0, 'side': 'long',
+            'info': {'pos': '2', 'instId': 'BTC-USDT-SWAP'}}]
+
+        self.assertEqual(['BTCUSDT'], api.list_position_symbols())
+
+        api.exchange.fetch_positions.return_value = [{
+            'symbol': 'BTC-USDT-SWAP', 'contracts': 2.0, 'side': 'long',
+            'info': {'pos': '2'}}]
+        self.assertEqual(['BTCUSDT'], api.list_position_symbols())
+
+    def test_list_position_symbols_rejects_malformed_usdt_identity(self):
+        api = _bare_api()
+        for symbol in ('btc/USDT:USDT', 'BTC//USDT:USDT'):
+            api.exchange.fetch_positions.return_value = [{
+                'symbol': symbol, 'contracts': 2.0, 'side': 'long',
+                'info': {'pos': '2'}}]
+            with self.subTest(symbol=symbol), self.assertRaises(PositionModeError):
+                api.list_position_symbols()
         api.exchange.fetch_positions.return_value = [
             {'symbol': 'BTC/USDT:USDT', 'contracts': None,
              'info': {'pos': '3'}}]
@@ -1579,7 +1624,7 @@ class PositionParsingStrictnessTest(unittest.TestCase):
     def test_list_position_symbols_reports_clean_positions(self):
         api = _bare_api()
         api.exchange.fetch_positions.return_value = [
-            {'symbol': 'BTC/USDT:USDT', 'contracts': 2.0,
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 2.0, 'side': 'long',
              'info': {'pos': '2'}},
             {'symbol': 'ETH/USDT:USDT', 'contracts': 0.0, 'info': {'pos': '0'}},
             {'symbol': 'LTC/USD:LTC', 'contracts': 1.0, 'info': {'pos': '1'}},
@@ -1819,6 +1864,25 @@ class OhlcvBoundaryValidationTest(unittest.TestCase):
             [1000, 10.0, float('nan'), 9.0, 11.0, 1.0]]
         with self.assertRaises(ValueError):
             api.fetch_ohlcv('BTC/USDT:USDT', '1d', limit=10)
+
+    def test_daily_fetch_rejects_internal_calendar_gap(self):
+        api = _bare_api()
+        day = 86_400_000
+        api.exchange.fetch_ohlcv.return_value = [
+            [0, 10.0, 12.0, 9.0, 11.0, 1.0],
+            [day * 2, 11.0, 13.0, 10.0, 12.0, 1.0],
+        ]
+
+        with self.assertRaisesRegex(ValueError, '不连续'):
+            api.fetch_ohlcv('BTC/USDT:USDT', '1d', limit=10)
+
+    def test_intraday_validation_does_not_apply_daily_spacing(self):
+        api = _bare_api()
+        api.exchange.fetch_ohlcv.return_value = self.GOOD
+
+        self.assertEqual(
+            self.GOOD,
+            api.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=10))
 
 
 class CompensationEvidenceReadOnlyTest(unittest.TestCase):

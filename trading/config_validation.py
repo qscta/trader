@@ -5,9 +5,8 @@
 严格整数）。此前这些常量与逻辑在 main.py 与 api_server.py 各存一份，靠人工同步——
 本模块把原语收敛于一处，让三入口的一致性由构造保证，而非碰巧相等。
 
-只放"叶子原语"（常量 + strict_int / strict_float_finite / strict_bool / risk / symbol）；
-各入口的编排（启动校验全量 config vs API 校验增量 delta）形态不同，仍各自保留，
-不强行统一成一个更难读的函数。
+除叶子原语外，策略块与交易对池的全量校验也在这里编排，供生产启动与部署迁移
+直接复用；HTTP API 的增量输入形态不同，仍复用同一组叶子原语。
 """
 
 import math
@@ -29,6 +28,7 @@ MA_PARAMETER_FIELDS = frozenset({
     'ma_stop_period', 'default_risk_per_trade',
 })
 SYMBOL_CONFIG_FIELDS = frozenset({'name', 'enabled', 'risk_per_trade'})
+SINGLE_STRATEGY_MIGRATION_JOURNAL = '.single_strategy_migration_journal.json'
 
 
 def _strategy_period(strategy_config, key, default):
@@ -124,3 +124,67 @@ def normalize_symbol_name(value, field='交易对名'):
     if not SYMBOL_RE.match(name):
         raise ValueError(f"{field}不合法: {value!r}（须为大写字母/数字且以 USDT 结尾，如 BTCUSDT）")
     return name
+
+
+def validate_and_normalize_strategy_config(strategy):
+    """生产启动与部署迁移共用的完整策略配置校验（就地规范化）。"""
+    if not isinstance(strategy, dict):
+        raise ValueError('config.strategy 必须是对象')
+    unknown = sorted(set(strategy) - MA_PARAMETER_FIELDS)
+    if unknown:
+        raise ValueError(f'config.strategy 含未知字段: {unknown}')
+    if strategy.get('default_risk_per_trade') is None:
+        raise ValueError(
+            "config.strategy 缺少必需参数 ['default_risk_per_trade']，"
+            "请对照 config.example.json 补全后再启动")
+
+    for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
+        if strategy.get(key) is None:
+            continue
+        value = strict_int(strategy[key], f'config.strategy.{key}')
+        if not (PERIOD_MIN <= value <= PERIOD_MAX):
+            raise ValueError(
+                f'config.strategy.{key} 超出允许范围 '
+                f'[{PERIOD_MIN}, {PERIOD_MAX}]: {value}')
+        strategy[key] = value
+
+    strategy['default_risk_per_trade'] = strict_risk_per_trade(
+        strategy['default_risk_per_trade'],
+        'config.strategy.default_risk_per_trade')
+    effective_short = strategy.get('ma_short_period', 7)
+    effective_long = strategy.get('ma_long_period', 28)
+    if effective_short >= effective_long:
+        raise ValueError(
+            f'config.strategy EMA 短期({effective_short})必须小于长期({effective_long})')
+    validate_ohlcv_capacity(strategy)
+    return strategy
+
+
+def validate_and_normalize_symbol_configs(symbols):
+    """生产启动与部署迁移共用的完整交易对池校验（就地规范化）。"""
+    if not isinstance(symbols, list):
+        raise ValueError('config.trading.symbols 必须是数组')
+    seen = set()
+    for index, symbol in enumerate(symbols):
+        if not isinstance(symbol, dict):
+            raise ValueError(
+                f'config.trading.symbols[{index}] 不是对象: {symbol!r}')
+        unknown = sorted(set(symbol) - SYMBOL_CONFIG_FIELDS)
+        if unknown:
+            raise ValueError(
+                f'config.trading.symbols[{index}] 含未知字段: {unknown}；'
+                '请先执行部署预检')
+        name = normalize_symbol_name(
+            symbol.get('name'),
+            f'config.trading.symbols[{index}] 交易对名')
+        if name in seen:
+            raise ValueError(f'config.trading.symbols 存在重复交易对: {name}')
+        seen.add(name)
+        symbol['name'] = name
+        if symbol.get('risk_per_trade') is not None:
+            symbol['risk_per_trade'] = strict_risk_per_trade(
+                symbol['risk_per_trade'], f'{name} risk_per_trade')
+        if symbol.get('enabled') is not None:
+            symbol['enabled'] = strict_bool(
+                symbol['enabled'], f'{name} enabled')
+    return symbols
