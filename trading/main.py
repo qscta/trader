@@ -757,11 +757,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return True
         return False
 
-    def is_symbol_quarantined(self, symbol):
-        """API/executor 可调用的统一隔离查询入口。"""
-        check = getattr(self.trade_state, 'is_position_quarantined', None)
-        return bool(check(symbol)) if callable(check) else False
-
     def _verify_existing_position_or_quarantine(
             self, symbol, local_position, exchange_position, clear_on_match=True):
         """两边都有仓时必须方向+张数完整一致。"""
