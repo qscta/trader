@@ -99,8 +99,8 @@ class SignalHandlersMixin:
                     # 保留 T+1 标记，下一根已收盘 K 线再按明确 EMA 方向重试。
                     logger.info(f"{symbol} [双均线] EMA 短长线暂时相等，无明确方向，保留 T+1 标记")
 
-    def handle_open_position_ma_cross(self, symbol, signal, position, symbol_config, df):
-        """双均线策略：处理已开仓头寸"""
+    def handle_open_position_ma_cross(self, symbol, signal, position, symbol_config):
+        """双均线策略：处理已开仓头寸（不需要 df：出场/反手全由 signal+position 决定）"""
         logger.info(f"{symbol} [双均线] 有开仓头寸({position['side']})，检查信号...")
 
         # 优先检查交易所端持仓状态（止损可能已触发）

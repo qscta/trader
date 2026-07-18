@@ -1283,7 +1283,7 @@ class MaCrossFlipTests(unittest.TestCase):
         position = {"side": "long", "position_size": 2.0, "stop_loss_price": 99}
 
         system.handle_open_position_ma_cross(
-            "BTCUSDT", signal, position, {"name": "BTCUSDT"}, df=object()
+            "BTCUSDT", signal, position, {"name": "BTCUSDT"}
         )
 
         system.trade_state.close_position.assert_called_once_with(

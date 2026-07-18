@@ -23,7 +23,7 @@ class _FakeNotifier:
         self.trade_close_summary_calls = 0
         self.trade_close_summary_payload = None
 
-    def notify_position_summary(self, positions, symbols_config, total_equity):
+    def notify_position_summary(self, positions, total_equity):
         self.calls += 1
         return self.result
 

@@ -731,7 +731,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
                 lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
             seen_actions = []
 
-            def observe(symbol, signal, position, _config, _df):
+            def observe(symbol, signal, position, _config):
                 seen_actions.append(signal.get('action'))
 
             system.handle_open_position_ma_cross = observe

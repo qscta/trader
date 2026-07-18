@@ -79,14 +79,13 @@ class ReportingMixin:
         """每天早上推送持仓汇总"""
         try:
             positions = self.trade_state.get_all_open_positions()
-            symbols_config = self.config['trading']['symbols']
             try:
                 balance = self.exchange_api.get_balance()
                 total_equity = float(balance['total']['USDT']) if balance else None
             except Exception as e:
                 logger.warning(f"获取权益失败: {e}")
                 total_equity = None
-            pushed = self.notifier.notify_position_summary(positions, symbols_config, total_equity)
+            pushed = self.notifier.notify_position_summary(positions, total_equity)
             if pushed:
                 logger.info("每日持仓汇总已推送")
                 return True

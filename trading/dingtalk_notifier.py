@@ -159,7 +159,7 @@ class DingTalkNotifier:
                 content += f"止损参考(N日高/低): {upper_stop} / {lower_stop}\n\n"
         return self.send_message(f"[交易系统] 信号未成交 - {symbol}", content)
 
-    def notify_position_summary(self, positions, symbols_config, total_equity):
+    def notify_position_summary(self, positions, total_equity):
         """发送每日持仓汇总"""
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         long_count = sum(1 for p in positions.values() if p.get('side') == 'long')

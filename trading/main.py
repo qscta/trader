@@ -1607,7 +1607,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     position = self.trade_state.get_open_position(symbol)
 
                     if position:
-                        self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
+                        self.handle_open_position_ma_cross(symbol, signal, position, symbol_config)
                     elif symbol_config.get('_retired_from_pool'):
                         logger.info(
                             f"{symbol} 已退池且当前仓位已结束；禁止新开仓并完成生命周期清理")

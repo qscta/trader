@@ -1051,7 +1051,7 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
         signal = {'current_close': 101}
         position = {'side': 'long', 'stop_loss_price': 99, 'position_size': 2, 'stop_order_id': 'stop-9'}
 
-        system.handle_open_position_ma_cross('ETHUSDT', signal, position, {'name': 'ETHUSDT'}, df=object())
+        system.handle_open_position_ma_cross('ETHUSDT', signal, position, {'name': 'ETHUSDT'})
 
         self.assertEqual(cancel_calls, ['stop-9'])
 
