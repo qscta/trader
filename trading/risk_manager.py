@@ -4,16 +4,15 @@ from config_validation import MAX_RISK_PER_TRADE
 
 
 class RiskManager:
-    def __init__(self, account_equity, risk_per_trade=0.01):
+    def __init__(self, account_equity):
         """
         初始化风险管理器
         account_equity: 账户权益
-        risk_per_trade: 每笔交易风险比例（默认1%）
         """
         self.account_equity = account_equity
-        self.risk_per_trade = risk_per_trade
 
-    def calculate_position_size(self, entry_price, stop_loss_price, risk_per_trade=None):
+    def calculate_position_size(
+            self, entry_price, stop_loss_price, risk_per_trade):
         """
         计算头寸大小（以损定量 - 百分比风险模型）
 
@@ -27,13 +26,16 @@ class RiskManager:
         数量级失控的仓位。生产链路上游已校验权益>0、价格有限>0、风险度∈(0,50%]，
         这里是那道防线万一被绕过时的最后兜底。
         """
-        risk_pct = risk_per_trade if risk_per_trade is not None else self.risk_per_trade
+        risk_pct = risk_per_trade
+        if any(isinstance(value, bool) for value in (
+                self.account_equity, entry_price, stop_loss_price, risk_pct)):
+            return 0
         try:
             equity = float(self.account_equity)
             entry_price = float(entry_price)
             stop_loss_price = float(stop_loss_price)
             risk_pct = float(risk_pct)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
         if not all(math.isfinite(v) for v in

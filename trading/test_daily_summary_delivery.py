@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import _test_stubs
 
 TradingSystem = _test_stubs.import_main().TradingSystem
-from trade_state import TradeState
+from trade_state import TradeState  # noqa: E402
 
 
 class _FakeNotifier:
@@ -105,6 +105,10 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
             get_open_position=lambda symbol: None,
+            get_open_intents=lambda: {},
+            has_stop_residue=lambda symbol: False,
+            clear_position_quarantine=lambda symbol: False,
+            set_last_daily_check_date=lambda _day: None,
         )
         system.config = {'strategy': {'default_risk_per_trade': 0.01}, 'trading': {'symbols': []}}
         system._retry_clear_stop_residues = lambda: None
@@ -131,6 +135,10 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.trade_state = SimpleNamespace(
             get_all_open_positions=lambda: {},
             get_open_position=lambda symbol: None,
+            get_open_intents=lambda: {},
+            has_stop_residue=lambda symbol: False,
+            clear_position_quarantine=lambda symbol: False,
+            set_last_daily_check_date=lambda _day: None,
         )
         system.config = {
             'strategy': {'default_risk_per_trade': 0.01},

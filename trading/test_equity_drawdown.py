@@ -46,7 +46,8 @@ def _jdump(data, path):
 
 class CoercePositiveFloatTest(unittest.TestCase):
     def test_rejects_nonfinite_values(self):
-        for bad in ("inf", "-inf", "nan", float('inf'), float('nan')):
+        for bad in ("inf", "-inf", "nan", float('inf'), float('nan'),
+                    True, False):
             self.assertIsNone(eqt._coerce_positive_float(bad), msg=repr(bad))
 
     def test_accepts_positive_finite_values(self):
@@ -281,6 +282,45 @@ class EquitySyncFlowTest(unittest.TestCase):
                 t.equity_sync(flow_amount=1500.0)
             with self.assertRaises(ValueError):
                 t.equity_sync(flow_amount=2000.0)
+
+    def test_extreme_finite_outflow_overflow_is_rejected_before_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t, _bal = self._tracker(tmp, equity=1500.0)
+            self.assertTrue(t.record_equity_tick(equity=1500.0))
+            before = {}
+            for name in os.listdir(tmp):
+                path = os.path.join(tmp, name)
+                if os.path.isfile(path):
+                    with open(path, 'rb') as handle:
+                        before[name] = handle.read()
+            t._commit_equity_sync_generation = Mock()
+            t.record_equity_tick = Mock()
+
+            with self.assertRaisesRegex(ValueError, '正有限数'):
+                t.equity_sync(flow_amount=-1.7976931348623157e308)
+
+            t._commit_equity_sync_generation.assert_not_called()
+            t.record_equity_tick.assert_not_called()
+            after = {}
+            for name in os.listdir(tmp):
+                path = os.path.join(tmp, name)
+                if os.path.isfile(path):
+                    with open(path, 'rb') as handle:
+                        after[name] = handle.read()
+            self.assertEqual(before, after)
+
+    def test_underflowed_initial_divisor_is_rejected_before_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t, _bal = self._tracker(
+                tmp, equity=float.fromhex('0x0.0000000000001p-1022'))
+            t._commit_equity_sync_generation = Mock()
+            t.record_equity_tick = Mock()
+
+            with self.assertRaisesRegex(ValueError, '除数'):
+                t.equity_sync()
+
+            t._commit_equity_sync_generation.assert_not_called()
+            t.record_equity_tick.assert_not_called()
 
     def test_legacy_no_flow_uses_latest_tick_anchor(self):
         """留空净变动 = 旧行为：以最近已记录指数为锚——在采样跑过之前及时点击仍然正确。"""

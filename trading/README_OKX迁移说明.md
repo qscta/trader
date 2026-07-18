@@ -15,7 +15,7 @@
 
 - **内部符号**统一 `BTCUSDT`，由 `to_ccxt_symbol()` 映射为欧易 `BTC/USDT:USDT`。
 - **仓位单位**：上层与本地状态始终用「币的数量」；欧易「张数」换算只在 `okx_api.py` 下单边界内部发生，不外泄，保证风控/盈亏口径与原版一致。
-- **双向事务句柄**：开仓用 `open_intent`，已有仓位的主动平仓用持仓内 `close_intent`；两者都在首次 POST 前固化基础 `clOrdId` 和计划量。平仓恢复会查询基础腿及确定性 `r1/r2`，把真实 VWAP、手续费和订单 ID 与完整/部分账本更新一次性收口。
+- **单订单事务句柄**：开仓用 `open_intent`，已有仓位的主动平仓用持仓内 `close_intent`；两者都在首次 POST 前固化唯一 `clOrdId` 和计划量。运行时只裁决这一条真实订单；部署迁移会阻断任何尚未收口的 intent/历史中间形态，须由旧版本或人工先核对收口。
 - 状态文件直接存在**项目根目录**（不再有 `data/<交易所>/` 子目录）。
 
 ## 二、配置（config.json）
@@ -67,8 +67,8 @@
 `/api/symbols`、`/api/account_stats`、`/api/equity_ohlc`(=`/api/qiusuo_index_ohlc`)、`/api/instant_open`、
 `/api/close_position`、`/api/strategy_params`、`/api/equity_sync`、`/api/trades`、`/api/manual_check`。
 
-> 多所时代的 `/api/exchanges`、`/api/overview`、`/api/overview_ohlc` 已删除；前端通道图下线后残留的
-> `/api/channel_data` 孤儿路由也已删除。其余路由不再接受 `?exchange=` 或 body 里的 `exchange` 字段。
+> 多所时代的废弃路由已删除；现有路由不再接受 `?exchange=` 或 body 里的
+> `exchange` 字段。
 
 ## 五、运行 / 部署
 
@@ -80,15 +80,16 @@ export FLASK_SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(3
 TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 ```
 
-- **时区**：每日 08:00 检查等 cron 任务按**服务器系统本地时区**触发。部署前确认时区符合预期（如 `timedatectl set-timezone Asia/Shanghai`），否则 UTC 服务器上 08:00 实际是北京时间 16:00。
+- **时区**：每日 08:00 检查等 cron 任务按**服务器系统本地时区**触发。部署要求 `Asia/Shanghai`（UTC+8）；启动时偏移不符会告警并拒绝启动。
 - 务必使用仓库的 `gunicorn.conf.py`：单 worker + gthread + 120 秒请求超时 + 900 秒优雅退出；`wsgi.py` 与
   `main.py`/`api_server.py` 共用项目内文件锁防重复 runner（抢不到锁直接退出）。默认仅监听
   `127.0.0.1:5000`，公网必须经 HTTPS 反代；一层可信反代需显式设置 `TRADING_PROXYFIX_X_FOR=1`。
 - `FLASK_SECRET_KEY` 少于 32 字节会拒绝启动；不要使用文档占位符、密码或可猜字符串。
   若用 `TRADING_RUNNER_LOCK_FILE` 改锁路径，锁必须位于当前用户所有的专用 0700 目录，
   不能直接放在 `/tmp` 等共享目录。
-- **一次性 legacy 迁移**：`data/okx/` 只在无 `.okx_legacy_migration_complete.json` 时参与裁决；迁移成功后原子写 marker，后续重启绝不再用永久旧快照复活主账本。根主账本/.bak 缺失冲突、两边存在不同生命周期数据、任一 schema/权限/符号链接异常均拒启；只在内容同源或安全空状态下迁移。
+- **旧状态硬门禁**：MA-only runtime 不再自动导入 `data/okx/`。目录非空但缺少有效 `.okx_legacy_migration_complete.json` 时，部署预检与启动都会拒绝；必须在停机窗口人工核对并收口，防止部署预检之后又从永久旧快照复活未审查的持仓或在途状态。
 - **单策略部署预检**：停 runner 后执行 `python3 migrate_single_strategy.py --data-dir .`；确认报告后加 `--apply`，再干跑一次必须显示通过。未收口开仓意图、旧版 `signal_execution=pending`、无法证明终态的旧执行状态或不兼容在途持仓都会返回非零并阻断部署。
+- **部署零开仓门禁**：任何生产变更前，必须用 runner 同源调度解析器证明当前调度日已成功完成，并对在线源执行只读迁移/配置预检；未到日检窗口、仍在 2 分钟宽限期或当日未完成时保持旧生产运行并退出。随后关闭公网入口、优雅排空 runner，再在 runtime 目录维持 `.maintenance_no_open`。哨兵存在时正式/手动日检在任何副作用前返回且不标记完成，只运行健康与 guardian；不存在“跳过并标记完成”的环境旁路。部署期间冻结 OKX UI、人工及其它 API 消费者，运行期 managed SWAP 也只允许经系统 API 操作。完整顺序见 `DEPLOY_NOTES.md`。
 - **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
 - **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。部分平仓后的止损缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
 - **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。

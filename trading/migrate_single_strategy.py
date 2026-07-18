@@ -7,21 +7,23 @@
 
 import argparse
 import copy
-import json
 import os
-import re
 import stat
 import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import (TradeState, atomic_write_json, open_private_text_file,
-                         private_file_exists)
+from trade_state import (TradeState, atomic_write_json,
+                         is_closed_trade_archive_candidate,
+                         is_closed_trade_archive_name, load_strict_json,
+                         open_private_text_file, owner_auxiliary_state_paths,
+                         private_file_exists, state_has_lifecycle_data,
+                         validate_closed_trade_record,
+                         validate_okx_owner_manifest)
 import config_validation as cfgv
 
 STRATEGY_ID = 'ma_cross'
 SIGNAL_FIELDS = frozenset({'last_processed_candle', 'last_update'})
-ARCHIVE_NAME_RE = re.compile(r'^closed_trades_archive(?:_.+)?\.json$')
 
 EXIT_OK = 0
 EXIT_UNSAFE = 2
@@ -33,10 +35,7 @@ EXIT_RESTORE_FAILED = 5
 def _load_json(path):
     # 部署预检必须是观察者：权限异常直接阻断，不得在“干跑”中偷偷 chmod。
     with open_private_text_file(path, adjust_permissions=False) as handle:
-        return json.load(
-            handle,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f'不允许的 JSON 数值常量: {value}')))
+        return load_strict_json(handle)
 
 
 def normalize_config(config):
@@ -46,6 +45,12 @@ def normalize_config(config):
     blockers = []
     if not isinstance(cleaned, dict):
         return cleaned, report, ['配置顶层必须是对象']
+    try:
+        legacy_layout = cfgv.canonicalize_single_okx_config(cleaned)
+    except (TypeError, ValueError) as exc:
+        return cleaned, report, [str(exc)]
+    if legacy_layout:
+        report.append('配置布局由 exchanges.okx 收敛为顶层 okx')
     trading = cleaned.get('trading')
     symbols = trading.get('symbols') if isinstance(trading, dict) else None
     if not isinstance(symbols, list):
@@ -64,8 +69,7 @@ def normalize_config(config):
         del symbol['strategy']
         report.append(f'{name}: 删除冗余 strategy 配置字段')
     try:
-        cfgv.validate_and_normalize_strategy_config(cleaned.get('strategy'))
-        cfgv.validate_and_normalize_symbol_configs(symbols)
+        cfgv.validate_and_normalize_execution_config(cleaned)
     except (TypeError, ValueError) as exc:
         blockers.append(str(exc))
     return cleaned, report, blockers
@@ -78,6 +82,9 @@ def normalize_ledger(state):
     blockers = []
     if not isinstance(cleaned, dict):
         return cleaned, report, ['账本顶层必须是对象']
+    if 'last_check_time' in cleaned:
+        del cleaned['last_check_time']
+        report.append('删除 runtime 已不使用的 last_check_time')
 
     intents = cleaned.get('open_intents', {})
     if not isinstance(intents, dict):
@@ -99,6 +106,25 @@ def normalize_ledger(state):
             if label != STRATEGY_ID:
                 blockers.append(
                     f'{symbol}: 在途持仓缺少可证明的双均线归属，必须人工裁决')
+            if position.get('close_intent') is not None:
+                blockers.append(
+                    f'{symbol}: 存在未收口 close_intent（包括未知/'
+                    'single_order_v1），部署前必须人工收口')
+            recovery_flags = any(
+                position.get(field) is True for field in (
+                    'recovered_partial_rollback',
+                    'recovered_unresolved_open',
+                    'recovered_open_overfill'))
+            recovery_finalized = position.get(
+                'execution_recovery_finalized')
+            if recovery_finalized is False:
+                blockers.append(
+                    f'{symbol}: execution_recovery_finalized=false，'
+                    '未决执行中间态禁止部署')
+            elif recovery_flags and recovery_finalized is not True:
+                blockers.append(
+                    f'{symbol}: recovery 持仓缺少严格权威终态凭证，'
+                    '禁止部署')
 
     signal_states = cleaned.get('signal_states', {})
     if not isinstance(signal_states, dict):
@@ -146,10 +172,19 @@ def normalize_ledger(state):
     closed = cleaned.get('closed_trades')
     if isinstance(closed, list):
         for index, trade in enumerate(closed):
-            if isinstance(trade, dict) and trade.get('strategy') not in (
-                    None, STRATEGY_ID):
+            if not isinstance(trade, dict):
+                blockers.append(f'closed_trades[{index}] 必须是对象')
+                continue
+            if trade.get('strategy') not in (None, STRATEGY_ID):
                 del trade['strategy']
                 report.append(f'closed_trades[{index}]: 删除不兼容历史标签')
+            try:
+                if validate_closed_trade_record(
+                        trade, f'closed_trades[{index}]', normalize=True):
+                    report.append(
+                        f'closed_trades[{index}]: 历史数值字段规范化')
+            except ValueError as exc:
+                blockers.append(str(exc))
     else:
         blockers.append('closed_trades 必须是数组')
 
@@ -175,6 +210,12 @@ def normalize_archive(records):
         if trade.get('strategy') not in (None, STRATEGY_ID):
             del trade['strategy']
             report.append(f'第 {index} 项: 删除不兼容历史标签')
+        try:
+            if validate_closed_trade_record(
+                    trade, f'平仓史书第 {index} 项', normalize=True):
+                report.append(f'第 {index} 项: 历史数值字段规范化')
+        except ValueError as exc:
+            blockers.append(str(exc))
     return cleaned, report, blockers
 
 
@@ -187,9 +228,23 @@ def _targets(data_dir, config_path):
         paths.append(('ledger', backup_state))
     if os.path.isdir(data_dir):
         for name in sorted(os.listdir(data_dir)):
-            if ARCHIVE_NAME_RE.fullmatch(name):
+            if is_closed_trade_archive_name(name):
                 paths.append(('archive', os.path.join(data_dir, name)))
     return paths
+
+
+def _validate_archive_names(data_dir):
+    try:
+        names = os.listdir(data_dir)
+    except OSError as exc:
+        return f'无法枚举平仓史书: {exc}'
+    invalid = sorted(
+        name for name in names
+        if (is_closed_trade_archive_candidate(name) and
+            not is_closed_trade_archive_name(name)))
+    if invalid:
+        return f'发现不受支持的平仓史书文件名: {invalid}'
+    return None
 
 
 def _fsync_directory(path):
@@ -222,6 +277,75 @@ def _validate_data_dir(data_dir, config_path):
     if os.path.dirname(config_path) != data_dir:
         return 'config.json 必须与 trade_state.json 位于同一真实数据目录'
     return None
+
+
+def _validate_legacy_state_gate(data_dir):
+    """旧状态只能由已完成标记证明收口；禁止在部署后由 runtime 再导入。"""
+    legacy_dir = os.path.join(data_dir, 'data', 'okx')
+    if not os.path.lexists(legacy_dir):
+        return None
+    try:
+        info = os.lstat(legacy_dir)
+    except OSError as exc:
+        return f'无法检查旧状态目录 {legacy_dir}: {exc}'
+    if not stat.S_ISDIR(info.st_mode):
+        return f'旧状态目录必须是真实目录（拒绝符号链接）: {legacy_dir}'
+    current_uid = os.geteuid() if hasattr(os, 'geteuid') else os.getuid()
+    if info.st_uid != current_uid:
+        return f'旧状态目录不属于当前用户: {legacy_dir}'
+    marker = os.path.join(data_dir, '.okx_legacy_migration_complete.json')
+    if private_file_exists(marker):
+        try:
+            payload = _load_json(marker)
+        except Exception as exc:
+            return f'旧状态迁移标记非法: {exc}'
+        try:
+            cfgv.validate_okx_legacy_migration_marker(payload)
+        except ValueError as exc:
+            return f'旧状态迁移标记内容非法: {exc}'
+        return None
+    try:
+        entries = os.listdir(legacy_dir)
+    except OSError as exc:
+        return f'无法枚举旧状态目录 {legacy_dir}: {exc}'
+    if entries:
+        return (
+            '检测到未收口的旧 data/okx 状态且缺少完成标记；'
+            '禁止让 MA-only runtime 在部署后自动导入，请先人工裁决')
+    return None
+
+
+def _validate_owner_manifest(data_dir):
+    """部署预检必须先证明 runtime 将读取的目录归属标记可安全启动。"""
+    path = os.path.join(data_dir, '.trading_data_owner.json')
+    if not private_file_exists(path):
+        return None
+    try:
+        payload = _load_json(path)
+    except Exception as exc:
+        return f'数据目录归属标记非法: {exc}'
+    try:
+        validate_okx_owner_manifest(payload)
+    except ValueError as exc:
+        return f'{exc}: {path}'
+    return None
+
+
+def _directory_has_unowned_state(data_dir):
+    """复用 startup 的路径集合与非空口径检查无 owner 的辅助状态。"""
+    for path in owner_auxiliary_state_paths(data_dir):
+        if not private_file_exists(path):
+            continue
+        payload = _load_json(path)
+        if payload not in ({}, [], None):
+            return True
+    backup = os.path.join(data_dir, 'trade_state.json.bak')
+    if private_file_exists(backup):
+        backup_state = _load_json(backup)
+        TradeState.validate_state(backup_state)
+        if state_has_lifecycle_data(backup_state):
+            return True
+    return False
 
 
 def _validate_journal_items(data_dir, journal):
@@ -276,6 +400,18 @@ def run(data_dir, apply=False, config_path=None):
     if directory_error:
         print(f'[阻断] {directory_error}')
         return EXIT_UNSAFE
+    legacy_error = _validate_legacy_state_gate(data_dir)
+    if legacy_error:
+        print(f'[阻断] {legacy_error}')
+        return EXIT_UNSAFE
+    archive_name_error = _validate_archive_names(data_dir)
+    if archive_name_error:
+        print(f'[阻断] {archive_name_error}')
+        return EXIT_UNSAFE
+    owner_error = _validate_owner_manifest(data_dir)
+    if owner_error:
+        print(f'[阻断] {owner_error}')
+        return EXIT_UNSAFE
     journal_path = os.path.join(
         data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
     if private_file_exists(journal_path):
@@ -315,6 +451,22 @@ def run(data_dir, apply=False, config_path=None):
             blockers.extend(f'{path}: {item}' for item in target_blockers)
         except Exception as exc:
             blockers.append(f'{path}: 读取或解析失败: {exc}')
+
+    ledger_path = os.path.join(data_dir, 'trade_state.json')
+    ledger = normalized.get(ledger_path)
+    owner_manifest = os.path.join(data_dir, '.trading_data_owner.json')
+    if isinstance(ledger, dict) and ledger.get('exchange') is None:
+        try:
+            unowned = (
+                state_has_lifecycle_data(ledger) or
+                _directory_has_unowned_state(data_dir))
+        except Exception as exc:
+            blockers.append(f'无归属辅助状态无法验证: {exc}')
+        else:
+            if unowned and not private_file_exists(owner_manifest):
+                blockers.append(
+                    '账本与目录均无 OKX 归属标记，但已存在生命周期/历史/权益状态；'
+                    '拒绝由 startup 自动认领')
 
     if blockers:
         for item in blockers:

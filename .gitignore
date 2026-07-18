@@ -19,6 +19,9 @@ trading/.trading_data_owner.json
 trading/.okx_legacy_migration_complete.json
 trading/.equity_sync_journal.json
 trading/.single_strategy_migration_journal.json
+trading/.maintenance_no_open
+trading/deployment_no_open_baseline.json
+trading/deployment_no_open_completion.json
 trading/data/
 trading/.runtime/
 

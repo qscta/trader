@@ -103,10 +103,19 @@ class TradeStateFeeTest(unittest.TestCase):
             persisted = reloaded.get_closed_trades()[-1]
             self.assertAlmostEqual(persisted['pnl'], 15.955)
 
+            corrupted = dict(persisted)
+            corrupted['final_exit_price'] = 121.0
+            with self.assertRaises(ValueError):
+                TradeState.validate_state({
+                    'open_positions': {}, 'closed_trades': [corrupted],
+                })
+
     def test_partial_close_rejects_full_quantity(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
-            state.add_open_position('ETHUSDT', 'short', 100, 2, 110, 'stop')
+            state.add_open_position(
+                'ETHUSDT', 'short', 100, 2, 110, 'stop',
+                strategy='ma_cross')
             with self.assertRaises(ValueError):
                 state.apply_partial_close('ETHUSDT', 2, 90)
 

@@ -1,93 +1,107 @@
-# 单策略版本部署门禁
+# MA-only production deployment handoff
 
-本版本只保留双均线 EMA，部署目标是稳定、纯净、简洁。以下步骤必须在 runner
-停止、交易所持仓与挂单已人工核对的维护窗口内执行。
+Production deployment has one canonical state path:
 
-## 1. 代码与依赖
+`PREPARED -> QUIESCED -> T0 -> VALIDATED -> SEALED -> COMMIT_READY -> COMMITTED`
 
-```bash
-git rev-parse HEAD
-python3 --version                  # 生产要求 Python 3.12
-python3 -m pip install -r requirements.lock
-python3 -m pip check
-```
+`COMMITTED` is derived, not written after the fact: the root phase journal is
+`COMMIT_READY`, the sealed baseline/completion pair is valid, and the sentinel
+is absent. The sentinel unlink performed by `gate commit` is the only commit.
 
-保存当前提交号、配置、账本、账本 `.bak`、权益文件与年度平仓史书的一致性加密备份。
-备份只放受控存储，不得进入 Git 或聊天工具。
+## Reviewed artifacts
 
-## 2. 单策略预检
+- `prepare_deployment.py` builds the credential-free stage and installed driver.
+- `deploy.sh` is the non-interactive one-way driver.
+- `emergency-stop.sh` synchronously blocks and stops every known writer.
+- `recover-deployment.sh` abandons one failed attempt and creates a fresh ID.
+- `deployment_attempt.py` owns the write-once root phase journal.
+- `deployment_no_open_gate.py` owns OKX read-only proof and sentinel evidence.
+- `deployment_evidence.py` validates short-lived root approvals and managed files.
 
-```bash
-cd trading
+Render the release SHA only through `prepare_deployment.py`. Preparation must run
+as root against a clean tracked/staged/unstaged worktree. Its invocation must list
+every required CI check and workflow by its exact reviewed name; a merely nonempty
+set of successful CI records is insufficient. Preparation reads no trading
+credential. It constructs stage and driver directories in their respective
+protected parents, fsyncs them, publishes driver first and stage second by atomic
+rename, and validates an already-published identical pair on retry.
 
-# 只读分析；非零退出码即停止部署
-python3 migrate_single_strategy.py --data-dir .
+## Safety sequence
 
-# 人工核对报告后才写入；脚本会先给配置、主备账本及年度史书留时间戳备份
-python3 migrate_single_strategy.py --data-dir . --apply
+1. Before creating a runtime root, installing a start block, or stopping any
+   unit, compute the current scheduler slot with the same pure resolver used by
+   the runner and require `last_daily_check_date` to equal it. Before the daily
+   window or while that slot is incomplete, exit with production untouched.
+   Run the migration dry-run and reviewed config-cleanup check against the live
+   source at this same pre-stop boundary; repeat all checks after the snapshot.
+2. The root approval bound to `writer-inventory.json` must explicitly freeze
+   OKX UI/manual order entry, every other API credential consumer, and the
+   reviewed host process/unit inventory. During deployment nobody and no other
+   program may open, close, amend, or cancel managed SWAP orders. During normal
+   runtime, managed instruments may be changed only through the system API.
+3. Install and reload a persistent `ConditionPathExists` start block, cut the
+   external tunnel, and gracefully drain backup/monitor/trading units. Gunicorn
+   stops accepting requests and waits for the scheduler/active trade thread.
+   A timeout or failed drain is hard-contained with cgroup freeze/SIGKILL but
+   returns failure and enters recovery; it never continues into migration.
+4. Arm the release sentinel and take stable inactive/PID/cgroup/lock samples.
+   Run two complete Q0-to-Q2 read-only visibility probes. The second Q0 must not
+   precede the first Q2. Baseline then proves history continuously from the
+   second Q2 through authoritative T0, takes its snapshot after T0, and persists
+   the T0 evidence. There is no Q2-to-T0 or snapshot-to-T0 blind interval.
+5. Keep the sentinel active while the exact formal service, memory monitor,
+   explicit backup (including its formal-service restart), backup timer, and
+   external tunnel are exercised. Every HTTP write returns 503; authenticated
+   GET status remains available. The runner's formal and manual daily-check
+   entry returns before any side effect while the sentinel exists; health and
+   guardian duties remain live. External approval binds the sentinel, baseline,
+   local health, nonce, config and exact environment hashes.
+6. Gracefully drain the whole stack again. With the runner lock proven free,
+   require migration dry-run and the same completed slot again, run the sole
+   final `verify`, recheck reviewed code/venv/CI/writer approval, and `seal`.
+   Seal writes completion but retains the sentinel.
+7. Restart the already-validated formal stack under the sentinel. Prove the exact
+   unit is active/running, its MainPID is in its cgroup, its working directory is
+   the immutable release, and that PID holds the exact runner-lock inode.
+8. While the sentinel still exists, remove both start block and temporary `/run`
+   authorization, daemon-reload, and repeat health, HTTP-gate, identity, and hash
+   checks. Write `COMMIT_READY`, disable fail-safe traps, then execute `gate commit`.
+   No fallible filesystem, service, evidence, health, or network action follows.
 
-# 幂等复验：必须返回 0 并显示已经通过
-python3 migrate_single_strategy.py --data-dir .
-```
+Runtime JSON, locks, sentinel, baseline and completion live under
+`/var/lib/trading-runtime/<sha>`. Reviewed code and its complete virtual
+environment live under `/opt/trader-releases/<sha>` and are root-owned,
+non-group/world-writable through every resolved interpreter target and ancestor.
+`trading.log` also lives in the runtime root so rotation never needs to write the
+release tree. The runtime identity can write only runtime data; config is
+inaccessible to the memory monitor.
 
-以下情况脚本会 fail-closed：
+`/etc/trading.env` has an exact key allowlist and is hash-bound/rechecked.
+Every Python boundary uses `-B -E`; direct tools use `env -i`, while formal,
+gate, health and monitor units reset inherited environment sources and remove
+all loader, Python, proxy and TLS override variables. Effective unit properties
+must prove the exact executable, environment files, empty pre/post hooks and
+the reviewed `UnsetEnvironment` set before a service can start.
 
-- 缺少 `config.json` 或 `trade_state.json`；
-- JSON 损坏、权限/符号链接不安全或规范化后 schema 非法；
-- 存在未收口 `open_intent` 或旧版 `signal_execution=pending`；
-- 配置带不兼容标签，或在途持仓无法证明属于双均线；平仓史书格式损坏；
-- 备份、写入或失败回滚任一步骤不能确认完成。
+OKX net positions do not provide a reliable identity that distinguishes an
+external same-side/same-size replacement. The no-open proof therefore depends
+on the single-writer boundary above and must not be described as attributing
+such a replacement to a particular actor.
 
-脚本要求 `config.json` 与账本位于同一目录；`--data-dir` 最后一级目录条目不得是
-符号链接或允许组/其他用户写入，敏感 JSON 必须预先为 `0600`；干跑只观察，绝不
-代为修改权限。脚本不证明所有祖先目录均非符号链接，部署时必须先用 `pwd -P` 进入
-受信、不可由其他用户改写的物理父目录，再传 `--data-dir .`。`--apply`
-会覆盖全部运行时平仓史书（包括 `closed_trades_archive_undated.json`），并在首个正式
-写入前建立 `.single_strategy_migration_journal.json`。若进程在多文件写入之间死亡，
-runner 会拒绝启动；普通干跑只报告并保持现场不变，显式加 `--apply` 后迁移器才会
-先从整组 `.premigrate.*` 备份恢复，再重新预检和迁移。
-事务日志和备份均已被 Git 忽略且由仓库卫生测试二次阻断，但它们仍含凭据/真钱状态，
-只能留在受控部署目录。
+## Failure and same-SHA retry
 
-禁止手改脚本退出码或清空账本绕过阻断。先核对交易所现实，收口生命周期，再重跑。
+Never restart `deploy.sh` for the same attempt ID. Before commit, any ordinary
+failure invokes the emergency boundary and leaves the system stopped, persistently
+blocked and sentinel-protected. Run the rendered `recover-deployment.sh` instead.
 
-## 3. 自动化门禁
+Recovery first refuses `COMMIT_READY + missing sentinel` and any ambiguous
+sentinel-missing durable evidence, so it cannot reinterpret a committed release as
+failed. It then writes `abandoned.json` in the old root attempt journal, completes
+the gate's journal-first evidence archive (retryable after interruption), atomically
+switches `active-attempt` to a fresh four-digit ID, fsyncs it, and arms a fresh
+sentinel. Human approvals and reports are attempt-local and cannot be reused.
 
-```bash
-# 纯标准库矩阵
-python3 -m unittest discover -s . -p "test_*.py" -v
-
-# 完整依赖矩阵，含真实 pandas EMA 行为
-python3 -m unittest discover -s tests -p "test_*.py" -v
-
-python3 -m compileall -q .
-node --check static/app.js
-```
-
-GitHub Actions 的 Python 3.10–3.13 标准库矩阵、Python 3.12 依赖矩阵和前端语法检查
-必须全部通过。任何跳过、预期失败或只在本机通过都不算部署证据。
-
-## 4. 模拟盘门禁
-
-当前候选提交及当前依赖必须重新执行：
-
-```bash
-OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
-OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
-OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
-OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --stop-id-reuse
-```
-
-超时或结果不确定不算通过。必须人工核对币数↔张数、单向持仓模式、reduce-only
-算法止损、触发平仓、撤单清单和确定性止损 ID 复用。
-
-## 5. 启动后观察
-
-1. 单实例锁正常，runner 与 Web 状态一致；
-2. 启动对账无孤儿仓、隔离、残留或未收口意图；
-3. 每个实仓稳定态只有一张数量、方向、触发价均匹配的止损；
-4. 正式日检完成日期与信号 K 线标记均正常持久化；
-5. 当日止损品种不重入，次日才按当前 EMA 方向重入；
-6. 磁盘、日志、钉钉和账户权益无异常。
-
-只有自动化门禁、模拟盘证据与启动后观察均通过，才允许逐步恢复真实资金流量。
+Deployment is authorized only after the required three full adversarial reviews,
+with the final two consecutive reviews reporting no issue, plus the final strongest
+model judgment. The live API key may remain configured because every stage before
+the unique commit is mechanically no-open and all HTTP writes are denied.

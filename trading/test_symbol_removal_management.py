@@ -8,16 +8,17 @@ import json
 import os
 import threading
 import tempfile
+import time
 import unittest
 from datetime import date, datetime
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import _test_stubs
 
 TradingSystem = _test_stubs.import_main().TradingSystem
-import trade_state as trade_state_module
-from trade_state import TradeState, TradeStatePersistenceError  # 真实现（纯标准库）
+import trade_state as trade_state_module  # noqa: E402
+from trade_state import TradeState, TradeStatePersistenceError  # noqa: E402  真实现（纯标准库）
 
 
 def _build_system(tmpdir, config_symbols):
@@ -30,6 +31,10 @@ def _build_system(tmpdir, config_symbols):
     system._stop_anomalies = {}
     system._last_check_date = None
     system._last_failure_notify_ts = 0
+    system._last_trade_check_failure = None
+    system._last_successful_trade_check_ts = None
+    system._last_guardian_failure = None
+    system._last_successful_guardian_ts = None
     system._pending_trade_open_notifications = []
     system._pending_trade_close_notifications = []
     system.equity_tracker = SimpleNamespace(
@@ -49,9 +54,93 @@ def _build_system(tmpdir, config_symbols):
     # K线返回空 → 循环对每个 symbol 走到 fetch 后 continue，不进入信号分支
     system.exchange_api = SimpleNamespace(
         to_ccxt_symbol=record_symbol,
+        list_position_symbols=lambda: [],
         get_position=lambda s: None,
         fetch_ohlcv=lambda *a, **k: [])
     return system, checked
+
+
+def _make_health_ready(system):
+    system.scheduler = SimpleNamespace(
+        running=True,
+        _thread=SimpleNamespace(is_alive=lambda: True))
+    system._heartbeat_lock = threading.Lock()
+    system._runner_heartbeat_ts = time.time()
+    system._stop_event = threading.Event()
+    system._last_check_date = system._daily_check_readiness(
+        datetime.now())[1]
+    return system
+
+
+class OperationalHealthLatchTest(unittest.TestCase):
+    def test_symbol_failure_degrades_health_until_full_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(
+                tmp, [{'name': 'BTCUSDT', 'enabled': True}])
+            _make_health_ready(system)
+
+            system.check_and_execute_trades(manual_run=True)
+
+            self.assertEqual(
+                'symbol_failures', system._last_trade_check_failure['kind'])
+            self.assertFalse(system.health_snapshot()['healthy'])
+
+            system.config['trading']['symbols'] = []
+            system.check_and_execute_trades(manual_run=True)
+
+            self.assertIsNone(system._last_trade_check_failure)
+            self.assertTrue(system.health_snapshot()['healthy'])
+
+    def test_trade_lock_conflict_degrades_health_until_full_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, [])
+            _make_health_ready(system)
+            system._trade_lock.acquire()
+            try:
+                system.check_and_execute_trades(manual_run=True)
+            finally:
+                system._trade_lock.release()
+
+            self.assertEqual(
+                'trade_lock_busy', system._last_trade_check_failure['kind'])
+            self.assertFalse(system.health_snapshot()['healthy'])
+
+            system.check_and_execute_trades(manual_run=True)
+
+            self.assertIsNone(system._last_trade_check_failure)
+            self.assertTrue(system.health_snapshot()['healthy'])
+
+    def test_outer_trade_check_exception_degrades_health(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, [])
+            _make_health_ready(system)
+            system.equity_tracker.record_daily_equity_snapshot = Mock(
+                side_effect=RuntimeError('snapshot broken'))
+
+            system.check_and_execute_trades()
+
+            self.assertEqual(
+                'check_exception', system._last_trade_check_failure['kind'])
+            self.assertFalse(system.health_snapshot()['healthy'])
+
+    def test_guardian_failure_degrades_health_until_full_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(
+                tmp, [{'name': 'BTCUSDT', 'enabled': True}])
+            _make_health_ready(system)
+            system.exchange_api.list_position_symbols = Mock(
+                side_effect=RuntimeError('position list broken'))
+
+            self.assertFalse(system.reconcile_intraday_stop_losses())
+            self.assertEqual(
+                'guardian_failures', system._last_guardian_failure['kind'])
+            self.assertFalse(system.health_snapshot()['healthy'])
+
+            system.exchange_api.list_position_symbols = lambda: []
+            self.assertTrue(system.reconcile_intraday_stop_losses())
+
+            self.assertIsNone(system._last_guardian_failure)
+            self.assertTrue(system.health_snapshot()['healthy'])
 
 
 class RemovedSymbolStillManagedTest(unittest.TestCase):
@@ -78,15 +167,15 @@ class RemovedSymbolStillManagedTest(unittest.TestCase):
 
             self.assertEqual(sorted(checked), ['BTCUSDT', 'ETHUSDT'])
 
-    def test_position_without_audit_label_is_still_managed(self):
+    def test_position_without_ma_audit_label_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, checked = _build_system(tmp, config_symbols=[])
-            system.trade_state.add_open_position(
-                'LTCUSDT', 'long', 100.0, 5.0, 90.0, strategy=None)
+            with self.assertRaises(TradeStatePersistenceError):
+                system.trade_state.add_open_position(
+                    'LTCUSDT', 'long', 100.0, 5.0, 90.0, strategy=None)
 
-            system.check_and_execute_trades()
-
-            self.assertEqual(checked, ['LTCUSDT'])
+            self.assertIsNone(system.trade_state.get_open_position('LTCUSDT'))
+            self.assertEqual(checked, [])
 
 
 class PerSymbolIsolationTest(unittest.TestCase):
@@ -188,35 +277,23 @@ class StartupCatchupTest(unittest.TestCase):
             system._run_startup_catchup_check(now=datetime(2026, 7, 3, 15, 0))
             self.assertEqual(calls, [])
 
-    def test_deploy_restart_skip_marks_today_done(self):
-        """部署晚间重启可显式跳过启动兜底，避免重启后立刻再跑一轮日检。"""
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmp:
-            system, calls = self._system(tmp)
-            with patch.dict(os.environ, {'TRADING_SKIP_STARTUP_CATCHUP_ONCE': '1'}):
-                self.assertTrue(system._apply_deploy_restart_skip_catchup(now=datetime(2026, 7, 3, 21, 0)))
-            self.assertEqual(system._last_check_date, '2026-07-03')
-            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 21, 30))
-            self.assertEqual(calls, [])
+    def test_no_environment_switch_can_mark_a_daily_check_complete(self):
+        self.assertFalse(hasattr(
+            TradingSystem, '_apply_deploy_restart_skip_catchup'))
 
-    def test_deploy_restart_skip_ignored_before_check_time(self):
-        """未到今日检查时间的重启：标志必须失效——此时本无兜底可跳，
-        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与仓位检查丢失。"""
-        from unittest.mock import patch
+    def test_maintenance_sentinel_skips_daily_check_without_marking(self):
         with tempfile.TemporaryDirectory() as tmp:
-            system, calls = self._system(tmp)
-            with patch.dict(os.environ, {'TRADING_SKIP_STARTUP_CATCHUP_ONCE': '1'}):
-                self.assertFalse(system._apply_deploy_restart_skip_catchup(now=datetime(2026, 7, 3, 7, 30)))
-            self.assertIsNone(system._last_check_date)
-            # 正点后兜底照常可跑（标志未生效，没有吞掉当日日检）
-            system._run_startup_catchup_check(now=datetime(2026, 7, 3, 8, 30))
-            self.assertEqual(calls, ['2026-07-03'])
-
-    def test_deploy_restart_skip_is_opt_in(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, _calls = self._system(tmp)
-            self.assertFalse(system._apply_deploy_restart_skip_catchup())
-            self.assertIsNone(system._last_check_date)
+            sentinel = os.path.join(tmp, '.maintenance_no_open')
+            with open(sentinel, 'w', encoding='utf-8') as handle:
+                handle.write('{}')
+            system = TradingSystem.__new__(TradingSystem)
+            system._last_check_date = '2026-07-18'
+            with patch.dict(os.environ, {
+                    'TRADING_MAINTENANCE_SENTINEL': sentinel}, clear=False):
+                system.check_and_execute_trades(
+                    scheduled_date='2026-07-19')
+            self.assertEqual('2026-07-18', system._last_check_date)
+            self.assertFalse(hasattr(system, '_trade_lock'))
 
     def test_buffer_window_spans_hour_boundary(self):
         """check_minute 接近整点时缓冲窗口须跨整点：check_minute=59 的缓冲应到 09:01，
@@ -296,7 +373,12 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             to_ccxt_symbol=lambda s: s,
             exchange=SimpleNamespace(fetch_ticker=lambda s: {'last': 2900.0}),
             get_last_price=lambda s: 2900.0,
-            close_position=lambda *a, **k: {'average': 2900.0},
+            close_position=lambda *a, **k: {
+                'id': 'close-1', 'ids': ['close-1'],
+                'average': 2900.0, 'confirmed': True,
+                'fully_closed': True, 'fully_filled': True,
+                'amount': 1.0, 'requested_amount': 1.0,
+                'remaining_amount': 0.0},
             cancel_order=lambda *a, **k: cancel_ok,
             cancel_all_orders=lambda *a, **k: cancel_ok or None)
         opened = []
@@ -389,6 +471,8 @@ class RetiredExternalFlatTest(unittest.TestCase):
             self.assertIsNotNone(closed)
             self.assertTrue(saved)
             self.assertTrue(cleared)
+            self.assertEqual('estimated_stop', closed['exit_price_source'])
+            self.assertIs(True, closed['exit_price_estimated'])
             self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
             self.assertEqual(system.stop_loss_dates, {})
 
@@ -464,13 +548,17 @@ class StateOwnerGuardTest(unittest.TestCase):
             system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy='ma_cross')
             system._guard_state_owner()  # 不应抛异常
 
-    def test_owned_by_other_exchange_blocks_startup(self):
-        """归属为其它交易所(如旧币安)：拒绝启动，防串仓。"""
+    def test_owned_by_other_exchange_is_rejected_at_schema_boundary(self):
+        """其它交易所归属在账本加载边界就拒绝，不能进入启动流程。"""
         with tempfile.TemporaryDirectory() as tmp:
-            system = self._system(tmp)
-            system.trade_state.claim_owner_exchange('binance')
-            with self.assertRaises(RuntimeError):
-                system._guard_state_owner()
+            path = os.path.join(tmp, 'trade_state.json')
+            payload = TradeState.get_default_state()
+            payload['exchange'] = 'other'
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle)
+            os.chmod(path, 0o600)
+            with self.assertRaises(TradeStatePersistenceError):
+                TradeState(path)
 
     def test_unmarked_state_with_positions_blocks_startup(self):
         """有持仓但无归属标记(可能是旧币安遗留)：拒绝启动，要求人工确认。"""
@@ -575,6 +663,29 @@ class IntradayReconcileResidueTest(unittest.TestCase):
 
 
 class UnknownStopResidueCleanupTest(unittest.TestCase):
+    def test_known_cancel_failure_cannot_be_washed_by_clean_cancel_all(self):
+        """精确 ID 撤销失败是终态不明；批量清扫成功也不得清除 residue。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, 'trade_state.json')
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(state_path)
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0,
+                'stop-known', strategy='ma_cross')
+            cancel_all = Mock(return_value=True)
+            system.exchange_api = SimpleNamespace(
+                cancel_order=Mock(return_value=False),
+                cancel_all_orders=cancel_all,
+            )
+            system.notifier = SimpleNamespace(notify_error=Mock())
+
+            self.assertFalse(system._cancel_stop_order_confirmed(
+                'BTCUSDT', 'BTC/USDT:USDT', 'stop-known'))
+
+            cancel_all.assert_called_once_with('BTC/USDT:USDT')
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(TradeState(state_path).has_stop_residue('BTCUSDT'))
+
     def test_known_id_success_still_requires_cancel_all_when_residue_marked(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
@@ -624,6 +735,7 @@ class IntradayPerSymbolIsolationTest(unittest.TestCase):
             # 盘中巡检先完整核对方向和张数，再进入止损自愈。
             system.exchange_api.get_position = lambda s: {'contracts': 1, 'side': 'long'}
             system.exchange_api._coin_to_contracts = lambda s, amount: amount
+            system.exchange_api._contracts_to_coins = lambda s, contracts: contracts
             ensured = []
 
             def ensure(symbol, ccxt_symbol, position, strategy_name):
@@ -636,6 +748,29 @@ class IntradayPerSymbolIsolationTest(unittest.TestCase):
             system.reconcile_intraday_stop_losses()  # 不应向外抛异常
 
             self.assertEqual(ensured, ['BBBUSDT'])  # 后续品种照常巡检
+
+    def test_negative_short_contracts_are_never_treated_as_flat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, config_symbols=[])
+            system.trade_state.add_open_position(
+                'ETHUSDT', 'short', 100.0, 1.0, 110.0,
+                strategy='ma_cross')
+            system.exchange_api.list_position_symbols = lambda: ['ETHUSDT']
+            system.exchange_api.get_position = lambda _symbol: {
+                'contracts': -1.0, 'side': 'short'}
+            system.exchange_api._coin_to_contracts = (
+                lambda _symbol, amount: amount)
+            system.exchange_api._contracts_to_coins = (
+                lambda _symbol, contracts: contracts)
+            system._ensure_stop_order_alive = Mock(return_value=True)
+            system._handle_exchange_flat_close = Mock(
+                side_effect=AssertionError('真实空头不得走空仓删账'))
+
+            self.assertTrue(system.reconcile_intraday_stop_losses())
+
+            self.assertIsNotNone(
+                system.trade_state.get_open_position('ETHUSDT'))
+            system._handle_exchange_flat_close.assert_not_called()
 
 
 class ResidueAutoClearGuardTest(unittest.TestCase):
@@ -666,7 +801,7 @@ class ResidueAutoClearGuardTest(unittest.TestCase):
 
 
 class MigrationGuardTest(unittest.TestCase):
-    """状态迁移边界：本地持仓状态是命脉，不能被空文件覆盖或绕过。"""
+    """旧状态不得在单策略预检之后由 runtime 自动导入。"""
 
     def _system(self, tmp):
         system = TradingSystem.__new__(TradingSystem)
@@ -679,8 +814,7 @@ class MigrationGuardTest(unittest.TestCase):
         with open(path, 'w') as f:
             json.dump({'open_positions': positions, 'closed_trades': []}, f)
 
-    def test_empty_root_with_legacy_positions_migrates_with_backup(self):
-        """根目录空仓文件 + data/okx 有旧持仓：备份空文件后迁移旧持仓（不许静默跳过）。"""
+    def test_unmarked_legacy_positions_block_without_touching_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             self._write(os.path.join(tmp, 'trade_state.json'), {})
             legacy = {'BTCUSDT': {
@@ -689,55 +823,21 @@ class MigrationGuardTest(unittest.TestCase):
             }}
             self._write(os.path.join(tmp, 'data', 'okx', 'trade_state.json'), legacy)
 
-            self._system(tmp)._migrate_okx_legacy_state()
-
-            with open(os.path.join(tmp, 'trade_state.json')) as f:
-                migrated = json.load(f)
-            self.assertIn('BTCUSDT', migrated['open_positions'])
-            self.assertEqual(migrated.get('exchange'), 'okx')  # 迁移顺带打归属标记
-            backups = [n for n in os.listdir(tmp) if n.startswith('trade_state.json.bak.empty.')]
-            self.assertEqual(len(backups), 1)
-
-    def test_both_have_positions_blocks_startup(self):
-        """两边都有持仓：无法自动裁决，拒绝启动等人工。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write(os.path.join(tmp, 'trade_state.json'), {'ETHUSDT': {
-                'symbol': 'ETHUSDT', 'side': 'short', 'entry_price': 3000,
-                'position_size': 1, 'stop_loss_price': 3200,
-            }})
-            self._write(os.path.join(tmp, 'data', 'okx', 'trade_state.json'), {'BTCUSDT': {
-                'symbol': 'BTCUSDT', 'side': 'long', 'entry_price': 60000,
-                'position_size': 0.1, 'stop_loss_price': 55000,
-            }})
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, '禁止.*自动导入'):
                 self._system(tmp)._migrate_okx_legacy_state()
 
-    def test_legacy_empty_keeps_root_untouched(self):
-        """旧文件无持仓：根目录维持现状，不迁移。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write(os.path.join(tmp, 'trade_state.json'), {'ETHUSDT': {
-                'symbol': 'ETHUSDT', 'side': 'short', 'entry_price': 3000,
-                'position_size': 1, 'stop_loss_price': 3200,
-            }})
-            self._write(os.path.join(tmp, 'data', 'okx', 'trade_state.json'), {})
+            with open(os.path.join(tmp, 'trade_state.json')) as f:
+                self.assertEqual({}, json.load(f)['open_positions'])
+            self.assertFalse(any(
+                name.startswith('trade_state.json.bak.empty.')
+                for name in os.listdir(tmp)))
 
+    def test_empty_legacy_directory_is_harmless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'data', 'okx'))
             self._system(tmp)._migrate_okx_legacy_state()
 
-            with open(os.path.join(tmp, 'trade_state.json')) as f:
-                self.assertIn('ETHUSDT', json.load(f)['open_positions'])
-
-    def test_unreadable_legacy_blocks_startup(self):
-        """旧文件损坏读不出：持仓不明，拒绝启动。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write(os.path.join(tmp, 'trade_state.json'), {})
-            legacy_path = os.path.join(tmp, 'data', 'okx', 'trade_state.json')
-            os.makedirs(os.path.dirname(legacy_path), exist_ok=True)
-            with open(legacy_path, 'w') as f:
-                f.write('{损坏的json')
-            with self.assertRaises(RuntimeError):
-                self._system(tmp)._migrate_okx_legacy_state()
-
-    def test_completed_migration_is_idempotent_on_next_restart(self):
+    def test_completed_marker_makes_legacy_directory_inert(self):
         with tempfile.TemporaryDirectory() as tmp:
             legacy = {'BTCUSDT': {
                 'symbol': 'BTCUSDT', 'side': 'long', 'entry_price': 60000,
@@ -745,61 +845,24 @@ class MigrationGuardTest(unittest.TestCase):
             }}
             self._write(
                 os.path.join(tmp, 'data', 'okx', 'trade_state.json'), legacy)
-            system = self._system(tmp)
-
-            system._migrate_okx_legacy_state()
-            system._migrate_okx_legacy_state()
-
-            self.assertTrue(os.path.exists(os.path.join(
-                tmp, '.okx_legacy_migration_complete.json')))
-            with open(os.path.join(tmp, 'trade_state.json')) as handle:
-                self.assertIn('BTCUSDT', json.load(handle)['open_positions'])
-
-    def test_missing_root_with_backup_never_revives_stale_legacy(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write(os.path.join(tmp, 'trade_state.json.bak'), {})
-            self._write(os.path.join(
-                tmp, 'data', 'okx', 'trade_state.json'), {'BTCUSDT': {
-                    'symbol': 'BTCUSDT', 'side': 'long', 'entry_price': 60000,
-                    'position_size': 0.1, 'stop_loss_price': 55000,
-                }})
-
-            with self.assertRaises(RuntimeError):
-                self._system(tmp)._migrate_okx_legacy_state()
-            self.assertFalse(os.path.exists(os.path.join(tmp, 'trade_state.json')))
-
-    def test_root_pending_is_not_overwritten_by_legacy_position(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = {
-                'open_positions': {}, 'closed_trades': [],
-                'signal_states': {'ETHUSDT': {
-                    'obsolete_transaction': {'status': 'pending'}}},
-            }
-            os.makedirs(tmp, exist_ok=True)
-            with open(os.path.join(tmp, 'trade_state.json'), 'w') as handle:
-                json.dump(root, handle)
-            self._write(os.path.join(
-                tmp, 'data', 'okx', 'trade_state.json'), {'BTCUSDT': {
-                    'symbol': 'BTCUSDT', 'side': 'long', 'entry_price': 60000,
-                    'position_size': 0.1, 'stop_loss_price': 55000,
-                }})
-
-            with self.assertRaises(RuntimeError):
-                self._system(tmp)._migrate_okx_legacy_state()
-
-    def test_closed_trade_archive_is_migrated_with_auxiliary_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            self._write(os.path.join(
-                tmp, 'data', 'okx', 'trade_state.json'), {})
-            archive = os.path.join(
-                tmp, 'data', 'okx', 'closed_trades_archive.json')
-            with open(archive, 'w', encoding='utf-8') as handle:
-                json.dump([{'symbol': 'BTCUSDT', 'pnl': 1}], handle)
+            marker = os.path.join(
+                tmp, '.okx_legacy_migration_complete.json')
+            with open(marker, 'w', encoding='utf-8') as handle:
+                json.dump({'exchange': 'okx'}, handle)
 
             self._system(tmp)._migrate_okx_legacy_state()
 
-            with open(os.path.join(tmp, 'closed_trades_archive.json')) as handle:
-                self.assertEqual('BTCUSDT', json.load(handle)[0]['symbol'])
+            self.assertFalse(os.path.exists(os.path.join(tmp, 'trade_state.json')))
+
+    def test_invalid_completed_marker_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'data', 'okx'))
+            marker = os.path.join(
+                tmp, '.okx_legacy_migration_complete.json')
+            with open(marker, 'w', encoding='utf-8') as handle:
+                json.dump({'exchange': 'other'}, handle)
+            with self.assertRaisesRegex(RuntimeError, '迁移标记非法'):
+                self._system(tmp)._migrate_okx_legacy_state()
 
 
 class StopSelfHealTest(unittest.TestCase):
@@ -916,17 +979,91 @@ class StopSelfHealTest(unittest.TestCase):
             self.assertEqual(system._stop_anomalies, {'BTCUSDT': 'replant_failed'})
             self.assertEqual(system.trade_state.get_open_position('BTCUSDT')['stop_order_id'], 'stop-1')
 
-    def test_residue_does_not_block_authoritative_read_and_replant(self):
+    def test_replant_exception_marks_unknown_residue_before_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, state='missing')
+            system.exchange_api.create_stop_loss_order = Mock(
+                side_effect=RuntimeError('POST outcome unknown'))
+
+            self._run(system)
+
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
+            self.assertEqual(
+                {'BTCUSDT': 'replant_failed'}, system._stop_anomalies)
+
+    def test_fresh_residue_missing_keeps_marker_and_never_replants(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp, state='missing')
             system.trade_state.mark_stop_residue('BTCUSDT')
             self._run(system)
             self.assertEqual(
                 self.find_calls, [('long', 0.1, 55000.0, 'stop-1')])
-            self.assertEqual(self.created, [('long', 0.1, 55000.0)])
-            # create 返回 None 可能是 POST 成功但确认丢失；新未知单必须继续阻断。
+            self.assertEqual(self.created, [])
             self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
             self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
+
+    def test_fresh_residue_intact_protects_but_does_not_release_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, state='intact')
+            system.trade_state.mark_stop_residue('BTCUSDT')
+
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT',
+                system.trade_state.get_open_position('BTCUSDT'),
+                '双均线 EMA'))
+
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
+            self.assertEqual(self.created, [])
+
+    def test_fresh_residue_adopts_visible_stop_but_keeps_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(
+                tmp, state={'state': 'adoptable', 'order_id': 'stop-new'})
+            system.trade_state.mark_stop_residue('BTCUSDT')
+
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT',
+                system.trade_state.get_open_position('BTCUSDT'),
+                '双均线 EMA'))
+
+            self.assertEqual(
+                'stop-new', system.trade_state.get_open_position(
+                    'BTCUSDT')['stop_order_id'])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
+            self.assertEqual(self.created, [])
+
+    def test_second_stop_visible_after_grace_becomes_mismatch_without_repost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.trade_state.mark_stop_residue('BTCUSDT')
+            system.exchange_api.find_stop_order_state = Mock(
+                side_effect=['intact', 'mismatch'])
+            position = system.trade_state.get_open_position('BTCUSDT')
+
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT', position, '双均线 EMA'))
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            self.assertFalse(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTCUSDT', position, '双均线 EMA'))
+
+            self.assertEqual(self.created, [])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
+
+    def test_elapsed_residue_missing_rechecks_then_replants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(
+                tmp, state='missing', create_result={'id': 'stop-new'})
+            system.trade_state.mark_stop_residue('BTCUSDT')
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+
+            self._run(system)
+
+            self.assertEqual(self.created, [('long', 0.1, 55000.0)])
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
 
     def test_query_failure_skips(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -989,13 +1126,17 @@ class TradeStateTransactionTest(unittest.TestCase):
             from unittest.mock import patch, Mock
             with patch.object(trade_state_module, 'atomic_write_json', Mock(return_value=False)):
                 with self.assertRaises(TradeStatePersistenceError):
-                    ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1')
+                    ts.add_open_position(
+                        'BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
+                        'stop-1', strategy='ma_cross')
             self.assertIsNone(ts.get_open_position('BTCUSDT'))
 
     def test_update_stop_loss_rolls_back_memory_on_save_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             ts = self._ts_with_failing_save(tmp)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1')
+            ts.add_open_position(
+                'BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
+                'stop-1', strategy='ma_cross')
             from unittest.mock import patch, Mock
             with patch.object(trade_state_module, 'atomic_write_json', Mock(return_value=False)):
                 with self.assertRaises(TradeStatePersistenceError):
@@ -1007,7 +1148,9 @@ class TradeStateTransactionTest(unittest.TestCase):
     def test_close_position_rolls_back_memory_on_save_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             ts = self._ts_with_failing_save(tmp)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1')
+            ts.add_open_position(
+                'BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
+                'stop-1', strategy='ma_cross')
             from unittest.mock import patch, Mock
             with patch.object(trade_state_module, 'atomic_write_json', Mock(return_value=False)):
                 with self.assertRaises(TradeStatePersistenceError):
@@ -1057,7 +1200,9 @@ class TradeStateTransactionTest(unittest.TestCase):
         """补偿通道不受影响：交易所动作已发生时，调用方用 force_runtime_* 强制内存反映现实。"""
         with tempfile.TemporaryDirectory() as tmp:
             ts = self._ts_with_failing_save(tmp)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, 'stop-1')
+            ts.add_open_position(
+                'BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
+                'stop-1', strategy='ma_cross')
             closed = ts.force_runtime_close_position('BTCUSDT', 62000.0)
             self.assertIsNotNone(closed)
             self.assertIsNone(ts.get_open_position('BTCUSDT'))

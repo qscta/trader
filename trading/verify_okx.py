@@ -47,34 +47,63 @@ import time
 import argparse
 import math
 
+import config_validation as cfgv
 from okx_api import OkxApi
+from trade_state import load_strict_json, open_private_text_file
 
 
 def load_cfg():
+    demo_env = os.environ.get('OKX_DEMO')
+    if demo_env is None:
+        sandbox = False
+    elif demo_env == '1':
+        sandbox = True
+    elif demo_env == '0':
+        sandbox = False
+    else:
+        sandbox = cfgv.strict_bool(demo_env, 'OKX_DEMO')
+    passphrase = cfgv.resolve_optional_alias(
+        os.environ.get('OKX_API_PASSPHRASE'),
+        os.environ.get('OKX_PASSWORD'),
+        'OKX passphrase 环境变量')
     cfg = {
         'apiKey': os.environ.get('OKX_API_KEY'),
         'secret': os.environ.get('OKX_API_SECRET'),
-        'password': os.environ.get('OKX_API_PASSPHRASE') or os.environ.get('OKX_PASSWORD'),
-        'margin_mode': os.environ.get('OKX_MARGIN_MODE', 'cross'),
-        'leverage': float(os.environ.get('OKX_LEVERAGE', '3')),
-        'sandbox': os.environ.get('OKX_DEMO') == '1',
+        'password': passphrase,
+        'sandbox': sandbox,
     }
+    if 'OKX_MARGIN_MODE' in os.environ:
+        cfg['margin_mode'] = os.environ['OKX_MARGIN_MODE']
+    if 'OKX_LEVERAGE' in os.environ:
+        cfg['leverage'] = os.environ['OKX_LEVERAGE']
     # config.json 补齐缺失项
     cfgfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
     if os.path.exists(cfgfile):
         try:
-            import json
-            with open(cfgfile, 'r', encoding='utf-8') as f:
-                raw = json.load(f)
-            okx = (raw.get('exchanges', {}) or {}).get('okx', {}) or raw.get('okx', {}) or {}
+            with open_private_text_file(cfgfile) as f:
+                raw = load_strict_json(f)
+            cfgv.canonicalize_single_okx_config(raw)
+            okx = raw.get('okx', {})
+            cfgv.validate_and_normalize_okx_config(okx)
             for k in ('apiKey', 'secret', 'password', 'margin_mode', 'leverage', 'leverage_overrides'):
-                if not cfg.get(k) and okx.get(k) is not None:
+                if ((k in ('apiKey', 'secret', 'password') and not cfg.get(k)) or
+                        (k not in cfg)) and k in okx:
                     cfg[k] = okx[k]
             # sandbox 跟随 config.json（环境变量 OKX_DEMO 优先）——防止 config 是模拟盘而脚本误连实盘
-            if os.environ.get('OKX_DEMO') is None and okx.get('sandbox') is not None:
-                cfg['sandbox'] = bool(okx['sandbox'])
+            if demo_env is None:
+                environment = {
+                    key: okx[key] for key in ('sandbox', 'demo') if key in okx
+                }
+                cfgv.validate_and_normalize_okx_environment(environment)
+                cfg['sandbox'] = bool(
+                    environment.get('sandbox', False) or
+                    environment.get('demo', False))
         except Exception as e:
             print('读取 config.json 失败:', e)
+            raise ValueError(f'无法安全读取验证配置: {e}') from e
+    cfg.setdefault('margin_mode', 'cross')
+    cfg.setdefault('leverage', 5)
+    cfgv.validate_and_normalize_okx_config(cfg)
     return cfg
 
 
@@ -94,6 +123,134 @@ def check_position_mode(api):
         print(f"  ⚠️ 无法自动确认持仓模式: {e}")
         print("  ⚠️ 上线前必须人工到欧易确认账户为「单向(净)持仓模式」——这是硬条件。")
         return None
+
+
+def confirm_open_order_contract(order, tag):
+    """只接受适配层已完整确认且无任何未决/歧义标记的开仓契约。"""
+    if not isinstance(order, dict):
+        print(f'[{tag}] ❌ 开仓未返回结构化成交契约')
+        return False
+    if order.get('confirmed') is not True:
+        print(f'[{tag}] ❌ 开仓订单未获终态确认')
+        return False
+    if order.get('fully_filled') is not True:
+        print(f'[{tag}] ❌ 开仓未完整成交，本次验证不构成证据')
+        return False
+    unsafe_flags = (
+        'open_execution_unresolved', 'open_order_may_remain_live',
+        'open_execution_attribution_ambiguous',
+        'open_execution_compensated', 'execution_ambiguous',
+    )
+    present = [key for key in unsafe_flags if order.get(key)]
+    if present:
+        print(f'[{tag}] ❌ 开仓契约含未决/歧义标记: {present}')
+        return False
+    amount_value = order.get('amount')
+    if isinstance(amount_value, bool):
+        print(f'[{tag}] ❌ 开仓成交量非法: {amount_value!r}')
+        return False
+    try:
+        amount = float(amount_value)
+    except (TypeError, ValueError):
+        amount = None
+    if amount is None or not math.isfinite(amount) or amount <= 0:
+        print(f'[{tag}] ❌ 开仓成交量不可确认: {amount_value!r}')
+        return False
+    return True
+
+
+def confirm_open_position(api, ccxt_symbol, expected_side, tag,
+                          expected_contracts=None, require_entry=False):
+    """ACK 后必须由真实仓位快照证明开仓成功；未知绝不算验证证据。"""
+    try:
+        position = api.get_position(ccxt_symbol)
+    except Exception as exc:
+        print(f'[{tag}] ❌ 开仓 ACK 后无法回读真实持仓: {exc}')
+        return None
+    if not isinstance(position, dict):
+        print(f'[{tag}] ❌ 开仓 ACK 后未形成可确认持仓')
+        return None
+    contracts_value = position.get('contracts')
+    if isinstance(contracts_value, bool):
+        print(f'[{tag}] ❌ 持仓张数字段非法: {contracts_value!r}')
+        return None
+    try:
+        contracts = abs(float(contracts_value))
+    except (TypeError, ValueError):
+        contracts = None
+    if contracts is None or not math.isfinite(contracts) or contracts <= 0:
+        print(f'[{tag}] ❌ 开仓 ACK 后持仓张数不可确认: {contracts_value!r}')
+        return None
+    if expected_contracts is not None:
+        try:
+            expected = abs(float(expected_contracts))
+        except (TypeError, ValueError):
+            expected = None
+        if (expected is None or not math.isfinite(expected) or expected <= 0 or
+                not math.isclose(
+                    contracts, expected, rel_tol=1e-9, abs_tol=1e-9)):
+            print(f'[{tag}] ❌ 真实持仓张数 {contracts} 与本次请求 '
+                  f'{expected_contracts!r} 不一致')
+            return None
+    if position.get('side') != expected_side:
+        print(f'[{tag}] ❌ 开仓方向不符: '
+              f'{position.get("side")!r}（期望 {expected_side}）')
+        return None
+    if require_entry:
+        entry_value = position.get('entryPrice')
+        try:
+            entry = float(entry_value)
+        except (TypeError, ValueError):
+            entry = None
+        if entry is None or not math.isfinite(entry) or entry <= 0:
+            print(f'[{tag}] ❌ 入场价不可确认: {entry_value!r}')
+            return None
+    return position
+
+
+def parse_position_snapshot(position, tag):
+    """把 None 解释为空仓；其它响应必须完整证明有限张数与有效方向。"""
+    if position is None:
+        return 0.0, None
+    if not isinstance(position, dict):
+        print(f'[{tag}] ❌ 持仓快照结构非法: {type(position).__name__}')
+        return None
+    value = position.get('contracts')
+    if isinstance(value, bool):
+        print(f'[{tag}] ❌ 持仓快照张数非法: {value!r}')
+        return None
+    try:
+        contracts = abs(float(value))
+    except (TypeError, ValueError):
+        contracts = None
+    if contracts is None or not math.isfinite(contracts):
+        print(f'[{tag}] ❌ 持仓快照张数不可确认: {value!r}')
+        return None
+    side = position.get('side')
+    if contracts > 0 and side not in ('long', 'short'):
+        print(f'[{tag}] ❌ 非零持仓方向不可确认: {side!r}')
+        return None
+    if contracts == 0 and side not in (None, 'long', 'short'):
+        print(f'[{tag}] ❌ 零仓快照方向字段非法: {side!r}')
+        return None
+    return contracts, side
+
+
+def require_flat_before_live_test(api, ccxt_symbol, tag):
+    """实弹写入前必须证明目标品种空仓，清理才不会误平既有仓位。"""
+    try:
+        snapshot = parse_position_snapshot(
+            api.get_position(ccxt_symbol), tag)
+    except Exception as exc:
+        print(f'[{tag}] ❌ 实弹前无法确认目标品种空仓: {exc}')
+        return False
+    if snapshot is None:
+        return False
+    contracts, side = snapshot
+    if contracts != 0:
+        print(f'[{tag}] ❌ 实弹前已有 {contracts} 张 {side} 仓位，拒绝测试和盲目清理')
+        return False
+    return True
 
 
 def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
@@ -120,12 +277,13 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
         return fallback
 
     try:
-        if api.cancel_all_orders(ccxt_symbol) is False:
-            cleanup_ok = False
-            print(f"[{tag}] ⚠️ 清理撤单返回失败，仍继续尝试平仓")
+        if api.cancel_all_orders(ccxt_symbol) is not True:
+            # 适配器的完整撤净契约包含“最终空仓”。此刻测试仓仍在，False
+            # 只表示尚未完成；平仓后会再次严格撤净，不能永久锁存假失败。
+            print(f"[{tag}] ⚠️ 平仓前撤单尚不能证明完整清理，继续平仓后复核")
     except Exception as e:
-        cleanup_ok = False
-        print(f"[{tag}] ⚠️ 清理撤单失败，仍继续尝试平仓:", e)
+        # 最终裁决只看平仓后的严格撤净与空仓复核。
+        print(f"[{tag}] ⚠️ 平仓前撤单异常，继续平仓后复核:", e)
 
     actual_position = None
     try:
@@ -134,11 +292,14 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
         cleanup_ok = False
         print(f"[{tag}] ⚠️ 清理前无法读取真实仓位，回退原方向/数量尝试平仓:", e)
 
-    actual_side = (actual_position or {}).get('side') or expected_side
-    if actual_side not in ('long', 'short'):
+    actual_snapshot = parse_position_snapshot(actual_position, tag)
+    if actual_snapshot is None:
         cleanup_ok = False
         actual_side = expected_side
-    contracts = abs(float((actual_position or {}).get('contracts') or 0))
+        contracts = 0.0
+    else:
+        contracts, actual_side = actual_snapshot
+        actual_side = actual_side or expected_side
     close_coin = coin_for_contracts(contracts, expected_coin)
     if actual_side != expected_side:
         print(f"[{tag}] 🔴 清理检测到方向已变化: {expected_side} → {actual_side}，"
@@ -156,7 +317,7 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
     # 平仓后再撤一次：首次撤单可能只是瞬时失败；若残留 reduce-only 止损
     # 一直挂着，未来同品种新仓仍可能被旧单干扰。
     try:
-        if api.cancel_all_orders(ccxt_symbol) is False:
+        if api.cancel_all_orders(ccxt_symbol) is not True:
             cleanup_ok = False
             print(f"[{tag}] ⚠️ 平仓后残留撤单返回失败")
     except Exception as e:
@@ -166,13 +327,18 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
     time.sleep(2)
     try:
         after = api.get_position(ccxt_symbol)
-        remaining = abs(float((after or {}).get('contracts') or 0))
+        after_snapshot = parse_position_snapshot(after, tag)
+        if after_snapshot is None:
+            cleanup_ok = False
+            remaining = 0.0
+            retry_side = None
+        else:
+            remaining, retry_side = after_snapshot
         print(f"[{tag}] 清理后剩余持仓（应 0）: {remaining}")
         if remaining:
             # 极窄但真实的竞态：首次撤单失败后，原止损可能在首次平仓调用前
             # 触发，使适配层因方向快照已过期而拒绝平仓。只按旧方向重试会继续
             # 失败，所以必须以此刻交易所返回的方向/数量补做一次有界清理。
-            retry_side = (after or {}).get('side')
             if retry_side in ('long', 'short'):
                 retry_coin = coin_for_contracts(remaining, expected_coin)
                 print(f"[{tag}] ⚠️ 检测到清理竞态，按最新仓位补平: "
@@ -188,7 +354,7 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
 
                 # 补平后再清一次算法单，防止第二次快照期间又出现已失效残单。
                 try:
-                    if api.cancel_all_orders(ccxt_symbol) is False:
+                    if api.cancel_all_orders(ccxt_symbol) is not True:
                         cleanup_ok = False
                         print(f"[{tag}] ⚠️ 补平后残留撤单返回失败")
                 except Exception as e:
@@ -197,7 +363,12 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
 
                 time.sleep(2)
                 after = api.get_position(ccxt_symbol)
-                remaining = abs(float((after or {}).get('contracts') or 0))
+                final_snapshot = parse_position_snapshot(after, tag)
+                if final_snapshot is None:
+                    cleanup_ok = False
+                    remaining = 0.0
+                else:
+                    remaining, _final_side = final_snapshot
                 print(f"[{tag}] 补平后剩余持仓（应 0）: {remaining}")
 
             if remaining:
@@ -209,74 +380,92 @@ def cleanup_live_position(api, ccxt_symbol, expected_side, expected_coin, tag):
     return cleanup_ok
 
 
+def _run_side_exercise(api, ccxt_symbol, coin, side, order, contracts):
+    """基础实弹验证主体；开仓尝试与最终清理由外层统一包住。"""
+    ok = confirm_open_order_contract(order, side)
+    if ok:
+        time.sleep(2)
+        pos = confirm_open_position(
+            api, ccxt_symbol, side, side,
+            expected_contracts=contracts, require_entry=True)
+        print(f"[{side}] 持仓:", {k: (pos or {}).get(k) for k in ('contracts', 'side', 'entryPrice')} if pos else None)
+        if pos is None:
+            ok = False
+    if ok:
+        entry = float(pos['entryPrice'])
+        # 多单止损在下方(-10%)、空单止损在上方(+10%)，远离市价不期望触发
+        stop_px = round(entry * (0.9 if side == 'long' else 1.1), 6)
+        close_dir = 'sell' if side == 'long' else 'buy'
+        print(f"[{side}] 挂止损 @ {stop_px}（应为 {close_dir} reduceOnly 条件单）")
+        stop = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
+        print(f"[{side}] 止损返回:", (stop or {}).get('id'))
+        if not stop:
+            print(f"[{side}] ⚠️ 止损创建失败 —— OKX 适配最关键点，请检查 create_stop_loss_order")
+            ok = False
+        time.sleep(2)
+
+        algos = api._fetch_algo_orders(ccxt_symbol)
+        print(f"[{side}] 查到算法/条件单 {len(algos)} 个（原生 orders-algo-pending 端点）:")
+        for algo in algos:
+            info = algo.get('info') or {}
+            print("    -", {'id': algo.get('id'), 'side': algo.get('side'),
+                            'reduceOnly': algo.get('reduceOnly'),
+                            'ordType': info.get('ordType'),
+                            'slTriggerPx': info.get('slTriggerPx')})
+        if not algos:
+            print(f"[{side}] ⚠️ 没查到算法止损单！可能没挂上或查询路径异常。")
+            ok = False
+
+        # 四态裁决全链路：原生查询 + 方向/触发价/张数严格匹配（止损自愈巡检同一路径）
+        try:
+            state = api.find_stop_order_state(
+                ccxt_symbol, side, coin, stop_px, (stop or {}).get('id'))
+            print(f"[{side}] find_stop_order_state = {state}（应为 intact）")
+            if state != 'intact':
+                print(f"[{side}] ⚠️ 四态裁决未返回 intact！严格匹配（触发价 tick 取整/张数）需人工核对。")
+                ok = False
+        except Exception as exc:
+            print(f"[{side}] ⚠️ 四态裁决异常: {exc}")
+            ok = False
+
+        print(f"[{side}] 撤止损 ...")
+        if stop and stop.get('id'):
+            cancelled = api.cancel_order(ccxt_symbol, stop['id'])
+            print(f"[{side}] cancel_order:", cancelled)
+        else:
+            cancelled = api.cancel_all_orders(ccxt_symbol)
+            print(f"[{side}] cancel_all_orders:", cancelled)
+        if cancelled is not True:
+            print(f"[{side}] ⚠️ 撤止损未获确认")
+            ok = False
+        time.sleep(2)
+        left = api._fetch_algo_orders(ccxt_symbol)
+        print(f"[{side}] 撤后算法单（应 0）: {len(left)}")
+        if left:
+            print(f"[{side}] ⚠️ 仍有残留算法单！")
+            ok = False
+    return ok
+
+
 def run_side(api, ccxt_symbol, coin, side):
-    """对单个方向跑一轮，finally 保证平仓清理。返回该方向是否全部检查通过。"""
+    """对单个方向跑一轮；任何开仓结果都进入最终清理。"""
     print(f"\n{'#' * 60}\n方向: {side.upper()}（{'做多' if side == 'long' else '做空'}）\n{'#' * 60}")
+    if not require_flat_before_live_test(api, ccxt_symbol, side):
+        return False
     contracts = api._coin_to_contracts(ccxt_symbol, coin)
     print(f"换算：{coin} 币 → {contracts} 张")
-
-    order = api.open_position(ccxt_symbol, side, coin)
-    print(f"[{side}] 开仓返回:", (order or {}).get('id'))
-    if not order:
-        print(f"[{side}] ❌ 开仓失败")
-        return False
-
-    ok = True
+    ok = False
     try:
-        time.sleep(2)
-        pos = api.get_position(ccxt_symbol)
-        print(f"[{side}] 持仓:", {k: (pos or {}).get(k) for k in ('contracts', 'side', 'entryPrice')} if pos else None)
-        entry = float((pos or {}).get('entryPrice') or 0)
-
-        if entry <= 0:
-            print(f"[{side}] 未取到入场价，跳过止损测试，直接进入清理。")
-        else:
-            # 多单止损在下方(-10%)、空单止损在上方(+10%)，远离市价不期望触发
-            stop_px = round(entry * (0.9 if side == 'long' else 1.1), 6)
-            close_dir = 'sell' if side == 'long' else 'buy'
-            print(f"[{side}] 挂止损 @ {stop_px}（应为 {close_dir} reduceOnly 条件单）")
-            stop = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
-            print(f"[{side}] 止损返回:", (stop or {}).get('id'))
-            if not stop:
-                print(f"[{side}] ⚠️ 止损创建失败 —— OKX 适配最关键点，请检查 create_stop_loss_order")
-                ok = False
-            time.sleep(2)
-
-            algos = api._fetch_algo_orders(ccxt_symbol)
-            print(f"[{side}] 查到算法/条件单 {len(algos)} 个（原生 orders-algo-pending 端点）:")
-            for o in algos:
-                info = o.get('info') or {}
-                print("    -", {'id': o.get('id'), 'side': o.get('side'),
-                                'reduceOnly': o.get('reduceOnly'),
-                                'ordType': info.get('ordType'),
-                                'slTriggerPx': info.get('slTriggerPx')})
-            if not algos:
-                print(f"[{side}] ⚠️ 没查到算法止损单！可能没挂上或查询路径异常。")
-                ok = False
-
-            # 四态裁决全链路：原生查询 + 方向/触发价/张数严格匹配（止损自愈巡检同一路径）
-            try:
-                state = api.find_stop_order_state(
-                    ccxt_symbol, side, coin, stop_px, (stop or {}).get('id'))
-                print(f"[{side}] find_stop_order_state = {state}（应为 intact）")
-                if state != 'intact':
-                    print(f"[{side}] ⚠️ 四态裁决未返回 intact！严格匹配（触发价 tick 取整/张数）需人工核对。")
-                    ok = False
-            except Exception as e:
-                print(f"[{side}] ⚠️ 四态裁决异常: {e}")
-                ok = False
-
-            print(f"[{side}] 撤止损 ...")
-            if stop and stop.get('id'):
-                print(f"[{side}] cancel_order:", api.cancel_order(ccxt_symbol, stop['id']))
+        try:
+            order = api.open_position(ccxt_symbol, side, coin)
+            print(f"[{side}] 开仓返回:", (order or {}).get('id'))
+            if not order:
+                print(f"[{side}] ❌ 开仓失败或结果无法确认")
             else:
-                print(f"[{side}] cancel_all_orders:", api.cancel_all_orders(ccxt_symbol))
-            time.sleep(2)
-            left = api._fetch_algo_orders(ccxt_symbol)
-            print(f"[{side}] 撤后算法单（应 0）: {len(left)}")
-            if left:
-                print(f"[{side}] ⚠️ 仍有残留算法单！")
-                ok = False
+                ok = _run_side_exercise(
+                    api, ccxt_symbol, coin, side, order, contracts)
+        except Exception as exc:
+            print(f"[{side}] ❌ 开仓/验证异常，转入强制清理: {exc}")
     finally:
         print(f"[{side}] --- 平仓 / 清理（保证执行）---")
         if not cleanup_live_position(
@@ -285,195 +474,273 @@ def run_side(api, ccxt_symbol, coin, side):
     return ok
 
 
-def run_fire_test(api, ccxt_symbol, coin, side, distance_pct=0.15, timeout_seconds=300, poll_interval=5):
-    """实弹触发验证：止损挂在离市价很近处，等待真实行情自然触发。
+def _run_fire_exercise(api, ccxt_symbol, coin, side, order,
+                       expected_contracts, distance_pct, timeout_seconds,
+                       poll_interval):
+    """执行触发试验主体；清理统一由外层裁决，避免 return 绕过清理结果。"""
+    tag = f'fire-{side}'
+    if not confirm_open_order_contract(order, tag):
+        return None
+    time.sleep(2)
+    if confirm_open_position(
+            api, ccxt_symbol, side, tag,
+            expected_contracts=expected_contracts) is None:
+        return None
+    last_price = api.get_last_price(ccxt_symbol)
+    stop_px = (
+        last_price * (1 - distance_pct / 100)
+        if side == 'long' else last_price * (1 + distance_pct / 100))
+    print(f"[{tag}] 市价={last_price}, 挂止损 @ {stop_px:.6f}")
 
-    本系统止损防线唯一从未被实测过的一环——reduce-only 标志本身已在非触发
-    场景（run_side）实证被交易所接受存储，但「触发瞬间是否真的只减仓、
-    绝不反向开出反向仓」此前完全依赖 OKX 平台承诺，代码从未亲眼验证过。
-
-    返回 True=触发且验证通过 / False=触发但发现问题 / None=超时未触发
-    （价格在窗口内未走到止损位，不构成证据，非失败，可调参数重试）。
-    finally 保证清理（撤单+平仓），不留残留仓位。
-    """
-    print(f"\n{'#' * 60}\n实弹触发验证: {side.upper()}（{'做多' if side == 'long' else '做空'}）\n{'#' * 60}")
-    print(f"止损距市价 {distance_pct}%，最长等待 {timeout_seconds}s（每 {poll_interval}s 轮询一次）")
-
-    order = api.open_position(ccxt_symbol, side, coin)
-    print(f"[fire-{side}] 开仓返回:", (order or {}).get('id'))
-    if not order:
-        print(f"[fire-{side}] ❌ 开仓失败")
+    stop = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
+    stop_id = (stop or {}).get('id')
+    print(f"[{tag}] 止损返回:", stop_id)
+    if not isinstance(stop, dict) or not stop_id:
+        print(f"[{tag}] ❌ 止损创建失败或缺少可追踪 ID，无法继续验证")
+        return None
+    state = api.find_stop_order_state(
+        ccxt_symbol, side, coin, stop_px, stop_id)
+    if state != 'intact':
+        print(f"[{tag}] ❌ 止损内容未获 intact 确认: {state!r}")
         return None
 
-    stop_id = None
-    try:
+    print(f"[{tag}] 等待自然行情触发...")
+    start = time.time()
+    triggered = False
+    reverse_observed = False
+    partial_fill_observed = False
+    initial_contracts = float(expected_contracts)
+    while time.time() - start < timeout_seconds:
+        pos = api.get_position(ccxt_symbol)
+        snapshot = parse_position_snapshot(pos, tag)
+        if snapshot is None:
+            return None
+        contracts, observed_side = snapshot
+        if contracts == 0:
+            triggered = True
+            break
+        if observed_side and observed_side != side:
+            reverse_observed = True
+            triggered = True
+            print(f"[{tag}] 🔴 轮询直接观察到反向仓: {contracts} 张 {observed_side}")
+            break
+        if contracts > initial_contracts and not math.isclose(
+                contracts, initial_contracts, rel_tol=1e-9, abs_tol=1e-9):
+            print(f"[{tag}] ❌ 试验期间仓位由 {initial_contracts} 增至 "
+                  f"{contracts} 张，无法唯一归因")
+            return False
+        if contracts < initial_contracts:
+            partial_fill_observed = True
+        print(f"[{tag}] 未触发（已等待 {int(time.time() - start)}s，持仓仍在）...")
+        time.sleep(poll_interval)
+
+    if not triggered:
+        if partial_fill_observed:
+            print(f"[{tag}] ❌ 观察到止损部分成交但未在超时前归零，按失败处理。")
+            return False
+        print(f"[{tag}] ⏱️ 超时未触发（{timeout_seconds}s 内价格未走到止损位），"
+              '本次不构成证据，非失败。清理后可调整参数重试。')
+        return None
+
+    if reverse_observed:
+        print(f"[{tag}] ❌ 检测到止损执行，但仓位直接反向")
+    else:
+        print(f"[{tag}] 观察到持仓已归零，继续按 algoId 核验止损成交归因")
+    time.sleep(2)
+    pos_after = api.get_position(ccxt_symbol)
+    after_snapshot = parse_position_snapshot(pos_after, tag)
+    if after_snapshot is None:
+        return None
+    contracts_after, side_after = after_snapshot
+
+    ok = not reverse_observed
+    if contracts_after > 0:
+        print(f"[{tag}] ⚠️⚠️ 触发后仍有持仓 {contracts_after} 张，方向={side_after}！")
+        if side_after and side_after != side:
+            print(f"[{tag}] 🔴🔴 严重：检测到反向持仓！请立即人工核查交易所！")
+        ok = False
+    else:
+        print(f"[{tag}] ✓ 归零后复核未见反向持仓")
+
+    execution_confirmed = False
+    for attempt in range(5):
+        try:
+            execution_confirmed = api.confirm_stop_execution(
+                ccxt_symbol, side, coin, stop_px, stop_id) is True
+        except Exception as exc:
+            print(f"[{tag}] 止损成交归因第 {attempt + 1} 次查询异常: {exc}")
+        if execution_confirmed:
+            break
+        if attempt < 4:
+            time.sleep(2)
+    if not execution_confirmed:
+        print(f"[{tag}] ❌ 未能证明该 algoId 以止损子订单完整成交；"
+              "归零可能来自手动平仓、清算或其它并发动作")
+        ok = False
+    else:
+        print(f"[{tag}] ✓ 算法单 effective 且唯一子订单完整成交，止损归因成立")
+
+    algos = api._fetch_algo_orders(ccxt_symbol)
+    still_listed = any(str(item.get('id')) == str(stop_id) for item in algos)
+    if still_listed:
         time.sleep(2)
-        last_price = api.get_last_price(ccxt_symbol)
-        stop_px = last_price * (1 - distance_pct / 100) if side == 'long' else last_price * (1 + distance_pct / 100)
-        print(f"[fire-{side}] 市价={last_price}, 挂止损 @ {stop_px:.6f}")
-
-        stop = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
-        print(f"[fire-{side}] 止损返回:", (stop or {}).get('id'))
-        if not stop:
-            print(f"[fire-{side}] ❌ 止损创建失败，无法继续验证")
-            return None
-        stop_id = stop.get('id')
-
-        print(f"[fire-{side}] 等待自然行情触发...")
-        start = time.time()
-        triggered = False
-        reverse_observed = False
-        partial_fill_observed = False
-        initial_contracts = None
-        while time.time() - start < timeout_seconds:
-            pos = api.get_position(ccxt_symbol)
-            contracts = abs(float((pos or {}).get('contracts') or 0))
-            observed_side = (pos or {}).get('side')
-            if pos is None or contracts == 0:
-                triggered = True
-                break
-            # 不要求必须先采样到“空仓”。如果错误的非 reduce-only 止损让仓位
-            # 在两个轮询点之间由 long 直接翻成 short（或反之），旧逻辑只会一路
-            # 等到超时并给出“不确定”，恰好漏掉最危险的证据。
-            if observed_side and observed_side != side:
-                reverse_observed = True
-                triggered = True
-                print(f"[fire-{side}] 🔴 轮询直接观察到反向仓: {contracts} 张 {observed_side}")
-                break
-            if initial_contracts is None:
-                initial_contracts = contracts
-            elif contracts < initial_contracts:
-                partial_fill_observed = True
-            print(f"[fire-{side}] 未触发（已等待 {int(time.time() - start)}s，持仓仍在）...")
-            time.sleep(poll_interval)
-
-        if not triggered:
-            if partial_fill_observed:
-                print(f"[fire-{side}] ❌ 观察到止损部分成交但未在超时前归零，按失败处理。")
-                return False
-            print(f"[fire-{side}] ⏱️ 超时未触发（{timeout_seconds}s 内价格未走到止损位），"
-                  f"本次不构成证据，非失败。清理后可加大 --fire-distance 或 --fire-timeout 重试。")
-            return None
-
-        if reverse_observed:
-            print(f"[fire-{side}] ❌ 检测到止损执行，但仓位直接反向")
-        else:
-            print(f"[fire-{side}] ✓ 检测到持仓已归零，止损已触发")
-        time.sleep(2)  # 留出成交回报与列表更新的短暂窗口
-        pos_after = api.get_position(ccxt_symbol)
-        contracts_after = abs(float((pos_after or {}).get('contracts') or 0))
-        side_after = (pos_after or {}).get('side')
-
-        ok = not reverse_observed
-        if pos_after is not None and contracts_after > 0:
-            print(f"[fire-{side}] ⚠️⚠️ 触发后仍有持仓 {contracts_after} 张，方向={side_after}！")
-            if side_after and side_after != side:
-                print(f"[fire-{side}] 🔴🔴 严重：检测到反向持仓！reduce-only 未生效，请立即人工核查交易所！")
-            ok = False
-        else:
-            print(f"[fire-{side}] ✓ 触发后持仓精确归零，未反向")
-
         algos = api._fetch_algo_orders(ccxt_symbol)
-        still_listed = any(str(o.get('id')) == str(stop_id) for o in algos)
-        if still_listed:
-            time.sleep(2)  # 列表可能滞后于触发生效，复查一次再裁决（与验证式撤单同一容忍）
-            algos = api._fetch_algo_orders(ccxt_symbol)
-            still_listed = any(str(o.get('id')) == str(stop_id) for o in algos)
-        print(f"[fire-{side}] 触发后该止损单是否仍在待触发列表（应否）: {still_listed}")
-        if still_listed:
-            print(f"[fire-{side}] ⚠️ 触发单未从待触发列表消失，需人工核对状态语义")
-            ok = False
+        still_listed = any(
+            str(item.get('id')) == str(stop_id) for item in algos)
+    print(f"[{tag}] 触发后该止损单是否仍在待触发列表（应否）: {still_listed}")
+    if still_listed:
+        print(f"[{tag}] ⚠️ 触发单未从待触发列表消失，需人工核对状态语义")
+        ok = False
+    return ok
 
-        return ok
+
+def run_fire_test(api, ccxt_symbol, coin, side, distance_pct=0.15,
+                  timeout_seconds=300, poll_interval=5):
+    """开小仓执行真实止损触发试验；主体与清理必须同时成功才算通过。"""
+    print(f"\n{'#' * 60}\n实弹触发验证: {side.upper()}（{'做多' if side == 'long' else '做空'}）\n{'#' * 60}")
+    print(f"止损距市价 {distance_pct}%，最长等待 {timeout_seconds}s（每 {poll_interval}s 轮询一次）")
+    tag = f'fire-{side}'
+    if not require_flat_before_live_test(api, ccxt_symbol, tag):
+        return False
+    expected_contracts = api._coin_to_contracts(ccxt_symbol, coin)
+    result = None
+    try:
+        try:
+            order = api.open_position(ccxt_symbol, side, coin)
+            print(f"[{tag}] 开仓返回:", (order or {}).get('id'))
+            if not order:
+                print(f"[{tag}] ❌ 开仓失败或结果无法确认")
+            else:
+                result = _run_fire_exercise(
+                    api, ccxt_symbol, coin, side, order, expected_contracts,
+                    distance_pct, timeout_seconds, poll_interval)
+        except Exception as exc:
+            print(f"[{tag}] ❌ 开仓/验证异常，转入强制清理: {exc}")
     finally:
-        print(f"[fire-{side}] --- 清理（保证执行）---")
-        cleanup_live_position(
-            api, ccxt_symbol, side, coin, f'fire-{side}')
+        print(f"[{tag}] --- 清理（保证执行）---")
+        cleanup_ok = cleanup_live_position(
+            api, ccxt_symbol, side, coin, tag)
+    if not cleanup_ok:
+        print(f"[{tag}] ❌ 清理未确认完成，验证强制失败")
+        return False
+    return result
+
+
+def _algo_client_order_id(order):
+    info = order.get('info') if isinstance(order, dict) else None
+    info = info if isinstance(info, dict) else {}
+    value = ((order or {}).get('clientOrderId') if isinstance(order, dict)
+             else None) or info.get('algoClOrdId') or info.get('clientOrderId')
+    return str(value) if value else None
+
+
+def _run_stop_id_reuse_exercise(
+        api, ccxt_symbol, coin, side, order, expected_contracts):
+    """执行 ID 复用试验主体；每个成功结论都复用严格四态止损裁决。"""
+    tag = f'reuse-{side}'
+    if not confirm_open_order_contract(order, tag):
+        return None
+    time.sleep(2)
+    if confirm_open_position(
+            api, ccxt_symbol, side, tag,
+            expected_contracts=expected_contracts) is None:
+        return None
+    last_price = api.get_last_price(ccxt_symbol)
+    stop_px = round(last_price * (0.9 if side == 'long' else 1.1), 6)
+    print(f"[{tag}] 市价={last_price}, 止损价={stop_px}（两次挂单使用同一价）")
+
+    first = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
+    first_id = (first or {}).get('id')
+    first_client_id = _algo_client_order_id(first)
+    print(f"[{tag}] 第一张止损: algoId={first_id}, algoClOrdId={first_client_id}")
+    if not isinstance(first, dict) or not first_id or not first_client_id:
+        print(f"[{tag}] ❌ 第一张止损创建失败或缺少可追踪 ID，无法继续")
+        return None
+    first_state = api.find_stop_order_state(
+        ccxt_symbol, side, coin, stop_px, first_id)
+    if first_state != 'intact':
+        print(f"[{tag}] ❌ 第一张止损未获 intact 确认: {first_state!r}")
+        return None
+
+    print(f"[{tag}] 验证式撤销第一张止损（撤销确认 = 终态证明）...")
+    cancelled = api.cancel_order(ccxt_symbol, first_id)
+    print(f"[{tag}] 撤销确认: {cancelled}")
+    if cancelled is not True:
+        print(f"[{tag}] ❌ 撤销未能确认，无法证明旧单已终态，本次不构成证据")
+        return None
+    time.sleep(2)
+
+    print(f"[{tag}] 用完全相同参数再挂一次（适配层将派生同一个 algoClOrdId）...")
+    second = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
+    if second:
+        second_id = second.get('id')
+        second_client_id = _algo_client_order_id(second)
+        print(f"[{tag}] 第二张止损: algoId={second_id}, algoClOrdId={second_client_id}")
+        if not second_id or second_client_id != first_client_id:
+            print(f"[{tag}] ⚠️ 第二次止损 ID 不完整或幂等 ID 不一致，本次不构成证据")
+            return None
+        if str(second_id) == str(first_id):
+            print(f"[{tag}] ⚠️ 第二次仍是已撤销 algoId，本次不构成证据")
+            return None
+        second_state = api.find_stop_order_state(
+            ccxt_symbol, side, coin, stop_px, second_id)
+        if second_state != 'intact':
+            print(f"[{tag}] ❌ 第二张止损内容未获 intact 确认: {second_state!r}")
+            return False
+        print(f"[{tag}] ✓ OKX 接受终态后复用幂等 ID（新 algoId={second_id}）")
+        return True
+
+    time.sleep(2)
+    algos = api._fetch_algo_orders(ccxt_symbol)
+    listed = [item for item in algos
+              if _algo_client_order_id(item) == first_client_id]
+    if not listed:
+        print(f"[{tag}] 🔴 第二次 POST 未产生任何可确认算法单")
+        return False
+    if len(listed) != 1:
+        print(f"[{tag}] 🔴 同一幂等 ID 出现 {len(listed)} 张算法单，拒绝判成功")
+        return False
+    second_id = listed[0].get('id')
+    if not second_id or str(second_id) == str(first_id):
+        print(f"[{tag}] ⚠️ 清单只看到旧单或无有效新 algoId，本次不构成证据")
+        return None
+    second_state = api.find_stop_order_state(
+        ccxt_symbol, side, coin, stop_px, second_id)
+    if second_state != 'intact':
+        print(f"[{tag}] 🔴 同幂等 ID 的待触发单内容不匹配: {second_state!r}")
+        return False
+    print(f"[{tag}] ⚠️ POST 返回不确定，但清单严格确认新止损完整（algoId={second_id}）")
+    return True
 
 
 def run_stop_id_reuse_test(api, ccxt_symbol, coin, side):
-    """止损幂等 ID 终态复用验证：撤销后按完全相同参数再挂，同一 algoClOrdId 是否被接受。
-
-    流程（全部走项目真实代码路径，不绕过适配层）：
-      1. 开小仓，按远离市价的固定止损价挂第一张止损（适配层由四元组派生 algoClOrdId）；
-      2. 验证式撤销该止损（两类清单验净 = 已进入终态）；
-      3. 用**完全相同**的 (方向, 币数, 触发价) 再调一次 create_stop_loss_order——
-         适配层必然派生出同一个 algoClOrdId，且预查在待触发清单中找不到旧单，会真实 POST；
-      4. 裁决：
-         - 第二次返回新算法单（同 algoClOrdId、不同 algoId）→ OKX 允许终态后复用 ✓
-         - 第二次返回 None 且该 ID 不在待触发清单 → 极可能被交易所以重复 ID 拒绝，
-           回看 stderr 中「止损单业务异常 / 止损 ACK 异常」日志里的 sCode 确认 🔴
-         - 第二次返回 None 但该 ID 已出现在待触发清单 → 复用实际成功、仅确认查询滞后 ✓(带警告)
-    返回 True=复用被接受 / False=复用被拒绝 / None=前置步骤未走通（不构成证据）。
-    finally 保证清理（撤单+平仓），不留残留仓位。
-    """
+    """验证终态后复用止损幂等 ID；主体与最终清理同时成功才通过。"""
     print(f"\n{'#' * 60}\n止损幂等 ID 终态复用验证: {side.upper()}（{'做多' if side == 'long' else '做空'}）\n{'#' * 60}")
-
-    order = api.open_position(ccxt_symbol, side, coin)
-    print(f"[reuse-{side}] 开仓返回:", (order or {}).get('id'))
-    if not order:
-        print(f"[reuse-{side}] ❌ 开仓失败，无法继续")
-        return None
-
-    try:
-        time.sleep(2)
-        last_price = api.get_last_price(ccxt_symbol)
-        # 与 run_side 同取向：远离市价（±10%），试验期间不期望被行情触发
-        stop_px = round(last_price * (0.9 if side == 'long' else 1.1), 6)
-        print(f"[reuse-{side}] 市价={last_price}, 止损价={stop_px}（两次挂单使用同一价）")
-
-        first = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
-        first_id = (first or {}).get('id')
-        first_client_id = (first or {}).get('clientOrderId')
-        print(f"[reuse-{side}] 第一张止损: algoId={first_id}, algoClOrdId={first_client_id}")
-        if not first or not first_id or not first_client_id:
-            print(f"[reuse-{side}] ❌ 第一张止损创建失败或缺少可追踪 ID，无法继续")
-            return None
-
-        print(f"[reuse-{side}] 验证式撤销第一张止损（撤销确认 = 终态证明）...")
-        cancelled = api.cancel_order(ccxt_symbol, first_id)
-        print(f"[reuse-{side}] 撤销确认: {cancelled}")
-        if not cancelled:
-            print(f"[reuse-{side}] ❌ 撤销未能确认，无法证明旧单已终态，本次不构成证据")
-            return None
-        time.sleep(2)
-
-        print(f"[reuse-{side}] 用完全相同参数再挂一次（适配层将派生同一个 algoClOrdId）...")
-        second = api.create_stop_loss_order(ccxt_symbol, side, coin, stop_px)
-
-        if second:
-            second_id = second.get('id')
-            second_client_id = second.get('clientOrderId')
-            print(f"[reuse-{side}] 第二张止损: algoId={second_id}, algoClOrdId={second_client_id}")
-            if second_client_id != first_client_id:
-                print(f"[reuse-{side}] ⚠️ 两次派生的 algoClOrdId 不一致"
-                      f"（{first_client_id} vs {second_client_id}），前提被破坏，本次不构成证据")
-                return None
-            if str(second_id) == str(first_id):
-                print(f"[reuse-{side}] ⚠️ 第二次返回了与已撤销单相同的 algoId——撤销可能未真正生效"
-                      f"（清单滞后），未产生新 POST，本次不构成证据")
-                return None
-            print(f"[reuse-{side}] ✓ OKX 接受了终态后复用的 algoClOrdId（新 algoId={second_id}）")
-            return True
-
-        # 第二次返回 None：区分「被拒绝」与「已创建但确认滞后」
-        time.sleep(2)
-        algos = api._fetch_algo_orders(ccxt_symbol)
-        listed = [o for o in algos if o.get('clientOrderId') == first_client_id]
-        if listed:
-            print(f"[reuse-{side}] ⚠️ 第二次调用返回 None，但该 algoClOrdId 已出现在待触发清单"
-                  f"（algoId={listed[0].get('id')}）——复用实际成功，仅确认查询滞后")
-            return True
-        print(f"[reuse-{side}] 🔴 第二次 POST 未产生任何算法单：同参数在数秒前刚成功过、账户状态未变，"
-              f"极可能是交易所拒绝了终态后复用的 algoClOrdId。")
-        print(f"[reuse-{side}]    请回看上方 stderr 日志「止损单业务异常 / OKX 止损 ACK 异常」中的 sCode 确认。")
-        print(f"[reuse-{side}]    运营含义：撤销后按完全相同参数补挂止损会失败——系统会大声失败"
-              f"（开仓路径自动回滚 / 巡检路径告警+隔离），不丢钱，但需人工介入且损失入场机会。")
+    tag = f'reuse-{side}'
+    if not require_flat_before_live_test(api, ccxt_symbol, tag):
         return False
+    expected_contracts = api._coin_to_contracts(ccxt_symbol, coin)
+    result = None
+    try:
+        try:
+            order = api.open_position(ccxt_symbol, side, coin)
+            print(f"[{tag}] 开仓返回:", (order or {}).get('id'))
+            if not order:
+                print(f"[{tag}] ❌ 开仓失败或结果无法确认")
+            else:
+                result = _run_stop_id_reuse_exercise(
+                    api, ccxt_symbol, coin, side, order,
+                    expected_contracts)
+        except Exception as exc:
+            print(f"[{tag}] ❌ 开仓/验证异常，转入强制清理: {exc}")
     finally:
-        print(f"[reuse-{side}] --- 清理（保证执行）---")
-        cleanup_live_position(
-            api, ccxt_symbol, side, coin, f'reuse-{side}')
+        print(f"[{tag}] --- 清理（保证执行）---")
+        cleanup_ok = cleanup_live_position(
+            api, ccxt_symbol, side, coin, tag)
+    if not cleanup_ok:
+        print(f"[{tag}] ❌ 清理未确认完成，验证强制失败")
+        return False
+    return result
 
 
 def main():
@@ -499,17 +766,29 @@ def main():
     if args.stop_id_reuse and args.side == 'both':
         print('❌ --stop-id-reuse 模式需要显式指定单一方向：--side long 或 --side short')
         return 2
+    write_mode = args.fire or args.stop_id_reuse
+    if (not math.isfinite(args.coin) or args.coin < 0 or
+            (write_mode and args.coin <= 0)):
+        print('❌ 写验证模式必须显式提供有限正数开仓币数；只读模式仅允许省略或使用 0')
+        return 2
 
-    cfg = load_cfg()
+    try:
+        cfg = load_cfg()
+    except (OSError, TypeError, ValueError) as exc:
+        print(f'❌ 验证配置非法: {exc}')
+        return 2
     if not (cfg['apiKey'] and cfg['secret'] and cfg['password']):
         print('请先设置 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE（或写进 config.json）')
+        return 2
+    # 这是验证工具，不是生产下单入口。实盘凭据下任何 coin>0
+    # 都会进入开/平/止损写路径，不得依赖可误触的交互式 yes。
+    if not cfg['sandbox'] and args.coin > 0:
+        print('❌ 实盘凭据只允许 coin=0 的只读检查；所有写验证必须使用明确的模拟盘账户')
         return 2
 
     print(f"== OKX 验证 {'[模拟盘 DEMO]' if cfg['sandbox'] else '[!! 实盘 LIVE !!]'} "
           f"symbol={args.symbol} coin={args.coin} side={args.side} "
           f"margin={cfg['margin_mode']} lev={cfg['leverage']} ==")
-    if not cfg['sandbox'] and input("当前是实盘，确认继续？输入 yes：").strip() != 'yes':
-        return 1
 
     api = OkxApi(cfg)
     ccxt_symbol = api.to_ccxt_symbol(args.symbol)
@@ -534,7 +813,7 @@ def main():
         return 1
     print("USDT 总额:", usdt_total)
 
-    if args.coin <= 0:
+    if args.coin == 0:
         print("\n未指定开仓币数，仅做只读检查，结束。")
         return 0
 

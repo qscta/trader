@@ -24,10 +24,33 @@ class Dummy:
         return lambda *args, **kwargs: None
 
 
+def _base_exchange_stub(*_args, **_kwargs):
+    raise NotImplementedError
+
+
+_EXCHANGE_API_METHODS = (
+    'to_ccxt_symbol', 'get_position', 'list_position_symbols',
+    'verify_one_way_mode', 'setup_symbol', 'open_position', 'close_position',
+    'compensation_client_order_id', 'create_stop_loss_order',
+    'cancel_stop_order_only', 'cancel_order', 'cancel_all_orders',
+    'round_quantity', 'get_quantity_precision', 'find_stop_order_state',
+    'find_existing_open_order', 'find_compensation_close_evidence',
+    'find_compensation_close_progress', 'confirm_stop_execution',
+)
+ExchangeApiStub = type(
+    'ExchangeApi', (),
+    {name: _base_exchange_stub for name in _EXCHANGE_API_METHODS},
+)
+
+
 _STUB_SPECS = (
     ('apscheduler', {}),
     ('apscheduler.schedulers', {}),
     ('apscheduler.schedulers.background', {'BackgroundScheduler': Dummy}),
+    # main imports this class directly for its startup capability-closure
+    # check.  Stubbing only okx_api left the supposedly stdlib-only suite
+    # dependent on whichever earlier test happened to cache exchange_base.
+    ('exchange_base', {'ExchangeApi': ExchangeApiStub}),
     ('ma_cross_strategy', {'MaCrossStrategy': Dummy}),
     ('risk_manager', {'RiskManager': Dummy}),
     ('dingtalk_notifier', {'DingTalkNotifier': Dummy}),  # 避免 requests

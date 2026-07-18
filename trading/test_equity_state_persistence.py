@@ -84,6 +84,18 @@ class EquityStatePersistenceTest(unittest.TestCase):
             with self.assertRaises(EquityStatePersistenceError):
                 tracker.load_equity_ticks()
 
+    def test_duplicate_json_keys_are_never_last_wins(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = self._tracker(temp_dir)
+            with open(tracker.PEAK_EQUITY_FILE, 'w', encoding='utf-8') as f:
+                f.write(
+                    '{"peak_equity": 1000, "peak_equity": 0, '
+                    '"peak_time": null}')
+
+            with self.assertRaisesRegex(
+                    EquityStatePersistenceError, '重复字段'):
+                tracker.load_peak_equity()
+
     def test_valid_json_with_wrong_shape_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = self._tracker(temp_dir)

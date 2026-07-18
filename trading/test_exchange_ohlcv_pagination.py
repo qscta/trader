@@ -63,6 +63,9 @@ class _Api(ExchangeApi):
     def _create_exchange(self, config):
         return config['exchange']
 
+    def to_ccxt_symbol(self, symbol):
+        return symbol
+
 
 class OhlcvSinglePageTest(unittest.TestCase):
     def test_small_request_keeps_single_call(self):

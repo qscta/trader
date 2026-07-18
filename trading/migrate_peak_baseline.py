@@ -7,13 +7,12 @@
 """
 
 import argparse
-import json
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import atomic_write_json, open_private_text_file
+from trade_state import atomic_write_json, load_strict_json, open_private_text_file
 
 
 ROLLOVER_HOUR = 8
@@ -131,7 +130,7 @@ def _load_json(path):
     if not os.path.lexists(path):
         return None
     with open_private_text_file(path) as handle:
-        return json.load(handle)
+        return load_strict_json(handle)
 
 
 def run(data_dir, apply):

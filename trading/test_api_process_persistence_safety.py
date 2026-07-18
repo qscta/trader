@@ -15,6 +15,15 @@ from runtime_guard import runner_lock_path
 from trade_state import TradeState, TradeStatePersistenceError, atomic_write_json
 
 
+def _closed_trade(symbol):
+    """构造可被生产 schema 消费的最小历史成交。"""
+    return {
+        'symbol': symbol, 'side': 'long',
+        'entry_price': 100.0, 'exit_price': 101.0,
+        'position_size': 1.0,
+    }
+
+
 class TradeStateSchemaSafetyTest(unittest.TestCase):
     def test_valid_json_with_wrong_shape_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,7 +152,7 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
             with open(state.archive_file, 'w', encoding='utf-8') as f:
-                json.dump([{'symbol': 'OLDUSDT'}], f)
+                json.dump([_closed_trade('OLDUSDT')], f)
             real_load = trade_state_module.json.load
             calls = []
 
@@ -160,8 +169,9 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
             with open(state.archive_file, 'w', encoding='utf-8') as f:
-                json.dump([{'symbol': f'T{i}'} for i in range(5)], f)
-            state.state['closed_trades'] = [{'symbol': 'T5'}, {'symbol': 'T6'}]
+                json.dump([_closed_trade(f'T{i}') for i in range(5)], f)
+            state.state['closed_trades'] = [
+                _closed_trade('T5'), _closed_trade('T6')]
 
             page1, total = state.get_closed_trades_page(1, 3)
             page2, _ = state.get_closed_trades_page(2, 3)

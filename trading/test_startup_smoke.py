@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 import _test_stubs
@@ -32,6 +33,9 @@ class _FakeOkxApi:
     def __init__(self, config):
         self.config = config
 
+    def verify_one_way_mode(self):
+        return None
+
     def get_balance(self):
         return {'total': {'USDT': 10000.0}, 'free': {'USDT': 10000.0}}
 
@@ -43,6 +47,84 @@ class _FakeOkxApi:
 
     def to_ccxt_symbol(self, symbol):
         return symbol[:-4] + '/USDT:USDT' if symbol.endswith('USDT') else symbol
+
+    def open_position(
+            self, symbol, side, amount, client_order_id=None, *,
+            require_existing=False):
+        raise AssertionError('无信号启动冒烟不得开仓')
+
+    def close_position(
+            self, symbol, side, amount, client_order_id=None, *,
+            require_existing=False):
+        raise AssertionError('空仓启动冒烟不得平仓')
+
+    @staticmethod
+    def compensation_client_order_id(open_client_order_id):
+        return f'R{str(open_client_order_id)[1:]}'
+
+    def find_existing_open_order(self, *args, **kwargs):
+        return None
+
+    def find_compensation_close_evidence(self, *args, **kwargs):
+        return None
+
+    def find_compensation_close_progress(
+            self, _symbol, _side, amount, open_client_order_id):
+        client_order_id = self.compensation_client_order_id(
+            open_client_order_id)
+        return {
+            'terminal': None, 'absent': True, 'confirmed': False,
+            'filled': 0.0, 'amount': 0.0,
+            'requested_amount': float(amount),
+            'remaining_amount': float(amount),
+            'clientOrderId': client_order_id,
+            'ids': [], 'read_only_evidence': True, 'order': None,
+            'order_state': {
+                'client_order_id': client_order_id,
+                'presence': 'absent', 'terminal': None, 'filled': None,
+            },
+        }
+
+    def confirm_stop_execution(self, *args, **kwargs):
+        return False
+
+    def cancel_stop_order_only(self, symbol, order_id):
+        return True
+
+    def get_last_price(self, symbol):
+        return 100.0
+
+    def setup_symbol(self, symbol):
+        return None
+
+    def round_quantity(self, symbol, quantity):
+        return float(quantity)
+
+    def get_quantity_precision(self, symbol):
+        return 3
+
+    def create_stop_loss_order(
+            self, symbol, side, amount, stop_price, *,
+            require_existing=False):
+        raise AssertionError('无信号启动冒烟不得挂止损')
+
+    def cancel_order(self, symbol, order_id):
+        return True
+
+    def cancel_all_orders(self, symbol):
+        return True
+
+    def find_stop_order_state(self, *args, **kwargs):
+        return {'status': 'missing'}
+
+    def _get_contract_size(self, symbol):
+        return 1.0
+
+    def _coin_to_contracts(self, symbol, amount):
+        return float(amount)
+
+    def _contracts_to_coins(self, symbol, contracts):
+        return float(contracts)
 
 
 def _write_config(tmp, extra=None):
@@ -80,6 +162,208 @@ class StartupSmokeTest(unittest.TestCase):
             self.assertEqual(system.trade_state.get_owner_exchange(), 'okx')
             self.assertEqual(system.equity_tracker.data_dir, tmp)
 
+    def test_non_utc8_runtime_is_rejected_before_exchange_reads(self):
+        class UtcDateTime:
+            @classmethod
+            def now(cls):
+                return type('UtcNow', (), {
+                    'astimezone': lambda self: type('UtcLocal', (), {
+                        'utcoffset': lambda self: timedelta(0)})()
+                })()
+
+        class CountingApi(_FakeOkxApi):
+            init_calls = 0
+            balance_reads = 0
+
+            def __init__(self, config):
+                type(self).init_calls += 1
+                super().__init__(config)
+
+            def get_balance(self):
+                type(self).balance_reads += 1
+                return super().get_balance()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(main, 'OkxApi', CountingApi), \
+                patch.object(main, 'datetime', UtcDateTime), \
+                self.assertRaisesRegex(RuntimeError, r'UTC\+8'):
+            TradingSystem(config_file=_write_config(tmp))
+        self.assertEqual(0, CountingApi.init_calls)
+        self.assertEqual(0, CountingApi.balance_reads)
+
+    def test_missing_post_fill_capability_blocks_before_balance_or_post(self):
+        class MissingStopApi(_FakeOkxApi):
+            create_stop_loss_order = None
+            balance_reads = 0
+
+            def get_balance(self):
+                type(self).balance_reads += 1
+                return super().get_balance()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(main, 'OkxApi', MissingStopApi), \
+                self.assertRaisesRegex(RuntimeError, 'create_stop_loss_order'):
+            TradingSystem(config_file=_write_config(tmp))
+        self.assertEqual(0, MissingStopApi.balance_reads)
+
+    def test_adapter_internal_helpers_are_not_outer_startup_contract(self):
+        internal_helpers = (
+            '_confirm_market_order', '_resolve_unconfirmed_open',
+            '_build_close_result', '_fetch_order_for_confirmation',
+            '_confirmed_order_result', '_contracts_tolerance',
+            '_finite_nonnegative', '_position_side',
+        )
+        private_api = type(
+            'PrivateHelpersHiddenApi', (_FakeOkxApi,),
+            {helper: None for helper in internal_helpers})
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(main, 'OkxApi', private_api):
+            system = TradingSystem(config_file=_write_config(tmp))
+        self.assertIs(type(system.exchange_api), private_api)
+
+    def test_directly_used_okx_helpers_remain_required_before_exchange_reads(self):
+        for helper in (
+                '_get_contract_size', '_coin_to_contracts',
+                '_contracts_to_coins'):
+            with self.subTest(helper=helper):
+                missing_api = type(
+                    f'Missing{helper}Api', (_FakeOkxApi,),
+                    {helper: None, 'balance_reads': 0})
+                with tempfile.TemporaryDirectory() as tmp, \
+                        patch.object(main, 'OkxApi', missing_api), \
+                        self.assertRaisesRegex(RuntimeError, helper):
+                    TradingSystem(config_file=_write_config(tmp))
+                self.assertEqual(0, missing_api.balance_reads)
+
+    def test_missing_open_intent_finalizer_blocks_before_exchange_reads(self):
+        original = TradingSystem._finalize_open_intent_rollback
+        try:
+            TradingSystem._finalize_open_intent_rollback = None
+            with tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    self.assertRaisesRegex(
+                        RuntimeError, '_finalize_open_intent_rollback'):
+                TradingSystem(config_file=_write_config(tmp))
+        finally:
+            TradingSystem._finalize_open_intent_rollback = original
+
+    def test_missing_ledger_commit_capability_blocks_before_exchange_reads(self):
+        class MissingAddTradeState(main.TradeState):
+            add_open_position = None
+
+        class CountingApi(_FakeOkxApi):
+            balance_reads = 0
+
+            def get_balance(self):
+                type(self).balance_reads += 1
+                return super().get_balance()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(main, 'TradeState', MissingAddTradeState), \
+                patch.object(main, 'OkxApi', CountingApi), \
+                self.assertRaisesRegex(RuntimeError, 'add_open_position'):
+            TradingSystem(config_file=_write_config(tmp))
+        self.assertEqual(0, CountingApi.balance_reads)
+
+    def test_every_public_exchange_stub_requires_concrete_okx_override(self):
+        public_capabilities = (
+            'to_ccxt_symbol', 'get_position', 'list_position_symbols',
+            'verify_one_way_mode', 'setup_symbol',
+            'open_position', 'close_position',
+            'compensation_client_order_id', 'create_stop_loss_order',
+            'cancel_stop_order_only', 'cancel_order', 'cancel_all_orders',
+            'round_quantity', 'get_quantity_precision',
+            'find_stop_order_state', 'find_existing_open_order',
+            'find_compensation_close_evidence',
+            'find_compensation_close_progress',
+            'confirm_stop_execution',
+        )
+        for capability in public_capabilities:
+            with self.subTest(capability=capability):
+                base_stub_api = type(
+                    f'BaseStub{capability}Api', (_FakeOkxApi,),
+                    {capability: getattr(main.ExchangeApi, capability)})
+                with tempfile.TemporaryDirectory() as tmp, \
+                        patch.object(main, 'OkxApi', base_stub_api), \
+                        self.assertRaisesRegex(
+                            RuntimeError, rf'{capability}.*base_stub'):
+                    TradingSystem(config_file=_write_config(tmp))
+
+    def test_unowned_lifecycle_state_is_never_auto_claimed(self):
+        lifecycle_cases = (
+            {'last_daily_summary_date': '2026-07-17'},
+            {'stop_loss_dates_migrated': True},
+        )
+        for lifecycle in lifecycle_cases:
+            with self.subTest(lifecycle=lifecycle), \
+                    tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                state = {
+                    'open_positions': {}, 'closed_trades': [],
+                    **lifecycle,
+                }
+                state_path = os.path.join(tmp, 'trade_state.json')
+                _jdump(state, state_path)
+                os.chmod(state_path, 0o600)
+                with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                        self.assertRaisesRegex(RuntimeError, '无交易所归属'):
+                    TradingSystem(config_file=path)
+
+    def test_okx_owner_allows_existing_lifecycle_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            state_path = os.path.join(tmp, 'trade_state.json')
+            _jdump({
+                'open_positions': {}, 'closed_trades': [],
+                'exchange': 'okx',
+                'last_daily_summary_date': '2026-07-17',
+            }, state_path)
+            os.chmod(state_path, 0o600)
+
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+
+            self.assertEqual('okx', system.trade_state.get_owner_exchange())
+
+    def test_foreign_or_empty_exchange_claim_is_rejected(self):
+        for owner in ('', 'other'):
+            with self.subTest(owner=owner), \
+                    tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                state_path = os.path.join(tmp, 'trade_state.json')
+                _jdump({
+                    'open_positions': {}, 'closed_trades': [],
+                    'exchange': owner,
+                }, state_path)
+                os.chmod(state_path, 0o600)
+                with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                        self.assertRaises(main.TradeStatePersistenceError):
+                    TradingSystem(config_file=path)
+
+    def test_owner_manifest_uses_the_same_strict_schema_at_startup(self):
+        bad_manifests = (
+            {'exchange': 'okx', 'obsolete': True},
+            {'exchange': 'okx', 'claimed_at': 123},
+            {'exchange': 'okx', 'claimed_at': 'not-an-iso-time'},
+        )
+        for manifest in bad_manifests:
+            with self.subTest(manifest=manifest), \
+                    tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                state_path = os.path.join(tmp, 'trade_state.json')
+                _jdump({
+                    'open_positions': {}, 'closed_trades': [],
+                    'exchange': 'okx',
+                }, state_path)
+                os.chmod(state_path, 0o600)
+                manifest_path = os.path.join(
+                    tmp, '.trading_data_owner.json')
+                _jdump(manifest, manifest_path)
+                os.chmod(manifest_path, 0o600)
+                with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                        self.assertRaisesRegex(RuntimeError, '归属标记非法'):
+                    TradingSystem(config_file=path)
+
     def test_register_jobs_smoke(self):
         """定时任务注册链路可空转（调度器为桩）。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,7 +383,33 @@ class StartupSmokeTest(unittest.TestCase):
             with patch.object(main, 'OkxApi', _FakeOkxApi):
                 system = TradingSystem(config_file=path)
             self.assertIn('okx', system.config)
+            self.assertNotIn('exchanges', system.config)
             self.assertEqual(system.config['okx']['apiKey'], 'k')
+
+    def test_dual_okx_config_sources_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            config = _jload(path)
+            config['exchanges'] = {'okx': {'sandbox': False}}
+            _jdump(config, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    self.assertRaisesRegex(ValueError, '双源'):
+                TradingSystem(config_file=path)
+
+    def test_duplicate_config_fields_are_rejected_instead_of_last_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'config.json')
+            raw = (
+                '{"okx":{"apiKey":"k","secret":"s","password":"p",'
+                '"sandbox":true},'
+                '"strategy":{"default_risk_per_trade":0.01,'
+                '"default_risk_per_trade":0.5},'
+                '"trading":{"symbols":[]},"scheduler":{},"dingtalk":{}}')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(raw)
+            with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    self.assertRaisesRegex(ValueError, '重复字段'):
+                TradingSystem(config_file=path)
 
     def test_missing_credentials_rejected(self):
         """凭据缺失：构造必须拒绝（fail closed），不能带病启动。"""
@@ -131,6 +441,52 @@ class StartupSmokeTest(unittest.TestCase):
                 with patch.object(main, 'OkxApi', _FakeOkxApi):
                     with self.assertRaises(ValueError):
                         TradingSystem(config_file=path)
+
+    def test_explicit_null_execution_fields_rejected_at_startup(self):
+        mutations = (
+            lambda c: c.__setitem__('okx', None),
+            lambda c: c.__setitem__('strategy', None),
+            lambda c: c.__setitem__('trading', None),
+            lambda c: c.__setitem__('scheduler', None),
+            lambda c: c['strategy'].__setitem__('ma_short_period', None),
+            lambda c: c['trading']['symbols'][0].__setitem__(
+                'risk_per_trade', None),
+            lambda c: c['trading']['symbols'][0].__setitem__('enabled', None),
+            lambda c: c['scheduler'].__setitem__('summary_minute', None),
+            lambda c: c['scheduler'].__setitem__(
+                'stop_loss_scan_interval_minutes', None),
+            lambda c: c['okx'].__setitem__('margin_mode', None),
+            lambda c: c['okx'].__setitem__('leverage_overrides', None),
+            lambda c: c.__setitem__('equity_tick_retention_days', None),
+        )
+        for mutate in mutations:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                config = _jload(path)
+                mutate(config)
+                _jdump(config, path)
+                with self.subTest(config=config), \
+                        patch.object(main, 'OkxApi', _FakeOkxApi), \
+                        self.assertRaises(ValueError):
+                    TradingSystem(config_file=path)
+
+    def test_non_object_top_level_config_is_rejected_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'config.json')
+            _jdump([], path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    self.assertRaisesRegex(ValueError, '顶层必须是对象'):
+                TradingSystem(config_file=path)
+
+    def test_sandbox_string_false_normalizes_to_real_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_config(tmp)
+            config = _jload(path)
+            config['okx']['sandbox'] = 'false'
+            _jdump(config, path)
+            with patch.object(main, 'OkxApi', _FakeOkxApi):
+                system = TradingSystem(config_file=path)
+            self.assertIs(system.config['okx']['sandbox'], False)
 
     def test_out_of_range_strategy_param_rejected(self):
         """手写 config.json 的非法范围值：启动即拒（与前端/API 改参同口径），
@@ -355,7 +711,7 @@ class StartupSmokeTest(unittest.TestCase):
                         f'退出前必须补发钉钉告警，实际: {alerts}')
 
     def test_large_scan_interval_passes_validation(self):
-        """巡检间隔 ≥ 60 分钟必须通过启动校验（_validate_scheduler_config 放行 [1,1440]）。
+        """巡检间隔 ≥ 60 分钟必须通过共享启动校验（允许 [1,1440]）。
 
         注意：本标准库套件把 BackgroundScheduler 换成 Dummy 桩，add_job 空转、不校验
         cron 表达式——所以「register_jobs 对 '*/60' 是否崩溃」只能在装了真 apscheduler
@@ -413,6 +769,10 @@ class StartupEquityParsingTest(unittest.TestCase):
             {'total': {'USDT': '10000.5'}}))
         self.assertEqual(0.0, main._parse_startup_equity(
             {'total': {'USDT': 0}}))
+
+    def test_huge_integer_equity_is_rejected_without_overflow(self):
+        self.assertIsNone(main._parse_startup_equity(
+            {'total': {'USDT': 10 ** 10000}}))
 
 
 if __name__ == '__main__':

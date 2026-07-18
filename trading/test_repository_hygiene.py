@@ -1,6 +1,7 @@
 """阻止凭据、账本和运行备份再次进入 Git 当前树。"""
 
 import subprocess
+import re
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,8 @@ SENSITIVE_RUNTIME_PATHS = {
     'trading/equity_ticks.json',
     'trading/peak_equity.json',
     'trading/qiusuo_index.json',
+    'trading/deployment_no_open_baseline.json',
+    'trading/deployment_no_open_completion.json',
 }
 
 
@@ -35,12 +38,43 @@ def _is_forbidden_tracked_path(path):
         return True
     if name == '.env' or (name.startswith('.env.') and name != '.env.example'):
         return True
-    if name == '.single_strategy_migration_journal.json':
+    if name in {
+            '.single_strategy_migration_journal.json',
+            '.maintenance_no_open'}:
         return True
     return name.endswith(('.save', '.tgz', '.tar', '.tar.gz', '.zip'))
 
 
 class RepositoryHygieneTest(unittest.TestCase):
+    def test_removed_strategy_markers_never_return(self):
+        root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ['git', 'ls-files', '-z'], cwd=root, check=True,
+            stdout=subprocess.PIPE)
+        tracked = [item for item in result.stdout.decode().split('\0') if item]
+        markers = (
+            'tur' + 'tle', 'don' + 'chian',
+            ''.join(chr(code) for code in (0x6d77, 0x9f9f)),
+            ''.join(chr(code) for code in (0x5510, 0x5947, 0x5b89)),
+        )
+        short_marker = 'a' + 'tr'
+        violations = []
+        for relative in tracked:
+            path_text = relative.casefold()
+            if any(marker.casefold() in path_text for marker in markers):
+                violations.append(f'{relative}:path')
+                continue
+            try:
+                content = (root / relative).read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                continue
+            folded = content.casefold()
+            if (any(marker.casefold() in folded for marker in markers) or
+                    re.search(
+                        rf'(?<![a-z]){short_marker}(?![a-z])', folded)):
+                violations.append(f'{relative}:content')
+        self.assertEqual([], violations, '检测到已删除策略的内容或路径残留')
+
     def test_production_dependency_lock_is_committed_and_used(self):
         root = Path(__file__).resolve().parents[1]
         direct = (root / 'trading' / 'requirements.txt').read_text(
@@ -98,7 +132,10 @@ class RepositoryHygieneTest(unittest.TestCase):
                 'trading/closed_trades_archive_2026.json.bak',
                 'trading/qiusuo_index.json.bak',
                 'trading/config.json.premigrate.20260718_080000',
-                'trading/.single_strategy_migration_journal.json'):
+                'trading/.single_strategy_migration_journal.json',
+                'trading/.maintenance_no_open',
+                'trading/deployment_no_open_baseline.json',
+                'trading/deployment_no_open_completion.json'):
             self.assertTrue(_is_forbidden_tracked_path(path), path)
         self.assertFalse(_is_forbidden_tracked_path('trading/config.example.json'))
         self.assertFalse(_is_forbidden_tracked_path('.env.example'))

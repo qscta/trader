@@ -35,7 +35,10 @@ TOP_PROCESS_COUNT = 5       # 告警时展示的Top进程数量
 
 # 日志配置
 # 交易账本/权益状态所在目录：其所在盘写满比 / 写满更致命，必须一并监控。
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get(
+    'TRADING_DATA_DIR', os.path.dirname(os.path.abspath(__file__)))
+if not os.path.isabs(DATA_DIR):
+    raise RuntimeError('TRADING_DATA_DIR 必须是绝对路径')
 # systemd 服务用动态低权限用户运行，日志目录由 LogsDirectory 创建；本地手工
 # 运行仍默认写项目目录。环境值只接受绝对路径，避免工作目录变化写到意外位置。
 _configured_log_file = os.environ.get('TRADING_MEM_MONITOR_LOG', '').strip()
@@ -55,7 +58,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 从 config.json 读取钉钉 webhook
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+CONFIG_FILE = os.environ.get('TRADING_CONFIG_FILE', os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'config.json'))
+if not os.path.isabs(CONFIG_FILE):
+    raise RuntimeError('TRADING_CONFIG_FILE 必须是绝对路径')
 
 
 def load_webhook():

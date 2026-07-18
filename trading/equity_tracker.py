@@ -10,7 +10,6 @@
 """
 
 import copy
-import json
 import logging
 import math
 import os
@@ -18,8 +17,8 @@ import threading
 import time
 from datetime import datetime, date, timedelta, timezone
 
-from trade_state import (atomic_write_json, open_private_text_file,
-                         private_file_exists)
+from trade_state import (atomic_write_json, load_strict_json,
+                         open_private_text_file, private_file_exists)
 import config_validation as cfgv
 
 logger = logging.getLogger(__name__)
@@ -27,10 +26,6 @@ logger = logging.getLogger(__name__)
 
 class EquityStatePersistenceError(RuntimeError):
     """权益/指数辅助状态无法被可信读取或保存。"""
-
-
-def _reject_nonfinite_json(value):
-    raise ValueError(f'JSON 不允许非有限数字常量: {value}')
 
 
 def _coerce_positive_float(value):
@@ -127,8 +122,7 @@ class EquityTracker:
             return
         try:
             with open_private_text_file(self.EQUITY_SYNC_JOURNAL_FILE) as handle:
-                journal = json.load(
-                    handle, parse_constant=_reject_nonfinite_json)
+                journal = load_strict_json(handle)
             if not isinstance(journal, dict) or journal.get('version') != 1:
                 raise ValueError('权益同步 journal 版本非法')
             old_generation = journal.get('old')
@@ -291,7 +285,7 @@ class EquityTracker:
             try:
                 with open_private_text_file(backup) as f:
                     recovered = self._validate_json_shape(
-                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, backup)
+                        load_strict_json(f), expected_type, backup)
                 if not atomic_write_json(filepath, recovered):
                     raise OSError('备份可读但无法恢复主文件')
                 logger.warning('辅助状态主文件缺失，已从备份恢复: %s', backup)
@@ -305,12 +299,12 @@ class EquityTracker:
         try:
             with open_private_text_file(filepath) as f:
                 return self._validate_json_shape(
-                    json.load(f, parse_constant=_reject_nonfinite_json), expected_type, filepath)
+                    load_strict_json(f), expected_type, filepath)
         except Exception as main_error:
             try:
                 with open_private_text_file(backup) as f:
                     recovered = self._validate_json_shape(
-                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, backup)
+                        load_strict_json(f), expected_type, backup)
                 if not atomic_write_json(filepath, recovered):
                     raise OSError('恢复后的状态无法写回主文件')
                 logger.warning('辅助状态已从备份恢复: %s', backup)
@@ -328,7 +322,7 @@ class EquityTracker:
             if private_file_exists(filepath):
                 with open_private_text_file(filepath) as f:
                     current = self._validate_json_shape(
-                        json.load(f, parse_constant=_reject_nonfinite_json), expected_type, filepath)
+                        load_strict_json(f), expected_type, filepath)
                 if not atomic_write_json(filepath + '.bak', current):
                     raise OSError('无法写入状态备份')
             if not atomic_write_json(filepath, data):
@@ -1059,22 +1053,36 @@ class EquityTracker:
             old_qiusuo = self.load_qiusuo_index_state()
             qiusuo_state = self.ensure_qiusuo_index_state(
                 current_equity=current_equity, now=now, persist=False)
-            old_divisor = qiusuo_state.get('current_divisor') or (current_equity / (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE))
+            old_divisor = _coerce_positive_float(
+                qiusuo_state.get('current_divisor') or
+                (current_equity /
+                 (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)))
+            if old_divisor is None:
+                raise ValueError('旧求索指数除数不是正有限数，拒绝同步')
             if flow_amount is not None:
                 # 状态边界 fail-closed：nan/inf 会写出 nan/0.0 的除数污染求索指数，
                 # 不依赖调用方（API 已挡一层，这里是最后防线）
                 flow_amount = cfgv.strict_float_finite(flow_amount, '净变动金额')
                 pre_flow_equity = current_equity - flow_amount
-                if pre_flow_equity <= 0:
+                if _coerce_positive_float(pre_flow_equity) is None:
                     raise ValueError(
-                        f'净变动金额不合理：当前权益 {current_equity:.2f}，净变动 {float(flow_amount):.2f}，'
-                        f'反推的变动前权益不为正，请核对金额与正负号')
-                qiusuo_anchor = pre_flow_equity / old_divisor
+                        '净变动金额不合理：反推的变动前权益'
+                        '不是正有限数，请核对金额、数量级与正负号')
+                qiusuo_anchor = _coerce_positive_float(
+                    pre_flow_equity / old_divisor)
+                if qiusuo_anchor is None:
+                    raise ValueError('求索指数锚点不是正有限数，拒绝同步')
                 anchor_time = now.isoformat(timespec='seconds')
             else:
                 qiusuo_anchor, anchor_time = self._latest_qiusuo_index_anchor(qiusuo_state)
                 qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
-            new_divisor = current_equity / qiusuo_anchor
+            qiusuo_anchor = _coerce_positive_float(qiusuo_anchor)
+            if qiusuo_anchor is None:
+                raise ValueError('求索指数锚点不是正有限数，拒绝同步')
+            new_divisor = _coerce_positive_float(
+                current_equity / qiusuo_anchor)
+            if new_divisor is None:
+                raise ValueError('新求索指数除数不是正有限数，拒绝同步')
 
             peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
 

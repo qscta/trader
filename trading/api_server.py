@@ -11,6 +11,7 @@ import secrets
 from datetime import datetime
 from trade_executor import safe_fill_price
 from trade_state import enrich_closed_trade_with_fees
+from runtime_guard import assess_runtime_health, runtime_data_path
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
@@ -24,7 +25,7 @@ from config_validation import (MA_PARAMETER_FIELDS, PERIOD_MAX, PERIOD_MIN,
 
 
 def _validate_symbol_input(name, risk_per_trade=None, enabled=None):
-    """校验并**规范化**品种写入字段（与启动校验 main._validate_symbol_configs 同源）。
+    """校验并**规范化**品种写入字段（与启动配置校验同源）。
 
     返回 (clean, error)：error 非 None 时 clean 为 None；否则 clean 仅含传入（非 None）
     字段的规范化值——name 恒有；risk_per_trade→float、enabled→bool。
@@ -108,6 +109,40 @@ _login_guard = threading.Lock()
 
 API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 
+def _maintenance_no_open_active(environ=None, cwd=None):
+    """Fail closed when the deployment sentinel exists or is malformed.
+
+    The explicit path is set by the deployment unit.  The cwd fallback keeps
+    the guard effective for the normal release service without another config
+    source.  Any object at the path activates maintenance; a symlink or odd
+    file must never turn writes back on.
+    """
+    env = os.environ if environ is None else environ
+    root = os.getcwd() if cwd is None else cwd
+    path = env.get(
+        'TRADING_MAINTENANCE_SENTINEL',
+        os.path.join(root, '.maintenance_no_open'))
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return True
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+@app.before_request
+def reject_maintenance_writes():
+    """Expose read-only status externally while deployment cannot open."""
+    if (request.method not in {'GET', 'HEAD', 'OPTIONS'} and
+            _maintenance_no_open_active()):
+        return jsonify({
+            'error': '系统处于部署维护态；配置、开仓和任务触发写接口已禁用',
+            'maintenance_no_open': True,
+        }), 503
+
 # 由 wsgi / __main__ 保存真实 runner 线程状态。不能仅凭 trading_system 非空就宣称
 # “运行中”：调度线程若在 register_jobs/start 中异常退出，Web 仍可能完全正常。
 _runner_thread = None
@@ -190,73 +225,67 @@ def _runner_health(system):
         issues.append('runner_thread_unregistered')
         thread_alive = False
     else:
-        thread_alive = thread.is_alive()
-        if not thread_alive:
-            issues.append('runner_thread_stopped')
-
-    # TradingSystem.health_snapshot 同时检查 APScheduler 内部线程。单看
-    # scheduler.running 会在调度线程异常退出后仍保留 RUNNING 状态；
-    # runner 主循环又会继续更新 heartbeat，从而把「所有 job 都停了」
-    # 误报为健康。测试桩没有 health_snapshot 时才走兼容回退。
-    system_health = {}
-    snapshot_reader = getattr(system, 'health_snapshot', None)
-    if callable(snapshot_reader):
         try:
-            system_health = snapshot_reader()
-            if not isinstance(system_health, dict):
-                raise TypeError('health_snapshot 必须返回对象')
-        except Exception as exc:
-            logger.error(f'读取交易 runner 健康快照失败: {exc}')
-            issues.append('system_health_unavailable')
-            system_health = {}
-
-    scheduler = getattr(system, 'scheduler', None)
-    scheduler_running = bool(system_health.get(
-        'scheduler_running', getattr(scheduler, 'running', False)))
-    scheduler_thread_alive = system_health.get('scheduler_thread_alive')
-    if scheduler_thread_alive is None:
-        scheduler_thread = getattr(scheduler, '_thread', None)
-        if scheduler_thread is None:
-            scheduler_thread_alive = scheduler_running
+            thread_probe = thread.is_alive()
+        except Exception:
+            thread_probe = None
+        if not isinstance(thread_probe, bool):
+            issues.append('runner_thread_state_invalid')
+            thread_alive = False
         else:
-            try:
-                scheduler_thread_alive = bool(scheduler_thread.is_alive())
-            except Exception:
-                scheduler_thread_alive = False
-    if not scheduler_running:
-        issues.append('scheduler_not_running')
-    elif not scheduler_thread_alive:
-        issues.append('scheduler_thread_stopped')
+            thread_alive = thread_probe
+            if not thread_alive:
+                issues.append('runner_thread_stopped')
 
-    # main.start 会更新该 epoch；兼容尚未带 heartbeat 的测试桩，但真实部署一旦存在
-    # 心跳，超过阈值就明确降级。阈值需覆盖主循环 60 秒睡眠及短暂调度抖动。
-    heartbeat = system_health.get(
-        'runner_heartbeat_ts', getattr(system, '_runner_heartbeat_ts', None))
-    heartbeat_age = None
-    if heartbeat is not None:
-        try:
-            heartbeat_age = max(0.0, time.time() - float(heartbeat))
-            if heartbeat_age > 150:
-                issues.append('runner_heartbeat_stale')
-        except (TypeError, ValueError):
-            issues.append('runner_heartbeat_invalid')
-    elif hasattr(system, '_runner_heartbeat_ts'):
-        issues.append('runner_heartbeat_missing')
-    stop_event = getattr(system, '_stop_event', None)
-    stopping = system_health.get('stopping')
-    if stopping is None and stop_event is not None:
-        stopping = stop_event.is_set()
-    if stopping:
-        issues.append('runner_stopping')
+    # TradingSystem.health_snapshot 只负责采集；运行时事实由共享纯函数按
+    # 唯一口径判定。Web 层只叠加本进程 runner 线程与启动失败状态。
+    try:
+        system_health = system.health_snapshot()
+        if not isinstance(system_health, dict):
+            raise TypeError('health_snapshot 必须返回对象')
+    except Exception as exc:
+        logger.error(f'读取交易 runner 健康快照失败: {exc}')
+        issues.append('system_health_unavailable')
+        system_health = {}
+    if 'healthy' not in system_health:
+        # API 的既有 health_snapshot 契约要求显式 healthy；共享判定允许 main
+        # 直接传原始事实，因此在此把“缺字段”规范成非法上游结论。
+        system_health = dict(system_health)
+        system_health['healthy'] = None
+    upstream_issues = system_health.get('issues')
+    if upstream_issues is not None:
+        if (not isinstance(upstream_issues, list) or
+                len(upstream_issues) > 64 or
+                any(not isinstance(item, str) or not item or len(item) > 128
+                    for item in upstream_issues)):
+            issues.append('system_health_issues_invalid')
+        else:
+            # main 已对原始探针做了第一次严格裁决；API 仍重新
+            # 裁决规范快照以防伪造 healthy，但不得丢掉首次的根因。
+            issues.extend(upstream_issues)
+    runtime_health = assess_runtime_health(system_health, time.time())
+    issues.extend(runtime_health['issues'])
     if failure:
         issues.append('runner_failed')
+    issues = list(dict.fromkeys(issues))
     return {
         'healthy': not issues,
         'runner_thread_alive': thread_alive,
-        'scheduler_running': scheduler_running,
-        'scheduler_thread_alive': bool(scheduler_thread_alive),
+        'scheduler_running': runtime_health['scheduler_running'],
+        'scheduler_thread_alive': runtime_health['scheduler_thread_alive'],
         'runner_started_at': started_at,
-        'heartbeat_age_seconds': round(heartbeat_age, 1) if heartbeat_age is not None else None,
+        'heartbeat_age_seconds': (
+            round(runtime_health['heartbeat_age_seconds'], 1)
+            if runtime_health['heartbeat_age_seconds'] is not None else None),
+        'persistence_degraded': runtime_health['persistence_degraded'],
+        'persistence_degraded_context': runtime_health[
+            'persistence_degraded_context'],
+        'safety_blockers': runtime_health['safety_blockers'],
+        'trade_check_failure': runtime_health['trade_check_failure'],
+        'guardian_failure': runtime_health['guardian_failure'],
+        'daily_check_overdue': runtime_health['daily_check_overdue'],
+        'expected_daily_check_date': runtime_health[
+            'expected_daily_check_date'],
         'failure': failure,
         'issues': issues,
     }
@@ -434,7 +463,8 @@ def check_auth():
 def get_logs():
     try:
         lines = max(1, min(request.args.get('lines', 50, type=int), 1000))
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
+        log_path = runtime_data_path(
+            'trading.log', default_dir=os.path.dirname(os.path.abspath(__file__)))
         # 从文件尾向前按块读取；正常请求不再为 80 行日志整读整个 10MB 文件。
         chunks = b''
         result = []
@@ -472,6 +502,8 @@ def get_status():
         return err
     try:
         open_positions = system.trade_state.get_all_open_positions()
+        open_intents = system.trade_state.get_open_intents()
+        last_daily_check_date = system.trade_state.get_last_daily_check_date()
         last_symbol_update = None
         try:
             mtime = os.path.getmtime(system.config_file)
@@ -479,14 +511,8 @@ def get_status():
         except Exception as e:
             logger.warning(f"忽略异常: {e}")
         manual_symbols = [s['name'] for s in system.config['trading']['symbols'] if s.get('enabled', True)]
-        try:
-            stop_residues = list(system.trade_state.get_stop_residues().keys())
-        except Exception:
-            stop_residues = []
-        try:
-            position_quarantines = system.trade_state.get_position_quarantines()
-        except Exception:
-            position_quarantines = {}
+        stop_residues = list(system.trade_state.get_stop_residues().keys())
+        position_quarantines = system.trade_state.get_position_quarantines()
         stop_anomalies = dict(getattr(system, '_stop_anomalies', {}) or {})
         health = _runner_health(system)
         payload = {
@@ -496,6 +522,8 @@ def get_status():
             'label': system.label,
             'open_positions_count': len(open_positions),
             'open_positions': open_positions,
+            'open_intents_count': len(open_intents),
+            'last_daily_check_date': last_daily_check_date,
             'enabled_symbols': manual_symbols,
             'manual_pool_count': len(manual_symbols),
             'stop_residues': stop_residues,
@@ -532,8 +560,9 @@ def add_symbol():
         return err
     try:
         data = request.get_json(silent=True)
-        if not isinstance(data, dict) or 'name' not in data:
-            return jsonify({'error': '缺少必要参数'}), 400
+        if (not isinstance(data, dict) or
+                not {'name', 'risk_per_trade'} <= set(data)):
+            return jsonify({'error': '缺少必要参数 name / risk_per_trade'}), 400
         unknown = sorted(set(data) - SYMBOL_CONFIG_FIELDS)
         if unknown:
             return jsonify({'error': f'未知字段: {unknown}'}), 400
@@ -544,7 +573,7 @@ def add_symbol():
 
         clean, invalid = _validate_symbol_input(
             data.get('name'),
-            data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
+            data['risk_per_trade'],
             data['enabled'] if 'enabled' in data else True)
         if invalid:
             return jsonify({'error': invalid}), 400
@@ -570,8 +599,7 @@ def add_symbol():
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
             if any(s['name'] == new_symbol['name'] for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对已存在'}), 400
-            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
-            if callable(intent_getter) and intent_getter(new_symbol['name']):
+            if system.trade_state.get_open_intent(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口开仓意图，禁止重新加入/改配"}), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'].append(new_symbol)
@@ -619,8 +647,7 @@ def update_symbol(symbol):
             disabling_only = (
                 clean.get('enabled') is False and
                 'risk_per_trade' not in clean)
-            intent_getter = getattr(system.trade_state, 'get_open_intent', None)
-            open_intent = intent_getter(symbol_u) if callable(intent_getter) else None
+            open_intent = system.trade_state.get_open_intent(symbol_u)
             if open_intent and not disabling_only:
                 # 紧急“禁用”必须允许：恢复裁决会在确认从未发单后消费意图；
                 # 若交易所已有真钱仓则仍补账/补止损，并按退池仓只平不开托管。
@@ -660,6 +687,11 @@ def delete_symbol(symbol):
     if err:
         return err
     try:
+        raw_body = request.get_data(cache=True)
+        if raw_body and request.get_json(silent=True) != {}:
+            return jsonify({
+                'error': '删除交易对不接受参数；请省略 body 或发送空对象 {}',
+            }), 400
         try:
             symbol_u = normalize_symbol_name(symbol)
         except ValueError as e:
@@ -682,14 +714,13 @@ def delete_symbol(symbol):
                 return err_resp
             # 清理也必须留在同一 trade lock 内；否则锁释放后即时开仓可插入，清理线程
             # 还拿旧的 exchange-flat 结论删除新仓的信号/T+1 元数据。
-            if not held and hasattr(system.trade_state, 'remove_symbol_metadata'):
+            if not held:
                 try:
                     clear_quarantine = False
-                    if hasattr(system.exchange_api, 'get_position'):
-                        ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
-                        exchange_position = system.exchange_api.get_position(ccxt_symbol)
-                        clear_quarantine = not exchange_position or float(
-                            exchange_position.get('contracts') or 0) == 0
+                    ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
+                    exchange_position = system.exchange_api.get_position(ccxt_symbol)
+                    clear_quarantine = not exchange_position or float(
+                        exchange_position.get('contracts') or 0) == 0
                     system.trade_state.remove_symbol_metadata(
                         symbol_u, clear_quarantine=clear_quarantine)
                 except Exception as e:
@@ -1039,27 +1070,29 @@ def instant_open():
     if err:
         return err
     try:
+        data = request.get_json(silent=True)
+        if (not isinstance(data, dict) or
+                not {'name', 'risk_per_trade'} <= set(data)):
+            return jsonify({
+                'error': '缺少必要参数 name / risk_per_trade',
+            }), 400
+        unknown = sorted(set(data) - (SYMBOL_CONFIG_FIELDS - {'enabled'}))
+        if unknown:
+            return jsonify({'error': f'未知字段: {unknown}'}), 400
+        null_error = _explicit_null_error(data, ('name', 'risk_per_trade'))
+        if null_error:
+            return jsonify({'error': null_error}), 400
+        clean, invalid = _validate_symbol_input(
+            data['name'], data['risk_per_trade'])
+        if invalid:
+            return jsonify({'error': invalid}), 400
+        symbol_name = clean['name']
+        risk_per_trade = clean['risk_per_trade']
+
         # 与 08:00 日检 / 盘中巡检互斥，防止并发下单（拿不到锁直接拒绝，不排队）
         if not system._trade_lock.acquire(blocking=False):
             return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
         try:
-            data = request.get_json(silent=True)
-            if not isinstance(data, dict) or 'name' not in data:
-                return jsonify({'error': '缺少交易对名称'}), 400
-            unknown = sorted(set(data) - (SYMBOL_CONFIG_FIELDS - {'enabled'}))
-            if unknown:
-                return jsonify({'error': f'未知字段: {unknown}'}), 400
-            null_error = _explicit_null_error(data, ('name', 'risk_per_trade'))
-            if null_error:
-                return jsonify({'error': null_error}), 400
-            clean, invalid = _validate_symbol_input(
-                data.get('name'),
-                data['risk_per_trade'] if 'risk_per_trade' in data else 0.01)
-            if invalid:
-                return jsonify({'error': invalid}), 400
-            symbol_name = clean['name']
-            risk_per_trade = clean['risk_per_trade']  # 规范化 float，杜绝字符串进仓位计算
-
             if system.trade_state.get_open_position(symbol_name):
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
 
@@ -1192,45 +1225,43 @@ def close_position():
     if err:
         return err
     try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or 'name' not in data:
+            return jsonify({'error': '缺少交易对名称'}), 400
+        unknown = sorted(set(data) - {'name'})
+        if unknown:
+            return jsonify({
+                'error': f'未知字段: {unknown}；整仓平仓只允许 name',
+            }), 400
+        try:
+            symbol_name = normalize_symbol_name(data['name'])
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+
         # 与 08:00 日检 / 盘中巡检互斥，防止并发下单（拿不到锁直接拒绝，不排队）
         if not system._trade_lock.acquire(blocking=False):
             return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
         try:
-            data = request.get_json(silent=True)
-            if not isinstance(data, dict) or 'name' not in data:
-                return jsonify({'error': '缺少交易对名称'}), 400
-
-            try:
-                symbol_name = normalize_symbol_name(data['name'])
-            except ValueError as e:
-                return jsonify({'error': str(e)}), 400
             position = system.trade_state.get_open_position(symbol_name)
             if not position:
                 return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
-            submit_close = getattr(system, '_submit_persisted_close', None)
-            if callable(submit_close):
-                close_order = submit_close(
-                    symbol_name, ccxt_symbol, position, 'API 手动平仓')
-            else:
-                # 兼容旧测试桩；真实 TradingSystem 必须走持久化 close intent。
-                close_order = system.exchange_api.close_position(
-                    ccxt_symbol, position['side'], position['position_size'])
+            close_order = system._submit_persisted_close(
+                symbol_name, ccxt_symbol, position, 'API 手动平仓')
             if not close_order:
                 return jsonify({'error': f'{symbol_name} 平仓失败'}), 500
+            if close_order.get('zero_fill_resolved') is True:
+                return jsonify({
+                    'status': 'no_fill',
+                    'error': (f'{symbol_name} 平仓单已终态但零成交；'
+                              '本次不重发，持仓与止损未改'),
+                }), 409
 
-            reject_partial = getattr(system, '_reject_partial_close', None)
-            if close_order.get('fully_closed') is False:
-                handle_partial = getattr(system, '_handle_partial_close', None)
-                safely_reconciled = False
-                if callable(handle_partial):
-                    safely_reconciled = bool(handle_partial(
-                        symbol_name, close_order, position, '手动平仓'))
-                elif callable(reject_partial):
-                    reject_partial(symbol_name, close_order, '手动平仓')
-                else:
-                    logger.critical(f'{symbol_name} 手动平仓仅部分成交，保留账本和止损')
+            close_state = system._classify_close_execution(close_order)
+            if close_state == 'partial':
+                safely_reconciled = bool(system._handle_partial_close(
+                    symbol_name, close_order, position, '手动平仓'))
                 # 绝不能继续撤掉保护余仓的止损或删除完整本地账本。
                 return jsonify({
                     'status': 'partial',
@@ -1240,19 +1271,23 @@ def close_position():
                     'remaining_amount': close_order.get('remaining_amount'),
                     'safely_reconciled': safely_reconciled,
                 }), 409
+            if close_state != 'closed':
+                system._handle_unproven_close_execution(
+                    symbol_name, close_order, 'API 手动平仓')
+                return jsonify({
+                    'status': 'unresolved',
+                    'error': (f'{symbol_name} 平仓回包未严格证明终态；'
+                              '已保留仓位、止损和 close intent 并隔离'),
+                }), 409
 
-            warn_ambiguous = getattr(system, '_warn_ambiguous_close_execution', None)
-            if callable(warn_ambiguous):
-                warn_ambiguous(symbol_name, close_order, '手动平仓')
-
-            # 仓位变化与订单成交量不一致时，订单 VWAP 不能代表完整平仓，使用保守行情回退。
-            actual_price = None if close_order.get('execution_ambiguous') \
-                else safe_fill_price(close_order, None)
+            actual_price = safe_fill_price(close_order, None)
             if not actual_price:
-                try:
-                    actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
-                except Exception:
-                    actual_price = position['entry_price']
+                system._handle_unproven_close_execution(
+                    symbol_name, close_order, '手动平仓缺少权威退出价')
+                return jsonify({
+                    'status': 'unresolved',
+                    'error': f'{symbol_name} 平仓缺少权威成交均价',
+                }), 409
             if close_order.get('fee') is not None or close_order.get('fees'):
                 logger.info(
                     f"{symbol_name} 手动平仓真实手续费: fee={close_order.get('fee')}, "
@@ -1262,20 +1297,23 @@ def close_position():
                 logger.error(f"[{system.label}] {symbol_name} 手动平仓后止损撤销不可确认，已标记残留并阻断该品种新开仓")
 
             # 记平 + 落盘失败的运行时补偿 + 告警 + 止损异常警示清理，统一复用主系统的收口方法
-            extract_fee = getattr(system, '_extract_usdt_fee', None)
-            exit_fee, exit_fee_currency = (
-                extract_fee(close_order) if callable(extract_fee) else (None, None))
-            order_ids_getter = getattr(system, '_order_ids', None)
-            exit_order_ids = (
-                order_ids_getter(close_order) if callable(order_ids_getter) else [])
+            exit_fee, exit_fee_currency = system._extract_usdt_fee(close_order)
+            exit_order_ids = system._order_ids(close_order)
+            stop_loss_date = (
+                system._stop_trigger_close_date(symbol_name)
+                if close_order.get('stop_triggered_before_post') is True
+                else None)
             closed_position, state_saved = system._close_trade_state_with_runtime_fallback(
                 symbol_name, actual_price, "手动平仓",
                 exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
                 exit_order_ids=exit_order_ids,
+                stop_loss_date=stop_loss_date,
                 close_intent_client_id=close_order.get(
-                    'close_intent_client_id'))
+                    'close_intent_client_id'),
+                exit_price_source=close_order.get('exit_price_source'))
             if not state_saved:
                 return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
+            system._sync_stop_trigger_date(symbol_name, stop_loss_date)
 
             direction_text = '做多' if position['side'] == 'long' else '做空'
             send_dingtalk(f'[{system.label}-手动平仓] {symbol_name} {direction_text}\n'
@@ -1309,9 +1347,14 @@ def manual_check():
         return err
     # 要求 JSON body（空 {} 即可）：其余写接口因解析 JSON 天然免疫跨站表单，
     # 本接口原本无参数，补上同等门槛（防 CSRF 触发手动检查）
-    if not isinstance(request.get_json(silent=True), dict):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
         return jsonify({'error': '请求须携带 JSON body（空对象 {} 即可），'
                                  '例如: curl -X POST -H "Content-Type: application/json" -d "{}"'}), 400
+    if data:
+        return jsonify({
+            'error': f'未知字段: {sorted(data)}；手动检查只接受空对象 {{}}',
+        }), 400
     if not _set_manual_check_running(True):
         return jsonify({'status': 'busy', 'message': '已有手动检查在执行中，请稍后再试'}), 409
     try:
@@ -1346,7 +1389,10 @@ def _bootstrap():
     if trading_system is not None:
         return trading_system
     from main import TradingSystem
-    trading_system = TradingSystem()
+    config_file = os.environ.get('TRADING_CONFIG_FILE', 'config.json')
+    if not os.path.isabs(config_file):
+        raise RuntimeError('TRADING_CONFIG_FILE 必须是绝对路径')
+    trading_system = TradingSystem(config_file=config_file)
     return trading_system
 
 

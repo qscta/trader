@@ -8,7 +8,7 @@ APP_DIR = Path(__file__).resolve().parents[1]
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import pandas as pd
+import pandas as pd  # noqa: E402
 
 from ma_cross_strategy import MaCrossStrategy  # noqa: E402
 

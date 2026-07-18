@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import _test_stubs
 
 TradingSystem = _test_stubs.import_main().TradingSystem
-from trade_state import TradeState
+from trade_state import TradeState  # noqa: E402
 
 
 class IntradayOrphanReconciliationTest(unittest.TestCase):

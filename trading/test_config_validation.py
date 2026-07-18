@@ -7,13 +7,29 @@ import unittest
 import config_validation as cv
 
 
+class AliasResolutionTest(unittest.TestCase):
+    def test_equal_or_single_values_are_accepted(self):
+        self.assertEqual(cv.resolve_optional_alias('x', None, 'secret'), 'x')
+        self.assertEqual(cv.resolve_optional_alias(None, 'x', 'secret'), 'x')
+        self.assertEqual(cv.resolve_optional_alias('x', 'x', 'secret'), 'x')
+        self.assertIsNone(cv.resolve_optional_alias(None, None, 'secret'))
+
+    def test_conflicting_aliases_fail_without_echoing_values(self):
+        with self.assertRaises(ValueError) as caught:
+            cv.resolve_optional_alias('primary-secret', 'legacy-secret', 'passphrase')
+        message = str(caught.exception)
+        self.assertNotIn('primary-secret', message)
+        self.assertNotIn('legacy-secret', message)
+
+
 class StrictIntTest(unittest.TestCase):
     def test_accepts_integral(self):
         for v in (28, 28.0, "28", " 28 "):
             self.assertEqual(cv.strict_int(v, 'x'), 28)
 
     def test_rejects_fractional_and_nonfinite(self):
-        for v in (28.9, "28.9", "inf", "-inf", "nan", "abc", None):
+        for v in (28.9, "28.9", "inf", "-inf", "nan", "abc", None,
+                  True, False):
             with self.assertRaises(ValueError, msg=repr(v)):
                 cv.strict_int(v, 'x')
 
@@ -24,9 +40,16 @@ class StrictFloatFiniteTest(unittest.TestCase):
         self.assertEqual(cv.strict_float_finite(-5, 'x'), -5.0)
 
     def test_rejects_nonfinite(self):
-        for v in ("inf", "-inf", "nan", float('inf'), float('nan'), "abc", None):
-            with self.assertRaises(ValueError, msg=repr(v)):
+        values = ("inf", "-inf", "nan", float('inf'), float('nan'),
+                  "abc", None, True, False, 10 ** 10000)
+        for index, v in enumerate(values):
+            # Python 3.11+ 对超过 4300 位的整数转字符串会自身
+            # 拒绝；错误消息不得在被测函数之前先 repr(v) 崩溃。
+            with self.assertRaises(
+                    ValueError,
+                    msg=f'case={index}, type={type(v).__name__}') as caught:
                 cv.strict_float_finite(v, 'x')
+            self.assertIn('x 不是', str(caught.exception))
 
 
 class StrictRiskTest(unittest.TestCase):
@@ -63,7 +86,8 @@ class NormalizeSymbolTest(unittest.TestCase):
         self.assertEqual(cv.normalize_symbol_name(" ethusdt "), "ETHUSDT")
 
     def test_rejects_bad(self):
-        for v in ("BTC-USDT", "BTCUSD", "", 123, None, "USDT"):
+        for v in ("BTC-USDT", "BTCUSD", "", 123, None, "USDT",
+                  "ſUSDT", "ßUSDT", "ıUSDT"):
             with self.assertRaises(ValueError, msg=repr(v)):
                 cv.normalize_symbol_name(v)
 
@@ -85,6 +109,125 @@ class MaOhlcvLimitTest(unittest.TestCase):
             cv.validate_ohlcv_capacity({
                 'ma_long_period': 150,
                 'ma_stop_period': 28})
+
+
+class CompleteExecutionConfigTest(unittest.TestCase):
+    @staticmethod
+    def _config():
+        return {
+            'okx': {'sandbox': False},
+            'strategy': {'default_risk_per_trade': 0.01},
+            'trading': {'symbols': [{'name': 'BTCUSDT'}]},
+            'scheduler': {},
+        }
+
+    def test_missing_optional_values_use_runtime_defaults(self):
+        config = self._config()
+
+        self.assertIs(config, cv.validate_and_normalize_execution_config(config))
+
+    def test_explicit_null_never_means_missing(self):
+        cases = (
+            lambda c: c['strategy'].__setitem__('ma_long_period', None),
+            lambda c: c['trading']['symbols'][0].__setitem__(
+                'risk_per_trade', None),
+            lambda c: c['trading']['symbols'][0].__setitem__('enabled', None),
+            lambda c: c['scheduler'].__setitem__('check_hour', None),
+            lambda c: c['scheduler'].__setitem__(
+                'stop_loss_scan_interval_minutes', None),
+            lambda c: c['okx'].__setitem__('margin_mode', None),
+            lambda c: c['okx'].__setitem__('leverage', None),
+            lambda c: c['okx'].__setitem__('leverage_overrides', None),
+            lambda c: c.__setitem__('equity_tick_retention_days', None),
+        )
+        for mutate in cases:
+            config = self._config()
+            mutate(config)
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                cv.validate_and_normalize_execution_config(config)
+
+    def test_okx_environment_boolean_is_normalized_and_conflicts_rejected(self):
+        config = self._config()
+        config['okx']['sandbox'] = 'false'
+        cv.validate_and_normalize_execution_config(config)
+        self.assertIs(config['okx']['sandbox'], False)
+
+        for bad in ('0', 0, None, 'maybe'):
+            config = self._config()
+            config['okx']['sandbox'] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                cv.validate_and_normalize_execution_config(config)
+
+        config = self._config()
+        config['okx'].update({'sandbox': False, 'demo': True})
+        with self.assertRaisesRegex(ValueError, '矛盾'):
+            cv.validate_and_normalize_execution_config(config)
+
+    def test_unknown_block_fields_and_scheduler_booleans_are_rejected(self):
+        mutations = (
+            lambda c: c.__setitem__('obsolete_execution', {}),
+            lambda c: c['trading'].__setitem__('obsolete_strategy', {}),
+            lambda c: c['scheduler'].__setitem__('check_huor', 8),
+            lambda c: c['okx'].__setitem__('obsolete_strategy', {}),
+            lambda c: c['scheduler'].__setitem__('check_hour', True),
+        )
+        for mutate in mutations:
+            config = self._config()
+            mutate(config)
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                cv.validate_and_normalize_execution_config(config)
+
+    def test_dingtalk_and_okx_text_fields_are_strictly_typed(self):
+        mutations = (
+            lambda c: c.__setitem__('dingtalk', None),
+            lambda c: c.__setitem__('dingtalk', {'obsolete': True}),
+            lambda c: c.__setitem__('dingtalk', {'webhook_url': 123}),
+            lambda c: c['okx'].__setitem__('apiKey', {}),
+            lambda c: c['okx'].__setitem__('secret', []),
+            lambda c: c['okx'].__setitem__('password', 123),
+            lambda c: c['okx'].__setitem__('label', False),
+        )
+        for mutate in mutations:
+            config = self._config()
+            mutate(config)
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                cv.validate_and_normalize_execution_config(config)
+
+    def test_okx_execution_values_are_normalized_and_null_overrides_rejected(self):
+        config = self._config()
+        config['okx'].update({
+            'margin_mode': ' ISOLATED ', 'leverage': '9',
+            'leverage_overrides': {'btcusdt': '3.5'},
+        })
+
+        cv.validate_and_normalize_execution_config(config)
+
+        self.assertEqual('isolated', config['okx']['margin_mode'])
+        self.assertEqual(9, config['okx']['leverage'])
+        self.assertEqual(
+            {'BTCUSDT': 3.5}, config['okx']['leverage_overrides'])
+        config = self._config()
+        config['okx']['leverage_overrides'] = {'BTCUSDT': None}
+        with self.assertRaises(ValueError):
+            cv.validate_and_normalize_execution_config(config)
+
+    def test_legacy_okx_layout_is_canonicalized_but_dual_source_rejected(self):
+        config = self._config()
+        old = {
+            'exchanges': {'okx': dict(
+                config['okx'], strategy=config['strategy'],
+                trading=config['trading'])},
+            'scheduler': {},
+        }
+
+        cv.validate_and_normalize_execution_config(old)
+
+        self.assertNotIn('exchanges', old)
+        self.assertIn('okx', old)
+        dual = self._config()
+        dual['exchanges'] = {'okx': {'sandbox': True}}
+        with self.assertRaisesRegex(ValueError, '双源'):
+            cv.validate_and_normalize_execution_config(dual)
 
 
 if __name__ == '__main__':

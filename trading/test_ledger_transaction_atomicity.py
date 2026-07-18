@@ -8,14 +8,16 @@
 3. 「已确认空仓后的只读补偿证据找回」绝不允许调用可真实下单的
    close_position——极端竞态下那会把用户人工开出的同向仓平掉。
 """
+import copy
 import json
 import math
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import trade_executor
+import migrate_single_strategy as migration
 from trade_state import TradeState, TradeStatePersistenceError
 
 
@@ -30,6 +32,31 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
         state.add_open_position(
             'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='ma_cross')
         return state
+
+    def test_duplicate_open_positions_cannot_hide_a_real_position(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'trade_state.json'
+            path.write_text(
+                '{"open_positions":{"BTCUSDT":{"symbol":"BTCUSDT"}},'
+                '"open_positions":{},"closed_trades":[]}',
+                encoding='utf-8')
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '重复字段'):
+                TradeState(str(path))
+
+    def test_nonstandard_save_failure_rolls_back_pending_close_intent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+
+            with patch.object(
+                    state, 'save_state', side_effect=MemoryError('fault')):
+                with self.assertRaises(MemoryError):
+                    state.prepare_close_intent(
+                        'BTCUSDT', 'C' + 'z' * 31, '日检平仓')
+
+            self.assertIsNone(state.get_close_intent('BTCUSDT'))
+            self.assertIsNone(
+                TradeState(state.state_file).get_close_intent('BTCUSDT'))
 
     def test_partial_close_rolls_back_memory_when_intent_check_fails(self):
         """反例：改完余仓后 close intent 校验失败，内存必须回到 10 币。"""
@@ -205,12 +232,316 @@ class ForceRuntimeInputBoundaryTest(unittest.TestCase):
             self.assertEqual(
                 10.0, state.get_open_position('BTCUSDT')['position_size'])
 
+    def test_force_runtime_partial_close_cannot_bypass_full_schema(self):
+        """force-runtime 也必须拒绝 writer 未局部检查的非法止损 ID。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            with self.assertRaises(TradeStatePersistenceError):
+                state.force_runtime_apply_partial_close(
+                    'BTCUSDT', 2.0, 105.0, new_stop_order_id=123)
+            position = state.get_open_position('BTCUSDT')
+            self.assertEqual(10.0, position['position_size'])
+            self.assertEqual('stop-1', position['stop_order_id'])
+            TradeState.validate_state(state.state)
+
+    def test_force_runtime_untracked_open_cannot_bypass_full_schema(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(TradeStatePersistenceError):
+                state.force_runtime_add_untracked_open_position(
+                    'ETHUSDT', 'long', 100.0, 1.0, 90.0,
+                    stop_order_id=123, strategy='ma_cross')
+            self.assertEqual({}, state.get_all_open_positions())
+            self.assertEqual({}, state.get_position_quarantines())
+            TradeState.validate_state(state.state)
+
     def test_force_runtime_close_books_entry_price_instead_of_nan(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = self._state(temp_dir)
             trade = state.force_runtime_close_position('BTCUSDT', float('nan'))
             self.assertEqual(100.0, trade['exit_price'])
             self.assertTrue(math.isfinite(trade['pnl']))
+            self.assertEqual(
+                'estimated_entry_fallback', trade['exit_price_source'])
+            self.assertIs(True, trade['exit_price_estimated'])
+            TradeState.validate_state(state.state)
+
+    def test_estimated_stop_source_must_match_stop_anchor(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._state(temp_dir)
+            with self.assertRaises(ValueError):
+                state.close_position(
+                    'BTCUSDT', 91.0,
+                    exit_price_source='estimated_stop')
+            self.assertIsNotNone(state.get_open_position('BTCUSDT'))
+            self.assertEqual([], state.get_closed_trades())
+
+            trade = state.close_position(
+                'BTCUSDT', 90.0,
+                exit_price_source='estimated_stop')
+            self.assertEqual('estimated_stop', trade['exit_price_source'])
+            self.assertIs(True, trade['exit_price_estimated'])
+            TradeState.validate_state(state.state)
+
+
+class OpenToClosedSchemaClosureTest(unittest.TestCase):
+    """在途仓共享字段必须在真钱平仓前满足 closed-trade schema。"""
+
+    @staticmethod
+    def _ledger():
+        return {
+            'exchange': 'okx',
+            'open_positions': {
+                'BTCUSDT': {
+                    'symbol': 'BTCUSDT', 'side': 'long',
+                    'entry_price': 100.0, 'position_size': 10.0,
+                    'original_position_size': 10.0,
+                    'stop_loss_price': 90.0, 'stop_order_id': 'stop-1',
+                    'stop_order_size': 10.0, 'strategy': 'ma_cross',
+                    'open_time': '2026-07-18T08:00:00',
+                    'last_stop_update': '2026-07-18T08:01:00',
+                    'last_partial_close': '2026-07-18T08:02:00',
+                    'recovered_partial_rollback': True,
+                    'recovered_unresolved_open': False,
+                },
+            },
+            'closed_trades': [], 'open_intents': {},
+            'signal_states': {}, 'stop_residues': {},
+            'stop_loss_dates': {}, 'position_quarantines': {},
+        }
+
+    def test_runtime_rejects_open_fields_that_closed_trade_would_reject(self):
+        """反例曾在交易所平仓完成后才爆；现在必须在启动阶段阻断。"""
+        corruptions = {
+            'original_position_size': '10',
+            'stop_order_size': '10',
+            'open_time': 'not-an-iso-time',
+            'last_stop_update': 123,
+            'last_partial_close': '',
+            'recovered_partial_rollback': 'true',
+            'recovered_unresolved_open': 1,
+        }
+        for field, bad_value in corruptions.items():
+            ledger = self._ledger()
+            ledger['open_positions']['BTCUSDT'][field] = bad_value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                TradeState.validate_state(ledger)
+
+    def test_migration_gate_rejects_same_inflight_corruptions(self):
+        """部署预检不得让坏在途字段穿过，等真实平仓后才失败。"""
+        corruptions = {
+            'original_position_size': '10',
+            'stop_order_size': '10',
+            'open_time': 'not-an-iso-time',
+            'last_stop_update': 123,
+            'last_partial_close': '',
+            'recovered_partial_rollback': 'true',
+            'recovered_unresolved_open': 1,
+        }
+        for field, bad_value in corruptions.items():
+            ledger = self._ledger()
+            ledger['open_positions']['BTCUSDT'][field] = bad_value
+            cleaned, _report, blockers = migration.normalize_ledger(
+                copy.deepcopy(ledger))
+            with self.subTest(field=field):
+                self.assertTrue(blockers)
+                with self.assertRaises(ValueError):
+                    TradeState.validate_state(cleaned)
+
+    def test_runtime_requires_explicit_ma_owner_for_every_open_position(self):
+        for label in (None, 'legacy_strategy'):
+            ledger = self._ledger()
+            if label is None:
+                ledger['open_positions']['BTCUSDT'].pop('strategy')
+            else:
+                ledger['open_positions']['BTCUSDT']['strategy'] = label
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                TradeState.validate_state(ledger)
+            self.assertTrue(
+                migration.normalize_ledger(copy.deepcopy(ledger))[2])
+
+
+class QuarantineSchemaSafetyTest(unittest.TestCase):
+    def test_nonfinite_diagnostics_are_sanitized_without_poisoning_next_save(self):
+        """交易所 NaN 诊断必须仍能持久化隔离，且不拖垮整个后续账本。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / 'trade_state.json')
+            state = TradeState(path)
+            quarantine = state.mark_position_quarantine(
+                'BTCUSDT', '仓位数量非法', {
+                    'exchange_contracts': float('nan'),
+                    'nested': [float('inf'), float('-inf')],
+                    'oversized_integer': 10 ** 10000,
+                })
+            self.assertEqual('nan', quarantine['details']['exchange_contracts'])
+            self.assertEqual(
+                ['inf', '-inf'], quarantine['details']['nested'])
+            self.assertRegex(
+                quarantine['details']['oversized_integer'],
+                r'^<integer-too-large:[0-9]+-bits>$')
+
+            # 修复前 force-runtime 会把 NaN 留在内存，此后的任何无关保存都失败。
+            state.mark_stop_residue('ETHUSDT')
+            TradeState.validate_state(state.state)
+            reloaded = TradeState(path)
+            self.assertTrue(reloaded.is_position_quarantined('BTCUSDT'))
+            self.assertTrue(reloaded.has_stop_residue('ETHUSDT'))
+
+
+class ClosedTradeStrictSchemaTest(unittest.TestCase):
+    def test_empty_or_incomplete_history_cannot_count_as_a_trade(self):
+        for record in ({}, {'symbol': 'BTCUSDT'}):
+            ledger = {
+                'open_positions': {}, 'closed_trades': [record],
+            }
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                TradeState.validate_state(ledger)
+            self.assertTrue(migration.normalize_ledger(ledger)[2])
+            self.assertTrue(migration.normalize_archive([record])[2])
+
+    def test_historical_okx_exit_evidence_keeps_relational_schema(self):
+        base = {
+            'symbol': 'BTCUSDT', 'side': 'long',
+            'entry_price': 100.0, 'exit_price': 90.0,
+            'position_size': 1.0,
+        }
+        corruptions = (
+            {'exit_price_source': 'garbage', 'exit_price_estimated': True},
+            {'exit_price_estimated': True},
+            {'exit_price_source': 'estimated_stop'},
+            {
+                'exit_price_source': 'okx_stop_fill',
+                'exit_price_estimated': False,
+            },
+            {
+                'exit_price_source': 'estimated_stop',
+                'exit_price_estimated': True,
+                'exchange_exit_time': '2026-07-18T08:00:00',
+            },
+            {
+                'exit_price_source': 'estimated_stop',
+                'exit_price_estimated': True,
+                'stop_loss_price': 91.0,
+            },
+            {
+                'exit_price_source': 'estimated_entry_fallback',
+                'exit_price_estimated': True,
+            },
+        )
+        for corruption in corruptions:
+            trade = dict(base, **corruption)
+            ledger = {'open_positions': {}, 'closed_trades': [trade]}
+            with self.subTest(corruption=corruption):
+                with self.assertRaises(ValueError):
+                    TradeState.validate_state(ledger)
+                self.assertTrue(migration.normalize_ledger(ledger)[2])
+                self.assertTrue(migration.normalize_archive([trade])[2])
+
+
+class FeeMetadataSchemaClosureTest(unittest.TestCase):
+    """手续费元数据必须在启动门禁拦住，不能等真钱成交后才爆账本。"""
+
+    @staticmethod
+    def _open_ledger():
+        return {
+            'exchange': 'okx',
+            'open_positions': {
+                'BTCUSDT': {
+                    'symbol': 'BTCUSDT', 'side': 'long',
+                    'entry_price': 100.0, 'position_size': 1.0,
+                    'stop_loss_price': 90.0, 'strategy': 'ma_cross',
+                },
+            },
+            'closed_trades': [], 'open_intents': {},
+            'signal_states': {}, 'stop_residues': {},
+            'stop_loss_dates': {}, 'position_quarantines': {},
+        }
+
+    def test_open_entry_fee_tuple_is_rejected_by_runtime_and_migration(self):
+        corruptions = (
+            {'entry_fee': 0.01},
+            {
+                'entry_fee': 0.01, 'entry_fee_source': 'typo',
+                'entry_fee_currency': 'USDT',
+            },
+            {
+                'entry_fee': 0.01, 'entry_fee_source': 'exchange',
+                'entry_fee_currency': 'BTC',
+            },
+            {
+                'entry_fee': 0.01, 'entry_fee_source': 'exchange',
+            },
+            {
+                'entry_fee_source': 'exchange',
+                'entry_fee_currency': 'USDT',
+            },
+        )
+        for corruption in corruptions:
+            ledger = self._open_ledger()
+            ledger['open_positions']['BTCUSDT'].update(corruption)
+            with self.subTest(corruption=corruption):
+                with self.assertRaises(ValueError):
+                    TradeState.validate_state(ledger)
+                self.assertTrue(
+                    migration.normalize_ledger(copy.deepcopy(ledger))[2])
+
+    def test_partial_and_closed_fee_sources_are_strict_in_all_history_gates(self):
+        partial_base = {
+            'position_size': 0.4, 'exit_price': 110.0,
+            'exit_notional': 44.0, 'gross_pnl': 4.0,
+            'exit_fee': 0.0198, 'fee_source': 'estimated',
+            'close_time': '2026-07-18T08:00:00',
+        }
+        partial_corruptions = (
+            {'fee_source': 'typo'},
+            {'fee_source': 'exchange'},
+            {'fee_source': 'estimated', 'exit_fee_currency': 'USDT'},
+            {'fee_source': 'exchange', 'exit_fee_currency': 'BTC'},
+        )
+        for corruption in partial_corruptions:
+            ledger = self._open_ledger()
+            position = ledger['open_positions']['BTCUSDT']
+            position.update({
+                'position_size': 0.6, 'original_position_size': 1.0,
+                'partial_closes': [dict(partial_base, **corruption)],
+            })
+            with self.subTest(layer='partial', corruption=corruption):
+                with self.assertRaises(ValueError):
+                    TradeState.validate_state(ledger)
+                self.assertTrue(
+                    migration.normalize_ledger(copy.deepcopy(ledger))[2])
+
+        closed_base = {
+            'symbol': 'BTCUSDT', 'side': 'long',
+            'entry_price': 100.0, 'exit_price': 110.0,
+            'position_size': 1.0,
+        }
+        for corruption in (
+                {'fee_source': 'typo'},
+                {'fee_source': 'actual', 'exit_fee_currency': 'BTC'},
+                {
+                    'fee_source': 'actual', 'entry_fee': 0.045,
+                    'exit_fee': 0.0495, 'total_fee': 0.0945,
+                    'gross_pnl': 10.0, 'pnl': 9.9055,
+                    'pnl_percent': 9.9055,
+                },
+                {
+                    'fee_source': 'estimated', 'entry_fee': 0.045,
+                    'exit_fee': 0.0495, 'total_fee': 0.0945,
+                    'gross_pnl': 10.0, 'pnl': 9.9055,
+                    'pnl_percent': 9.9055,
+                    'entry_fee_source': 'exchange',
+                    'entry_fee_currency': 'USDT',
+                }):
+            trade = dict(closed_base, **corruption)
+            ledger = {'open_positions': {}, 'closed_trades': [trade]}
+            with self.subTest(layer='closed', corruption=corruption):
+                with self.assertRaises(ValueError):
+                    TradeState.validate_state(ledger)
+                self.assertTrue(
+                    migration.normalize_ledger(copy.deepcopy(ledger))[2])
+                self.assertTrue(
+                    migration.normalize_archive([copy.deepcopy(trade)])[2])
 
 
 class SafeFillPriceTest(unittest.TestCase):
@@ -235,6 +566,75 @@ class SafeFillPriceTest(unittest.TestCase):
         self.assertEqual(50000.5, safe({'average': '50000.5'}, 100.0))
 
 
+class ExecutionResultBoundaryTest(unittest.TestCase):
+    def test_close_classifier_requires_exact_confirmed_and_terminal_bools(self):
+        classify = (
+            trade_executor.TradeExecutorMixin()._classify_close_execution)
+        self.assertEqual(
+            'closed', classify({
+                'id': 'close-full', 'average': 99.0,
+                'confirmed': True, 'fully_closed': True,
+                'remaining_amount': 0.0}))
+        self.assertEqual(
+            'partial', classify({
+                'id': 'close-partial', 'average': 99.0,
+                'confirmed': True, 'fully_closed': False,
+                'remaining_amount': 0.5}))
+        invalid = (
+            None, {}, {'fully_closed': True},
+            {'confirmed': None, 'fully_closed': True},
+            {'confirmed': 'true', 'fully_closed': True},
+            {'confirmed': False, 'fully_closed': True},
+            {'confirmed': True},
+            {'confirmed': True, 'fully_closed': None},
+            {'confirmed': True, 'fully_closed': 'true'},
+            {'confirmed': True, 'fully_closed': True,
+             'remaining_amount': 1.0},
+            {'confirmed': True, 'fully_closed': False,
+             'remaining_amount': 0.0},
+            {'confirmed': True, 'fully_closed': True,
+             'remaining_amount': True},
+            {'confirmed': True, 'fully_closed': True,
+             'remaining_amount': float('nan')},
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                self.assertEqual('unresolved', classify(value))
+
+    def test_actual_amount_rejects_bool_nonfinite_and_nonpositive(self):
+        parse = trade_executor.TradeExecutorMixin._order_actual_amount
+        for bad in (
+                True, False, float('nan'), float('inf'), float('-inf'),
+                'nan', 'inf', 'garbage', 0, -1, [], {}):
+            with self.subTest(source='order', bad=bad):
+                self.assertIsNone(parse({'amount': bad}, 1.0))
+            with self.subTest(source='fallback', bad=bad):
+                self.assertIsNone(parse({}, bad))
+        self.assertEqual(1.25, parse({'amount': '1.25'}, None))
+
+    def test_fee_and_order_id_metadata_are_strict(self):
+        fee = trade_executor.TradeExecutorMixin._extract_usdt_fee
+        for bad in (True, False, float('nan'), float('inf')):
+            with self.subTest(cost=bad):
+                self.assertEqual(
+                    (None, None),
+                    fee({'fee': {'cost': bad, 'currency': 'USDT'}}))
+        self.assertEqual(
+            (None, None),
+            fee({'fees_complete': 'false',
+                 'fee': {'cost': 1, 'currency': 'USDT'}}))
+        self.assertEqual(
+            (0.5, 'USDT'),
+            fee({'fees_complete': True,
+                 'fee': {'cost': 0.5, 'currency': 'USDT'}}))
+
+        order_ids = trade_executor.TradeExecutorMixin._order_ids
+        self.assertEqual(['123'], order_ids({'ids': '123', 'id': '123'}))
+        self.assertEqual(
+            ['A', '12'],
+            order_ids({'ids': [' A ', True, {}, 12, 'A', '']}))
+
+
 class _EvidenceHost(trade_executor.TradeExecutorMixin):
     def __init__(self, exchange_api):
         self.exchange_api = exchange_api
@@ -243,16 +643,19 @@ class _EvidenceHost(trade_executor.TradeExecutorMixin):
 class ReadOnlyCompensationEvidenceTest(unittest.TestCase):
     """只读恢复路径的资金安全边界：任何分支都不得发出真实平仓 POST。"""
 
-    def test_adapter_without_readonly_finder_never_falls_back_to_posting(self):
+    def test_adapter_without_readonly_finder_fails_loudly_without_posting(self):
         api = Mock(spec=['close_position'])
         host = _EvidenceHost(api)
-        result = host._recover_flat_compensation_evidence(
-            'BTC/USDT:USDT', 'long', 0.5, 'OPENID1')
-        self.assertIsNone(result)
+        with self.assertRaises(AttributeError):
+            host._recover_flat_compensation_evidence(
+                'BTC/USDT:USDT', 'long', 0.5, 'OPENID1')
         api.close_position.assert_not_called()
 
     def test_readonly_finder_result_is_returned_without_posting(self):
-        evidence = {'fully_closed': True, 'average': 50000.5, 'ids': ['1']}
+        evidence = {
+            'confirmed': True, 'fully_closed': True,
+            'remaining_amount': 0.0,
+            'average': 50000.5, 'ids': ['1']}
         api = Mock(
             spec=['close_position', 'find_compensation_close_evidence'])
         api.find_compensation_close_evidence.return_value = evidence
@@ -265,8 +668,14 @@ class ReadOnlyCompensationEvidenceTest(unittest.TestCase):
             'BTC/USDT:USDT', 'long', 0.5, 'OPENID1')
 
     def test_incomplete_or_ambiguous_evidence_is_discarded(self):
-        for bad in (None, {'fully_closed': False},
-                    {'fully_closed': True, 'execution_ambiguous': True},
+        for bad in (None, {'confirmed': True, 'fully_closed': False},
+                    {'confirmed': True, 'fully_closed': True,
+                     'remaining_amount': 0.0,
+                     'execution_ambiguous': True},
+                    {'fully_closed': True},
+                    {'confirmed': None, 'fully_closed': True},
+                    {'confirmed': 'true', 'fully_closed': True},
+                    {'confirmed': False, 'fully_closed': True},
                     'not-a-dict'):
             api = Mock(
                 spec=['close_position', 'find_compensation_close_evidence'])

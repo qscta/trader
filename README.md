@@ -87,7 +87,7 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 
 | 要求 | 原因 |
 |---|---|
-| 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC）；系统启动时校验 UTC+8，不符告警 |
+| 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC）；系统启动时校验 UTC+8，不符即告警并拒绝启动 |
 | `gunicorn -c gunicorn.conf.py` | 固定单 worker + gthread；120 秒请求超时、900 秒优雅退出窗口，避免在 OKX 长重试/交易收尾中误杀 runner |
 | 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；`FLASK_SECRET_KEY` 必须是至少 32 字节的随机值，缺失或过短均拒绝启动 |
 | 自定义 `TRADING_RUNNER_LOCK_FILE` 时使用专用 0700 目录 | 不得直接指向 `/tmp/runner.lock` 等共享目录；例如 `/run/user/$UID/trader/runner.lock` |

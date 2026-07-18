@@ -12,6 +12,10 @@ from risk_manager import RiskManager
 
 
 class PositionSizeGuardTest(unittest.TestCase):
+    def test_risk_is_required_at_each_calculation(self):
+        with self.assertRaises(TypeError):
+            RiskManager(10000).calculate_position_size(100.0, 95.0)
+
     def test_valid_input_unchanged(self):
         # 权益 1 万、1% 风险、5% 止损距 → 仓位价值 = 100/0.05 = 2000，数量 = 20
         size = RiskManager(10000).calculate_position_size(100.0, 95.0, 0.01)
@@ -45,6 +49,36 @@ class PositionSizeGuardTest(unittest.TestCase):
 
     def test_stop_equals_entry_returns_zero(self):
         self.assertEqual(RiskManager(10000).calculate_position_size(100.0, 100.0, 0.01), 0)
+
+    def test_bool_is_never_treated_as_one(self):
+        cases = (
+            (True, 100.0, 95.0, 0.01),
+            (10000, True, 95.0, 0.01),
+            (10000, 100.0, True, 0.01),
+            (10000, 100.0, 95.0, True),
+        )
+        for equity, entry, stop, risk in cases:
+            with self.subTest(
+                    equity=equity, entry=entry, stop=stop, risk=risk):
+                self.assertEqual(
+                    0,
+                    RiskManager(equity).calculate_position_size(
+                        entry, stop, risk))
+
+    def test_huge_integer_in_any_numeric_slot_returns_zero(self):
+        huge = 10 ** 10000
+        cases = (
+            (huge, 100.0, 95.0, 0.01),
+            (10000, huge, 95.0, 0.01),
+            (10000, 100.0, huge, 0.01),
+            (10000, 100.0, 95.0, huge),
+        )
+        for equity, entry, stop, risk in cases:
+            with self.subTest(slot=(equity, entry, stop, risk)):
+                self.assertEqual(
+                    0,
+                    RiskManager(equity).calculate_position_size(
+                        entry, stop, risk))
 
     def test_result_is_always_finite_nonnegative(self):
         # 无论输入怎么畸形，输出要么是有限正数，要么是 0——绝不 NaN/负。

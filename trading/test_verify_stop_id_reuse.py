@@ -23,8 +23,8 @@ sys.modules['pandas'] = types.ModuleType('pandas')
 sys.modules.pop('exchange_base', None)
 sys.modules.pop('okx_api', None)
 sys.modules.pop('verify_okx', None)
-import verify_okx
-from verify_okx import run_stop_id_reuse_test
+import verify_okx  # noqa: E402
+from verify_okx import run_stop_id_reuse_test  # noqa: E402
 for _name, _orig in _saved.items():
     if _orig is None:
         sys.modules.pop(_name, None)
@@ -42,14 +42,33 @@ def _fake_api(create_results, cancel_ok=True, pending_after_second=None):
     pending_after_second: 第二次返回 None 后 _fetch_algo_orders 的清单内容。
     """
     api = Mock()
-    api.open_position.return_value = {'id': 'order-1'}
+    api._coin_to_contracts.return_value = 10
+    api.open_position.return_value = {
+        'id': 'order-1', 'confirmed': True,
+        'fully_filled': True, 'amount': 0.1,
+    }
     api.get_last_price.return_value = 100.0
     api.create_stop_loss_order.side_effect = list(create_results)
     api.cancel_order.return_value = cancel_ok
+    api.find_stop_order_state.return_value = 'intact'
     api._fetch_algo_orders.return_value = list(pending_after_second or [])
     api.cancel_all_orders.return_value = True
     api.close_position.return_value = {'id': 'close-1'}
-    api.get_position.return_value = None  # 清理后的复核：无仓
+    first_read = {'pending': True}
+
+    def get_position(_symbol):
+        if not api.open_position.called:
+            return None
+        if first_read['pending']:
+            first_read['pending'] = False
+            return {
+                'contracts': 10.0,
+                'side': api.open_position.call_args.args[1],
+                'entryPrice': 100.0,
+            }
+        return None
+
+    api.get_position.side_effect = get_position
     return api
 
 
@@ -78,6 +97,17 @@ class StopIdReuseDecisionLogicTest(unittest.TestCase):
         # finally 清理保证执行
         api.cancel_all_orders.assert_called()
         api.close_position.assert_called()
+
+    def test_preclose_cancel_failure_does_not_poison_final_cleanup(self):
+        """平仓前撤单只因仍有仓而返回 False，最终撤净且空仓后仍应通过。"""
+        api = _fake_api([dict(_FIRST), dict(_SECOND_NEW)])
+        api.cancel_all_orders.side_effect = [False, True]
+
+        result = run_stop_id_reuse_test(
+            api, 'BTC/USDT:USDT', 0.1, 'long')
+
+        self.assertTrue(result)
+        self.assertEqual(2, api.cancel_all_orders.call_count)
 
     def test_rejection_returns_false(self):
         """第二次返回 None 且该 ID 不在待触发清单 → False（判定为交易所拒绝复用）。"""
@@ -124,13 +154,73 @@ class StopIdReuseDecisionLogicTest(unittest.TestCase):
         result = run_stop_id_reuse_test(api, 'BTC/USDT:USDT', 0.1, 'long')
         self.assertIsNone(result)
 
-    def test_open_position_failure_returns_none_without_cleanup(self):
-        """开仓失败：直接返回 None，不进入清理逻辑（无仓可平）。"""
+    def test_open_none_or_exception_always_runs_cleanup(self):
+        """幂等 ID 验证的开仓未知结果不得越过 finally 清理。"""
+        for outcome in ('none', 'exception'):
+            api = _fake_api([dict(_FIRST), dict(_SECOND_NEW)])
+            if outcome == 'none':
+                api.open_position.return_value = None
+            else:
+                api.open_position.side_effect = RuntimeError(
+                    'POST outcome unknown')
+
+            result = run_stop_id_reuse_test(
+                api, 'BTC/USDT:USDT', 0.1, 'long')
+
+            with self.subTest(outcome=outcome):
+                self.assertIsNone(result)
+                api.cancel_all_orders.assert_called()
+                api.close_position.assert_called_once_with(
+                    'BTC/USDT:USDT', 'long', 0.1)
+
+    def test_open_ack_without_real_position_is_inconclusive(self):
         api = _fake_api([dict(_FIRST), dict(_SECOND_NEW)])
-        api.open_position.return_value = None
-        result = run_stop_id_reuse_test(api, 'BTC/USDT:USDT', 0.1, 'long')
+        api.get_position.side_effect = None
+        api.get_position.return_value = None
+
+        result = run_stop_id_reuse_test(
+            api, 'BTC/USDT:USDT', 0.1, 'long')
+
         self.assertIsNone(result)
-        api.close_position.assert_not_called()
+        api.create_stop_loss_order.assert_not_called()
+        api.close_position.assert_called()
+
+    def test_unresolved_open_with_real_position_is_inconclusive(self):
+        api = _fake_api([dict(_FIRST), dict(_SECOND_NEW)])
+        api.open_position.return_value.update({
+            'confirmed': False, 'open_execution_unresolved': True})
+
+        result = run_stop_id_reuse_test(
+            api, 'BTC/USDT:USDT', 0.1, 'long')
+
+        self.assertIsNone(result)
+        api.create_stop_loss_order.assert_not_called()
+
+    def test_wrong_content_with_matching_client_id_is_failure(self):
+        wrong = {
+            'id': 'algo-2', 'clientOrderId': _FIRST['clientOrderId'],
+            'side': 'buy', 'amount': 999,
+            'info': {'ordType': 'trigger'},
+        }
+        api = _fake_api(
+            [dict(_FIRST), None], pending_after_second=[wrong])
+        api.find_stop_order_state.side_effect = ['intact', 'mismatch']
+
+        result = run_stop_id_reuse_test(
+            api, 'BTC/USDT:USDT', 0.1, 'long')
+
+        self.assertFalse(result)
+
+    def test_successful_reuse_with_failed_cleanup_is_failure(self):
+        for unconfirmed in (False, None, 0, {}):
+            api = _fake_api([dict(_FIRST), dict(_SECOND_NEW)])
+            api.cancel_all_orders.return_value = unconfirmed
+
+            result = run_stop_id_reuse_test(
+                api, 'BTC/USDT:USDT', 0.1, 'long')
+
+            with self.subTest(unconfirmed=unconfirmed):
+                self.assertFalse(result)
 
     def test_short_side_uses_stop_above_market(self):
         """做空方向的止损价必须在市价上方（+10%），两次挂单同价。"""

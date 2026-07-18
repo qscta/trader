@@ -46,9 +46,16 @@ class ResourceMonitorStartupTest(unittest.TestCase):
             'status_code': 200,
             'json': lambda self: {'errcode': 310000, 'errmsg': 'rejected'},
         })()
-        with patch.object(mem_monitor.requests, 'post', return_value=accepted):
+        # 纯标准库矩阵使用 stub；不完整的审查虚拟环境也可能
+        # 只留下 requests namespace package。两者都不应让测试在
+        # 执行 send_dingtalk 前就因缺少 post 属性崩溃。
+        with patch.object(
+                mem_monitor.requests, 'post', return_value=accepted,
+                create=True):
             self.assertTrue(mem_monitor.send_dingtalk('https://example.invalid', 'ok'))
-        with patch.object(mem_monitor.requests, 'post', return_value=rejected):
+        with patch.object(
+                mem_monitor.requests, 'post', return_value=rejected,
+                create=True):
             self.assertFalse(mem_monitor.send_dingtalk('https://example.invalid', 'no'))
 
     def test_config_webhook_must_be_a_string(self):

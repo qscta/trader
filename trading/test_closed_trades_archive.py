@@ -16,8 +16,8 @@ from unittest.mock import patch
 import _test_stubs
 
 TradingSystem = _test_stubs.import_main().TradingSystem  # noqa: F841  保证桩机制先行
-import trade_state as trade_state_module
-from trade_state import TradeState, TradeStatePersistenceError
+import trade_state as trade_state_module  # noqa: E402
+from trade_state import TradeState, TradeStatePersistenceError  # noqa: E402
 
 
 def _make_state(tmp, keep=5):
@@ -34,6 +34,17 @@ def _close_n(ts, n, start=0):
 
 def _symbols(trades):
     return [t['symbol'] for t in trades]
+
+
+def _closed_trade(symbol, close_time, **extra):
+    """构造与 runtime writer 同形的最小合法平仓记录。"""
+    trade = {
+        'symbol': symbol, 'side': 'long',
+        'entry_price': 100.0, 'exit_price': 101.0,
+        'position_size': 1.0, 'close_time': close_time,
+    }
+    trade.update(extra)
+    return trade
 
 
 def _year_archive(ts, year=None):
@@ -87,9 +98,9 @@ class CompactionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=1)
             ts.state['closed_trades'] = [
-                {'symbol': 'OLDUSDT', 'close_time': '2025-12-31T23:59:00'},
-                {'symbol': 'NEWUSDT', 'close_time': '2026-01-01T00:01:00'},
-                {'symbol': 'RECENTUSDT', 'close_time': '2026-02-01T00:00:00'},
+                _closed_trade('OLDUSDT', '2025-12-31T23:59:00'),
+                _closed_trade('NEWUSDT', '2026-01-01T00:01:00'),
+                _closed_trade('RECENTUSDT', '2026-02-01T00:00:00'),
             ]
             ts.save_state()
 
@@ -106,13 +117,15 @@ class CompactionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=1)
             with open(ts.archive_file, 'w', encoding='utf-8') as handle:
-                json.dump([{'symbol': 'LEGACYUSDT',
-                            'close_time': '2024-01-01T00:00:00'}], handle)
+                json.dump([
+                    _closed_trade('LEGACYUSDT', '2024-01-01T00:00:00')],
+                    handle)
             with open(_year_archive(ts, '2025'), 'w', encoding='utf-8') as handle:
-                json.dump([{'symbol': 'YEARUSDT',
-                            'close_time': '2025-01-01T00:00:00'}], handle)
+                json.dump([
+                    _closed_trade('YEARUSDT', '2025-01-01T00:00:00')],
+                    handle)
             ts.state['closed_trades'] = [
-                {'symbol': 'RECENTUSDT', 'close_time': '2026-01-01T00:00:00'}]
+                _closed_trade('RECENTUSDT', '2026-01-01T00:00:00')]
 
             self.assertEqual(
                 _symbols(ts.get_closed_trades()),
@@ -171,12 +184,14 @@ class ArchiveFailSafeTest(unittest.TestCase):
         """史书已有第一笔、账本前两笔内容相同：只跳过有序重叠的一笔。"""
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=1)
-            duplicate = {'symbol': 'SAMEUSDT', 'pnl': 1, 'close_time': 'legacy'}
-            recent = {'symbol': 'RECENTUSDT', 'pnl': 2, 'close_time': 'new'}
+            duplicate = _closed_trade(
+                'SAMEUSDT', '2025-01-01T00:00:00', pnl=1)
+            recent = _closed_trade(
+                'RECENTUSDT', '2025-02-01T00:00:00', pnl=2)
             ts.state['closed_trades'] = [
                 copy.deepcopy(duplicate), copy.deepcopy(duplicate), recent]
             ts.save_state()
-            with open(_year_archive(ts), 'w', encoding='utf-8') as handle:
+            with open(_year_archive(ts, '2025'), 'w', encoding='utf-8') as handle:
                 json.dump([duplicate], handle)
 
             self.assertEqual(2, ts.compact_closed_trades())
@@ -189,9 +204,9 @@ class ArchiveFailSafeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=1)
             ts.state['closed_trades'] = [
-                {'symbol': 'OLDUSDT', 'close_time': '2025-12-31T00:00:00'},
-                {'symbol': 'NEWUSDT', 'close_time': '2026-01-01T00:00:00'},
-                {'symbol': 'RECENTUSDT', 'close_time': '2026-02-01T00:00:00'},
+                _closed_trade('OLDUSDT', '2025-12-31T00:00:00'),
+                _closed_trade('NEWUSDT', '2026-01-01T00:00:00'),
+                _closed_trade('RECENTUSDT', '2026-02-01T00:00:00'),
             ]
             ts.save_state()
             real_write = trade_state_module.atomic_write_json

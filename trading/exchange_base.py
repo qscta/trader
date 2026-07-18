@@ -56,13 +56,12 @@ def retry_on_network_error(max_retries=3, backoff_seconds=(1, 2, 4)):
 class ExchangeApi:
     """交易所适配层抽象基类。
 
-    子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
+    子类必须实现：_create_exchange、to_ccxt_symbol、verify_one_way_mode、
+    get_position、open_position、
     close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
     round_quantity、get_quantity_precision、find_stop_order_state、
     list_position_symbols、find_existing_open_order、
-    find_compensation_close_evidence。
-
-    可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。
+    compensation_client_order_id、find_compensation_close_evidence、setup_symbol。
 
     通用且与交易所无关的实现（K 线读取、收盘过滤、余额/持仓/挂单读取）在基类提供。
     """
@@ -83,20 +82,35 @@ class ExchangeApi:
         """内部符号(BTCUSDT) -> 该交易所的 ccxt 永续符号。"""
         raise NotImplementedError
 
+    def verify_one_way_mode(self):
+        """只读证明账户为单向净持仓模式；不得在验证中修改账户。"""
+        raise NotImplementedError
+
     def get_position(self, symbol):
         """获取单个交易对的持仓（ccxt 统一结构，无持仓返回 None 或 contracts=0）。"""
         raise NotImplementedError
 
-    def open_position(self, symbol, side, amount):
-        """市价开仓。amount 单位为‘币数’。"""
+    def open_position(
+            self, symbol, side, amount, client_order_id=None, *,
+            require_existing=False):
+        """市价开仓；require_existing=True 时只允许找回旧单，禁止 POST。"""
         raise NotImplementedError
 
-    def close_position(self, symbol, side, amount, client_order_id=None):
-        """市价平仓。amount 单位为‘币数’。"""
+    def close_position(
+            self, symbol, side, amount, client_order_id=None, *,
+            require_existing=False):
+        """市价平仓；require_existing=True 时只找回原订单，禁止 POST。"""
         raise NotImplementedError
 
-    def create_stop_loss_order(self, symbol, side, amount, stop_price):
-        """创建止损单（触发后市价平仓）。amount 单位为‘币数’。"""
+    @staticmethod
+    def compensation_client_order_id(open_client_order_id):
+        """从已持久化的开仓 clOrdId 派生确定性 reduce-only 补偿句柄。"""
+        raise NotImplementedError
+
+    def create_stop_loss_order(
+            self, symbol, side, amount, stop_price, *,
+            require_existing=False):
+        """创建止损；require_existing=True 时只找回旧算法单，禁止 POST。"""
         raise NotImplementedError
 
     def cancel_order(self, symbol, order_id):
@@ -118,8 +132,8 @@ class ExchangeApi:
         raise NotImplementedError
 
     def setup_symbol(self, ccxt_symbol):
-        """开仓前的一次性准备（如设置杠杆/保证金模式）。默认无操作。"""
-        return None
+        """开仓前显式完成该品种的杠杆/保证金准备。"""
+        raise NotImplementedError
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
         """检查止损：intact/adoptable/mismatch/missing 四种结果。"""
@@ -140,12 +154,22 @@ class ExchangeApi:
 
     def find_compensation_close_evidence(self, symbol, side, amount,
                                          open_client_order_id):
-        """已确认空仓后，只读找回由开仓句柄派生的补偿平仓聚合成交。
+        """已确认空仓后，只读找回由开仓句柄派生的单笔补偿平仓订单。
 
-        契约：明确无补偿腿或证据不完整返回 None；完整证据返回聚合结果；
+        契约：明确无补偿订单或证据不完整返回 None；完整证据返回单笔订单结果；
         查询不确定必须抛出。本方法永不创建订单——「查询」绝不允许用可
         下单的 close_position 模拟。
         """
+        raise NotImplementedError
+
+    def find_compensation_close_progress(self, symbol, side, amount,
+                                         open_client_order_id):
+        """只读返回单笔补偿订单 absent/full/terminal-partial 终态。"""
+        raise NotImplementedError
+
+    def confirm_stop_execution(
+            self, symbol, side, amount, stop_price, stop_order_id):
+        """只读证明指定 reduce-only 保护止损已全量触发成交。"""
         raise NotImplementedError
 
     # ===================== 交易所无关的通用实现 =====================
@@ -274,11 +298,13 @@ class ExchangeApi:
             raise ValueError(
                 f'K 线请求 {requested} 根超过 OKX 单页上限 300；'
                 '策略配置必须在最新单页内完成计算')
+        ccxt_symbol = self.to_ccxt_symbol(symbol)
         # 所有行情入口共用同一边界校验：坏蜡烛（NaN/重复/乱序/区间矛盾）
         # 一律在适配层拒绝，绝不让 EMA 在污染数据上算出“有效”信号。
         return self.validate_ohlcv(
-            self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested),
-            symbol, timeframe=timeframe)
+            self.exchange.fetch_ohlcv(
+                ccxt_symbol, timeframe, limit=requested),
+            ccxt_symbol, timeframe=timeframe)
 
     @retry_on_network_error(max_retries=3)
     def get_balance(self):
@@ -291,6 +317,17 @@ class ExchangeApi:
         上层读市价的唯一入口（收口此前散落各处的 exchange.fetch_ticker 直调，
         顺带获得网络重试保护）。失败/无价向上抛出，回退逻辑由调用方自持。
         """
-        ccxt_symbol = symbol if '/' in symbol else self.to_ccxt_symbol(symbol)
+        ccxt_symbol = self.to_ccxt_symbol(symbol)
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
-        return float(ticker['last'])
+        if not isinstance(ticker, dict):
+            raise ValueError(f'{ccxt_symbol} ticker 响应不是对象')
+        raw = ticker.get('last')
+        if isinstance(raw, bool):
+            raise ValueError(f'{ccxt_symbol} 最新价不能是布尔值')
+        try:
+            price = float(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f'{ccxt_symbol} 最新价不是有效数字') from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f'{ccxt_symbol} 最新价必须是有限正数')
+        return price

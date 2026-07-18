@@ -1,7 +1,6 @@
-"""终极审判：时间边界 / 真实并发混沌 / 灾难恢复 / 风控数学性质 / 孤儿仓告警。
+"""时间边界 / 真实并发混沌 / 灾难恢复 / 风控数学性质 / 孤儿仓告警。
 
-此前的测试矩阵覆盖了行为正确性（85 用例）与防线杀伤力（变异 7/7），
-本文件验证四个此前从未触达的维度——纯标准库，本机可跑。
+这些回归补充常规行为测试不易覆盖的系统级维度；纯标准库，本机可跑。
 """
 import json
 import os
@@ -16,9 +15,9 @@ import _test_stubs
 
 main = _test_stubs.import_main()
 TradingSystem = main.TradingSystem
-import equity_tracker as eqt
-from risk_manager import RiskManager
-from trade_state import TradeState, TradeStatePersistenceError
+import equity_tracker as eqt  # noqa: E402
+from risk_manager import RiskManager  # noqa: E402
+from trade_state import TradeState, TradeStatePersistenceError  # noqa: E402
 
 
 class TimeBoundaryTest(unittest.TestCase):
@@ -114,6 +113,32 @@ class DisasterRecoveryTest(unittest.TestCase):
             self.assertIsNotNone(pos)  # 从 .bak 恢复
             self.assertEqual(pos['entry_price'], 60000.0)
 
+    def test_foreign_owner_main_is_never_overwritten_by_okx_backup(self):
+        """主账本可严格解析且显式属于 Binance 时，归属冲突不是损坏。
+        即使 .bak 是完整 OKX 账本，也必须拒绝启动且不得重写主文件。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trade_state.json')
+            foreign = TradeState.get_default_state()
+            foreign['exchange'] = 'binance'
+            okx_backup = TradeState.get_default_state()
+            okx_backup['exchange'] = 'okx'
+            with open(path, 'w') as f:
+                json.dump(foreign, f)
+            with open(path + '.bak', 'w') as f:
+                json.dump(okx_backup, f)
+
+            with open(path, 'rb') as f:
+                before_bytes = f.read()
+            before_inode = os.stat(path).st_ino
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '归属冲突'):
+                TradeState(path)
+
+            self.assertEqual(os.stat(path).st_ino, before_inode)
+            with open(path, 'rb') as f:
+                self.assertEqual(f.read(), before_bytes)
+
     def test_corrupted_main_and_backup_refuses_startup(self):
         """主备全毁：账本曾存在却无法确认记录过什么 → 抛异常拒绝启动，
         绝不以空状态「失忆」运行（失忆后日检会对有真实仓位的品种重复开仓）。"""
@@ -203,6 +228,7 @@ class DisasterRecoveryTest(unittest.TestCase):
             system.exchange_api = SimpleNamespace(
                 to_ccxt_symbol=lambda s: s,
                 _coin_to_contracts=lambda s, amount: 10.0,
+                _contracts_to_coins=lambda s, contracts: contracts / 100.0,
                 get_position=lambda s: {'contracts': 10.0, 'side': 'long'},
                 find_stop_order_state=lambda *args, **kwargs: 'intact',
                 list_position_symbols=lambda: ['BTCUSDT'])  # 两边一致
@@ -224,7 +250,7 @@ class RiskInvariantTest(unittest.TestCase):
                                 rng.uniform(1000, 1_000_000)])  # BTC 类极大价
             stop = entry * (1 - rng.uniform(0.005, 0.5))        # 多单止损在下方
             risk = rng.uniform(0.001, 0.5)
-            rm = RiskManager(equity, risk)
+            rm = RiskManager(equity)
 
             size = rm.calculate_position_size(entry, stop, risk)
 
@@ -237,14 +263,14 @@ class RiskInvariantTest(unittest.TestCase):
                                      f'风险超预算: equity={equity}, entry={entry}, stop={stop}, risk={risk}')
 
     def test_degenerate_inputs_yield_zero(self):
-        rm = RiskManager(10000, 0.01)
-        self.assertEqual(rm.calculate_position_size(100, 100), 0)   # 止损=入场
-        self.assertEqual(rm.calculate_position_size(0, 90), 0)      # 零价格
+        rm = RiskManager(10000)
+        self.assertEqual(rm.calculate_position_size(100, 100, 0.01), 0)  # 止损=入场
+        self.assertEqual(rm.calculate_position_size(0, 90, 0.01), 0)     # 零价格
 
     def test_position_size_keeps_sub_milli_precision_for_exchange_rounding(self):
-        rm = RiskManager(1000, 0.01)
+        rm = RiskManager(1000)
 
-        size = rm.calculate_position_size(50000, 36242.09078404402)
+        size = rm.calculate_position_size(50000, 36242.09078404402, 0.01)
 
         self.assertGreater(size, 0)
         self.assertLess(size, 0.001)
