@@ -21,7 +21,7 @@ class IntradayOrphanReconciliationTest(unittest.TestCase):
         system.config = {
             'strategy': {'default_risk_per_trade': 0.01},
             'trading': {'symbols': [
-                {'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'},
+                {'name': 'BTCUSDT', 'enabled': True},
             ]},
         }
         system.exchange_api = SimpleNamespace(

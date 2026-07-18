@@ -1,7 +1,7 @@
 # 欧易（OKX）程序化交易系统 — 架构与上线说明
 
 本系统由币安版迁移而来，现已收敛为「**欧易单所版**」：只对接欧易，状态、配置、前端均按单所组织。
-两套策略的**信号语义**保持不变；但当前版本不是“只换适配层”：已同时加固下单幂等、订单终态归因、补偿回滚、原子账本、崩溃恢复、止损残留隔离与三入口配置校验。
+当前只运行双均线 EMA；同时具备下单幂等、订单终态归因、补偿回滚、原子账本、崩溃恢复、止损残留隔离与三入口配置校验。
 
 ## 一、整体架构
 
@@ -30,7 +30,7 @@
     "sandbox": false
   },
   "strategy": { "ma_short_period": 7, "ma_long_period": 28, "ma_stop_period": 28, ... },
-  "trading":  { "symbols": [ {"name": "BTCUSDT", "enabled": true, "strategy": "ma_cross", ...} ] },
+  "trading":  { "symbols": [ {"name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01} ] },
   "equity_tick_retention_days": 30,
   "scheduler": {...},
   "dingtalk": {"webhook_url": "..."}
@@ -51,8 +51,7 @@
 
 ### 删除交易对的语义
 - 删除 ≠ 立即平仓、≠ 立即停止保护。正确语义：**从品种池移除，只托管当前仓位到下一次平仓**；`DELETE /api/symbols/<symbol>` 不动当前持仓、不撤保护止损，但退池后禁止反手、止损后重入或任何新腿；当前仓一旦结束即彻底停止监控和交易。
-- 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（唯一在役策略 ma_cross；遗留 turtle 持仓亦按双均线语义托管）继续跟踪、推进止损、处理平仓，直到仓位自然结束。
-- 老仓兜底：若删除时发现该持仓缺 `strategy` 字段，会先从当前配置补写进持仓再删；配置里也没有时**拒绝删除**，提示先明确策略。
+- 如本地已有持仓，`check_and_execute_trades()` 会继续把账本中的 symbol 加入检查集合，按双均线语义继续保护和处理平仓，直到仓位自然结束。
 
 ### 未创新高统计口径
 - **峰值口径（按日收盘高水位）**：`peak_equity` / `peak_time` 是「未创新高/回撤」家族的高水位线，**只允许正式日检最前面的每日收盘快照（`record_daily_equity_snapshot`）推进**；同一交易日首份快照写入后锁定，失败重试、08:01 去重触发、日检末尾统计刷新和手动「立即检查」都不能覆盖它。5 分钟按市值权益采样只维护求索指数，**绝不推进峰值**——否则持仓的日内浮盈冒一个高点就会把峰值时间刷成「现在」，`days_since_peak` 被反复清零、回撤时长指标失效。
@@ -89,9 +88,10 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
   若用 `TRADING_RUNNER_LOCK_FILE` 改锁路径，锁必须位于当前用户所有的专用 0700 目录，
   不能直接放在 `/tmp` 等共享目录。
 - **一次性 legacy 迁移**：`data/okx/` 只在无 `.okx_legacy_migration_complete.json` 时参与裁决；迁移成功后原子写 marker，后续重启绝不再用永久旧快照复活主账本。根主账本/.bak 缺失冲突、两边存在不同生命周期数据、任一 schema/权限/符号链接异常均拒启；只在内容同源或安全空状态下迁移。
+- **单策略部署预检**：停 runner 后执行 `python3 migrate_single_strategy.py --data-dir .`；确认报告后加 `--apply`，再干跑一次必须显示通过。未收口开仓意图或不兼容在途持仓会返回非零并阻断部署。
 - **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
-- **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。止损更新/缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
-- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手/止损推进。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
+- **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。部分平仓后的止损缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
+- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
 - **OKX 原生止损单**：直调 `POST /api/v5/trade/order-algo`，发送 `ordType=conditional`、`slTriggerPx`、`slOrdPx=-1`、`reduceOnly=true` 和确定性 `algoClOrdId`；每个意图最多一次 POST，ACK 或超时都只按同 ID 查询，绝不盲重发。
 - **状态归属护栏（防串仓红线）**：启动时校验 `trade_state.json` 顶层 `exchange` 标记——
   - 标记为 `okx`：放行；标记为其它交易所（如旧币安）：**拒绝启动**；

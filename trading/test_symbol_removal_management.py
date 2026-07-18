@@ -1,8 +1,7 @@
 """删除交易对后的持仓托管 + 状态归属护栏 单测（纯标准库，可本机运行）。
 
 覆盖 Codex 审查要求：
-- 有本地持仓的交易对从配置品种池删除后，check_and_execute_trades 仍会检查该 symbol，
-  并按持仓记录的 strategy 选择对应策略托管（缺失时按唯一在役策略 ma_cross 兜底）。
+- 有本地持仓的交易对从配置品种池删除后，check_and_execute_trades 仍会检查该 symbol。
 - trade_state.json 的交易所归属护栏：归属不符或来路不明(有持仓无标记)时拒绝启动。
 """
 import json
@@ -33,34 +32,31 @@ def _build_system(tmpdir, config_symbols):
     system._last_failure_notify_ts = 0
     system._pending_trade_open_notifications = []
     system._pending_trade_close_notifications = []
-    system._pending_stop_loss_updates = []
     system.equity_tracker = SimpleNamespace(
         record_daily_equity_snapshot=lambda: None,
         refresh_account_stats_state=lambda: None)
     system.notifier = SimpleNamespace(
         send_message=lambda *a, **k: True,
-        notify_error=lambda *a, **k: True,
-        notify_stop_loss_updates_summary=lambda *a, **k: True)
+        notify_error=lambda *a, **k: True)
     system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True, **kwargs: False
 
-    checked = []  # [(symbol, strategy_type)]，由策略选择处记录
+    checked = []
 
-    def record_strategy(symbol_config):
-        checked.append((symbol_config['name'], symbol_config.get('strategy', 'ma_cross')))
-        return SimpleNamespace(check_signal=lambda *a, **k: None), symbol_config.get('strategy', 'ma_cross')
-
-    system.get_strategy_for_symbol = record_strategy
+    def record_symbol(symbol):
+        if symbol not in checked:
+            checked.append(symbol)
+        return symbol
     # K线返回空 → 循环对每个 symbol 走到 fetch 后 continue，不进入信号分支
     system.exchange_api = SimpleNamespace(
-        to_ccxt_symbol=lambda s: s,
+        to_ccxt_symbol=record_symbol,
         get_position=lambda s: None,
         fetch_ohlcv=lambda *a, **k: [])
     return system, checked
 
 
 class RemovedSymbolStillManagedTest(unittest.TestCase):
-    def test_removed_symbol_with_position_is_checked_with_its_strategy(self):
-        """配置池已删但本地有 ma_cross 持仓：仍被检查，且按持仓的 ma_cross 托管。"""
+    def test_removed_symbol_with_position_is_still_checked(self):
+        """配置池已删但本地仍有持仓时继续托管。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, checked = _build_system(tmp, config_symbols=[])
             system.trade_state.add_open_position(
@@ -68,22 +64,21 @@ class RemovedSymbolStillManagedTest(unittest.TestCase):
 
             system.check_and_execute_trades()
 
-            self.assertEqual(checked, [('ETHUSDT', 'ma_cross')])
+            self.assertEqual(checked, ['ETHUSDT'])
 
     def test_pool_symbols_and_held_orphans_are_both_checked(self):
-        """配置池品种与已删除但有持仓的品种都进入检查集合，各按各的策略。"""
+        """配置池品种与已删除但有持仓的品种都进入检查集合。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, checked = _build_system(
-                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
+                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True}])
             system.trade_state.add_open_position(
                 'ETHUSDT', 'short', 3000.0, 1.0, 3200.0, strategy='ma_cross')
 
             system.check_and_execute_trades()
 
-            self.assertEqual(sorted(checked), [('BTCUSDT', 'ma_cross'), ('ETHUSDT', 'ma_cross')])
+            self.assertEqual(sorted(checked), ['BTCUSDT', 'ETHUSDT'])
 
-    def test_orphan_position_without_strategy_falls_back_to_ma_cross(self):
-        """老仓缺 strategy 字段时按 ma_cross 兜底（海龟已下线，唯一在役策略）。"""
+    def test_position_without_audit_label_is_still_managed(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, checked = _build_system(tmp, config_symbols=[])
             system.trade_state.add_open_position(
@@ -91,7 +86,7 @@ class RemovedSymbolStillManagedTest(unittest.TestCase):
 
             system.check_and_execute_trades()
 
-            self.assertEqual(checked, [('LTCUSDT', 'ma_cross')])
+            self.assertEqual(checked, ['LTCUSDT'])
 
 
 class PerSymbolIsolationTest(unittest.TestCase):
@@ -100,8 +95,8 @@ class PerSymbolIsolationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
                 tmp, config_symbols=[
-                    {'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'},
-                    {'name': 'ETHUSDT', 'enabled': True, 'strategy': 'ma_cross'},
+                    {'name': 'BTCUSDT', 'enabled': True},
+                    {'name': 'ETHUSDT', 'enabled': True},
                 ])
             fetched = []
 
@@ -122,7 +117,7 @@ class PerSymbolIsolationTest(unittest.TestCase):
         """空 OHLCV 是未完成而非成功：保留当日重试。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
-                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
+                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True}])
 
             system.check_and_execute_trades()
 
@@ -130,10 +125,10 @@ class PerSymbolIsolationTest(unittest.TestCase):
 
     def test_manual_run_does_not_mark_day_done(self):
         """手动检查不得标记当日完成：00:00–08:00 间手动触发跑的是昨日数据，
-        若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失。"""
+        若标记会让当天 08:00 的正式日检被跳过，整日的新信号与仓位检查丢失。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
-                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
+                tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True}])
             snapshot = Mock()
             system.equity_tracker.record_daily_equity_snapshot = snapshot
 
@@ -206,7 +201,7 @@ class StartupCatchupTest(unittest.TestCase):
 
     def test_deploy_restart_skip_ignored_before_check_time(self):
         """未到今日检查时间的重启：标志必须失效——此时本无兜底可跳，
-        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与止损推进丢失。"""
+        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与仓位检查丢失。"""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             system, calls = self._system(tmp)
@@ -389,7 +384,7 @@ class RetiredExternalFlatTest(unittest.TestCase):
             position = system.trade_state.get_open_position('ETHUSDT')
             closed, saved, cleared = system._handle_exchange_flat_close(
                 'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
-                '退池外部平仓', strategy_type='ma_cross')
+                '退池外部平仓')
 
             self.assertIsNotNone(closed)
             self.assertTrue(saved)
@@ -403,7 +398,7 @@ class RetiredExternalFlatTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.config = {'trading': {'symbols': [
-                {'name': 'ETHUSDT', 'enabled': False, 'strategy': 'ma_cross'}]}}
+                {'name': 'ETHUSDT', 'enabled': False}]}}
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.add_open_position(
                 'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
@@ -415,7 +410,7 @@ class RetiredExternalFlatTest(unittest.TestCase):
             position = system.trade_state.get_open_position('ETHUSDT')
             closed, saved, _cleared = system._handle_exchange_flat_close(
                 'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
-                '禁用仓外部平仓', strategy_type='ma_cross')
+                '禁用仓外部平仓')
 
             self.assertIsNotNone(closed)
             self.assertTrue(saved)
@@ -427,7 +422,7 @@ class RetiredExternalFlatTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.config = {'trading': {'symbols': [
-                {'name': 'ETHUSDT', 'enabled': True, 'strategy': 'ma_cross'}]}}
+                {'name': 'ETHUSDT', 'enabled': True}]}}
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.add_open_position(
                 'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
@@ -439,82 +434,9 @@ class RetiredExternalFlatTest(unittest.TestCase):
             position = system.trade_state.get_open_position('ETHUSDT')
             system._handle_exchange_flat_close(
                 'ETHUSDT', 'ETH-USDT-SWAP', position, 2800.0,
-                'ma_cross 日检平仓', strategy_type='ma_cross')
+                'ma_cross 日检平仓')
 
             self.assertIn('ETHUSDT', system.trade_state.get_stop_loss_dates())
-
-
-class StopUpdateGapGuardTest(unittest.TestCase):
-    """撤旧确认与挂新止损之间的缝隙：交易所已无持仓时不得再挂新止损（防孤儿 reduce-only 单）。"""
-
-    def _build(self, tmp, position_after_cancel):
-        system = TradingSystem.__new__(TradingSystem)
-        system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-        system.trade_state.add_open_position(
-            'BTCUSDT', 'long', 50000.0, 0.1, 48000.0, 'stop-1', strategy='ma_cross')
-        system._pending_stop_loss_updates = []
-        system.notifier = SimpleNamespace(notify_error=lambda *a, **k: True)
-        created = []
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=lambda s: s,
-            cancel_order=lambda *a, **k: True,
-            cancel_stop_order_only=lambda *a, **k: True,
-            get_position=position_after_cancel,
-            create_stop_loss_order=lambda *a, **k: created.append(a) or {'id': 'stop-2'})
-        return system, created
-
-    def test_no_position_after_cancel_skips_new_stop(self):
-        """撤旧确认后交易所已无仓（止损恰在撤销瞬间触发/人工平仓）：不挂新止损。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(tmp, position_after_cancel=lambda s: None)
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])  # 不留孤儿 reduce-only 单
-            # 本地保持旧止损记录，交由巡检/日检确认记平
-            self.assertEqual(system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'], 48000.0)
-
-    def test_query_failure_keeps_old_stop_and_skips_update(self):
-        """持仓复核查询失败：旧保护仍在，安全跳过而不制造未知新单。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            def boom(_s):
-                raise RuntimeError('查询失败')
-            system, created = self._build(tmp, position_after_cancel=boom)
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])
-            self.assertEqual(
-                system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'],
-                48000.0)
-
-    def test_position_present_updates_stop_normally(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(tmp, position_after_cancel=lambda s: {'contracts': 10})
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(len(created), 1)
-            self.assertEqual(system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'], 49000.0)
-            self.assertEqual(len(system._pending_stop_loss_updates), 1)  # 汇总通知照常入队
-
-    def test_unknown_stop_residue_blocks_replacement_before_new_order(self):
-        """未知旧单需全量清扫时，不得先挂新单再把新保护一并扫掉。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(
-                tmp, position_after_cancel=lambda s: {'contracts': 10})
-            system.trade_state.mark_stop_residue('BTCUSDT')
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])
-            self.assertEqual(
-                system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'],
-                48000.0)
 
 
 class StateOwnerGuardTest(unittest.TestCase):
@@ -850,11 +772,8 @@ class MigrationGuardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = {
                 'open_positions': {}, 'closed_trades': [],
-                'signal_states': {'ETHUSDT': {'signal_execution': {
-                    'strategy': 'turtle', 'signal_id': 'candle|long',
-                    'client_order_id': 'TPENDING', 'status': 'pending',
-                    'payload': {'side': 'long'},
-                }}},
+                'signal_states': {'ETHUSDT': {
+                    'obsolete_transaction': {'status': 'pending'}}},
             }
             os.makedirs(tmp, exist_ok=True)
             with open(os.path.join(tmp, 'trade_state.json'), 'w') as handle:
@@ -1142,27 +1061,6 @@ class TradeStateTransactionTest(unittest.TestCase):
             closed = ts.force_runtime_close_position('BTCUSDT', 62000.0)
             self.assertIsNotNone(closed)
             self.assertIsNone(ts.get_open_position('BTCUSDT'))
-
-
-class SetPositionStrategyTest(unittest.TestCase):
-    def test_backfills_strategy_and_persists(self):
-        """老仓缺 strategy 时可补写并持久化（删除前兜底用）。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, 'trade_state.json')
-            ts = TradeState(path)
-            ts.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0, strategy=None)
-
-            updated = ts.set_position_strategy('BTCUSDT', 'ma_cross')
-
-            self.assertEqual(updated['strategy'], 'ma_cross')
-            self.assertEqual(ts.get_open_position('BTCUSDT')['strategy'], 'ma_cross')
-            with open(path) as f:
-                self.assertEqual(json.load(f)['open_positions']['BTCUSDT']['strategy'], 'ma_cross')
-
-    def test_missing_symbol_returns_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            ts = TradeState(os.path.join(tmp, 'trade_state.json'))
-            self.assertIsNone(ts.set_position_strategy('NONEXIST', 'ma_cross'))
 
 
 if __name__ == '__main__':

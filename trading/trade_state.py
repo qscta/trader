@@ -373,10 +373,8 @@ class TradeState:
             order_id = position.get('stop_order_id')
             if order_id is not None and not isinstance(order_id, str):
                 raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 null')
-            # 'turtle' 仅为旧账本数据容忍（海龟策略已移除）：带该标签的遗留
-            # 仓位照常加载，并按双均线语义托管退出；新写入只会产生 ma_cross。
-            if position.get('strategy') not in (None, 'turtle', 'ma_cross'):
-                raise ValueError(f'{symbol}.strategy 必须是 ma_cross/null（容忍遗留 turtle）')
+            if position.get('strategy') not in (None, 'ma_cross'):
+                raise ValueError(f'{symbol}.strategy 与单策略账本不兼容')
             for field in ('original_position_size', 'stop_order_size'):
                 if field in position:
                     if isinstance(position[field], bool):
@@ -463,44 +461,27 @@ class TradeState:
                         raise ValueError(f'{symbol}.partial_closes.{field} 非法')
         if any(not isinstance(trade, dict) for trade in state['closed_trades']):
             raise ValueError('closed_trades 的每一项都必须是对象')
-        # signal_states 的 mid_line_crossed / signal_execution 是海龟时代的遗留
-        # 字段：读写机制已全部移除，这里仅在旧账本携带时做类型把关，保证
-        # 升级后启动不因历史数据崩溃；新代码不会再写入这些字段。
+        allowed_signal_fields = {'last_processed_candle', 'last_update'}
         for symbol, record in (state.get('signal_states') or {}).items():
             if not isinstance(symbol, str) or not isinstance(record, dict):
                 raise ValueError('signal_states 必须是 品种→对象')
-            if ('mid_line_crossed' in record
-                    and not isinstance(record['mid_line_crossed'], bool)):
-                raise ValueError(f'{symbol}.mid_line_crossed 必须是 bool')
-            execution = record.get('signal_execution')
-            if execution is not None:
-                if not isinstance(execution, dict):
-                    raise ValueError(f'{symbol}.signal_execution 必须是对象')
-                for field in ('strategy', 'signal_id', 'client_order_id', 'status'):
-                    if not isinstance(execution.get(field), str) or not execution[field]:
-                        raise ValueError(
-                            f'{symbol}.signal_execution.{field} 必须是非空字符串')
-                if execution['strategy'] not in ('turtle', 'ma_cross'):
-                    raise ValueError(
-                        f'{symbol}.signal_execution.strategy 必须是 turtle/ma_cross')
-                if execution['status'] not in ('pending', 'confirmed'):
-                    raise ValueError(
-                        f'{symbol}.signal_execution.status 必须是 pending/confirmed')
-                payload = execution.get('payload')
-                if payload is not None and not isinstance(payload, dict):
-                    raise ValueError(f'{symbol}.signal_execution.payload 必须是对象或 null')
-                if 'planned_position_size' in execution:
-                    if isinstance(execution['planned_position_size'], bool):
-                        raise ValueError(
-                            f'{symbol}.signal_execution.planned_position_size 必须是正有限数')
-                    try:
-                        planned = float(execution['planned_position_size'])
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            f'{symbol}.signal_execution.planned_position_size 必须是正有限数') from exc
-                    if not math.isfinite(planned) or planned <= 0:
-                        raise ValueError(
-                            f'{symbol}.signal_execution.planned_position_size 必须是正有限数')
+            unknown = set(record) - allowed_signal_fields
+            if unknown:
+                raise ValueError(
+                    f'{symbol}.signal_states 含不兼容字段: {sorted(unknown)}；'
+                    '请先执行部署预检')
+            marker = record.get('last_processed_candle')
+            if marker is not None and (not isinstance(marker, str) or not marker):
+                raise ValueError(
+                    f'{symbol}.last_processed_candle 必须是非空字符串或 null')
+            last_update = record.get('last_update')
+            if last_update is not None:
+                if not isinstance(last_update, str) or not last_update:
+                    raise ValueError(f'{symbol}.last_update 必须是非空字符串')
+                try:
+                    datetime.fromisoformat(last_update)
+                except ValueError as exc:
+                    raise ValueError(f'{symbol}.last_update 非法') from exc
         for symbol, intent in (state.get('open_intents') or {}).items():
             if not isinstance(symbol, str) or not isinstance(intent, dict):
                 raise ValueError('open_intents 必须是 品种→对象')
@@ -508,9 +489,7 @@ class TradeState:
                           'created_at', 'updated_at'):
                 if not isinstance(intent.get(field), str) or not intent[field]:
                     raise ValueError(f'{symbol}.open_intent.{field} 必须是非空字符串')
-            # 'turtle' 仅为旧账本遗留意图容忍：泛型 open-intent 裁决与策略标签
-            # 无关（按 clOrdId 查证后收口/建账），新写入只会产生 ma_cross。
-            if intent['strategy'] not in ('turtle', 'ma_cross'):
+            if intent['strategy'] != 'ma_cross':
                 raise ValueError(f'{symbol}.open_intent.strategy 非法')
             if intent['side'] not in ('long', 'short'):
                 raise ValueError(f'{symbol}.open_intent.side 非法')
@@ -1484,14 +1463,13 @@ class TradeState:
             return copy.deepcopy(
                 (self.state.get('signal_states') or {}).get(symbol) or {})
 
-    def mark_candle_processed(self, symbol, strategy, candle_id):
-        """持久化某策略最后成功处理的已收盘 K 线 ID。"""
+    def mark_candle_processed(self, symbol, candle_id):
+        """持久化最后成功处理的已收盘 K 线 ID。"""
         if not candle_id:
             raise ValueError('candle_id 不能为空')
         with self.lock:
             snapshot = self._snapshot_locked()
             record = self.state.setdefault('signal_states', {}).setdefault(symbol, {})
-            record['strategy'] = strategy
             record['last_processed_candle'] = str(candle_id)
             record['last_update'] = datetime.now().isoformat()
             self._save_or_rollback_locked(snapshot)
@@ -1560,30 +1538,6 @@ class TradeState:
     def get_open_intents(self):
         with self.lock:
             return copy.deepcopy(self.state.get('open_intents') or {})
-
-    def set_open_intent_amount(self, symbol, client_order_id, position_size):
-        if isinstance(position_size, bool):
-            raise ValueError('open intent 数量不能是 bool')
-        try:
-            amount = float(position_size)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('open intent 数量非法') from exc
-        if not math.isfinite(amount) or amount <= 0:
-            raise ValueError('open intent 数量必须是正有限数')
-        with self.lock:
-            intent = (self.state.get('open_intents') or {}).get(symbol) or {}
-            if (intent.get('status') != 'pending' or
-                    intent.get('client_order_id') != str(client_order_id)):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 不存在匹配 open intent')
-            existing = intent.get('planned_position_size')
-            if existing is not None:
-                return float(existing)
-            snapshot = self._snapshot_locked()
-            intent['planned_position_size'] = amount
-            intent['updated_at'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return amount
 
     def resolve_open_intent(self, symbol, client_order_id):
         with self.lock:
@@ -1773,16 +1727,6 @@ class TradeState:
             self.state['last_daily_summary_date'] = summary_date
             self._save_or_rollback_locked(snapshot)
             return summary_date
-
-    def set_position_strategy(self, symbol, strategy):
-        """为已有持仓补写策略字段（老仓缺 strategy 时兜底，避免删除后误按默认策略托管）。"""
-        with self.lock:
-            if symbol not in self.state['open_positions']:
-                return None
-            snapshot = self._snapshot_locked()
-            self.state['open_positions'][symbol]['strategy'] = strategy
-            self._save_or_rollback_locked(snapshot)
-            return copy.deepcopy(self.state['open_positions'][symbol])
 
     # ---- 止损残留标记：旧止损单撤销无法确认时阻断该品种新开仓，直到确认清理 ----
 

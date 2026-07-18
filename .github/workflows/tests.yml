@@ -40,7 +40,7 @@ jobs:
           pip install -r requirements.lock
       - name: Run dependency-based test suite
         working-directory: trading
-        run: python3 -m unittest tests.test_trading_logic_unittest -v
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
   frontend-syntax:
     # 前端 JS 语法检查：node --check 解析（不执行，无需浏览器/DOM）我们自己的 app.js，

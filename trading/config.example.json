@@ -21,8 +21,8 @@
 
   "trading": {
     "symbols": [
-      { "name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "ma_cross" },
-      { "name": "ETHUSDT", "enabled": true, "risk_per_trade": 0.01, "strategy": "ma_cross" }
+      { "name": "BTCUSDT", "enabled": true, "risk_per_trade": 0.01 },
+      { "name": "ETHUSDT", "enabled": true, "risk_per_trade": 0.01 }
     ]
   },
 

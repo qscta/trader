@@ -16,8 +16,6 @@ class _FakeNotifier:
         self.result = result
         self.calls = 0
         self.send_message_calls = 0
-        self.stop_loss_update_summary_calls = 0
-        self.stop_loss_update_summary_payload = None
         self.trade_open_summary_calls = 0
         self.trade_open_summary_payload = None
         self.trade_close_summary_calls = 0
@@ -31,11 +29,6 @@ class _FakeNotifier:
         self.send_message_calls += 1
         return True
 
-    def notify_stop_loss_updates_summary(self, updates):
-        self.stop_loss_update_summary_calls += 1
-        self.stop_loss_update_summary_payload = updates
-        return True
-
     def notify_trade_opened_summary(self, trades):
         self.trade_open_summary_calls += 1
         self.trade_open_summary_payload = trades
@@ -45,33 +38,6 @@ class _FakeNotifier:
         self.trade_close_summary_calls += 1
         self.trade_close_summary_payload = trades
         return True
-
-
-class _FakeExchangeApi:
-    def __init__(self):
-        self.cancel_calls = 0
-        self.stop_order_calls = 0
-
-    def to_ccxt_symbol(self, symbol):
-        return symbol[:-4] + '/USDT' if symbol.endswith('USDT') else symbol
-
-    def cancel_order(self, symbol, order_id):
-        self.cancel_calls += 1
-        return True
-
-    def cancel_stop_order_only(self, symbol, order_id):
-        self.cancel_calls += 1
-        return True
-
-    def cancel_all_orders(self, symbol):
-        return True
-
-    def create_stop_loss_order(self, symbol, side, amount, stop_price):
-        self.stop_order_calls += 1
-        return {'id': 'stop-123'}
-
-    def get_position(self, symbol):
-        return {'contracts': 1.5, 'side': 'long'}
 
 
 class DailySummaryDeliveryTest(unittest.TestCase):
@@ -85,7 +51,6 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system._summary_lock = threading.Lock()
         system._pending_trade_open_notifications = []
         system._pending_trade_close_notifications = []
-        system._pending_stop_loss_updates = []
         return system
 
     def test_daily_summary_is_only_sent_once_per_day(self):
@@ -169,7 +134,7 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         )
         system.config = {
             'strategy': {'default_risk_per_trade': 0.01},
-            'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}]},
+            'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True}]},
         }
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda symbol: symbol,
@@ -184,59 +149,6 @@ class DailySummaryDeliveryTest(unittest.TestCase):
         system.check_and_execute_trades()
 
         self.assertEqual([300], requested_limits)
-
-    def test_stop_loss_update_is_buffered_for_summary_notification(self):
-        system = TradingSystem.__new__(TradingSystem)
-        system.exchange_api = _FakeExchangeApi()
-        system.notifier = _FakeNotifier(result=True)
-        system.trade_state = SimpleNamespace(
-            has_stop_residue=lambda symbol: False,
-            clear_stop_residue=lambda symbol: None,
-            mark_stop_residue=lambda symbol: None,
-        )
-        system._pending_stop_loss_updates = []
-        system._update_trade_state_stop_with_runtime_fallback = (
-            lambda symbol, stop_price, order_id, context, **kwargs: (
-                {'symbol': symbol}, True)
-        )
-
-        position = {
-            'side': 'long',
-            'position_size': 1.5,
-            'stop_loss_price': 100.0,
-            'stop_order_id': 'old-stop',
-        }
-
-        system._update_stop_order('BTCUSDT', position, 98.0)
-
-        self.assertEqual(0, system.notifier.stop_loss_update_summary_calls)
-        self.assertEqual(1, len(system._pending_stop_loss_updates))
-        self.assertEqual('BTCUSDT', system._pending_stop_loss_updates[0]['symbol'])
-        self.assertEqual(1, system.exchange_api.cancel_calls)
-        self.assertEqual(1, system.exchange_api.stop_order_calls)
-
-    def test_stop_loss_updates_are_sent_as_single_summary_message(self):
-        system = self._build_system(notify_result=True)
-        system._pending_stop_loss_updates = [
-            {'symbol': 'BTCUSDT', 'old_stop_loss_price': 100, 'new_stop_loss_price': 98},
-            {'symbol': 'ETHUSDT', 'old_stop_loss_price': 200, 'new_stop_loss_price': 190},
-        ]
-        system._last_check_date = None
-        system._trade_lock = SimpleNamespace(acquire=lambda blocking=False: True, release=lambda: None)
-        system._last_failure_notify_ts = 0
-        system._last_summary_date = date.today().isoformat()
-        system.trade_state = SimpleNamespace(
-            get_all_open_positions=lambda: {},
-            get_open_position=lambda symbol: None,
-        )
-        system.config = {'trading': {'symbols': []}}
-        system.exchange_api = SimpleNamespace(fetch_ohlcv=lambda *args, **kwargs: [], get_balance=lambda: {'total': {'USDT': 1000}})
-        system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True, **kwargs: False
-
-        system.notifier.notify_stop_loss_updates_summary(system._pending_stop_loss_updates)
-
-        self.assertEqual(1, system.notifier.stop_loss_update_summary_calls)
-        self.assertEqual(2, len(system.notifier.stop_loss_update_summary_payload))
 
     def test_trade_open_notification_is_buffered_for_summary(self):
         system = self._build_system(notify_result=True)

@@ -21,7 +21,7 @@ from trade_state import (
 )
 from stop_guardian import StopGuardianMixin
 from reporting import ReportingMixin
-from signal_handlers import SignalHandlersMixin
+from signal_handlers import NO_POSITION_T1_BLOCKED, SignalHandlersMixin
 from trade_executor import TradeExecutorMixin
 from runtime_guard import acquire_runner_lock
 import config_validation as cfgv
@@ -157,7 +157,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._last_summary_date = self.trade_state.get_last_daily_summary_date()
         self._pending_trade_open_notifications = []
         self._pending_trade_close_notifications = []
-        self._pending_stop_loss_updates = []
         self._trade_lock = threading.Lock()  # 防并发执行锁
         self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
         self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
@@ -313,6 +312,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         RiskManager 权益×"0.01"→TypeError。与凭据缺失同标准 fail-loud，绝不静默塞
         默认值（真钱系统默认策略参数比拒启更危险）。
         """
+        if not isinstance(strategy, dict):
+            raise ValueError('config.strategy 必须是对象')
+        unknown = sorted(set(strategy) - cfgv.MA_PARAMETER_FIELDS)
+        if unknown:
+            raise ValueError(f'config.strategy 含未知字段: {unknown}')
         if strategy.get('default_risk_per_trade') is None:
             raise ValueError(
                 "config.strategy 缺少必需参数 ['default_risk_per_trade']，"
@@ -336,20 +340,25 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         eff_long = strategy.get('ma_long_period', 28)
         if eff_short >= eff_long:
             raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
-        cfgv.validate_strategy_ohlcv_capacity(strategy)
+        cfgv.validate_ohlcv_capacity(strategy)
 
     def _validate_symbol_configs(self, symbols):
         """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
 
-        手写 config.json 的品种 risk_per_trade / strategy / name 此前无启动校验：
+        手写 config.json 的品种 risk_per_trade / name 此前无启动校验：
         risk_per_trade=1.0（100%）会直接进 _execute_open 的仓位计算放大到全仓风险；
-        非法策略名若不拒绝会被静默当作合法配置托管。补齐三校验，
+        冗余策略字段若继续存在会制造已经删除的分派轴。补齐校验与规范化，
         与增删品种的 API 入口一致，堵住"手写配置"这条绕过风控的入口。
         """
         seen = set()
         for i, s in enumerate(symbols):
             if not isinstance(s, dict):
                 raise ValueError(f"config.trading.symbols[{i}] 不是对象: {s!r}")
+            unknown = sorted(set(s) - cfgv.SYMBOL_CONFIG_FIELDS)
+            if unknown:
+                raise ValueError(
+                    f"config.trading.symbols[{i}] 含未知字段: {unknown}；"
+                    "请先执行部署预检")
             name = cfgv.normalize_symbol_name(s.get('name'), f"config.trading.symbols[{i}] 交易对名")
             if name in seen:
                 raise ValueError(f"config.trading.symbols 存在重复交易对: {name}")
@@ -360,16 +369,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
             if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
                 s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
-            if s.get('strategy') in cfgv.RETIRED_STRATEGIES:
-                # 海龟已下线：遗留品种不崩溃启动，改为强制禁用（只平不开）并
-                # 大声告警。fail-closed——禁用品种不会开新仓，配合“已无海龟仓”
-                # 前提等于安全空转；请人工从品种池删除或改配 ma_cross。
-                logger.critical(
-                    f"{name} 配置为已退役策略 {s['strategy']!r}，已强制禁用（只平不开）；"
-                    "请从品种池删除或改配 ma_cross")
-                s['enabled'] = False
-            elif s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
-                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 ma_cross）")
 
     @staticmethod
     def _state_has_lifecycle_data(state):
@@ -812,8 +811,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         open_positions[symbol]['entry_price'])
                     closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
                         symbol, ccxt_symbol, open_positions[symbol], exit_price,
-                        "启动同步平仓",
-                        strategy_type=(open_positions[symbol].get('strategy') or 'ma_cross'))
+                        "启动同步平仓")
                     if not closed_position:
                         logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
                         self._quarantine_position_mismatch(
@@ -830,8 +828,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     local_position = open_positions[symbol]
                     if self._verify_existing_position_or_quarantine(
                             symbol, local_position, position, clear_on_match=False):
-                        strategy_type = local_position.get('strategy') or 'ma_cross'
-                        strategy_name = self._get_strategy_display_name(strategy_type)
+                        strategy_name = self._get_strategy_display_name()
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position, strategy_name):
                             self._quarantine_position_mismatch(
@@ -886,11 +883,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         symbol, f'无法完成启动孤儿仓核对: {e}')
 
         logger.info("持仓状态同步完成")
-
-    def get_strategy_for_symbol(self, symbol_config):
-        """唯一在役策略 ma_cross（海龟已彻底移除；遗留 turtle 持仓同样由
-        双均线语义托管退出——EMA 反向平仓 + N 日高低点止损推进）。"""
-        return self.ma_cross_strategy, 'ma_cross'
 
     def _load_stop_loss_dates(self):
         """从主账本加载 T+1；首次升级时严格迁移旧独立 JSON。"""
@@ -981,22 +973,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             decimals = 10
         return f'{number:.{decimals}f}'
 
-    @staticmethod
-    def _closed_candle_id(df):
-        """返回最新已收盘 K 线的稳定 ID（带时区无关的 ISO 字符串）。"""
-        value = df.iloc[-1].get('timestamp') if len(df) else None
-        if value is None:
-            raise ValueError('K 线缺少 timestamp，无法建立幂等信号 ID')
-        try:
-            return value.isoformat()
-        except AttributeError:
-            return str(value)
-
-
-
-
-
-    def _recovery_symbol_config(self, symbol, strategy):
+    def _recovery_symbol_config(self, symbol):
         """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
 
         恢复已有交易所仓位时，即使品种已经退池也必须补账、补止损；但在
@@ -1011,7 +988,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 'name': symbol,
                 'enabled': False,
                 'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                'strategy': strategy,
                 '_retired_from_pool': True,
             }, True
         symbol_config = dict(configured)
@@ -1113,8 +1089,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             stop_price = float(payload['stop_loss_price'])
         except (KeyError, TypeError, ValueError):
             return False
-        symbol_config, _retired = self._recovery_symbol_config(
-            symbol, intent.get('strategy') or 'ma_cross')
+        symbol_config, _retired = self._recovery_symbol_config(symbol)
         outcome = self._execute_open(
             symbol, side, entry_price, stop_price, symbol_config,
             buffer_notification=False,
@@ -1221,8 +1196,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self._quarantine_position_mismatch(
                 symbol, f'{reason}；open intent 查无订单不能证明从未送达')
             return False
-        symbol_config, retired = self._recovery_symbol_config(
-            symbol, intent.get('strategy') or 'ma_cross')
+        symbol_config, retired = self._recovery_symbol_config(symbol)
         if retired:
             self.trade_state.resolve_open_intent(
                 symbol, intent.get('client_order_id'))
@@ -1287,7 +1261,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 unresolved.add(symbol)
         return unresolved
 
-    def _ma_signal_with_catchup(self, symbol, strategy, df):
+    def _ma_signal_with_catchup(self, symbol, df):
         """只检查最新已收盘 K 线是否刚发生 EMA 交叉。
 
         last_processed_candle 仅用于同一根 K 线的消费幂等。即使停机或
@@ -1295,24 +1269,23 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         只比较最新两根已收盘 K 线，避免恢复后补做历史交易。
         """
         metadata = self.trade_state.get_signal_metadata(symbol)
-        last_id = metadata.get('last_processed_candle') if metadata.get('strategy') in (None, 'ma_cross') else None
+        last_id = metadata.get('last_processed_candle')
         candle_ids = [
             (v.isoformat() if hasattr(v, 'isoformat') else str(v))
             for v in df['timestamp'].tolist()
         ]
         current_id = candle_ids[-1]
-        current_state = strategy.check_current_state(df)
+        current_state = self.ma_cross_strategy.check_current_state(df)
         if current_state is None:
-            return None, current_id, 0
+            return None, current_id
 
         if last_id == current_id:
             # 已处理过这根 K 线：仍返回当前指标供 T+1/持仓检查，但不重放交叉。
             current_state['action'] = None
-            return current_state, current_id, 0
+            return current_state, current_id
 
-        rebaseline, _, _, gap = self._history_requires_rebaseline(
-            symbol, 'ma_cross', df)
-        latest_signal = strategy.check_signal(df)
+        rebaseline, _, _, gap = self._history_requires_rebaseline(symbol, df)
+        latest_signal = self.ma_cross_strategy.check_signal(df)
         latest_action = (
             latest_signal.get('action') if isinstance(latest_signal, dict) else None)
         current_state['action'] = (
@@ -1326,16 +1299,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 f"当前={current_id}，间隔={gap}；忽略间隔内的历史交叉，"
                 f"仅检查最新一根，信号={current_state['action']}")
 
-        return current_state, current_id, int(current_state['action'] is not None)
+        return current_state, current_id
 
 
-    def _history_requires_rebaseline(self, symbol, strategy_type, df,
-                                     max_gap_candles=3):
+    def _history_requires_rebaseline(self, symbol, df, max_gap_candles=3):
         """判断信号 marker 与当前可见历史是否存在不可安全回放的断层。"""
         metadata = self.trade_state.get_signal_metadata(symbol)
-        last_id = (
-            metadata.get('last_processed_candle')
-            if metadata.get('strategy') in (None, strategy_type) else None)
+        last_id = metadata.get('last_processed_candle')
         candle_ids = [
             (value.isoformat() if hasattr(value, 'isoformat') else str(value))
             for value in df['timestamp'].tolist()
@@ -1412,7 +1382,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.info("开始检查交易信号...")
             self._pending_trade_open_notifications = []
             self._pending_trade_close_notifications = []
-            self._pending_stop_loss_updates = []
 
             unresolved_pending = self._reconcile_all_open_intents('日检')
 
@@ -1444,18 +1413,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             failed_symbols = sorted(unresolved_pending)
             data_unready_symbols = []
             for symbol in sorted(symbols_to_check):
-                # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
+                # 单品种异常只跳过该品种，不得中断其余品种的保护复核/平仓检查（真钱红线）
                 try:
                     symbol_config = symbol_config_map.get(symbol)
                     if symbol_config is None:
-                        # 品种已从手动池删除但仍有持仓：用持仓记录的策略托管退出
-                        held = all_open_positions.get(symbol) or {}
-                        held_strategy = held.get('strategy') or 'ma_cross'
+                        # 品种已从手动池删除但仍有持仓：继续按唯一策略托管退出。
                         symbol_config = {
                             'name': symbol,
                             'enabled': True,
                             'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                            'strategy': held_strategy,
                             # 删除品种只托管当前仓位到下一次平仓；禁止反手或再开新腿。
                             '_retired_from_pool': True,
                         }
@@ -1465,8 +1431,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         symbol_config = dict(symbol_config)
                         symbol_config['_retired_from_pool'] = True
 
-                    strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
-                    logger.info(f"检查 {symbol} (策略: {strategy_type})...")
+                    logger.info(f"检查 {symbol} (策略: ma_cross)...")
 
                     if symbol in unresolved_pending:
                         logger.error(
@@ -1502,7 +1467,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             continue
                         if not self._ensure_stop_order_alive(
                                 symbol, ccxt_symbol, local_position,
-                                self._get_strategy_display_name(strategy_type)):
+                                self._get_strategy_display_name()):
                             self._quarantine_position_mismatch(
                                 symbol, '日检仓位一致但止损保护未能严格确认')
                             failed_symbols.append(symbol)
@@ -1522,8 +1487,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             local_position.get('entry_price'))
                         closed, state_saved, _stop_cleared = self._handle_exchange_flat_close(
                             symbol, ccxt_symbol, local_position, exit_price,
-                            f'{strategy_type} 日检仓位对账',
-                            strategy_type=strategy_type)
+                            'ma_cross 日检仓位对账')
                         if not closed:
                             self._quarantine_position_mismatch(
                                 symbol, '交易所已空仓但本地日检平仓补偿失败')
@@ -1546,10 +1510,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     elif not local_position and not exchange_position:
                         self._clear_position_quarantine_after_reconcile(symbol)
 
-                    required_closed_candles = cfgv.required_closed_candles_for_strategy(
-                        strategy_type, self.config.get('strategy', {}))
-                    fetch_limit = cfgv.ohlcv_fetch_limit_for_strategy(
-                        strategy_type, self.config.get('strategy', {}))
+                    required_closed_candles = cfgv.required_closed_candles(
+                        self.config.get('strategy', {}))
+                    fetch_limit = cfgv.ohlcv_fetch_limit(
+                        self.config.get('strategy', {}))
 
                     ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
                     if not ohlcv:
@@ -1565,11 +1529,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         continue
                     if len(df) < required_closed_candles:
                         logger.warning(
-                            f"{symbol} K线数据不足：{strategy_type} 策略配置至少需要 "
+                            f"{symbol} K线数据不足：双均线策略配置至少需要 "
                             f"{required_closed_candles} 根已收盘K线，本轮仅取得 {len(df)} 根"
                             f"（请求 {fetch_limit} 根），请检查周期配置或交易所历史K线供应")
                         if local_position:
-                            # 有钱仓位不得以“新币历史不足”降级：退出/止损推进未完成。
+                            # 有钱仓位不得以“新币历史不足”降级：退出信号检查未完成。
                             failed_symbols.append(symbol)
                         else:
                             # 双边已确认空仓且历史确实不足，属结构性 data-unready。
@@ -1583,15 +1547,20 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         logger.critical(
                             f"{symbol} 最新已收盘日 K 陈旧：latest={latest_candle_date}，"
                             f"本次调度日={today}，最低允许={minimum_candle_date}；"
-                            "禁止本品种开仓、平仓、反手及策略止损推进")
+                            "禁止本品种开仓、平仓及反手")
                         failed_symbols.append(symbol)
                         continue
 
-                    signal, candle_id, _missed_crosses = self._ma_signal_with_catchup(
-                        symbol, strategy, df)
+                    signal, candle_id = self._ma_signal_with_catchup(symbol, df)
 
                     if not signal:
-                        logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
+                        # 根数与新鲜度均已通过后仍无法计算，只可能是指标输入/结果
+                        # 不可用。必须让当日保持未完成并进入日内重试；若静默跳过，
+                        # 其余品种成功会把整日标记完成，永久吞掉本品种这根 K 线。
+                        logger.error(
+                            f"{symbol} 双均线无法从已收盘 K 线计算有效状态；"
+                            "不推进 K 线标记，等待日内重试")
+                        failed_symbols.append(symbol)
                         continue
 
                     current_close = float(df['close'].iloc[-1])
@@ -1606,13 +1575,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
                     position = self.trade_state.get_open_position(symbol)
 
+                    no_position_outcome = None
                     if position:
                         self.handle_open_position_ma_cross(symbol, signal, position, symbol_config)
                     elif symbol_config.get('_retired_from_pool'):
                         logger.info(
                             f"{symbol} 已退池且当前仓位已结束；禁止新开仓并完成生命周期清理")
                     else:
-                        self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
+                        no_position_outcome = self.handle_no_position_ma_cross(
+                            symbol, signal, symbol_config, df)
 
                     # EMA 交叉只有在目标方向已经真实落到账本后才可消费。
                     # 平仓失败/部分成交/反手开仓失败时保留旧 marker，让 08:01
@@ -1624,7 +1595,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             symbol_config.get('_retired_from_pool') and
                             position and position.get('side') != target_side and
                             not post_position)
-                        if (not retired_exit_complete and
+                        intentionally_blocked = (
+                            no_position_outcome == NO_POSITION_T1_BLOCKED)
+                        if (not retired_exit_complete and not intentionally_blocked and
                                 (not post_position or
                                  post_position.get('side') != target_side)):
                             logger.error(
@@ -1632,8 +1605,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 '不推进 K 线幂等标记，等待日内重试')
                             failed_symbols.append(symbol)
                             continue
-                    self.trade_state.mark_candle_processed(
-                        symbol, 'ma_cross', candle_id)
+                    self.trade_state.mark_candle_processed(symbol, candle_id)
 
                 except Exception as sym_e:
                     logger.exception(f"{symbol} 本轮检查异常，跳过该品种继续: {sym_e}")
@@ -1652,9 +1624,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             # 信号检查完成后按汇总顺序推送，避免 08:00 单条消息过多触发限流
             self._flush_pending_trade_notifications()
-            if self._pending_stop_loss_updates:
-                logger.info(f"信号检查完毕，推送止损更新汇总({len(self._pending_stop_loss_updates)}条)...")
-                self.notifier.notify_stop_loss_updates_summary(self._pending_stop_loss_updates)
             logger.info("信号检查完毕，刷新账户统计状态...")
             self.equity_tracker.refresh_account_stats_state()
             logger.info("信号检查完毕，推送每日持仓汇总...")
@@ -1677,7 +1646,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         f"失败品种: {', '.join(sorted(failed_symbols))}\n其余品种已正常检查")
             elif not manual_run:
                 # 手动检查不标记当日完成：00:00–08:00 间手动触发跑的是昨日已收盘数据，
-                # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失
+                # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与仓位生命周期检查丢失
                 self._mark_daily_check_complete(today)
         except Exception as e:
             logger.exception(f"交易检查异常: {e}")
@@ -1692,7 +1661,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         finally:
             self._pending_trade_open_notifications = []
             self._pending_trade_close_notifications = []
-            self._pending_stop_loss_updates = []
             self._trade_lock.release()
             logger.info("交易检查锁已释放")
 
@@ -1724,7 +1692,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         （启动时调用一次 + 每 30 分钟周期兜底，守卫幂等，已跑则空转）。
 
         场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
-        新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
+        新信号与仓位生命周期检查整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
         _last_check_date 已持久化到主账本：成功调度日跨重启仍去重，
         未完成调度日才会补跑。持仓对账/信号 ID/T+1 继续作为业务幂等防护。
         缓冲 2 分钟：恰在调度窗口内启动时，让正常 cron（:05/:20/:40 与 +1 分钟重试）先走。
@@ -1767,7 +1735,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         只在已过今日检查窗口（与 _run_startup_catchup_check 同一阈值）时生效：
         未到检查时间本就没有兜底补跑可跳，若此时也标记，当天正点日检会被
-        _last_check_date 拦截，整日的新信号与止损推进丢失——标志按无效处理并告警。
+        _last_check_date 拦截，整日的新信号与仓位生命周期检查丢失——标志按无效处理并告警。
         """
         if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
             return False

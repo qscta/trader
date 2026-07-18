@@ -1,3 +1,6 @@
+import math
+
+
 class MaCrossStrategy:
     def __init__(self, short_period=7, long_period=28, stop_loss_period=28):
         """
@@ -10,9 +13,30 @@ class MaCrossStrategy:
         self.long_period = long_period
         self.stop_loss_period = stop_loss_period
 
+    @staticmethod
+    def _has_valid_closes(df, count):
+        """指标窗口只接受足量、正数、有限的收盘价。"""
+        try:
+            values = list(df['close'].iloc[-count:])
+        except (KeyError, TypeError, AttributeError):
+            return False
+        if len(values) < count:
+            return False
+        for value in values:
+            if isinstance(value, bool):
+                return False
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(number) or number <= 0:
+                return False
+        return True
+
     def calculate_ema(self, df):
         """计算EMA短期和长期均线"""
         df = df.copy()
+        df['close'] = df['close'].astype(float)
         df['ema_short'] = df['close'].ewm(span=self.short_period, adjust=False).mean()
         df['ema_long'] = df['close'].ewm(span=self.long_period, adjust=False).mean()
         return df
@@ -23,11 +47,12 @@ class MaCrossStrategy:
         做多止损 = 前N天收盘价最低值
         做空止损 = 前N天收盘价最高值
         """
-        if len(df) < self.stop_loss_period + 1:
+        if (len(df) < self.stop_loss_period + 1 or
+                not self._has_valid_closes(df, self.stop_loss_period + 1)):
             return None, None
 
         # 前stop_loss_period根K线的收盘价（不含当前K线）
-        close_prices = df.iloc[-(self.stop_loss_period + 1):-1]['close']
+        close_prices = df.iloc[-(self.stop_loss_period + 1):-1]['close'].astype(float)
 
         upper_stop = close_prices.max()
         lower_stop = close_prices.min()
@@ -46,12 +71,10 @@ class MaCrossStrategy:
         返回信号字典，action 可能的值：
         - 'long': 做多（含从空翻多）
         - 'short': 做空（含从多翻空）
-        - 'close_long': 平多（EMA死叉）
-        - 'close_short': 平空（EMA金叉）
         - None: 无信号
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
-        if len(df) < min_required:
+        if len(df) < min_required or not self._has_valid_closes(df, len(df)):
             return None
 
         df = self.calculate_ema(df)
@@ -111,7 +134,7 @@ class MaCrossStrategy:
         4. 止损价使用最新的N天收盘价高低点
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
-        if len(df) < min_required:
+        if len(df) < min_required or not self._has_valid_closes(df, len(df)):
             return None
 
         df = self.calculate_ema(df)
@@ -151,7 +174,7 @@ class MaCrossStrategy:
         返回: (should_reenter, side, signal)
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
-        if len(df) < min_required:
+        if len(df) < min_required or not self._has_valid_closes(df, len(df)):
             return False, None, None
 
         df = self.calculate_ema(df)

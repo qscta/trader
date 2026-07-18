@@ -15,19 +15,19 @@ from trade_state import enrich_closed_trade_with_fees
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
 # 三入口（前端/API/文件）由构造保证一致，不再靠人工同步两份常量。
-from config_validation import (PERIOD_MAX, PERIOD_MIN, STRATEGY_WHITELIST,
-                               ohlcv_fetch_limit_for_strategy,
-                               required_closed_candles_for_strategy, strict_int,
+from config_validation import (MA_PARAMETER_FIELDS, PERIOD_MAX, PERIOD_MIN,
+                               SYMBOL_CONFIG_FIELDS, ohlcv_fetch_limit,
+                               required_closed_candles, strict_int,
                                strict_risk_per_trade, strict_bool,
                                normalize_symbol_name, strict_float_finite,
-                               validate_strategy_ohlcv_capacity)
+                               validate_ohlcv_capacity)
 
 
-def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=None):
+def _validate_symbol_input(name, risk_per_trade=None, enabled=None):
     """校验并**规范化**品种写入字段（与启动校验 main._validate_symbol_configs 同源）。
 
     返回 (clean, error)：error 非 None 时 clean 为 None；否则 clean 仅含传入（非 None）
-    字段的规范化值——name 恒有；risk_per_trade→float、enabled→bool、strategy 原样（已白名单）。
+    字段的规范化值——name 恒有；risk_per_trade→float、enabled→bool。
     路由必须用 clean 的值写入 config，杜绝 "0.01"/"false" 等字符串混入下单/开仓资格路径。
     """
     clean = {}
@@ -39,10 +39,6 @@ def _validate_symbol_input(name, risk_per_trade=None, strategy=None, enabled=Non
             clean['enabled'] = strict_bool(enabled)
     except ValueError as e:
         return None, str(e)
-    if strategy is not None:
-        if strategy not in STRATEGY_WHITELIST:
-            return None, f'未知策略: {strategy!r}（只支持 ma_cross）'
-        clean['strategy'] = strategy
     return clean, None
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
@@ -538,21 +534,23 @@ def add_symbol():
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or 'name' not in data:
             return jsonify({'error': '缺少必要参数'}), 400
+        unknown = sorted(set(data) - SYMBOL_CONFIG_FIELDS)
+        if unknown:
+            return jsonify({'error': f'未知字段: {unknown}'}), 400
         null_error = _explicit_null_error(
-            data, ('name', 'risk_per_trade', 'strategy', 'enabled'))
+            data, ('name', 'risk_per_trade', 'enabled'))
         if null_error:
             return jsonify({'error': null_error}), 400
 
         clean, invalid = _validate_symbol_input(
             data.get('name'),
             data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
-            data['strategy'] if 'strategy' in data else 'ma_cross',
             data['enabled'] if 'enabled' in data else True)
         if invalid:
             return jsonify({'error': invalid}), 400
         new_symbol = {  # 全部用规范化值：name 大写、risk float、enabled 真 bool
             'name': clean['name'], 'enabled': clean['enabled'],
-            'risk_per_trade': clean['risk_per_trade'], 'strategy': clean['strategy'],
+            'risk_per_trade': clean['risk_per_trade'],
         }
         for s in system.config['trading']['symbols']:
             if s['name'] == new_symbol['name']:
@@ -599,36 +597,35 @@ def update_symbol(symbol):
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not data:
             return jsonify({'error': '缺少参数'}), 400
-        null_error = _explicit_null_error(data, ('risk_per_trade', 'strategy', 'enabled'))
+        unknown = sorted(set(data) - (SYMBOL_CONFIG_FIELDS - {'name'}))
+        if unknown:
+            return jsonify({'error': f'未知字段: {unknown}'}), 400
+        null_error = _explicit_null_error(data, ('risk_per_trade', 'enabled'))
         if null_error:
             return jsonify({'error': null_error}), 400
         clean, invalid = _validate_symbol_input(
-            symbol, data.get('risk_per_trade'), data.get('strategy'), data.get('enabled'))
+            symbol, data.get('risk_per_trade'), data.get('enabled'))
         if invalid:
             return jsonify({'error': invalid}), 400
-        if not any(k in clean for k in ('risk_per_trade', 'strategy', 'enabled')):
-            return jsonify({'error': '缺少可更新字段（risk_per_trade / strategy / enabled）'}), 400
+        if not any(k in clean for k in ('risk_per_trade', 'enabled')):
+            return jsonify({'error': '缺少可更新字段（risk_per_trade / enabled）'}), 400
         symbol_u = clean['name']
         changes = None
         with _trade_then_config(system) as locked:
             if not locked:
                 return jsonify({'error': '交易检查/巡检正在执行中，请稍后再修改配置'}), 409
-            # 未收口生命周期存在时，只允许“单独禁用”这一紧急收口动作；风险/
-            # 策略修改或重新启用可能让旧意图被另一套配置接管。
+            # 未收口生命周期存在时，只允许“单独禁用”这一紧急收口动作；
+            # 风险修改或重新启用可能让旧意图被另一套配置接管。
             disabling_only = (
                 clean.get('enabled') is False and
-                not any(key in clean for key in ('risk_per_trade', 'strategy')))
+                'risk_per_trade' not in clean)
             intent_getter = getattr(system.trade_state, 'get_open_intent', None)
             open_intent = intent_getter(symbol_u) if callable(intent_getter) else None
             if open_intent and not disabling_only:
                 # 紧急“禁用”必须允许：恢复裁决会在确认从未发单后消费意图；
                 # 若交易所已有真钱仓则仍补账/补止损，并按退池仓只平不开托管。
                 return jsonify({'error': f'{symbol_u} 存在未收口开仓意图，'
-                                         '仅允许紧急禁用，禁止改风险/策略或重新启用'}), 409
-            # 检查与提交必须同在 trade lock 内；否则检查后日检可开仓，随后策略仍被改掉。
-            if 'strategy' in clean and system.trade_state.get_open_position(symbol_u):
-                return jsonify({'error': f'{symbol_u} 当前有持仓，禁止修改策略（会改变现有仓位的止损/出场逻辑）。'
-                                         '请等待平仓后再改，或删除该品种让持仓按原策略托管到结束。'}), 400
+                                         '仅允许紧急禁用，禁止改风险或重新启用'}), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             for s in system.config['trading']['symbols']:
                 if s['name'] == symbol_u:
@@ -636,9 +633,6 @@ def update_symbol(symbol):
                         s['enabled'] = clean['enabled']          # 规范化真 bool（挡 "false"）
                     if 'risk_per_trade' in clean:
                         s['risk_per_trade'] = clean['risk_per_trade']  # 规范化 float
-                    if 'strategy' in clean:
-                        s['strategy'] = clean['strategy']
-
                     err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，更新已回滚')
                     if err_resp:
                         return err_resp
@@ -648,8 +642,6 @@ def update_symbol(symbol):
                         changes.append(f'状态: {"启用" if clean["enabled"] else "禁用"}')
                     if 'risk_per_trade' in clean:
                         changes.append(f'风险度: {clean["risk_per_trade"]*100:.1f}%')
-                    if 'strategy' in clean:
-                        changes.append('策略: 双均线EMA')
                     break
         if changes is None:
             return jsonify({'error': '交易对不存在'}), 404
@@ -680,17 +672,7 @@ def delete_symbol(symbol):
             # 会走完过滤（空操作）后返回 200 已删除，还误发一条删除钉钉，掩盖前端/调用方的错。
             if not any(s['name'] == symbol_u for s in system.config['trading']['symbols']):
                 return jsonify({'error': '交易对不存在'}), 404
-            # 删除前兜底：若该品种本地仍有持仓但持仓缺 strategy 字段(老仓)，先把策略固化进持仓，
-            # 保证删除后按明确记录的策略托管到仓位结束。
             held = system.trade_state.get_open_position(symbol_u)
-            if held and not held.get('strategy'):
-                cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_u), None)
-                cfg_strategy = (cfg or {}).get('strategy')
-                if cfg_strategy:
-                    system.trade_state.set_position_strategy(symbol_u, cfg_strategy)
-                else:
-                    return jsonify({'error': '该持仓缺少策略信息，无法保证删除后继续按原策略托管，已阻止删除。'
-                                             '请先在品种配置中明确该交易对的策略后再删除。'}), 400
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'] = [
                 s for s in system.config['trading']['symbols'] if s['name'] != symbol_u
@@ -985,11 +967,7 @@ def update_strategy_params():
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not data:
             return jsonify({'error': '缺少参数'}), 400
-        allowed_fields = {
-            'ma_short_period', 'ma_long_period',
-            'ma_stop_period', 'default_risk_per_trade',
-        }
-        unknown = sorted(set(data) - allowed_fields)
+        unknown = sorted(set(data) - MA_PARAMETER_FIELDS)
         if unknown:
             return jsonify({'error': f'未知策略参数: {unknown}'}), 400
         null_error = _explicit_null_error(
@@ -1028,7 +1006,7 @@ def update_strategy_params():
             proposed = dict(cur)
             proposed.update(parsed)
             try:
-                validate_strategy_ohlcv_capacity(proposed)
+                validate_ohlcv_capacity(proposed)
             except ValueError as exc:
                 return jsonify({'error': str(exc)}), 400
             backup = json.loads(json.dumps(system.config.get('strategy', {})))
@@ -1056,7 +1034,7 @@ def update_strategy_params():
 @app.route('/api/instant_open', methods=['POST'])
 @require_auth
 def instant_open():
-    """即时开仓 - 根据交易对策略类型使用对应信号检测。"""
+    """按当前双均线方向即时开仓。"""
     system, err = _require_system()
     if err:
         return err
@@ -1068,40 +1046,32 @@ def instant_open():
             data = request.get_json(silent=True)
             if not isinstance(data, dict) or 'name' not in data:
                 return jsonify({'error': '缺少交易对名称'}), 400
-            null_error = _explicit_null_error(data, ('name', 'risk_per_trade', 'strategy'))
+            unknown = sorted(set(data) - (SYMBOL_CONFIG_FIELDS - {'enabled'}))
+            if unknown:
+                return jsonify({'error': f'未知字段: {unknown}'}), 400
+            null_error = _explicit_null_error(data, ('name', 'risk_per_trade'))
             if null_error:
                 return jsonify({'error': null_error}), 400
             clean, invalid = _validate_symbol_input(
                 data.get('name'),
-                data['risk_per_trade'] if 'risk_per_trade' in data else 0.01,
-                data['strategy'] if 'strategy' in data else 'ma_cross')
+                data['risk_per_trade'] if 'risk_per_trade' in data else 0.01)
             if invalid:
                 return jsonify({'error': invalid}), 400
             symbol_name = clean['name']
             risk_per_trade = clean['risk_per_trade']  # 规范化 float，杜绝字符串进仓位计算
-            strategy_type = clean['strategy']
 
             if system.trade_state.get_open_position(symbol_name):
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
 
-            # 品种池已有该交易对且策略不同：拒绝。日检对在池品种一律按池内策略托管，
-            # 按请求策略开出的仓会立刻被另一套止损/出场逻辑接管（与「有持仓禁改策略」同一护栏）
-            pool_cfg = next((s for s in system.config['trading']['symbols'] if s['name'] == symbol_name), None)
-            if pool_cfg and pool_cfg.get('strategy', 'ma_cross') != strategy_type:
-                pool_strategy = pool_cfg.get('strategy', 'ma_cross')
-                return jsonify({'error': f'{symbol_name} 已在品种池中且策略为 {pool_strategy}，'
-                                         f'与本次请求的 {strategy_type} 不一致——开仓后将被日检按池内策略托管。'
-                                         '请改按池内策略开仓，或先在品种池中调整该交易对的策略'}), 400
-
-            fetch_limit = ohlcv_fetch_limit_for_strategy(strategy_type, system.config.get('strategy', {}))
-            required_closed = required_closed_candles_for_strategy(strategy_type, system.config.get('strategy', {}))
+            fetch_limit = ohlcv_fetch_limit(system.config.get('strategy', {}))
+            required_closed = required_closed_candles(system.config.get('strategy', {}))
             ccxt_symbol, df = _load_closed_daily_df(
                 system, symbol_name, fetch_limit)
             if df is None:
                 return jsonify({'error': f'{symbol_name} 获取K线数据失败'}), 500
 
             if len(df) < required_closed:
-                return jsonify({'error': f'{symbol_name} K线数据不足：{strategy_type} 策略至少需要 '
+                return jsonify({'error': f'{symbol_name} K线数据不足：双均线至少需要 '
                                          f'{required_closed} 根已收盘K线，当前仅 {len(df)} 根'}), 400
 
             fresh, latest_candle_date, minimum_candle_date = (
@@ -1136,11 +1106,10 @@ def instant_open():
             signal_info = {'ema_short': float(signal.get('ema_short', 0)),
                            'ema_long': float(signal.get('ema_long', 0)),
                            'upper_stop': float(signal.get('upper_stop', 0)),
-                           'lower_stop': float(signal.get('lower_stop', 0)),
-                           'strategy': 'ma_cross'}
+                           'lower_stop': float(signal.get('lower_stop', 0))}
 
             symbol_config = {'name': symbol_name, 'enabled': True,
-                             'risk_per_trade': risk_per_trade, 'strategy': strategy_type}
+                             'risk_per_trade': risk_per_trade}
             # buffer_notification=False：本路由下方自发专属钉钉，不进日检汇总缓冲
             outcome = system._execute_open(
                 symbol_name, signal_side, current_price, stop_loss_price,
@@ -1206,7 +1175,7 @@ def instant_open():
                                       'position_size': new_position['position_size'],
                                       'stop_loss_price': new_position['stop_loss_price'],
                                       'stop_order_id': new_position.get('stop_order_id'),
-                                      'risk_per_trade': risk_per_trade, 'strategy': strategy_type,
+                                      'risk_per_trade': risk_per_trade,
                                       'signal_info': signal_info}})
         finally:
             system._trade_lock.release()

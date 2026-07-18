@@ -6,7 +6,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_display_name。
+_stop_anomalies / record_stop_loss / _get_strategy_display_name。
 """
 
 import logging
@@ -46,13 +46,11 @@ class StopGuardianMixin:
                 return
 
             logger.debug(f"开始盘中止损巡检，当前本地持仓数: {len(open_positions)}")
-            symbol_configs = {s['name']: s for s in self.config['trading']['symbols']}
-
             for symbol, position in sorted(open_positions.items()):
                 # 单品种异常只跳过该品种，不得中断其余品种的巡检（与日检同一隔离标准）：
                 # 止损自愈补挂/撤单确认都可能抛出（如面值不可得、撤单重试耗尽）
                 try:
-                    self._reconcile_symbol_intraday(symbol, position, symbol_configs)
+                    self._reconcile_symbol_intraday(symbol, position)
                 except Exception as sym_e:
                     logger.exception(f"{symbol} 盘中止损巡检单品种异常，跳过该品种继续: {sym_e}")
         except Exception as e:
@@ -93,7 +91,7 @@ class StopGuardianMixin:
             if symbol not in exchange_symbols and symbol not in local_symbols:
                 self._clear_position_quarantine_after_reconcile(symbol)
 
-    def _reconcile_symbol_intraday(self, symbol, position, symbol_configs):
+    def _reconcile_symbol_intraday(self, symbol, position):
         """单品种盘中巡检：持仓核对 + 止损自愈 + 交易所端已平的记账。异常由调用方按品种隔离。"""
         close_recovery = self._resume_persisted_close_intent(
             symbol, position, '盘中巡检')
@@ -103,15 +101,7 @@ class StopGuardianMixin:
             position = self.trade_state.get_open_position(symbol)
             if not position:
                 return
-        symbol_config = symbol_configs.get(symbol, {
-            'name': symbol,
-            'enabled': True,
-            'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-            # 品种已删但仍有持仓时，与日线主检查保持一致：用持仓记录的策略托管
-            'strategy': position.get('strategy') or 'ma_cross'
-        })
-        _strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
-        strategy_name = self._get_strategy_display_name(strategy_type)
+        strategy_name = self._get_strategy_display_name()
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
         try:
@@ -137,7 +127,7 @@ class StopGuardianMixin:
         exit_price = position.get('stop_loss_price') or position.get('entry_price')
         closed_position, state_saved, _stop_cleared = self._handle_exchange_flat_close(
             symbol, ccxt_symbol, position, exit_price,
-            f"{strategy_name}盘中止损巡检", strategy_type=strategy_type)
+            f"{strategy_name}盘中止损巡检")
         if not closed_position:
             return
 
@@ -461,16 +451,14 @@ class StopGuardianMixin:
                 logger.error(f"{residue_symbol} 止损残留清理重试失败: {e}")
 
     def _handle_exchange_flat_close(
-            self, symbol, ccxt_symbol, position, exit_price, context,
-            strategy_type=None):
-        """「本地有仓、交易所已无仓」的统一确认收尾（启动同步/盘中巡检/两策略日检共用）：
+            self, symbol, ccxt_symbol, position, exit_price, context):
+        """「本地有仓、交易所已无仓」的统一确认收尾（启动同步/巡检/日检共用）：
 
         记平本地仓位（落盘失败走运行时补偿）后，只要记平成功——哪怕落盘失败——
         都必须验证式确认旧止损条件单已消失：手动/外部平仓留下的残留 reduce-only 单
         会错杀未来新仓，不可确认则标记残留阻断该品种开仓。
         返回 (closed_position, state_saved, stop_cleared)；closed 为 None 时调用方直接放弃。
         """
-        effective_strategy = strategy_type or position.get('strategy') or 'ma_cross'
         config = getattr(self, 'config', None)
         pool = (config.get('trading', {}).get('symbols', [])
                 if isinstance(config, dict) else [])
@@ -490,7 +478,7 @@ class StopGuardianMixin:
             residue_preexisting = True
         stop_loss_date = (
             date.today().strftime('%Y-%m-%d')
-            if effective_strategy == 'ma_cross' and not retired_from_pool else None)
+            if not retired_from_pool else None)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, exit_price, context, stop_loss_date=stop_loss_date,
             stop_cleanup_pending=True)

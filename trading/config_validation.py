@@ -1,7 +1,7 @@
 """配置校验的共享原语（零依赖，只用标准库 re）。
 
 单一事实源：交易系统有三条配置入口——前端表单、HTTP API、手写 config.json，
-它们必须用**同一套**规则把关（周期范围、风险度上限、交易对名格式、策略白名单、
+它们必须用**同一套**规则把关（周期范围、风险度上限、交易对名格式、
 严格整数）。此前这些常量与逻辑在 main.py 与 api_server.py 各存一份，靠人工同步——
 本模块把原语收敛于一处，让三入口的一致性由构造保证，而非碰巧相等。
 
@@ -24,11 +24,11 @@ OPEN_CANDLE_FETCH_BUFFER = 1
 MAX_RISK_PER_TRADE = 0.5
 # 内部交易对名：大写字母/数字，以 USDT 结尾（U 本位永续）
 SYMBOL_RE = re.compile(r'^[A-Z0-9]{1,20}USDT$')
-# 支持的策略。海龟已下线：新增/改配一律只接受 ma_cross；账本/config 里
-# 遗留的 turtle 品种由启动加载强制禁用（只平不开），不再当合法新配置接受。
-STRATEGY_WHITELIST = ('ma_cross',)
-# 已退役策略：仅用于识别遗留配置并安全禁用，绝不再参与开仓/信号计算。
-RETIRED_STRATEGIES = ('turtle',)
+MA_PARAMETER_FIELDS = frozenset({
+    'ma_short_period', 'ma_long_period',
+    'ma_stop_period', 'default_risk_per_trade',
+})
+SYMBOL_CONFIG_FIELDS = frozenset({'name', 'enabled', 'risk_per_trade'})
 
 
 def _strategy_period(strategy_config, key, default):
@@ -40,29 +40,26 @@ def _strategy_period(strategy_config, key, default):
     return strict_int(value, f'config.strategy.{key}')
 
 
-def required_closed_candles_for_strategy(strategy_type, strategy_config=None):
-    """返回策略计算所需的最低“已收盘”K 线根数。"""
-    if strategy_type == 'ma_cross':
-        long_period = _strategy_period(strategy_config, 'ma_long_period', 28)
-        stop_period = _strategy_period(strategy_config, 'ma_stop_period', 28)
-        return max(long_period * 2, stop_period + 1)
-    raise ValueError(f'未知策略: {strategy_type!r}')
+def required_closed_candles(strategy_config=None):
+    """返回双均线计算所需的最低“已收盘”K 线根数。"""
+    long_period = _strategy_period(strategy_config, 'ma_long_period', 28)
+    stop_period = _strategy_period(strategy_config, 'ma_stop_period', 28)
+    return max(long_period * 2, stop_period + 1)
 
 
-def ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config=None):
-    """策略日检固定请求 OKX 单页上限；超容量配置由入口拒绝。"""
-    required = required_closed_candles_for_strategy(strategy_type, strategy_config)
+def ohlcv_fetch_limit(strategy_config=None):
+    """日检固定请求 OKX 单页上限；超容量配置由入口拒绝。"""
+    required = required_closed_candles(strategy_config)
     if required + OPEN_CANDLE_FETCH_BUFFER > STRATEGY_OHLCV_FETCH_LIMIT:
         raise ValueError(
-            f'{strategy_type} 策略最低需要 {required} 根已收盘 K 线，'
+            f'双均线最低需要 {required} 根已收盘 K 线，'
             f'加未收盘缓冲后超过单次 {STRATEGY_OHLCV_FETCH_LIMIT} 根上限')
     return STRATEGY_OHLCV_FETCH_LIMIT
 
 
-def validate_strategy_ohlcv_capacity(strategy_config=None):
-    """确保启用策略均可由一次 300 根请求完整计算。"""
-    for strategy_type in STRATEGY_WHITELIST:
-        ohlcv_fetch_limit_for_strategy(strategy_type, strategy_config)
+def validate_ohlcv_capacity(strategy_config=None):
+    """确保当前参数可由一次 300 根请求完整计算。"""
+    ohlcv_fetch_limit(strategy_config)
     return True
 
 

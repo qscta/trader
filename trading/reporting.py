@@ -19,16 +19,15 @@ logger = logging.getLogger(__name__)
 
 class ReportingMixin:
 
-    def _get_strategy_display_name(self, strategy_type):
-        # 唯一在役策略；遗留标签也按当前实际托管语义（双均线）显示
+    def _get_strategy_display_name(self):
         return '双均线 EMA'
 
 
-    def _notify_missing_position_after_signal(self, symbol, strategy_type, side, signal, reason):
-        logger.warning(f"{symbol} [{strategy_type}] {reason}")
+    def _notify_missing_position_after_signal(self, symbol, side, signal, reason):
+        logger.warning(f"{symbol} [ma_cross] {reason}")
         self.notifier.notify_signal_missed(
             symbol,
-            self._get_strategy_display_name(strategy_type),
+            self._get_strategy_display_name(),
             side,
             reason,
             signal=signal

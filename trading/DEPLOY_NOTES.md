@@ -1,108 +1,82 @@
-# 部署说明：海龟下线收尾 + 账本死字段迁移（给 Codex）
+# 单策略版本部署门禁
 
-分支：`claude/turtle-code-review-tbddqk`
+本版本只保留双均线 EMA，部署目标是稳定、纯净、简洁。以下步骤必须在 runner
+停止、交易所持仓与挂单已人工核对的维护窗口内执行。
 
-本文覆盖两件独立的事：**(1) 代码改动**（部署分支）与 **(2) 账本数据迁移**（清除
-海龟遗留死字段）。两者相互独立、无强制先后——迁移是清数据，代码不依赖数据已清。
+## 1. 代码与依赖
 
----
+```bash
+git rev-parse HEAD
+python3 --version                  # 生产要求 Python 3.12
+python3 -m pip install -r requirements.lock
+python3 -m pip check
+```
 
-## 一、本轮代码改动清单（可安全部署，除一处通知展示外全部行为保持）
+保存当前提交号、配置、账本、账本 `.bak`、权益文件与年度平仓史书的一致性加密备份。
+备份只放受控存储，不得进入 Git 或聊天工具。
 
-| 提交 | 内容 | 行为影响 |
-|------|------|---------|
-| `9751da5` | 通知层 `notify_signal_missed` 不再读海龟唐奇安通道字段（上轨/下轨/中轨——对双均线信号恒为空的死代码），改展示双 EMA + N 日高低止损参考；`exchange_base` 两处注释去掉海龟"突破"词 | **唯一行为变化**：仅"信号未成交"钉钉通知的展示字段。非交易逻辑 |
-| `7c738a0` | 文档：`README_OKX迁移说明.md` 去残留"突破"词；`审查说明.md` 追加"2026-07-18 海龟彻底下线"当前口径节 | 纯文档 |
-| `5ffafb8` | 删除零调用的死方法 `main.is_symbol_quarantined`（自引入起从未接线） | 行为保持 |
-| `5cda1f9` | 删除两个死参数：`notify_position_summary(symbols_config)`、`handle_open_position_ma_cross(df)`（体内均未用），同步更新测试桩 | 行为保持 |
-| `34646d2` | 新增 `migrate_signal_states.py` + `test_signal_states_migration.py`（迁移工具，不参与运行时） | 无（新文件） |
+## 2. 单策略预检
 
-> 分支同时携带更早未合并到 `main` 的海龟移除系列与加固历史；具体部署基线（prod
-> 当前在哪个提交、要不要整分支上线）由你/Codex 决定，本文不替你判断。
-
-**部署前验证**（两条命令须全绿）：
 ```bash
 cd trading
-python3 -m unittest discover -s . -p "test_*.py"     # 期望：481 OK（纯标准库）
-.venv/bin/python -m unittest tests.test_trading_logic_unittest   # 期望：103 OK（需 flask/pandas/ccxt）
+
+# 只读分析；非零退出码即停止部署
+python3 migrate_single_strategy.py --data-dir .
+
+# 人工核对报告后才写入；脚本会先给配置、主备账本及年度史书留时间戳备份
+python3 migrate_single_strategy.py --data-dir . --apply
+
+# 幂等复验：必须返回 0 并显示已经通过
+python3 migrate_single_strategy.py --data-dir .
 ```
 
----
+以下情况脚本会 fail-closed：
 
-## 二、账本死字段迁移 runbook
+- 缺少 `config.json` 或 `trade_state.json`；
+- JSON 损坏、权限/符号链接不安全或规范化后 schema 非法；
+- 存在未收口 `open_intent`；
+- 配置带不兼容标签，或在途持仓无法证明属于双均线；平仓史书格式损坏；
+- 备份、写入或失败回滚任一步骤不能确认完成。
 
-**背景**：海龟下线后代码不再读写 `signal_states` 里的 `mid_line_crossed` /
-`signal_execution`，但 `mark_candle_processed` 用 `setdefault` 逐键更新，旧账本
-已写入的死字段会永久滞留。迁移脚本纯删这两个键，保留 `last_processed_candle` /
-`strategy` / `last_update` 等 live 字段，幂等。生产现状：活账本 38 品种均带
-`mid_line_crossed`（无 `signal_execution`）。
+禁止手改脚本退出码或清空账本绕过阻断。先核对交易所现实，收口生命周期，再重跑。
 
-**只迁移活账本这一对**：`/home/ubuntu/trader/trading/trade_state.json` 及其
-`.bak`。`trader_deploy_backups/`、`trader_backups/`、`deploy_backups/` 里的是冻结
-的历史回滚点，**不要动**。
-
-**安全前提**：迁移读-改-写对交易服务不是原子的，须在写入方停下时做。停 app 期间
-仓位仍受 **OKX 交易所侧 reduce-only 止损单**保护，app 巡检只是二次兜底。
+## 3. 自动化门禁
 
 ```bash
-# 1) 停交易服务（写入方）
-sudo systemctl stop trading.service
-systemctl is-active trading.service                       # 期望 inactive
-ps -eo pid,cmd | grep -Ei 'gunicorn|wsgi' | grep -v grep  # 期望无输出
+# 纯标准库矩阵
+python3 -m unittest discover -s . -p "test_*.py" -v
 
-# 2) 手动全量备份活账本（脚本自身还会再留一份 .premigrate 备份，这是额外保险）
-cd /home/ubuntu/trader/trading
-ts=$(date +%Y%m%d_%H%M%S)
-cp -av trade_state.json      trade_state.json.manualbak.$ts
-cp -av trade_state.json.bak  trade_state.json.bak.manualbak.$ts
+# 完整依赖矩阵，含真实 pandas EMA 行为
+python3 -m unittest discover -s tests -p "test_*.py" -v
 
-# 3) 干跑（只分析，不写盘）——核对：两个文件各列出 ~38 品种「将删除 mid_line_crossed」
-.venv/bin/python3 migrate_signal_states.py --data-dir "$PWD"
-
-# 4) 确认干跑无误后再执行写入（写前自动备份 + 原子写，主文件与 .bak 各清各的）
-.venv/bin/python3 migrate_signal_states.py --data-dir "$PWD" --apply
-
-# 5) 启服务并确认健康
-sudo systemctl start trading.service
-systemctl is-active trading.service                       # 期望 active
-journalctl -u trading.service -n 50 --no-pager            # 期望正常启动、无账本校验报错
+python3 -m compileall -q .
+node --check static/app.js
 ```
 
-**迁移后自检**（应显示两个活账本文件均「无（账本已干净）」）：
+GitHub Actions 的 Python 3.10–3.13 标准库矩阵、Python 3.12 依赖矩阵和前端语法检查
+必须全部通过。任何跳过、预期失败或只在本机通过都不算部署证据。
+
+## 4. 模拟盘门禁
+
+当前候选提交及当前依赖必须重新执行：
+
 ```bash
-for L in /home/ubuntu/trader/trading/trade_state.json /home/ubuntu/trader/trading/trade_state.json.bak; do
-  echo "== $L =="
-  python3 - "$L" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1])); ss=d.get('signal_states') or {}
-hits={s:[k for k in ('mid_line_crossed','signal_execution') if isinstance(r,dict) and k in r] for s,r in ss.items()}
-print("  含死字段的品种:", {s:v for s,v in hits.items() if v} or "无（账本已干净）")
-PY
-done
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --stop-id-reuse
 ```
 
----
+超时或结果不确定不算通过。必须人工核对币数↔张数、单向持仓模式、reduce-only
+算法止损、触发平仓、撤单清单和确定性止损 ID 复用。
 
-## 三、明确**不做**的事：保留 trade_state 的遗留字段校验
+## 5. 启动后观察
 
-`trade_state.py` 中 `_validate_state` 对 `mid_line_crossed` / `signal_execution`
-的约 38 行类型校验**建议保留，不要删**。理由：
+1. 单实例锁正常，runner 与 Web 状态一致；
+2. 启动对账无孤儿仓、隔离、残留或未收口意图；
+3. 每个实仓稳定态只有一张数量、方向、触发价均匹配的止损；
+4. 正式日检完成日期与信号 K 线标记均正常持久化；
+5. 当日止损品种不重入，次日才按当前 EMA 方向重入；
+6. 磁盘、日志、钉钉和账户权益无异常。
 
-- 它不是防当前崩溃（未知键本就被容忍加载），而是 **fail-closed 防线**——若日后
-  回滚到某个仍带这些字段的历史备份（`trader_deploy_backups/` 等目录里都有），
-  这段校验保证"要么干净加载、要么大声拒绝畸形值"。
-- 你手里保留着多份带旧字段的部署备份，这道防线便宜且真实相关。
-- 删它还会连带需要改一个断言"拒绝畸形 signal_execution"的 fail-closed 测试
-  （`test_api_process_persistence_safety.test_schema_rejects_bool_for_optional_numeric_state`）。
-
-净收益是 38 行只在加载时跑一次的代码，代价是放松一条 fail-closed 不变量——在真钱
-系统 + 保留旧备份的现实下不划算。
-
----
-
-## 四、回滚
-
-- **代码**：`git revert` 对应提交，或部署基线切回上一个 tag/commit。
-- **账本迁移**：从 step 2 的 `trade_state.json.manualbak.<ts>` / `.bak.manualbak.<ts>`
-  复制回原名即可；脚本自动留的 `trade_state.json.premigrate.<ts>` 是同一份原始态。
-  回滚账本前同样先 `systemctl stop trading.service`，回滚后再 `start`。
+只有自动化门禁、模拟盘证据与启动后观察均通过，才允许逐步恢复真实资金流量。

@@ -113,25 +113,6 @@ class DingTalkNotifier:
         )
         return self.send_message(f"[交易系统] 止损触发 - {symbol}", content)
 
-    def notify_stop_loss_updates_summary(self, updates):
-        """发送本轮止损更新汇总。"""
-        if not updates:
-            return False
-
-        lines = []
-        for item in updates:
-            lines.append(
-                f"- {item['symbol']}: {item['old_stop_loss_price']} -> {item['new_stop_loss_price']}"
-            )
-
-        content = (
-            f"### 交易系统止损更新汇总\n\n"
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"更新数量: {len(updates)}\n\n"
-            f"{chr(10).join(lines)}"
-        )
-        return self.send_message("[交易系统] 止损更新汇总", content)
-
     def notify_signal_missed(self, symbol, strategy_name, side, reason, signal=None):
         """标准信号已出现但最终未形成持仓时提醒人工复核。"""
         side_cn = "做多" if side == 'long' else "做空"
@@ -145,7 +126,7 @@ class DingTalkNotifier:
         )
         if signal:
             # 双均线 EMA 是唯一在役策略：展示其信号字段（收盘价、双 EMA、
-            # N 日高低止损参考）。海龟通道的 上轨/下轨/中轨 已随策略下线移除。
+            # N 日高低止损参考）。
             current_close = signal.get('current_close')
             ema_short = signal.get('ema_short')
             ema_long = signal.get('ema_long')

@@ -88,8 +88,7 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90}, planned_position_size=1.0)
 
             state.add_open_position(
                 'BTCUSDT', 'long', 100, 1, 90, 'stop-1',
@@ -105,8 +104,7 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90}, planned_position_size=1.0)
             with patch('trade_state.atomic_write_json', return_value=False):
                 with self.assertRaises(TradeStatePersistenceError):
                     state.add_open_position(
@@ -145,7 +143,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             'strategy': {'default_risk_per_trade': 0.01},
             'trading': {'symbols': [{
                 'name': 'BTCUSDT', 'enabled': True,
-                'strategy': 'ma_cross', 'risk_per_trade': 0.01,
+                'risk_per_trade': 0.01,
             }]},
         }
         system.risk_manager = SimpleNamespace(
@@ -154,7 +152,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
         system.notifier = SimpleNamespace(
             notify_error=Mock(), send_message=Mock())
         system._pending_trade_open_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         return system, seen_client_ids
@@ -165,7 +162,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
 
             outcome = system._execute_open(
                 'BTCUSDT', 'long', 100.0, 90.0,
-                {'name': 'BTCUSDT', 'strategy': 'ma_cross',
+                {'name': 'BTCUSDT',
                  'risk_per_trade': 0.01})
 
             self.assertEqual('opened', outcome['status'])
@@ -181,9 +178,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             system.trade_state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IRECOVER123',
                 {'side': 'long', 'entry_price': 100.0,
-                 'stop_loss_price': 90.0})
-            system.trade_state.set_open_intent_amount(
-                'BTCUSDT', 'IRECOVER123', 1.0)
+                 'stop_loss_price': 90.0}, planned_position_size=1.0)
             system.risk_manager.calculate_position_size = Mock(
                 side_effect=AssertionError('恢复 open intent 不得重算风险'))
 
@@ -213,7 +208,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
         retired_configs = (
             [],
             [{'name': 'BTCUSDT', 'enabled': False,
-              'strategy': 'ma_cross', 'risk_per_trade': 0.01}],
+              'risk_per_trade': 0.01}],
         )
         for symbols in retired_configs:
             with self.subTest(symbols=symbols), tempfile.TemporaryDirectory() as tmp:
@@ -263,7 +258,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             outcome = system._execute_open(
                 'BTCUSDT', 'long', 100.0, 90.0,
                 {'name': 'BTCUSDT', 'enabled': False,
-                 'strategy': 'ma_cross', 'risk_per_trade': 0.01})
+                 'risk_per_trade': 0.01})
 
             self.assertEqual('retired_blocked', outcome['status'])
             self.assertEqual([], seen_client_ids)
@@ -285,7 +280,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
 
             outcome = system._execute_open(
                 'BTCUSDT', 'long', 100.0, 90.0,
-                {'name': 'BTCUSDT', 'strategy': 'ma_cross',
+                {'name': 'BTCUSDT',
                  'risk_per_trade': 0.01})
 
             self.assertEqual('rolled_back', outcome['status'])
@@ -311,7 +306,7 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
 
             outcome = system._execute_open(
                 'BTCUSDT', 'long', 100.0, 90.0,
-                {'name': 'BTCUSDT', 'strategy': 'ma_cross',
+                {'name': 'BTCUSDT',
                  'risk_per_trade': 0.01})
 
             self.assertEqual('rolled_back', outcome['status'])
@@ -438,33 +433,29 @@ class MaCatchupStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't3')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't3')
+            system.ma_cross_strategy = self._Strategy()
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
-            signal, candle_id, missed = system._ma_signal_with_catchup(
-                'BTCUSDT', self._Strategy(), frame)
-            self.assertEqual(1, missed)
+            signal, candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
             self.assertEqual('long', signal['action'])
             self.assertEqual('t5', candle_id)
 
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't5')
-            signal, _candle_id, missed = system._ma_signal_with_catchup(
-                'BTCUSDT', self._Strategy(), frame)
-            self.assertEqual(0, missed)
+            system.trade_state.mark_candle_processed('BTCUSDT', 't5')
+            signal, _candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
             self.assertIsNone(signal['action'])
 
     def test_large_history_gap_ignores_old_bars_but_keeps_latest_cross(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't1')
+            system.ma_cross_strategy = self._Strategy()
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
-            signal, candle_id, missed = system._ma_signal_with_catchup(
-                'BTCUSDT', self._Strategy(), frame)
+            signal, candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
 
             self.assertEqual('t5', candle_id)
-            self.assertEqual(1, missed)
             self.assertEqual('long', signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
             self.assertEqual(4, signal['_history_gap_candles'])
@@ -473,14 +464,13 @@ class MaCatchupStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't1')
+            system.ma_cross_strategy = self._OldCrossOnlyStrategy()
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
-            signal, candle_id, count = system._ma_signal_with_catchup(
-                'BTCUSDT', self._OldCrossOnlyStrategy(), frame)
+            signal, candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
 
             self.assertEqual('t5', candle_id)
-            self.assertEqual(0, count)
             self.assertIsNone(signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
 
@@ -489,14 +479,13 @@ class MaCatchupStateTest(unittest.TestCase):
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.mark_candle_processed(
-                'BTCUSDT', 'ma_cross', 'outside-visible-window')
+                'BTCUSDT', 'outside-visible-window')
+            system.ma_cross_strategy = self._Strategy()
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
-            signal, candle_id, missed = system._ma_signal_with_catchup(
-                'BTCUSDT', self._Strategy(), frame)
+            signal, candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
 
             self.assertEqual('t5', candle_id)
-            self.assertEqual(1, missed)
             self.assertEqual('long', signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
 
@@ -504,13 +493,12 @@ class MaCatchupStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            system.ma_cross_strategy = self._Strategy()
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
-            signal, candle_id, missed = system._ma_signal_with_catchup(
-                'BTCUSDT', self._Strategy(), frame)
+            signal, candle_id = system._ma_signal_with_catchup('BTCUSDT', frame)
 
             self.assertEqual('t5', candle_id)
-            self.assertEqual(1, missed)
             self.assertEqual('long', signal['action'])
             self.assertTrue(signal['_history_discontinuity'])
 
@@ -521,7 +509,7 @@ class MaCatchupStateTest(unittest.TestCase):
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
 
             rebaseline, previous, current, gap = (
-                system._history_requires_rebaseline('BTCUSDT', 'ma_cross', frame))
+                system._history_requires_rebaseline('BTCUSDT', frame))
 
             self.assertTrue(rebaseline)
             self.assertIsNone(previous)
@@ -533,16 +521,16 @@ class MaCatchupStateTest(unittest.TestCase):
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             frame = self._Frame(['t1', 't2', 't3', 't4', 't5'])
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't1')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't1')
 
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'ma_cross', frame)
+                'BTCUSDT', frame)
             self.assertTrue(rebaseline)
             self.assertEqual(4, gap)
 
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't2')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't2')
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'ma_cross', frame)
+                'BTCUSDT', frame)
             self.assertFalse(rebaseline)
             self.assertEqual(3, gap)
 
@@ -551,7 +539,7 @@ class MaCatchupStateTest(unittest.TestCase):
             system = TradingSystem.__new__(TradingSystem)
             system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
             system.trade_state.mark_candle_processed(
-                'BTCUSDT', 'ma_cross', '2026-05-05T00:00:00')
+                'BTCUSDT', '2026-05-05T00:00:00')
             frame = self._Frame([
                 '2026-05-05T00:00:00',
                 '2026-07-09T00:00:00',
@@ -559,7 +547,7 @@ class MaCatchupStateTest(unittest.TestCase):
             ])
 
             rebaseline, _, _, gap = system._history_requires_rebaseline(
-                'BTCUSDT', 'ma_cross', frame)
+                'BTCUSDT', frame)
 
             self.assertTrue(rebaseline)
             self.assertEqual(66, gap)
@@ -653,7 +641,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
                 'BTCUSDT', held_side, 10.0, 1.0,
                 8.0 if held_side == 'long' else 12.0,
                 'stop-old', strategy='ma_cross')
-        system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't3')
+        system.trade_state.mark_candle_processed('BTCUSDT', 't3')
         system.config = {
             'strategy': {
                 'default_risk_per_trade': 0.01,
@@ -661,7 +649,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             },
             'trading': {'symbols': [{
                 'name': 'BTCUSDT', 'enabled': True,
-                'strategy': 'ma_cross', 'risk_per_trade': 0.01,
+                'risk_per_trade': 0.01,
             }]},
         }
         frame = self._Frame()
@@ -676,26 +664,22 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             ohlcv_to_dataframe=lambda _rows: frame,
             filter_closed_candles=lambda df, timeframe='1d': df,
         )
-        system.get_strategy_for_symbol = (
-            lambda _cfg: (SimpleNamespace(), 'ma_cross'))
+        system.ma_cross_strategy = SimpleNamespace()
         system._trade_lock = threading.Lock()
         system._last_check_date = None
         system._last_failure_notify_ts = 0
         system._pending_trade_open_notifications = []
         system._pending_trade_close_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         system.equity_tracker = SimpleNamespace(
             record_daily_equity_snapshot=lambda: None,
             refresh_account_stats_state=lambda: None)
         system.notifier = SimpleNamespace(
-            notify_error=Mock(), notify_signal_missed=Mock(),
-            notify_stop_loss_updates_summary=Mock(), send_message=Mock())
+            notify_error=Mock(), notify_signal_missed=Mock(), send_message=Mock())
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = lambda **kwargs: True
-        system._closed_candle_id = lambda _df: 't5'
         system._daily_candle_is_fresh = (
             lambda _df, _scheduled_date: (True, date(2026, 7, 10), date(2026, 7, 9)))
         return system
@@ -713,7 +697,7 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)
             system._ma_signal_with_catchup = (
-                lambda *args, **kwargs: (self._signal(), 't5', 1))
+                lambda *args, **kwargs: (self._signal(), 't5'))
             system._execute_open = Mock(return_value=None)
 
             system.check_and_execute_trades()
@@ -723,12 +707,45 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             self.assertIsNone(system._last_check_date)
             system.notifier.notify_signal_missed.assert_called_once()
 
+    def test_same_day_stop_block_consumes_cross_without_failure_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.stop_loss_dates['BTCUSDT'] = date.today().isoformat()
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5'))
+            system._execute_open = Mock(
+                side_effect=AssertionError('T+1 当日不得再次开仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t5', metadata['last_processed_candle'])
+            self.assertEqual(date.today().isoformat(), system._last_check_date)
+            system._execute_open.assert_not_called()
+            system.notifier.notify_signal_missed.assert_not_called()
+
+    def test_invalid_ma_state_keeps_day_incomplete_for_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (None, 't5'))
+            system._execute_open = Mock(
+                side_effect=AssertionError('无有效指标状态时不得开仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t3', metadata['last_processed_candle'])
+            self.assertIsNone(system._last_check_date)
+            system._execute_open.assert_not_called()
+            system.notifier.send_message.assert_called_once()
+
     def test_opposite_held_position_does_not_flip_without_latest_cross(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp, held_side='short')
-            system.trade_state.mark_candle_processed('BTCUSDT', 'ma_cross', 't5')
+            system.trade_state.mark_candle_processed('BTCUSDT', 't5')
             system._ma_signal_with_catchup = (
-                lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
+                lambda *args, **kwargs: (self._signal(action=None), 't5'))
             seen_actions = []
 
             def observe(symbol, signal, position, _config):

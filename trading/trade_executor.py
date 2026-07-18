@@ -8,7 +8,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / risk_manager / config /
-_pending_stop_loss_updates / record_stop_loss / _cancel_stop_order_confirmed /
+record_stop_loss / _cancel_stop_order_confirmed /
 _close_trade_state_with_runtime_fallback / _update_trade_state_stop_with_runtime_fallback /
 _buffer_trade_open_notification / _buffer_trade_close_notification /
 。
@@ -1187,7 +1187,7 @@ class TradeExecutorMixin:
                 generated_client_id = f'I{uuid.uuid4().hex[:31]}'
                 try:
                     open_intent = prepare_intent(
-                        symbol, symbol_config.get('strategy', 'ma_cross'), side,
+                        symbol, 'ma_cross', side,
                         generated_client_id,
                         {'side': side, 'entry_price': float(entry_price),
                          'stop_loss_price': float(stop_loss_price)},
@@ -1293,7 +1293,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 original_size, stop_loss_price,
-                symbol_config.get('strategy', 'ma_cross'),
+                'ma_cross',
                 open_order, rollback_contract, '未决开仓内部补偿',
                 allow_stop_rebuild=not recovery_requires_close,
                 open_intent_client_id=open_intent_client_id)
@@ -1319,7 +1319,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 actual_position_size, stop_loss_price,
-                symbol_config.get('strategy', 'ma_cross'),
+                'ma_cross',
                 open_order, rollback, '歧义开仓紧急回滚',
                 open_intent_client_id=open_intent_client_id)
             self.notifier.notify_error(f"{symbol} 开仓成交存在外部并发歧义，已尝试回滚，请核对交易所")
@@ -1336,7 +1336,7 @@ class TradeExecutorMixin:
                 symbol, ccxt_symbol, side,
                 open_order.get('average') or calc_price,
                 actual_position_size, stop_loss_price,
-                symbol_config.get('strategy', 'ma_cross'),
+                'ma_cross',
                 open_order, rollback, '超量开仓紧急回滚',
                 open_intent_client_id=open_intent_client_id)
             self.notifier.notify_error(f"{symbol} 开仓超量成交，已尝试回滚，请核对交易所")
@@ -1368,7 +1368,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
+                stop_loss_price, 'ma_cross',
                 open_order, rollback, '止损失效后的紧急回滚',
                 allow_stop_rebuild=False,
                 open_intent_client_id=open_intent_client_id)
@@ -1392,7 +1392,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
+                stop_loss_price, 'ma_cross',
                 open_order, rollback, '止损创建失败后的紧急回滚',
                 stop_residue_possible=True,
                 open_intent_client_id=open_intent_client_id)
@@ -1437,7 +1437,7 @@ class TradeExecutorMixin:
                 client_order_id)
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side, actual_price, position_size,
-                stop_loss_price, symbol_config.get('strategy', 'ma_cross'),
+                stop_loss_price, 'ma_cross',
                 open_order, rollback, '成交后风险超标紧急回滚',
                 existing_stop_order_id=stop_order_id,
                 existing_stop_order_size=position_size,
@@ -1453,7 +1453,7 @@ class TradeExecutorMixin:
 
         persist_result = self._persist_open_position_or_rollback(
             symbol, ccxt_symbol, side, actual_price, position_size, stop_loss_price, stop_order_id,
-            strategy=symbol_config.get('strategy', 'ma_cross'), open_order=open_order,
+            strategy='ma_cross', open_order=open_order,
             open_intent_client_id=open_intent_client_id
         )
         if persist_result is not True:
@@ -1466,98 +1466,3 @@ class TradeExecutorMixin:
             'entry_price': actual_price, 'position_size': position_size,
             'stop_order_id': stop_order_id,
         }
-
-
-    def _update_stop_order(self, symbol, position, new_stop_loss_price):
-        """以 make-before-break 顺序替换止损，任何中间态都至少有旧保护。"""
-        ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
-        old_stop_loss_price = position['stop_loss_price']
-
-        # 未知残留要求 cancel_all 才能验净；若此时先挂新止损，后续全量清扫会
-        # 把刚挂的新保护一起撤掉，再把其 ID 误记为有效。残留只能先由 guardian
-        # 通过完整算法单清单裁决，不能在止损推进路径里边挂边清。
-        try:
-            if self.trade_state.has_stop_residue(symbol):
-                logger.warning(
-                    f"{symbol} 仍有未知止损残留，保留现有保护并跳过本轮止损推进")
-                return
-        except Exception as e:
-            msg = f"{symbol} 无法确认止损残留状态({e})，按 fail-closed 跳过止损推进"
-            logger.critical(msg)
-            self.notifier.notify_error(msg)
-            return
-
-        # 旧保护仍在，因此查询不确定时可以安全地跳过本次推进；不能为了更新
-        # 止损而在未知仓位现实下再造一张可能成为孤儿的条件单。
-        try:
-            if self.exchange_api.get_position(ccxt_symbol) is None:
-                logger.warning(f"{symbol} 止损推进前交易所已无持仓（可能已触发/人工平仓），"
-                               f"不再挂新止损，交由盘中巡检/日检确认记平")
-                return
-        except Exception as e:
-            logger.warning(f"{symbol} 止损推进前持仓复核失败({e})，保留旧止损并跳过本轮")
-            return
-
-        # 先确认新 reduce-only 止损已存在，再撤旧。若新单失败，旧单原封不动。
-        stop_order = self.exchange_api.create_stop_loss_order(
-            ccxt_symbol, position['side'], position['position_size'],
-            new_stop_loss_price)
-        if not stop_order:
-            logger.error(f"{symbol} 创建新止损单失败，旧止损仍保留")
-            # None 仍可能是“交易所已创建、确认暂不可见”；完整清单复核前
-            # 不能假定绝未创建，否则未知新单会从后续清扫链路消失。
-            self._mark_possible_unknown_stop_residue(symbol)
-            self.notifier.notify_error(
-                f"{symbol} 更新止损单失败，旧止损仍在；请检查！")
-            return
-
-        stop_order_id = stop_order.get('id')
-        if not stop_order_id:
-            self._mark_possible_unknown_stop_residue(symbol)
-            self.notifier.notify_error(
-                f'{symbol} 新止损已返回但缺少可追踪 ID，已隔离并保留旧止损')
-            return
-
-        previous_ids = []
-        for value in ([position.get('stop_order_id')] +
-                      list(position.get('extra_stop_order_ids') or [])):
-            if value and str(value) != str(stop_order_id) and str(value) not in {
-                    str(item) for item in previous_ids}:
-                previous_ids.append(value)
-
-        # 新单和所有旧 ID 先一起落盘。此后哪怕崩溃，guardian 也会看到多单
-        # 歧义并保持 fail-closed，而不会遗忘其中任何一张。
-        updated_position, first_saved = self._update_trade_state_stop_with_runtime_fallback(
-            symbol, new_stop_loss_price, stop_order_id, "止损先挂后撤切换",
-            stop_order_size=position['position_size'],
-            extra_stop_order_ids=previous_ids,
-            stop_resize_pending=bool(previous_ids))
-        if not updated_position:
-            return
-
-        uncleared_ids = self._cancel_active_stop_ids_only(
-            symbol, ccxt_symbol, previous_ids)
-        if uncleared_ids:
-            logger.error(
-                f"{symbol} 新止损已生效，但旧止损撤销不可确认；已保留所有 ID 与残留阻断")
-            self.notifier.notify_error(
-                f'{symbol} 新止损已挂，但旧止损 {uncleared_ids} 撤销不可确认；'
-                '已保留双重保护记录并隔离，未执行全量撤单')
-            return
-
-        # 旧单全部验净后再清理 extra IDs。落盘失败会保留运行时新保护并隔离，
-        # 磁盘上的保守旧记录在重启时仍会由 guardian 重新裁决。
-        updated_position, final_saved = self._update_trade_state_stop_with_runtime_fallback(
-            symbol, new_stop_loss_price, stop_order_id, "止损切换收口",
-            stop_order_size=position['position_size'], extra_stop_order_ids=[],
-            notify_on_failure=first_saved)
-        if not updated_position:
-            return
-
-        logger.info(f"{symbol} 止损单已更新: 新止损价={new_stop_loss_price}, 新止损单ID={stop_order_id}")
-        if first_saved and final_saved:
-            self._pending_stop_loss_updates.append({
-                'symbol': symbol,
-                'old_stop_loss_price': old_stop_loss_price,
-                'new_stop_loss_price': new_stop_loss_price,
-            })

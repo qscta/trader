@@ -8,7 +8,7 @@ from unittest.mock import patch
 # stdlib-only CI job intentionally does not install requests.  These tests never
 # perform HTTP; provide only the import-time shape needed by mem_monitor.
 try:
-    import requests  # noqa: F401
+    __import__('requests')
 except ImportError:
     requests_stub = types.ModuleType('requests')
     requests_stub.post = None

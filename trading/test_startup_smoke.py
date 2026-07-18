@@ -50,7 +50,7 @@ def _write_config(tmp, extra=None):
         'okx': {'label': '欧易', 'apiKey': 'k', 'secret': 's', 'password': 'p', 'sandbox': True},
         'strategy': {'ma_short_period': 6, 'ma_long_period': 28,
                      'ma_stop_period': 28, 'default_risk_per_trade': 0.01},
-        'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}]},
+        'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True}]},
         'scheduler': {}, 'dingtalk': {},
     }
     if extra:
@@ -156,18 +156,16 @@ class StartupSmokeTest(unittest.TestCase):
 
     def test_out_of_range_symbol_config_rejected(self):
         """手写 config.json 的品种池非法值：启动即拒（与增删品种的 API 入口同口径），
-        堵住「手写配置绕过风控」——100% 风险度 / 非法策略名 / 脏交易对名都不得带病启动。"""
+        堵住「手写配置绕过风控」——100% 风险度 / 脏交易对名都不得带病启动。"""
         bad_symbol_lists = [
-            [{'name': 'BTC-USDT', 'strategy': 'ma_cross'}],         # 含非法字符
-            [{'name': 'BTCUSD', 'strategy': 'ma_cross'}],           # 非 USDT 结尾
-            [{'name': 123, 'strategy': 'ma_cross'}],                # 非字符串名
+            [{'name': 'BTC-USDT'}],                                # 含非法字符
+            [{'name': 'BTCUSD'}],                                  # 非 USDT 结尾
+            [{'name': 123}],                                       # 非字符串名
             [{'name': 'BTCUSDT', 'risk_per_trade': 1.0}],           # 风险度 100% 超上限
             [{'name': 'BTCUSDT', 'risk_per_trade': -0.01}],         # 负风险度
             [{'name': 'BTCUSDT', 'risk_per_trade': 'inf'}],         # 非有限风险度
-            [{'name': 'BTCUSDT', 'strategy': 'foobar'}],            # 非法策略名（未知策略拒启）
             [{'name': 'BTCUSDT', 'enabled': 'maybe'}],             # 非法布尔（歧义值拒绝）
-            [{'name': 'BTCUSDT', 'strategy': 'ma_cross'},
-             {'name': 'BTCUSDT', 'strategy': 'ma_cross'}],          # 重复交易对
+            [{'name': 'BTCUSDT'}, {'name': 'BTCUSDT'}],            # 重复交易对
         ]
         for bad in bad_symbol_lists:
             with tempfile.TemporaryDirectory() as tmp:
@@ -189,7 +187,7 @@ class StartupSmokeTest(unittest.TestCase):
             cfg['strategy']['ma_short_period'] = "6"
             cfg['strategy']['default_risk_per_trade'] = "0.01"
             cfg['trading']['symbols'] = [
-                {'name': ' btcusdt ', 'risk_per_trade': "0.02", 'strategy': 'ma_cross', 'enabled': 'true'}]
+                {'name': ' btcusdt ', 'risk_per_trade': "0.02", 'enabled': 'true'}]
             _jdump(cfg, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi):
                 system = TradingSystem(config_file=path)
@@ -206,28 +204,39 @@ class StartupSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_config(tmp)
             cfg = _jload(path)
-            cfg['trading']['symbols'] = [{'name': 'BTCUSDT', 'enabled': 'false', 'strategy': 'ma_cross'}]
+            cfg['trading']['symbols'] = [{'name': 'BTCUSDT', 'enabled': 'false'}]
             _jdump(cfg, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi):
                 system = TradingSystem(config_file=path)
             self.assertIs(system.config['trading']['symbols'][0]['enabled'], False)
 
-    def test_legacy_turtle_config_force_disabled_not_crash(self):
-        """海龟已彻底下线：遗留 strategy=turtle 配置不得让启动崩溃，而是
-        被识别为已退役策略并强制禁用（只平不开）——稳定性契约，保证升级后
-        带着老 config.json 也能安全空转，等待人工改配 ma_cross 或删除。"""
+    def test_incompatible_symbol_strategy_field_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _write_config(tmp)
             cfg = _jload(path)
             cfg['trading']['symbols'] = [
-                {'name': 'BTCUSDT', 'enabled': True, 'strategy': 'turtle',
+                {'name': 'BTCUSDT', 'enabled': True, 'strategy': 'unsupported',
                  'risk_per_trade': 0.01}]
             _jdump(cfg, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi):
-                system = TradingSystem(config_file=path)
-            sym = system.config['trading']['symbols'][0]
-            self.assertEqual('turtle', sym['strategy'])   # 标签保留（不改写历史）
-            self.assertIs(sym['enabled'], False)           # 但强制禁用，绝不开新仓
+                with self.assertRaisesRegex(ValueError, '未知字段'):
+                    TradingSystem(config_file=path)
+
+    def test_unknown_strategy_and_symbol_fields_are_rejected(self):
+        for section, field in (('strategy', 'obsolete_period'),
+                               ('symbol', 'obsolete_flag')):
+            with self.subTest(section=section):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = _write_config(tmp)
+                    cfg = _jload(path)
+                    if section == 'strategy':
+                        cfg['strategy'][field] = 20
+                    else:
+                        cfg['trading']['symbols'][0][field] = True
+                    _jdump(cfg, path)
+                    with patch.object(main, 'OkxApi', _FakeOkxApi):
+                        with self.assertRaisesRegex(ValueError, '未知字段'):
+                            TradingSystem(config_file=path)
 
     def test_fractional_period_rejected(self):
         """严格整数：小数周期（28.9 / "28.9"）拒绝而非静默截断为 28；
