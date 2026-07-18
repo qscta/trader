@@ -177,7 +177,7 @@ class ExchangeApi:
         服务所有行情入口（日检、即时开仓、API 展示）：时间戳必须严格递增
         不得重复；开高低收必须是有限正数（拒绝 bool/NaN/无穷）；蜡烛内部
         关系必须成立（low<=open/close<=high）；成交量必须是有限非负数。
-        坏数据进入 EMA/突破计算仍可能算出「有效」信号并进入开仓链路，
+        坏数据进入 EMA 计算仍可能算出「有效」信号并进入开仓链路，
         因此只能拒绝，不能静默丢弃或修补。
         """
         if ohlcv is None:
@@ -270,7 +270,7 @@ class ExchangeApi:
                 f'K 线请求 {requested} 根超过 OKX 单页上限 300；'
                 '策略配置必须在最新单页内完成计算')
         # 所有行情入口共用同一边界校验：坏蜡烛（NaN/重复/乱序/区间矛盾）
-        # 一律在适配层拒绝，绝不让 EMA/突破在污染数据上算出“有效”信号。
+        # 一律在适配层拒绝，绝不让 EMA 在污染数据上算出“有效”信号。
         return self.validate_ohlcv(
             self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested),
             symbol)
