@@ -1,14 +1,23 @@
 """单策略部署预检的失败原子性、阻断与幂等回归。"""
 
 import copy
+import importlib.util
 import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import _test_stubs
 import migrate_single_strategy as migration
+
+_CLEANUP_SPEC = importlib.util.spec_from_file_location(
+    'confirmed_config_cleanup',
+    Path(__file__).resolve().parent / 'remove-one-confirmed-config-key.py',
+)
+cleanup = importlib.util.module_from_spec(_CLEANUP_SPEC)
+_CLEANUP_SPEC.loader.exec_module(cleanup)
 
 TradingSystem = _test_stubs.import_main().TradingSystem
 
@@ -424,6 +433,66 @@ class RunTest(unittest.TestCase):
 
             self.assertEqual(originals, (_read(config_path), _read(state_path)))
             self.assertFalse(any('.premigrate.' in name for name in os.listdir(tmp)))
+
+    def test_dry_run_can_preview_reviewed_cleanup_without_writing_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            config_path, state_path = self._paths(tmp)
+            config = _read(config_path)
+            config['obsolete_execution'] = {'confirmed': True}
+            _write(config_path, config)
+            originals = (_read(config_path), _read(state_path))
+            spec_path = os.path.join(tmp, 'cleanup.spec.json')
+            release_sha = '1' * 40
+
+            self.assertEqual(migration.EXIT_UNSAFE, migration.run(tmp))
+            cleanup.generate_spec(
+                config_path,
+                spec_path,
+                release_sha,
+                ('obsolete_execution',),
+                'remove confirmed obsolete execution key',
+            )
+
+            self.assertEqual(
+                migration.EXIT_OK,
+                migration.run(
+                    tmp,
+                    cleanup_spec=spec_path,
+                    release_sha=release_sha,
+                ),
+            )
+            self.assertEqual(originals, (_read(config_path), _read(state_path)))
+            self.assertFalse(any(
+                '.premigrate.' in name for name in os.listdir(tmp)))
+
+    def test_cleanup_preview_is_dry_run_only_and_requires_sha_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            config_path, _state_path = self._paths(tmp)
+            spec_path = os.path.join(tmp, 'cleanup.spec.json')
+            release_sha = '2' * 40
+            cleanup.generate_spec(
+                config_path,
+                spec_path,
+                release_sha,
+                ('strategy', 'default_risk_per_trade'),
+                'valid spec used only to test rejected argument combinations',
+            )
+
+            self.assertEqual(
+                migration.EXIT_UNSAFE,
+                migration.run(tmp, cleanup_spec=spec_path),
+            )
+            self.assertEqual(
+                migration.EXIT_UNSAFE,
+                migration.run(
+                    tmp,
+                    apply=True,
+                    cleanup_spec=spec_path,
+                    release_sha=release_sha,
+                ),
+            )
 
     def test_dry_run_rejects_explicit_null_without_writing(self):
         with tempfile.TemporaryDirectory() as tmp:

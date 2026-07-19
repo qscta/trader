@@ -12,7 +12,12 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import atomic_write_json, load_strict_json, open_private_text_file
+from trade_state import (
+    AtomicWriteCommitDurabilityError,
+    atomic_write_json,
+    load_strict_json,
+    open_private_text_file,
+)
 
 
 ROLLOVER_HOUR = 8
@@ -179,13 +184,28 @@ def run(data_dir, apply):
         return 0
 
     backup = f'{peak_path}.premigrate.{datetime.now().strftime("%Y%m%d_%H%M%S")}'
-    if not atomic_write_json(backup, peak_data):
+    try:
+        backup_saved = atomic_write_json(backup, peak_data)
+    except AtomicWriteCommitDurabilityError as exc:
+        print(f'  [失败] 备份已替换但目录耐久性不可证明，未改主文件: {exc}')
+        return 1
+    if not backup_saved:
         print(f'  [失败] 备份原峰值失败，未改动: {backup}')
         return 1
-    if not atomic_write_json(peak_path, corrected):
+    try:
+        peak_saved = atomic_write_json(peak_path, corrected)
+    except AtomicWriteCommitDurabilityError as exc:
+        print(f'  [失败] 主峰值已替换但目录耐久性不可证明；请核对备份: {exc}')
+        return 1
+    if not peak_saved:
         print(f'  [失败] 写入主峰值失败；请从备份恢复: {backup}')
         return 1
-    if not atomic_write_json(peak_path + '.bak', corrected):
+    try:
+        refreshed = atomic_write_json(peak_path + '.bak', corrected)
+    except AtomicWriteCommitDurabilityError as exc:
+        print(f'  [失败] 新备份已替换但目录耐久性不可证明: {exc}')
+        return 1
+    if not refreshed:
         print(f'  [失败] 主峰值已纠正但备份刷新失败；原值仍保存在: {backup}')
         return 1
     print(f'  [完成] 已备份到 {backup} 并写入纠正峰值。')

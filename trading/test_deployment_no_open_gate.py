@@ -3,6 +3,7 @@
 import copy
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -35,6 +36,8 @@ from deployment_no_open_gate import (
     commit_sealed,
     create_read_only_exchange,
     load_okx_config,
+    probe_api_permission_mode,
+    probe_public_history_exposure,
     require_completed_schedule_slot,
     run_baseline,
     run_quiescence,
@@ -57,12 +60,14 @@ def _envelope(data):
     return {'code': '0', 'msg': '', 'data': data}
 
 
-def _account(uid='1001', main_uid='1001', acct_lv='2', pos_mode='net_mode'):
+def _account(uid='1001', main_uid='1001', acct_lv='2', pos_mode='net_mode',
+             perm='read_only,trade'):
     return {
         'uid': uid,
         'mainUid': main_uid,
         'acctLv': acct_lv,
         'posMode': pos_mode,
+        'perm': perm,
     }
 
 
@@ -505,6 +510,21 @@ class ProofWindowTest(unittest.TestCase):
                 _account(main_uid='')):
             with self.subTest(config=config), self.assertRaises(GateError):
                 ReadOnlyOkxGate(FakeExchange(account_configs=[config])).account_config()
+
+    def test_api_permission_parser_is_exact_and_never_returns_credentials(self):
+        self.assertEqual(
+            ('read_only',),
+            ReadOnlyOkxGate(FakeExchange(account_configs=[
+                _account(perm='read_only')])).api_permissions())
+        self.assertEqual(
+            ('read_only', 'trade'),
+            ReadOnlyOkxGate(FakeExchange(account_configs=[
+                _account(perm='read_only,trade')])).api_permissions())
+        for malformed in ('', 'trade', 'read_only, trade',
+                          'read_only,read_only', 'read_only,admin'):
+            with self.subTest(perm=malformed), self.assertRaises(GateError):
+                ReadOnlyOkxGate(FakeExchange(account_configs=[
+                    _account(perm=malformed)])).api_permissions()
 
     def test_account_identity_change_during_window_fails(self):
         exchange = FakeExchange(account_configs=[
@@ -1041,6 +1061,53 @@ class SecureStateMachineTest(unittest.TestCase):
             self.assertEqual('env-key', okx['apiKey'])
             with self.assertRaisesRegex(GateError, '值不一致'):
                 load_okx_config(path, environ=dict(env, OKX_PASSWORD='other'))
+
+    def test_bootstrap_permission_probe_requires_exact_read_only_then_trade(self):
+        with _canonical_temp_directory() as directory:
+            path = self._write_config(directory)
+            read_only = probe_api_permission_mode(
+                path, 'read_only', exchange=FakeExchange(
+                    account_configs=[_account(perm='read_only')]), environ={})
+            self.assertEqual(['read_only'], read_only['permissions'])
+            with self.assertRaisesRegex(GateError, '精确为 read_only'):
+                probe_api_permission_mode(
+                    path, 'read_only', exchange=FakeExchange(
+                        account_configs=[_account()]), environ={})
+            restored = probe_api_permission_mode(
+                path, 'trade', exchange=FakeExchange(
+                    account_configs=[_account()]), environ={})
+            self.assertIn('trade', restored['permissions'])
+            with self.assertRaisesRegex(GateError, '禁止 withdraw'):
+                probe_api_permission_mode(
+                    path, 'trade', exchange=FakeExchange(account_configs=[
+                        _account(perm='read_only,trade,withdraw')]), environ={})
+
+    def test_public_history_exposure_gate_returns_only_safe_booleans(self):
+        with _canonical_temp_directory() as directory:
+            path = self._write_config(directory)
+            summary = probe_public_history_exposure(path, environ={})
+            self.assertFalse(
+                summary['current_okx_key_matches_exposed_history'])
+            self.assertFalse(
+                summary['current_dingtalk_matches_exposed_history'])
+            self.assertNotIn('api_fingerprint', summary)
+
+            api_hash = hashlib.sha256(
+                _okx()['apiKey'].encode('utf-8')).hexdigest()
+            with mock.patch.object(
+                    gate_module, 'EXPOSED_OKX_API_KEY_FINGERPRINTS',
+                    frozenset({api_hash})), self.assertRaisesRegex(
+                        GateError, 'OKX API Key'):
+                probe_public_history_exposure(path, environ={})
+
+            hook = 'https://example.invalid/test-hook'
+            hook_hash = hashlib.sha256(hook.encode('utf-8')).hexdigest()
+            with mock.patch.object(
+                    gate_module, 'EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS',
+                    frozenset({hook_hash})), self.assertRaisesRegex(
+                        GateError, 'DingTalk webhook'):
+                probe_public_history_exposure(
+                    path, environ={'DINGTALK_WEBHOOK': hook})
 
     def test_symlinks_hardlinks_and_unsafe_runtime_mode_are_rejected(self):
         with _canonical_temp_directory() as directory:

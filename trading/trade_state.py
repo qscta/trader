@@ -544,6 +544,26 @@ class TradeStatePersistenceError(RuntimeError):
     """交易状态持久化失败。"""
 
 
+class AtomicWriteCommitDurabilityError(RuntimeError):
+    """文件已 rename 提交，但父目录 fsync 失败，掉电耐久性不可证明。"""
+
+    def __init__(self, filepath, cause):
+        self.filepath = os.path.abspath(filepath)
+        self.cause = cause
+        super().__init__(
+            f'写入已提交但父目录耐久性不可证明: {self.filepath}: {cause}')
+
+
+class TradeStateCommitDurabilityError(TradeStatePersistenceError):
+    """主账本已替换、内存不得回滚，但进程必须永久降级并禁开仓。"""
+
+    def __init__(self, message):
+        super().__init__(message)
+        # ``_transact_locked`` 会在抛出前补上本次事务结果，供已经发生
+        # 交易所写入的收口器继续按新内存现实托管，绝不能再 force 重放。
+        self.committed_result = None
+
+
 def _reject_nonfinite_json(value):
     """json.load 默认接受 NaN/Infinity；命脉状态只接受标准 JSON。"""
     raise ValueError(f'不允许的 JSON 数值常量: {value}')
@@ -645,9 +665,13 @@ def atomic_write_json(filepath, data):
             dir_fd = os.open(dir_name, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
             os.fsync(dir_fd)
         except Exception as e:
-            # rename 已经提交，绝不能返回 False 让调用方回滚内存、制造磁盘/内存分叉。
-            # 目录 fsync 不可用只影响掉电耐久性，运行时真实状态仍是“写入成功”。
-            logger.critical(f'目录 fsync 失败，写入已提交但掉电耐久性降级: {dir_name}: {e}')
+            # rename 已经提交，既不能返回 False 让调用方回滚内存，也不能返回
+            # True 冒充已耐久。显式抛出第三态，由命脉状态层保留新内存并永久
+            # 拉起降级门闩；普通调用方也会 fail closed，而不是静默继续。
+            logger.critical(
+                f'目录 fsync 失败，写入已提交但掉电耐久性不可证明: '
+                f'{dir_name}: {e}')
+            raise AtomicWriteCommitDurabilityError(filepath, e) from e
         finally:
             if dir_fd is not None:
                 try:
@@ -655,6 +679,9 @@ def atomic_write_json(filepath, data):
                 except OSError as e:
                     logger.warning(f'关闭目录 fd 失败（写入已提交）: {dir_name}: {e}')
         return True
+    except AtomicWriteCommitDurabilityError:
+        # rename 后临时路径已经不存在；保留显式第三态给调用方。
+        raise
     except Exception as e:
         logger.error(f'原子写入失败 {filepath}: {e}')
         try:
@@ -1350,10 +1377,30 @@ class TradeState:
                 except Exception as e:
                     raise TradeStatePersistenceError(
                         f'当前主账本无法验证，拒绝覆盖并保存: {self.state_file}: {e}') from e
-                if not atomic_write_json(self.state_file + '.bak', previous):
+                try:
+                    backup_saved = atomic_write_json(
+                        self.state_file + '.bak', previous)
+                except AtomicWriteCommitDurabilityError as exc:
+                    # 只有备份 rename 已发生，主账本仍未写；当前事务可以且必须
+                    # 回滚内存，但持久化基础设施已经不可信，进程永久禁开仓。
+                    self._latch_runtime_persistence_degraded_locked(
+                        'backup_directory_fsync_failed')
+                    raise TradeStatePersistenceError(
+                        f'备份已替换但耐久性不可证明，主账本未提交: '
+                        f'{self.state_file}.bak') from exc
+                if not backup_saved:
                     raise TradeStatePersistenceError(
                         f'保存备份失败，主账本未提交: {self.state_file}.bak')
-            if not atomic_write_json(self.state_file, snapshot):
+            try:
+                state_saved = atomic_write_json(self.state_file, snapshot)
+            except AtomicWriteCommitDurabilityError as exc:
+                # 主文件 rename 已经发生。回滚内存会制造“磁盘新/内存旧”的
+                # 双重现实，因此保留新内存，同时以专用异常向上传递非耐久状态。
+                self._latch_runtime_persistence_degraded_locked(
+                    'state_directory_fsync_failed_after_replace')
+                raise TradeStateCommitDurabilityError(
+                    f'主账本已替换但耐久性不可证明: {self.state_file}') from exc
+            if not state_saved:
                 raise TradeStatePersistenceError(f'保存状态失败: {self.state_file}')
             return True
 
@@ -1367,6 +1414,9 @@ class TradeState:
         """
         try:
             self.save_state()
+        except TradeStateCommitDurabilityError:
+            # 主账本已替换；新内存是唯一与当前可见磁盘一致的现实。
+            raise
         except BaseException:
             self.state = snapshot
             raise
@@ -1399,15 +1449,32 @@ class TradeState:
                 raise TradeStatePersistenceError(
                     f'账本事务产生 schema 非法状态: {exc}') from exc
             if save:
-                self._save_or_rollback_locked(snapshot)
+                try:
+                    self._save_or_rollback_locked(snapshot)
+                except TradeStateCommitDurabilityError as exc:
+                    exc.committed_result = copy.deepcopy(result)
+                    raise
             else:
-                self._runtime_persistence_degraded = True
-                self._runtime_persistence_degraded_context = (
+                self._latch_runtime_persistence_degraded_locked(
                     'runtime_only_trade_state_mutation')
             return result
+        except TradeStateCommitDurabilityError:
+            # rename 后不允许外层通用回滚覆盖新内存。
+            raise
         except BaseException:
             self.state = snapshot
             raise
+
+    def _latch_runtime_persistence_degraded_locked(self, context):
+        """一次置位、终身保持；首个根因最接近真实故障，后续不覆盖。"""
+        self._runtime_persistence_degraded = True
+        if self._runtime_persistence_degraded_context is None:
+            self._runtime_persistence_degraded_context = str(context)
+
+    def mark_runtime_persistence_degraded(self, context):
+        """供非账本命脉写入在 committed-but-not-durable 时拉起同一门闩。"""
+        with self.lock:
+            self._latch_runtime_persistence_degraded_locked(context)
 
     def get_runtime_persistence_status(self):
         """返回进程级持久化降级门闩；无运行时清除接口。"""
@@ -1894,7 +1961,7 @@ class TradeState:
             stop_resize_pending=False, quarantine_reason=None,
             quarantine_details=None, stop_residue_possible=False,
             open_intent_client_id=None, requested_position_size=None,
-            preserve_open_intent=False):
+            preserve_open_intent=False, stop_residue_marked_at=None):
         """建立“补偿零成交/不可确认”后的完整余仓；调用方必须同时隔离。"""
         if symbol in self.state['open_positions']:
             raise ValueError(f'{symbol} 已有本地持仓，拒绝覆盖')
@@ -1958,7 +2025,22 @@ class TradeState:
             quarantine_details,
             now)
         if stop_residue_possible:
-            self.state.setdefault('stop_residues', {}).setdefault(symbol, now)
+            marked_at = now if stop_residue_marked_at is None else stop_residue_marked_at
+            if not isinstance(marked_at, str) or not marked_at:
+                raise ValueError('stop_residue_marked_at 必须是 ISO 时间字符串')
+            try:
+                marked_dt = datetime.fromisoformat(marked_at)
+                current_dt = (
+                    datetime.now(marked_dt.tzinfo)
+                    if marked_dt.tzinfo is not None else datetime.now())
+                if marked_dt > current_dt:
+                    raise ValueError('stop_residue_marked_at 不得位于未来')
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError('stop_residue_marked_at 非法') from exc
+            residues = self.state.setdefault('stop_residues', {})
+            # 既有值由真正的 make-before-write 止损边界产生，代表未知 POST
+            # 的可见性起点；绝不能用更早的 open intent 时间覆盖并缩短宽限。
+            residues.setdefault(symbol, marked_at)
         if open_intent_client_id is not None and not preserve_open_intent:
             del self.state['open_intents'][symbol]
         return copy.deepcopy(position)
@@ -2298,7 +2380,18 @@ class TradeState:
                         f'读取年度平仓史书失败，本轮跳过（账本保留全部记录）: '
                         f'{path}: {exc}')
                     return 0
-                if not atomic_write_json(path, existing + records):
+                try:
+                    archive_saved = atomic_write_json(path, existing + records)
+                except AtomicWriteCommitDurabilityError as exc:
+                    self._latch_runtime_persistence_degraded_locked(
+                        'archive_directory_fsync_failed_after_replace')
+                    # 史书已可见、账本尚未收缩；下一轮依靠有序重叠去重。
+                    # 这里显式失败并禁开仓，不能把非耐久史书当成功。
+                    self._archive_cache_key = None
+                    self._archive_cache_records = None
+                    raise TradeStatePersistenceError(
+                        f'年度平仓史书已替换但耐久性不可证明: {path}') from exc
+                if not archive_saved:
                     logger.error(
                         f'年度平仓史书写入失败，本轮跳过（账本保留全部记录）: {path}')
                     return 0

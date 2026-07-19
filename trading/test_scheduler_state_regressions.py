@@ -531,6 +531,30 @@ class OpenIntentStateTest(unittest.TestCase):
 
 
 class PartialOpenCrashRecoveryTest(unittest.TestCase):
+    def test_existing_stop_post_anchor_wins_over_older_intent_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            intent = state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IAnchor123',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
+            state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'IAnchor123', 'open_compensation', 1.0,
+                compensation_client_order_id='RAnchor123')
+            state.mark_stop_residue('BTCUSDT')
+            post_anchor = state.get_stop_residues()['BTCUSDT']
+
+            state.add_untracked_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0,
+                strategy='ma_cross', stop_residue_possible=True,
+                stop_residue_marked_at=intent['created_at'],
+                open_intent_client_id='IAnchor123',
+                preserve_open_intent=True)
+
+            self.assertEqual(
+                post_anchor, state.get_stop_residues()['BTCUSDT'])
+
     def test_terminal_partial_open_builds_read_only_provisional_by_actual_fill(self):
         cases = (
             ('absent', 0.0, 5.0),
@@ -550,6 +574,12 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                     {'side': 'long', 'entry_price': 100.0,
                      'stop_loss_price': 90.0},
                     planned_position_size=10.0)
+                old_anchor = (datetime.now() - timedelta(minutes=10)).isoformat()
+                with system.trade_state.lock:
+                    system.trade_state.state['open_intents']['BTCUSDT'][
+                        'created_at'] = old_anchor
+                    system.trade_state.save_state()
+                intent = system.trade_state.get_open_intent('BTCUSDT')
                 open_post = Mock()
                 close_post = Mock()
                 compensation_id = 'RPartialCrash123'
@@ -579,6 +609,8 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                     close_position=close_post,
                 )
                 system._quarantine_position_mismatch = Mock()
+                system._protect_unresolved_lifecycle_position = Mock(
+                    return_value=False)
 
                 recovered = system._resume_open_intent_position(
                     'BTCUSDT', intent)
@@ -594,10 +626,14 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                 self.assertFalse(position['execution_recovery_finalized'])
                 self.assertEqual([], position.get('partial_closes', []))
                 self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+                self.assertEqual(
+                    old_anchor,
+                    system.trade_state.get_stop_residues()['BTCUSDT'])
                 unresolved = system.trade_state.get_open_intent(
                     'BTCUSDT')['unresolved_execution']
                 self.assertEqual(5.0, unresolved['expected_position_size'])
                 system._quarantine_position_mismatch.assert_not_called()
+                system._protect_unresolved_lifecycle_position.assert_called_once()
 
     def test_malformed_progress_cannot_build_provisional_or_replay(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1093,6 +1129,35 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
             self.assertIsNotNone(system.trade_state.get_open_position('BTCUSDT'))
 
+    def test_central_open_boundary_blocks_same_day_stop_for_every_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, seen_client_ids = self._system(tmp)
+            system.trade_state.replace_stop_loss_dates({
+                'BTCUSDT': date.today().isoformat(),
+            })
+
+            outcome = system._execute_open(
+                'BTCUSDT', 'long', 100.0, 90.0,
+                {'name': 'BTCUSDT', 'risk_per_trade': 0.01})
+
+            self.assertEqual('t1_blocked', outcome['status'])
+            self.assertEqual([], seen_client_ids)
+            self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
+
+    def test_central_open_boundary_blocks_persistence_degraded_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, seen_client_ids = self._system(tmp)
+            system.trade_state.mark_runtime_persistence_degraded(
+                'test_durability_failure')
+
+            outcome = system._execute_open(
+                'BTCUSDT', 'long', 100.0, 90.0,
+                {'name': 'BTCUSDT', 'risk_per_trade': 0.01})
+
+            self.assertEqual('state_blocked', outcome['status'])
+            self.assertEqual([], seen_client_ids)
+            self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
+
     def test_orphan_position_resumes_same_intent_without_recalculating_risk(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, seen_client_ids = self._system(
@@ -1438,6 +1503,34 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertEqual(['close-rollback'], closed[0]['exit_order_ids'])
             self.assertEqual('actual', closed[0]['fee_source'])
             self.assertAlmostEqual(0.3, closed[0]['total_fee'])
+
+    def test_round_trip_finalizer_rejects_quantity_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = self._system(tmp)
+            intent = system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IFINALQTYMISMATCH1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0}, planned_position_size=1.0)
+            system.exchange_api.get_position = Mock(return_value=None)
+
+            finalized = system._finalize_open_intent_rollback(
+                'BTCUSDT', intent, {
+                    'status': 'rolled_back',
+                    'open_order': {
+                        'id': 'open-qty', 'average': 100.0, 'amount': 1.0},
+                    'close_order': {
+                        'id': 'close-qty', 'confirmed': True,
+                        'fully_closed': True, 'remaining_amount': 0.0,
+                        'average': 99.0, 'amount': 0.5},
+                    'entry_price': 100.0, 'position_size': 0.5,
+                })
+
+            self.assertFalse(finalized)
+            self.assertIsNotNone(
+                system.trade_state.get_open_intent('BTCUSDT'))
+            self.assertEqual([], system.trade_state.get_closed_trades())
+            self.assertTrue(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_position_save_failure_books_real_compensation_immediately(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1860,6 +1953,9 @@ class MaMarkerIntegrationTest(unittest.TestCase):
 
     def _system(self, tmp, *, held_side=None):
         system = TradingSystem.__new__(TradingSystem)
+        # check_and_execute_trades 的真钱边界要求宿主显式绑定运行目录；
+        # 绕过正式构造器的集成夹具必须复现这一约束。
+        system.base_dir = tmp
         system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
         if held_side:
             system.trade_state.add_open_position(

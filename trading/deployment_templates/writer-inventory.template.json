@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "release_sha": "__RELEASE_SHA__",
+  "all_other_writers_frozen": true,
+  "single_writer_boundary": {
+    "exchange_ui_manual_actions_frozen": true,
+    "all_other_api_credentials_and_consumers_frozen": true,
+    "host_process_inventory_complete": true,
+    "runtime_system_api_only_acknowledged": true,
+    "same_side_size_replacement_unattributable_acknowledged": true,
+    "public_history_okx_keys_revoked_and_activity_audited": true,
+    "public_history_dingtalk_webhooks_rotated": true
+  },
+  "writers": [
+    {
+      "id": "reviewed-human-boundary",
+      "type": "human",
+      "scope": "managed_swap_order_writes",
+      "frozen": true,
+      "evidence": {
+        "control": "operator_attestation_and_okx_ui_order_entry_freeze",
+        "observed_at": "__OBSERVED_AT_UTC__",
+        "subject": "__NAMED_OPERATORS_AND_MANUAL_ORDER_SURFACES__"
+      }
+    },
+    {
+      "id": "reviewed-host-boundary",
+      "type": "host",
+      "scope": "managed_swap_order_writes",
+      "frozen": true,
+      "evidence": {
+        "control": "reviewed_process_and_unit_inventory",
+        "observed_at": "__OBSERVED_AT_UTC__",
+        "subject": "__EXACT_HOST_PROCESS_UNIT_CONTAINER_INVENTORY__"
+      }
+    },
+    {
+      "id": "reviewed-credential-boundary",
+      "type": "credential_consumer",
+      "scope": "managed_swap_order_writes",
+      "frozen": true,
+      "evidence": {
+        "control": "credential_consumer_inventory_and_freeze",
+        "observed_at": "__OBSERVED_AT_UTC__",
+        "subject": "__ALL_OKX_API_CREDENTIALS_AND_NAMED_CONSUMERS__"
+      }
+    }
+  ]
+}

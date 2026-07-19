@@ -17,8 +17,13 @@ import threading
 import time
 from datetime import datetime, date, timedelta, timezone
 
-from trade_state import (atomic_write_json, load_strict_json,
-                         open_private_text_file, private_file_exists)
+from trade_state import (
+    AtomicWriteCommitDurabilityError,
+    atomic_write_json,
+    load_strict_json,
+    open_private_text_file,
+    private_file_exists,
+)
 import config_validation as cfgv
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 class EquityStatePersistenceError(RuntimeError):
     """权益/指数辅助状态无法被可信读取或保存。"""
+
+
+class EquitySyncCommitDurabilityError(EquityStatePersistenceError):
+    """权益世代已完整落盘，但提交阶段的目录耐久性曾无法证明。"""
 
 
 def _coerce_positive_float(value):
@@ -87,6 +96,18 @@ class EquityTracker:
             data_dir, '.equity_sync_journal.json')
         self._recover_equity_sync_journal()
 
+    def _atomic_write_json(self, filepath, data):
+        """权益命脉写入共用第三态：rename 已提交时拉起全系统禁开仓门闩。"""
+        try:
+            return atomic_write_json(filepath, data)
+        except AtomicWriteCommitDurabilityError:
+            try:
+                self.system.trade_state.mark_runtime_persistence_degraded(
+                    'equity_directory_fsync_failed_after_replace')
+            except Exception:
+                logger.exception('权益写入非耐久，且无法拉起交易状态降级门闩')
+            raise
+
     def _equity_sync_targets(self):
         return {
             'peak': (self.PEAK_EQUITY_FILE, dict),
@@ -97,16 +118,30 @@ class EquityTracker:
     def _remove_sync_journal(self):
         if not private_file_exists(self.EQUITY_SYNC_JOURNAL_FILE):
             return
-        os.unlink(self.EQUITY_SYNC_JOURNAL_FILE)
-        directory_fd = None
         try:
-            directory_fd = os.open(
-                self.data_dir,
-                os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-            os.fsync(directory_fd)
-        finally:
-            if directory_fd is not None:
-                os.close(directory_fd)
+            os.unlink(self.EQUITY_SYNC_JOURNAL_FILE)
+            directory_fd = None
+            try:
+                directory_fd = os.open(
+                    self.data_dir,
+                    os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                os.fsync(directory_fd)
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+        except Exception as exc:
+            try:
+                self.system.trade_state.mark_runtime_persistence_degraded(
+                    'equity_journal_removal_not_durable')
+            except Exception:
+                logger.exception('权益 journal 提交失败且无法拉起交易状态降级门闩')
+            # 调用方只会在目标世代的全部主文件和备份都已耐久写入后删除
+            # journal。无论 unlink 本身失败，还是 unlink 后目录 fsync 失败，
+            # 此时都绝不能回滚目标世代：journal 若在重启后出现会幂等前滚，
+            # 若未出现则完整的新世代已在位。
+            raise EquitySyncCommitDurabilityError(
+                '权益世代已完整落盘，但同步 journal 退场的耐久性无法证明'
+            ) from exc
 
     def _validate_sync_generation(self, generation, field):
         if not isinstance(generation, dict):
@@ -130,14 +165,14 @@ class EquityTracker:
             self._validate_sync_generation(old_generation, 'old')
             self._validate_sync_generation(new_generation, 'new')
             for key, (path, _expected) in self._equity_sync_targets().items():
-                if not atomic_write_json(path + '.bak', old_generation[key]):
+                if not self._atomic_write_json(path + '.bak', old_generation[key]):
                     raise OSError(f'恢复权益同步时写备份失败: {path}.bak')
-                if not atomic_write_json(path, new_generation[key]):
+                if not self._atomic_write_json(path, new_generation[key]):
                     raise OSError(f'恢复权益同步时写新一代失败: {path}')
             # journal 删除后，单文件损坏会走普通 .bak 恢复；备份也必须属于
             # 同一新世代，否则会把三文件重新拆成半旧半新。
             for key, (path, _expected) in self._equity_sync_targets().items():
-                if not atomic_write_json(path + '.bak', new_generation[key]):
+                if not self._atomic_write_json(path + '.bak', new_generation[key]):
                     raise OSError(f'恢复权益同步时刷新新世代备份失败: {path}.bak')
             self._remove_sync_journal()
             logger.warning('检测到中断的权益同步，已按 journal 完整前滚同一代状态')
@@ -153,37 +188,70 @@ class EquityTracker:
             'version': 1, 'created_at': datetime.now().isoformat(),
             'old': old_generation, 'new': new_generation,
         }
-        if not atomic_write_json(self.EQUITY_SYNC_JOURNAL_FILE, journal):
+        journal_commit_uncertain = False
+        try:
+            journal_saved = self._atomic_write_json(
+                self.EQUITY_SYNC_JOURNAL_FILE, journal)
+        except AtomicWriteCommitDurabilityError:
+            # rename 已发生且当前进程可见。不能把待提交 journal 留给仍在
+            # 运行的调度器再写其它权益文件；继续在本锁栈完成整代前滚，后续
+            # 目录 fsync 会收敛出唯一可见结论，最终仍以专用异常保持系统降级。
+            journal_saved = True
+            journal_commit_uncertain = True
+        if not journal_saved:
             raise EquityStatePersistenceError('无法写权益同步预提交 journal')
         try:
             for key, (path, _expected) in self._equity_sync_targets().items():
-                if not atomic_write_json(path + '.bak', old_generation[key]):
+                if not self._atomic_write_json(path + '.bak', old_generation[key]):
                     raise OSError(f'写权益同步备份失败: {path}.bak')
-                if not atomic_write_json(path, new_generation[key]):
+                if not self._atomic_write_json(path, new_generation[key]):
                     raise OSError(f'写权益同步新状态失败: {path}')
             for key, (path, _expected) in self._equity_sync_targets().items():
-                if not atomic_write_json(path + '.bak', new_generation[key]):
+                if not self._atomic_write_json(path + '.bak', new_generation[key]):
                     raise OSError(f'刷新权益同步新世代备份失败: {path}.bak')
-            self._remove_sync_journal()
+            try:
+                self._remove_sync_journal()
+            except EquitySyncCommitDurabilityError:
+                # 三个主文件及三个新世代备份均已耐久落盘，这是事务提交点。
+                # journal 退场不确定只能降级并等待恢复确认，绝不能再写回旧世代。
+                raise
+            if journal_commit_uncertain:
+                raise EquitySyncCommitDurabilityError(
+                    '权益同步 journal 预提交时目录耐久性曾无法证明；'
+                    '新世代已完整落盘且 journal 已耐久退场，系统仍保持降级')
             return True
+        except EquitySyncCommitDurabilityError:
+            raise
         except Exception as commit_error:
             rollback_ok = True
+            rollback_errors = []
             for key, (path, _expected) in self._equity_sync_targets().items():
-                if not atomic_write_json(path, old_generation[key]):
+                try:
+                    if not self._atomic_write_json(path, old_generation[key]):
+                        raise OSError(f'回滚权益同步主文件失败: {path}')
+                except Exception as exc:
                     rollback_ok = False
-                if not atomic_write_json(path + '.bak', old_generation[key]):
+                    rollback_errors.append(exc)
+                try:
+                    if not self._atomic_write_json(
+                            path + '.bak', old_generation[key]):
+                        raise OSError(f'回滚权益同步备份失败: {path}.bak')
+                except Exception as exc:
                     rollback_ok = False
+                    rollback_errors.append(exc)
             if rollback_ok:
                 try:
                     self._remove_sync_journal()
-                except Exception:
+                except Exception as exc:
                     rollback_ok = False
+                    rollback_errors.append(exc)
             if rollback_ok:
                 raise EquityStatePersistenceError(
                     f'权益同步提交失败，旧一代已完整恢复: {commit_error}') from commit_error
             raise EquityStatePersistenceError(
-                f'权益同步提交且同步回滚均失败；journal 已保留，'
-                f'下次启动将前滚恢复: {commit_error}') from commit_error
+                f'权益同步提交且同步回滚均失败；恢复 journal 若仍可见，'
+                f'下次启动将前滚恢复（回滚错误 {len(rollback_errors)} 个）: '
+                f'{commit_error}') from commit_error
 
     @staticmethod
     def _validate_json_shape(data, expected_type, filepath):
@@ -286,7 +354,7 @@ class EquityTracker:
                 with open_private_text_file(backup) as f:
                     recovered = self._validate_json_shape(
                         load_strict_json(f), expected_type, backup)
-                if not atomic_write_json(filepath, recovered):
+                if not self._atomic_write_json(filepath, recovered):
                     raise OSError('备份可读但无法恢复主文件')
                 logger.warning('辅助状态主文件缺失，已从备份恢复: %s', backup)
                 return recovered
@@ -305,7 +373,7 @@ class EquityTracker:
                 with open_private_text_file(backup) as f:
                     recovered = self._validate_json_shape(
                         load_strict_json(f), expected_type, backup)
-                if not atomic_write_json(filepath, recovered):
+                if not self._atomic_write_json(filepath, recovered):
                     raise OSError('恢复后的状态无法写回主文件')
                 logger.warning('辅助状态已从备份恢复: %s', backup)
                 return recovered
@@ -323,11 +391,16 @@ class EquityTracker:
                 with open_private_text_file(filepath) as f:
                     current = self._validate_json_shape(
                         load_strict_json(f), expected_type, filepath)
-                if not atomic_write_json(filepath + '.bak', current):
+                if not self._atomic_write_json(filepath + '.bak', current):
                     raise OSError('无法写入状态备份')
-            if not atomic_write_json(filepath, data):
+            if not self._atomic_write_json(filepath, data):
                 raise OSError('原子写入失败')
             return True
+        except AtomicWriteCommitDurabilityError as e:
+            logger.critical('%s: %s: %s', label, filepath, e)
+            self.notify_failure(label, filepath)
+            raise EquityStatePersistenceError(
+                f'{label}: 文件已替换但目录耐久性不可证明: {filepath}') from e
         except Exception as e:
             logger.error('%s: %s: %s', label, filepath, e)
             self.notify_failure(label, filepath)

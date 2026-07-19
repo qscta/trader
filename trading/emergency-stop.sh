@@ -21,16 +21,23 @@ RELEASE_TRADING="$RELEASE_ROOT/trading"
 PYTHON="$RELEASE_TRADING/.venv/bin/python"
 DATA_DIR="/var/lib/trading-runtime/$RELEASE_SHA"
 CURRENT_TRADING=''
+CURRENT_DATA=''
+CURRENT_CONFIG=''
+CURRENT_SENTINEL=''
 OLD_RUNNER_LOCK_FILE=''
 START_BLOCK_DIR='/etc/systemd/system/trading.service.d'
 START_BLOCK="$START_BLOCK_DIR/00-deploy-closed.conf"
 START_AUTH='/run/trading-deploy-authorize-start'
 RELEASE_ENV='/etc/trading-release.env'
 EVIDENCE_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/deployment_evidence.py"
+OLD_GATE_HELPER="$(dirname -- "${BASH_SOURCE[0]}")/deployment_old_runner_gate.py"
 EVIDENCE_PYTHON='/usr/bin/python3'
 ACTION="${1:---stop-and-arm}"
+BOUNDARY_MODE="${2:-}"
+BOUNDARY_EVIDENCE="${3:-}"
 SHOULD_ARM=1
 GRACEFUL=0
+UNSET_ENV='LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_PROFILE GUNICORN_CMD_ARGS PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE PYTHONWARNINGS PYTHONBREAKPOINT PYTHONPYCACHEPREFIX PYTHONPLATLIBDIR PYTHONEXECUTABLE PYTHONCASEOK PYTHONHTTPSVERIFY HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE AWS_CA_BUNDLE OPENSSL_CONF OPENSSL_MODULES SSLKEYLOGFILE GRPC_DEFAULT_SSL_ROOTS_FILE_PATH'
 
 if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo 'emergency stop: release SHA was not rendered' >&2
@@ -95,7 +102,8 @@ install_start_block() {
 }
 
 verify_old_lock_contract() {
-  local direct envfiles envfile env_count=0 env_mode lock_line
+  local direct envfiles envfile env_count=0 env_mode lock_line data_line
+  local config_line sentinel_line
   sudo test -f /etc/trading.env || return 1
   test -f "$EVIDENCE_HELPER" && test ! -L "$EVIDENCE_HELPER" || return 1
   test "$(stat -c '%U:%G:%a' "$EVIDENCE_HELPER")" = root:root:555 || return 1
@@ -115,12 +123,18 @@ verify_old_lock_contract() {
     test "$?" -eq 1 || return 1
   fi
   direct="$(systemctl show trading.service -p Environment --value)" || return 1
-  case "$direct" in *TRADING_RUNNER_LOCK_FILE=*) return 1;; esac
+  case "$direct" in
+    *TRADING_RUNNER_LOCK_FILE=*|*TRADING_DATA_DIR=*|*TRADING_CONFIG_FILE=*|\
+    *TRADING_MAINTENANCE_SENTINEL=*) return 1 ;;
+  esac
   CURRENT_TRADING="$(systemctl show trading.service -p WorkingDirectory --value)" || return 1
   [[ "$CURRENT_TRADING" = "$LIVE_TRADING" ||
      "$CURRENT_TRADING" =~ ^/opt/trader-releases/[0-9a-f]{40}/trading$ ]] || return 1
   test "$(realpath -e -- "$CURRENT_TRADING")" = "$CURRENT_TRADING" || return 1
   test -d "$CURRENT_TRADING" && test ! -L "$CURRENT_TRADING" || return 1
+  CURRENT_DATA="$CURRENT_TRADING"
+  CURRENT_CONFIG="$CURRENT_TRADING/config.json"
+  CURRENT_SENTINEL="$CURRENT_TRADING/.maintenance_no_open"
   OLD_RUNNER_LOCK_FILE="$CURRENT_TRADING/.runtime/runner.lock"
   envfiles="$(systemctl show trading.service -p EnvironmentFiles --value)" || return 1
   while IFS= read -r envfile; do
@@ -134,13 +148,108 @@ verify_old_lock_contract() {
         sudo "$EVIDENCE_PYTHON" -I -B "$EVIDENCE_HELPER" validate-managed \
           --file "$RELEASE_ENV" --kind release_env || return 1
         lock_line="$(sudo sed -n 's/^TRADING_RUNNER_LOCK_FILE=//p' "$RELEASE_ENV")" || return 1
-        [[ -n "$lock_line" ]] || return 1
+        data_line="$(sudo sed -n 's/^TRADING_DATA_DIR=//p' "$RELEASE_ENV")" || return 1
+        config_line="$(sudo sed -n 's/^TRADING_CONFIG_FILE=//p' "$RELEASE_ENV")" || return 1
+        sentinel_line="$(sudo sed -n 's/^TRADING_MAINTENANCE_SENTINEL=//p' "$RELEASE_ENV")" || return 1
+        [[ -n "$lock_line" && -n "$data_line" && -n "$config_line" &&
+           -n "$sentinel_line" ]] || return 1
         OLD_RUNNER_LOCK_FILE="$lock_line"
+        CURRENT_DATA="$data_line"
+        CURRENT_CONFIG="$config_line"
+        CURRENT_SENTINEL="$sentinel_line"
         ;;
       *) return 1;;
     esac
   done < <(grep -oE '/[^ ;)]+' <<<"$envfiles")
-  test "$env_count" -eq 1
+  test "$env_count" -eq 1 || return 1
+  [[ "$CURRENT_DATA" = "$CURRENT_TRADING" ||
+     "$CURRENT_DATA" =~ ^/var/lib/trading-runtime/[0-9a-f]{40}$ ]] || return 1
+  test "$(realpath -e -- "$CURRENT_DATA")" = "$CURRENT_DATA" || return 1
+  test "$OLD_RUNNER_LOCK_FILE" = "$CURRENT_DATA/.runtime/runner.lock" || return 1
+  test "$CURRENT_CONFIG" = "$CURRENT_DATA/config.json" || return 1
+  test "$CURRENT_SENTINEL" = "$CURRENT_DATA/.maintenance_no_open" || return 1
+  test -f "$CURRENT_CONFIG" && test ! -L "$CURRENT_CONFIG"
+}
+
+old_gate_helper() {
+  sudo systemd-run --quiet --wait --collect --pipe \
+    --property=EnvironmentFile=/etc/trading.env \
+    --property="UnsetEnvironment=$UNSET_ENV" \
+    /usr/bin/python3 -I -B "$OLD_GATE_HELPER" "$@"
+}
+
+credential_mode() {
+  local required=$1
+  sudo systemd-run --quiet --wait --collect --pipe \
+    --uid=ubuntu --gid=ubuntu \
+    --property="WorkingDirectory=$RELEASE_TRADING" \
+    --property=EnvironmentFile=/etc/trading.env \
+    --property="UnsetEnvironment=$UNSET_ENV" \
+    "$PYTHON" -B -E "$RELEASE_TRADING/deployment_no_open_gate.py" \
+    credential-mode --config "$CURRENT_CONFIG" --require-mode "$required"
+}
+
+verify_planned_no_open_boundary() {
+  local state pid cgroup proof_tmp current_tmp rc
+  state="$(systemctl show trading.service -p ActiveState --value)" || return 1
+  case "$state" in
+    inactive|failed) return 0 ;;
+    active|activating|deactivating) ;;
+    *) return 1 ;;
+  esac
+  test -f "$OLD_GATE_HELPER" && test ! -L "$OLD_GATE_HELPER" || return 1
+  test "$(stat -c '%U:%G:%a' "$OLD_GATE_HELPER")" = root:root:555 || return 1
+  pid="$(systemctl show trading.service -p MainPID --value)" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  test "$(sudo realpath -e -- "/proc/$pid/cwd")" = "$CURRENT_TRADING" || return 1
+  cgroup="$(systemctl show trading.service -p ControlGroup --value)" || return 1
+  [[ "$cgroup" = /* && -f "/sys/fs/cgroup$cgroup/cgroup.procs" ]] || return 1
+  grep -Fxq "$pid" "/sys/fs/cgroup$cgroup/cgroup.procs" || return 1
+  if sudo -u ubuntu flock --nonblock "$OLD_RUNNER_LOCK_FILE" true; then
+    return 1
+  else
+    rc=$?
+    test "$rc" -eq 1 || return 1
+  fi
+
+  # Once the reviewed release itself is active, its exact sentinel is the
+  # persistent boundary for later drains and recovery.  The first legacy drain
+  # may use only the same-lock HTTP handshake or an exact read-only API key.
+  if [[ "$CURRENT_TRADING" = "$RELEASE_TRADING" ]]; then
+    old_gate_helper verify-release-sentinel \
+      --path "$CURRENT_SENTINEL" --release-sha "$RELEASE_SHA" >/dev/null
+    return
+  fi
+  case "$BOUNDARY_MODE" in
+    handshake)
+      [[ -n "$BOUNDARY_EVIDENCE" ]] || return 1
+      old_gate_helper verify-handshake --evidence "$BOUNDARY_EVIDENCE" \
+        --current-data "$CURRENT_DATA" --service-cgroup "$cgroup" >/dev/null
+      ;;
+    credential_read_only)
+      [[ -n "$BOUNDARY_EVIDENCE" ]] || return 1
+      proof_tmp="$(mktemp)" || return 1
+      current_tmp="$(mktemp)" || { rm -f -- "$proof_tmp"; return 1; }
+      if ! old_gate_helper credential-evidence \
+          --evidence "$BOUNDARY_EVIDENCE" >"$proof_tmp"; then
+        rm -f -- "$proof_tmp" "$current_tmp"
+        return 1
+      fi
+      if ! credential_mode read_only >"$current_tmp"; then
+        rm -f -- "$proof_tmp" "$current_tmp"
+        return 1
+      fi
+      if ! cmp -s -- "$proof_tmp" "$current_tmp"; then
+        rm -f -- "$proof_tmp" "$current_tmp"
+        return 1
+      fi
+      rm -f -- "$proof_tmp" "$current_tmp"
+      ;;
+    *) return 1 ;;
+  esac
+  # Refuse if the service identity changed during the final proof call.
+  test "$(systemctl show trading.service -p MainPID --value)" = "$pid" || return 1
+  grep -Fxq "$pid" "/sys/fs/cgroup$cgroup/cgroup.procs"
 }
 
 unit_exists() {
@@ -211,17 +320,21 @@ case "$ACTION" in
     SHOULD_ARM=0
     ;;
   *)
-    echo 'usage: emergency-stop.sh [--install-block-only|--graceful-stop-and-arm|--stop-and-arm|--stop-only]' >&2
+    echo 'usage: emergency-stop.sh [--install-block-only|--graceful-stop-and-arm [handshake|credential_read_only evidence]|--stop-and-arm|--stop-only]' >&2
     exit 2
     ;;
 esac
 
-if ! install_start_block; then
-  echo 'emergency stop refused: persistent formal-service block is not proven' >&2
-  exit 1
-fi
 if ! verify_old_lock_contract; then
   echo 'emergency stop refused: old runner lock path is overridden or unknown' >&2
+  exit 1
+fi
+if [[ "$GRACEFUL" -eq 1 ]] && ! verify_planned_no_open_boundary; then
+  echo 'emergency stop refused: planned no-open boundary is not proven' >&2
+  exit 1
+fi
+if ! install_start_block; then
+  echo 'emergency stop refused: persistent formal-service block is not proven' >&2
   exit 1
 fi
 

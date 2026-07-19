@@ -43,6 +43,9 @@ class _FakeNotifier:
 class DailySummaryDeliveryTest(unittest.TestCase):
     def _build_system(self, notify_result=True):
         system = TradingSystem.__new__(TradingSystem)
+        # 与正式 __init__ 的运行目录契约一致，避免维护门因夹具缺字段而
+        # fail-closed；本文件不会创建仓库目录下的维护哨兵。
+        system.base_dir = os.path.dirname(os.path.abspath(__file__))
         system.trade_state = SimpleNamespace(get_all_open_positions=lambda: {'BTCUSDT': {'side': 'long'}})
         system.config = {'trading': {'symbols': [{'name': 'BTCUSDT', 'enabled': True}]}}
         system.exchange_api = SimpleNamespace(get_balance=lambda: {'total': {'USDT': 1000}})

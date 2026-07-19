@@ -1421,6 +1421,9 @@ class OkxApi(ExchangeApi):
         compensation_remaining = (
             self._finite_nonnegative(compensation.get('remaining_amount'))
             if isinstance(compensation, dict) else None)
+        compensation_filled = (
+            self._finite_nonnegative(compensation.get('filled'))
+            if isinstance(compensation, dict) else None)
         if (compensation and compensation.get('confirmed') is True and
                 compensation.get('fully_closed') is True and
                 compensation_remaining == 0.0):
@@ -1429,7 +1432,7 @@ class OkxApi(ExchangeApi):
             try:
                 final_order = self._fetch_order_for_confirmation(
                     ccxt_symbol, cancel_ref, client_order_id)
-                terminal, _filled, _status = self._terminal_fill(
+                terminal, original_filled, _status = self._terminal_fill(
                     final_order, contracts, tolerance)
                 final_position = self.get_position(ccxt_symbol)
             except Exception as exc:
@@ -1437,7 +1440,16 @@ class OkxApi(ExchangeApi):
                     f'{ccxt_symbol} 补偿全平后原开仓终态复核失败: {exc}')
                 terminal = False
                 final_position = None
-            if terminal and not final_position:
+                original_filled = None
+            quantities_conserved = (
+                original_filled is not None and
+                original_filled > tolerance and
+                abs(original_filled - last_contracts) <= tolerance and
+                compensation_filled is not None and
+                compensation_filled > tolerance and
+                abs(compensation_filled - last_contracts) <= tolerance and
+                abs(compensation_filled - original_filled) <= tolerance)
+            if terminal and not final_position and quantities_conserved:
                 authoritative = self._sanitize_financial_evidence(final_order)
                 result = {
                     'id': authoritative.get('id') or cancel_ref,
@@ -1445,7 +1457,8 @@ class OkxApi(ExchangeApi):
                     'status': 'compensated_flat',
                     'confirmed': False,
                     'open_execution_compensated': True,
-                    'amount': self._contracts_to_coins(ccxt_symbol, last_contracts),
+                    'amount': self._contracts_to_coins(
+                        ccxt_symbol, original_filled),
                     'remaining_amount': 0.0,
                     'compensation': compensation,
                     'info': '原开仓已终态且 reduce-only 补偿后同轮确认全平',
@@ -1455,6 +1468,29 @@ class OkxApi(ExchangeApi):
                     if key in authoritative:
                         result[key] = authoritative[key]
                 return result
+            if terminal and not final_position and not quantities_conserved:
+                # flat 只证明当前净仓为零，不证明被补偿的仓全部来自本系统。
+                # 原单、补偿单与补偿前净仓三者必须同量，否则可能已经误平
+                # 人工同向仓；保留生命周期 blocker，绝不伪造一笔往返。
+                logger.critical(
+                    f'{ccxt_symbol} 补偿后虽为零仓，但原单成交、补偿成交与'
+                    '补偿前净仓不守恒；按开仓归因歧义保留句柄')
+                attributable = (
+                    original_filled if original_filled is not None and
+                    original_filled > tolerance else last_contracts)
+                return {
+                    'id': cancel_ref,
+                    'clientOrderId': client_order_id,
+                    'status': 'compensation_attribution_ambiguous',
+                    'confirmed': False,
+                    'open_execution_attribution_ambiguous': True,
+                    'amount': self._contracts_to_coins(
+                        ccxt_symbol, attributable),
+                    'observed_position_amount': 0.0,
+                    'remaining_amount': 0.0,
+                    'compensation': compensation,
+                    'info': '原开仓/补偿/净仓数量不守恒，拒绝消费执行句柄',
+                }
             observed = 0.0
             if final_position and final_position.get('contracts') is not None:
                 observed = self._contracts_to_coins(

@@ -21,12 +21,15 @@ DRIVER_FILES = (
     "recover-deployment.sh",
     "deployment_evidence.py",
     "deployment_attempt.py",
+    "deployment_old_runner_gate.py",
 )
 REVIEWED_INPUTS = {
-    "remove-one-confirmed-config-key.py": 0o755,
     "remove-one-confirmed-config-key.spec.json": 0o600,
     "writer-inventory.json": 0o600,
     "backup-script.patch": 0o600,
+}
+TRACKED_REVIEWED_INPUTS = {
+    "remove-one-confirmed-config-key.py": 0o755,
 }
 ROOT_UID = 0
 ROOT_GID = 0
@@ -362,7 +365,15 @@ def main(argv=None):
         "required_checks": sorted(args.required_check),
         "required_workflows": sorted(args.required_workflow),
         "reviewed_inputs": {
-            name: digest(args.reviewed_input / name) for name in REVIEWED_INPUTS},
+            **{
+                name: digest(args.reviewed_input / name)
+                for name in REVIEWED_INPUTS
+            },
+            **{
+                name: digest(trading / name)
+                for name in TRACKED_REVIEWED_INPUTS
+            },
+        },
         "backup_original_sha256": digest(original),
     }
     drivers = expected_drivers(trading, args.release_sha)
@@ -380,6 +391,8 @@ def main(argv=None):
         copy_reviewed(args.ci_runs, stage_tmp / "ci-workflow-runs.json")
         for name, mode in REVIEWED_INPUTS.items():
             copy_reviewed(args.reviewed_input / name, stage_tmp / name, mode)
+        for name, mode in TRACKED_REVIEWED_INPUTS.items():
+            copy_reviewed(trading / name, stage_tmp / name, mode)
         write_private(
             stage_tmp / "prepare-request.json",
             json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n")

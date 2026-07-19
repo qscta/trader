@@ -12,7 +12,13 @@ from unittest.mock import patch
 
 import trade_state as trade_state_module
 from runtime_guard import runner_lock_path
-from trade_state import TradeState, TradeStatePersistenceError, atomic_write_json
+from trade_state import (
+    AtomicWriteCommitDurabilityError,
+    TradeState,
+    TradeStateCommitDurabilityError,
+    TradeStatePersistenceError,
+    atomic_write_json,
+)
 
 
 def _closed_trade(symbol):
@@ -90,15 +96,40 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 TradeState.validate_state(payload)
 
-    def test_directory_fsync_failure_does_not_report_false_after_replace(self):
+    def test_directory_fsync_failure_reports_committed_but_not_durable(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'state.json')
             with patch.object(
                     trade_state_module.os, 'fsync',
                     side_effect=[None, OSError('directory fsync unavailable')]):
-                self.assertTrue(atomic_write_json(path, {'committed': True}))
+                with self.assertRaises(AtomicWriteCommitDurabilityError):
+                    atomic_write_json(path, {'committed': True})
             with open(path, 'r', encoding='utf-8') as f:
                 self.assertEqual(json.load(f), {'committed': True})
+
+    def test_main_replace_durability_failure_preserves_memory_and_latches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trade_state.json')
+            state = TradeState(path)
+            with patch.object(
+                    trade_state_module.os, 'fsync',
+                    side_effect=[None, OSError('directory fsync unavailable')]):
+                with self.assertRaises(TradeStateCommitDurabilityError):
+                    state.mark_candle_processed('BTCUSDT', 'c1')
+
+            self.assertEqual(
+                'c1', state.get_signal_metadata('BTCUSDT')[
+                    'last_processed_candle'])
+            self.assertEqual(
+                {
+                    'degraded': True,
+                    'context': 'state_directory_fsync_failed_after_replace',
+                },
+                state.get_runtime_persistence_status())
+            with open(path, 'r', encoding='utf-8') as f:
+                self.assertEqual(
+                    'c1', json.load(f)['signal_states']['BTCUSDT'][
+                        'last_processed_candle'])
 
     def test_backup_failure_aborts_commit_and_rolls_back_memory(self):
         with tempfile.TemporaryDirectory() as tmp:

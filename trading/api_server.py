@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
+import ipaddress
 import logging
 import threading
 import time
@@ -10,8 +11,17 @@ import os
 import secrets
 from datetime import datetime
 from trade_executor import safe_fill_price
-from trade_state import enrich_closed_trade_with_fees
-from runtime_guard import assess_runtime_health, runtime_data_path
+from trade_state import (
+    AtomicWriteCommitDurabilityError,
+    enrich_closed_trade_with_fees,
+)
+from runtime_guard import (
+    arm_maintenance_sentinel,
+    assess_runtime_health,
+    maintenance_sentinel_active,
+    maintenance_sentinel_path,
+    runtime_data_path,
+)
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
@@ -112,25 +122,24 @@ API_TOKEN = os.environ.get('TRADING_API_TOKEN')
 def _maintenance_no_open_active(environ=None, cwd=None):
     """Fail closed when the deployment sentinel exists or is malformed.
 
-    The explicit path is set by the deployment unit.  The cwd fallback keeps
-    the guard effective for the normal release service without another config
-    source.  Any object at the path activates maintenance; a symlink or odd
-    file must never turn writes back on.
+    The explicit path is set by the deployment unit; otherwise the initialized
+    system's canonical base directory is required.  Any object at the path
+    activates maintenance; a symlink or odd file must never turn writes back
+    on.
     """
+    system = globals().get('trading_system')
     env = os.environ if environ is None else environ
-    root = os.getcwd() if cwd is None else cwd
-    path = env.get(
-        'TRADING_MAINTENANCE_SENTINEL',
-        os.path.join(root, '.maintenance_no_open'))
-    if not isinstance(path, str) or not os.path.isabs(path):
-        return True
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
+    base_dir = getattr(system, 'base_dir', None)
+    if env.get('TRADING_MAINTENANCE_SENTINEL') is None and base_dir is None:
+        # Web 进程尚未绑定 runner（以及只测单一路由的最小桩）时，本层没有
+        # 可解析的运行目录，也没有任何可放行的开仓引擎。让各路由自行返回
+        # 未就绪/输入错误；真实开仓边界仍会因缺失 base_dir 独立 fail-closed。
         return False
-    except OSError:
-        return True
-    return True
+    path = maintenance_sentinel_path(
+        environ=environ,
+        base_dir=base_dir,
+        cwd=cwd)
+    return maintenance_sentinel_active(path)
 
 
 @app.before_request
@@ -389,7 +398,17 @@ def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_messag
     回滚为 backup，并返回 500 错误响应；成功则 reload 策略并返回 None。
     必须在固定顺序的 system._trade_lock → system._config_lock 内调用
     （写路由的统一收口，替代五处重复样板）。"""
-    if not _persist_config():
+    try:
+        persisted = _persist_config()
+    except AtomicWriteCommitDurabilityError:
+        # 文件已经 rename；回滚内存会制造配置双重现实。保留新配置并同步
+        # 策略对象，但明确返回降级，中央开仓门闩已经由 persist_config 拉起。
+        system.reload_strategies()
+        return jsonify({
+            'error': ('配置文件已替换，但目录耐久性不可证明；已保留新内存配置、'
+                      '系统已禁开仓，请修复存储并完整重启对账'),
+        }), 503
+    if not persisted:
         if sub_key is None:
             system.config[section_key] = backup
         else:
@@ -400,6 +419,82 @@ def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_messag
 
 
 # ============ 全局路由 ============
+
+
+def _request_is_loopback():
+    try:
+        return ipaddress.ip_address(request.remote_addr).is_loopback
+    except (TypeError, ValueError):
+        return False
+
+
+@app.route('/api/deployment/no-open-capability', methods=['GET'])
+@require_auth
+def deployment_no_open_capability():
+    """只读声明旧 runner 是否支持同锁禁开仓握手。"""
+    system, err = _require_system()
+    if err:
+        return err
+    if not _request_is_loopback():
+        return jsonify({'error': '部署握手只接受本机回环请求'}), 403
+    path = maintenance_sentinel_path(base_dir=getattr(system, 'base_dir', None))
+    gate = system._maintenance_open_gate_status()
+    return jsonify({
+        'protocol': 'trade-lock-no-open-v1',
+        'worker_pid': os.getpid(),
+        'sentinel_path': path,
+        'maintenance_active': (
+            isinstance(gate, dict) and
+            gate.get('status') == 'maintenance_blocked'),
+    })
+
+
+@app.route('/api/deployment/arm-no-open', methods=['POST'])
+@require_auth
+def deployment_arm_no_open():
+    """持有与全部交易路径相同的锁，落盘 sentinel 后才释放在途边界。"""
+    system, err = _require_system()
+    if err:
+        return err
+    if not _request_is_loopback():
+        return jsonify({'error': '部署握手只接受本机回环请求'}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or set(data) != {'release_sha', 'nonce'}:
+        return jsonify({'error': '部署握手字段必须精确为 release_sha / nonce'}), 400
+    if not system._trade_lock.acquire(timeout=120):
+        return jsonify({'error': '交易锁在 120 秒内未排空，拒绝部署握手'}), 503
+    try:
+        path = maintenance_sentinel_path(
+            base_dir=getattr(system, 'base_dir', None))
+        if maintenance_sentinel_active(path):
+            return jsonify({
+                'error': '旧 runner sentinel 已存在、路径非法或状态不可确认',
+            }), 409
+        payload, identity = arm_maintenance_sentinel(
+            path, data.get('release_sha'), data.get('nonce'), os.getpid())
+        gate = system._maintenance_open_gate_status()
+        if (not isinstance(gate, dict) or
+                gate.get('status') != 'maintenance_blocked' or
+                gate.get('sentinel_path') != path):
+            raise RuntimeError('sentinel 已写但交易引擎未返回 maintenance_blocked')
+        return jsonify({
+            'protocol': 'trade-lock-no-open-v1',
+            'status': 'maintenance_blocked',
+            'inflight_open_boundary_drained': True,
+            'sentinel': {
+                **payload,
+                'path': path,
+                'dev': identity['dev'],
+                'ino': identity['ino'],
+            },
+        })
+    except Exception as exc:
+        logger.exception(f'旧 runner 禁开仓握手失败: {exc}')
+        return jsonify({
+            'error': '禁开仓握手失败；任意已创建 sentinel 将继续保持维护态',
+        }), 503
+    finally:
+        system._trade_lock.release()
 
 @app.route('/')
 def index():
@@ -1183,8 +1278,20 @@ def instant_open():
                             'stop_order_id': new_position.get('stop_order_id'),
                         },
                     }), 409
-                status_code = 409 if outcome_status in {
-                    'rolled_back', 'order_unresolved', 'attribution_unresolved'} else 500
+                if outcome_status == 't1_blocked':
+                    return jsonify({
+                        'error': f'{symbol_name} 今天已有止损记录，T+1 禁止重新开仓',
+                        'outcome_status': outcome_status,
+                    }), 409
+                if outcome_status in {'maintenance_blocked', 'state_blocked'}:
+                    status_code = 503
+                elif outcome_status in {
+                    'rolled_back', 'order_unresolved', 'attribution_unresolved',
+                    'retired_blocked',
+                }:
+                    status_code = 409
+                else:
+                    status_code = 500
                 return jsonify({
                     'error': f'{symbol_name} 开仓未成功，请查看日志',
                     'outcome_status': outcome_status or 'unknown',

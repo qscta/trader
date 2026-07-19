@@ -16,7 +16,6 @@ _buffer_trade_open_notification / _buffer_trade_close_notification /
 
 import logging
 import math
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -24,8 +23,11 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from config_validation import strict_float_finite
-from runtime_guard import maintenance_sentinel_active
-from trade_state import TradeStatePersistenceError
+from runtime_guard import maintenance_sentinel_active, maintenance_sentinel_path
+from trade_state import (
+    TradeStateCommitDurabilityError,
+    TradeStatePersistenceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,15 @@ def safe_fill_price(order, fallback):
 class TradeExecutorMixin:
 
     _safe_fill_price = staticmethod(safe_fill_price)
+
+    def _maintenance_open_gate_status(self):
+        """API 握手与真实开仓共用同一解析/裁决，不允许两套 sentinel 路径。"""
+        path = maintenance_sentinel_path(
+            base_dir=getattr(self, 'base_dir', None))
+        return {
+            'status': 'maintenance_blocked',
+            'sentinel_path': path,
+        } if maintenance_sentinel_active(path) else None
 
     @staticmethod
     def _order_ids(order):
@@ -897,6 +908,12 @@ class TradeExecutorMixin:
                 close_intent_client_id=close_order.get(
                     'close_intent_client_id'))
             state_saved = True
+        except TradeStateCommitDurabilityError as e:
+            # 主账本 rename 已提交；新内存已经包含本次缩仓。再次 force 会
+            # 重复扣减，必须只读取专用异常携带的事务结果。
+            updated = e.committed_result
+            state_saved = False
+            self._notify_trade_state_persistence_issue(symbol, context, e)
         except TradeStatePersistenceError as e:
             try:
                 updated = self.trade_state.force_runtime_apply_partial_close(
@@ -1336,6 +1353,11 @@ class TradeExecutorMixin:
         try:
             updated = self.trade_state.add_open_after_partial_rollback(**kwargs)
             state_saved = True
+        except TradeStateCommitDurabilityError as exc:
+            updated = exc.committed_result
+            state_saved = False
+            self._notify_trade_state_persistence_issue(
+                symbol, f'{context}部分回滚余仓建账', exc)
         except TradeStatePersistenceError as exc:
             try:
                 updated = self.trade_state.force_runtime_add_open_after_partial_rollback(
@@ -1433,6 +1455,11 @@ class TradeExecutorMixin:
         try:
             updated = self.trade_state.add_untracked_open_position(**kwargs)
             state_saved = True
+        except TradeStateCommitDurabilityError as exc:
+            updated = exc.committed_result
+            state_saved = False
+            self._notify_trade_state_persistence_issue(
+                symbol, f'{context}完整余仓建账', exc)
         except TradeStatePersistenceError as exc:
             try:
                 updated = self.trade_state.force_runtime_add_untracked_open_position(
@@ -1990,17 +2017,45 @@ class TradeExecutorMixin:
         本边界只处理本调用新建的 open intent。崩溃恢复由 main 的
         只读 lifecycle 裁决器处理，不得重入本方法回放旧信号。
         """
-        no_open_path = os.environ.get('TRADING_MAINTENANCE_SENTINEL')
-        if no_open_path is None:
-            base_dir = getattr(self, 'base_dir', None)
-            no_open_path = (
-                os.path.join(base_dir, '.maintenance_no_open')
-                if isinstance(base_dir, str) else None)
-        if maintenance_sentinel_active(no_open_path):
+        maintenance_gate = self._maintenance_open_gate_status()
+        if maintenance_gate is not None:
+            no_open_path = maintenance_gate.get('sentinel_path')
             logger.warning(
                 f'{symbol} 部署禁开仓哨兵存在、路径非法或状态不可确认 '
                 f'({no_open_path!r})，按 fail-closed 阻断任何新开仓')
             return {'status': 'maintenance_blocked'}
+
+        # 目录 fsync 失败后的主账本虽然当前可见，但掉电后可能回退；该门闩
+        # 运行中不可清除。所有开仓入口必须在任何交易所 I/O 前统一拒绝。
+        try:
+            persistence = self.trade_state.get_runtime_persistence_status()
+            if (not isinstance(persistence, dict) or
+                    set(persistence) != {'degraded', 'context'} or
+                    not isinstance(persistence.get('degraded'), bool) or
+                    persistence.get('degraded')):
+                logger.critical(
+                    f'{symbol} 持久化健康状态降级或不可验证，中央边界禁开仓: '
+                    f'{persistence!r}')
+                return {'status': 'state_blocked'}
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 无法读取持久化健康状态，中央边界禁开仓: {exc}')
+            return {'status': 'state_blocked'}
+
+        # T+1 是系统级风险约束，不属于某个信号入口。直接读命脉账本，防止
+        # 即时开仓或未来新入口绕过当天止损标记；没有隐式人工 override。
+        try:
+            stop_loss_dates = self.trade_state.get_stop_loss_dates()
+            if not isinstance(stop_loss_dates, dict):
+                raise TypeError('stop_loss_dates 不是对象')
+            stopped_on = stop_loss_dates.get(symbol)
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 无法读取 T+1 状态，中央边界禁开仓: {exc}')
+            return {'status': 'state_blocked'}
+        if stopped_on == date.today().isoformat():
+            logger.warning(f'{symbol} 当天已有止损记录，中央边界执行 T+1 禁开仓')
+            return {'status': 't1_blocked'}
 
         retired = bool(
             symbol_config.get('_retired_from_pool') or

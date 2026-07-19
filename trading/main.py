@@ -16,7 +16,9 @@ from ma_cross_strategy import MaCrossStrategy
 from risk_manager import RiskManager
 from dingtalk_notifier import DingTalkNotifier
 from trade_state import (
-    TradeState, TradeStatePersistenceError, atomic_write_json,
+    AtomicWriteCommitDurabilityError, TradeState,
+    TradeStateCommitDurabilityError, TradeStatePersistenceError,
+    atomic_write_json,
     load_strict_json, open_private_text_file, owner_auxiliary_state_paths,
     private_file_exists, state_has_lifecycle_data,
     validate_okx_owner_manifest,
@@ -30,7 +32,7 @@ from signal_handlers import (
 from trade_executor import TradeExecutorMixin
 from runtime_guard import (
     acquire_runner_lock, assess_runtime_health, catchup_schedule_slot,
-    maintenance_sentinel_active, runtime_data_path,
+    runtime_data_path,
 )
 import config_validation as cfgv
 
@@ -86,6 +88,7 @@ _REQUIRED_TRADE_STATE_RUNTIME_METHODS = (
     'mark_stop_residue', 'force_runtime_mark_stop_residue',
     'has_stop_residue', 'get_stop_residues', 'clear_stop_residue',
     'get_runtime_persistence_status',
+    'mark_runtime_persistence_degraded',
     'replace_stop_loss_dates', 'get_stop_loss_dates',
     'stop_loss_dates_migrated',
     'remove_symbol_metadata', 'prune_inactive_symbol_metadata',
@@ -105,7 +108,8 @@ _REQUIRED_EXCHANGE_API_OVERRIDES = (
     'find_compensation_close_progress', 'confirm_stop_execution',
 )
 _REQUIRED_SYSTEM_RUNTIME_METHODS = (
-    '_execute_open', '_submit_persisted_close', '_handle_partial_close',
+    '_execute_open', '_maintenance_open_gate_status',
+    '_submit_persisted_close', '_handle_partial_close',
     '_cancel_stop_order_confirmed',
     '_close_trade_state_with_runtime_fallback',
     '_extract_usdt_fee', '_order_ids',
@@ -513,7 +517,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     disk_okx[key] = originals[key]
                 else:
                     disk_okx.pop(key, None)
-            return atomic_write_json(self.config_file, disk_config)
+            try:
+                return atomic_write_json(self.config_file, disk_config)
+            except AtomicWriteCommitDurabilityError:
+                # config 已替换，调用方不得回滚内存；同时复用交易账本的永久
+                # 降级门闩，使所有中央开仓入口立即 fail closed。
+                self.trade_state.mark_runtime_persistence_degraded(
+                    'config_directory_fsync_failed_after_replace')
+                raise
 
     def reload_strategies(self):
         """重新加载策略参数"""
@@ -1040,8 +1051,42 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         open_order = (outcome or {}).get('open_order') or {}
         open_evidence = self._authoritative_single_order_evidence(open_order)
         close_evidence = self._authoritative_single_order_evidence(close_order)
-        position_size = (outcome or {}).get('position_size') or intent.get(
-            'planned_position_size')
+        position_size = self._order_actual_amount(
+            {'amount': (outcome or {}).get('position_size')}, None)
+        open_amount = self._order_actual_amount(open_order, None)
+        close_amount = self._order_actual_amount(close_order, None)
+        conserved = False
+        if None not in (position_size, open_amount, close_amount):
+            tolerance = max(
+                1e-12,
+                math.ulp(max(position_size, open_amount, close_amount, 1.0)) * 8)
+            conserved = (
+                abs(position_size - open_amount) <= tolerance and
+                abs(position_size - close_amount) <= tolerance and
+                abs(open_amount - close_amount) <= tolerance)
+        if not conserved:
+            expected = self._order_actual_amount(
+                {'amount': intent.get('planned_position_size')}, None)
+            try:
+                compensation_id = (
+                    self.exchange_api.compensation_client_order_id(
+                        intent.get('client_order_id')))
+                if expected is not None:
+                    self._mark_unresolved_open_execution(
+                        symbol, intent.get('client_order_id'),
+                        'open_compensation', expected,
+                        '完整回滚数量不守恒，拒绝消费 open intent',
+                        {'open_amount': open_amount,
+                         'close_amount': close_amount,
+                         'outcome_position_size': position_size},
+                        compensation_client_order_id=compensation_id)
+            except Exception as exc:
+                logger.critical(
+                    f'{symbol} 完整回滚数量不守恒，且 lifecycle blocker '
+                    f'建立失败: {exc}')
+            self._quarantine_position_mismatch(
+                symbol, '完整回滚原开仓/补偿/结果数量不守恒')
+            return False
         if open_evidence is None or close_evidence is None:
             try:
                 compensation_id = (
@@ -1205,17 +1250,47 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 # 崩溃点可能在保护单 POST 之后；未查完整算法单
                 # 清单前严禁自动补挂第二张。
                 stop_residue_possible=True,
+                # 不能把重启时间当成未知保护单的新可见性起点；open intent
+                # 在首次外部写之前已落盘，是安全且更早的保守锚点。
+                stop_residue_marked_at=intent.get('created_at'),
                 open_intent_client_id=open_client_id,
                 requested_position_size=planned,
                 preserve_open_intent=True)
             try:
-                self.trade_state.add_untracked_open_position(**kwargs)
-            except TradeStatePersistenceError:
-                self.trade_state.force_runtime_add_untracked_open_position(
+                recovered_position = self.trade_state.add_untracked_open_position(
                     **kwargs)
+            except TradeStateCommitDurabilityError as exc:
+                # rename 已提交，新内存不能再 force 重放；进程门闩已禁开仓。
+                recovered_position = exc.committed_result
+                logger.critical(
+                    f'{symbol} provisional 已提交但账本目录耐久性不可证明；'
+                    '保留新内存并继续同栈建立风险保护')
+            except TradeStatePersistenceError:
+                recovered_position = (
+                    self.trade_state.force_runtime_add_untracked_open_position(
+                        **kwargs))
+            if not recovered_position:
+                raise RuntimeError('provisional 余仓未能进入运行时账本')
             logger.critical(
                 f'{symbol} 已用只读订单证据建立 provisional '
                 '余仓；未调用通用开仓/补偿 POST')
+            # 不能等下一轮 guardian：刚恢复出的真实余仓必须在同一交易锁调用栈
+            # 立刻按完整算法单清单裁决，并在旧 residue 宽限已过时 make-before-write。
+            refreshed_local = self.trade_state.get_open_position(symbol)
+            if not refreshed_local:
+                raise RuntimeError('provisional 落账后无法重新读取本地余仓')
+            try:
+                protected = self._protect_unresolved_lifecycle_position(
+                    symbol, self.trade_state.get_open_intent(symbol),
+                    refreshed_local)
+            except Exception as exc:
+                protected = False
+                logger.exception(
+                    f'{symbol} 崩溃恢复余仓本栈保护器异常；保留全部阻断: {exc}')
+            if not protected:
+                logger.critical(
+                    f'{symbol} 崩溃恢复余仓本栈未能严格确认 reduce-only 保护；'
+                    '保留 lifecycle blocker/quarantine 并等待下一轮巡检')
             return False
         except Exception as exc:
             self._quarantine_position_mismatch(
@@ -1771,9 +1846,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def check_and_execute_trades(self, manual_run=False, scheduled_date=None):
         """检查并执行交易"""
-        maintenance_path = os.environ.get('TRADING_MAINTENANCE_SENTINEL')
-        if (maintenance_path is not None and
-                maintenance_sentinel_active(maintenance_path)):
+        if self._maintenance_open_gate_status() is not None:
             logger.warning('部署维护哨兵生效：本次日检完全跳过且不标记完成')
             return
         # 三重防护：线程锁 + 日期检查 + APScheduler max_instances

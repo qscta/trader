@@ -18,6 +18,7 @@ RECOVER = ROOT / "recover-deployment.sh"
 PREPARE = ROOT / "prepare_deployment.py"
 ATTEMPT = ROOT / "deployment_attempt.py"
 GATE = ROOT / "deployment_no_open_gate.py"
+OLD_GATE = ROOT / "deployment_old_runner_gate.py"
 EVIDENCE = ROOT / "deployment_evidence.py"
 NOTES = ROOT / "DEPLOY_NOTES.md"
 PLACEHOLDER = "__RELEASE_SHA__"
@@ -26,6 +27,14 @@ TEST_SHA = "a" * 40
 
 def load_evidence_module():
     spec = importlib.util.spec_from_file_location("deployment_evidence", EVIDENCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_old_gate_module():
+    spec = importlib.util.spec_from_file_location(
+        "deployment_old_runner_gate", OLD_GATE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -40,8 +49,34 @@ class DeploymentArtifactTests(unittest.TestCase):
         cls.prepare = PREPARE.read_text(encoding="utf-8")
         cls.attempt = ATTEMPT.read_text(encoding="utf-8")
         cls.gate = GATE.read_text(encoding="utf-8")
+        cls.old_gate = OLD_GATE.read_text(encoding="utf-8")
         cls.notes = NOTES.read_text(encoding="utf-8")
         cls.evidence = load_evidence_module()
+        cls.old_gate_module = load_old_gate_module()
+
+    def test_old_runner_http_uses_strict_json(self):
+        response = SimpleNamespace(
+            status=200,
+            read=lambda _limit: b'{"protocol":"x","protocol":"y"}',
+        )
+        with mock.patch.dict(os.environ, {
+                "TRADING_API_TOKEN": "test-token"}), \
+                mock.patch.object(
+                    self.old_gate_module.urllib.request, "urlopen",
+                    return_value=response):
+            with self.assertRaisesRegex(
+                    self.old_gate_module.GateError, "duplicate|重复"):
+                self.old_gate_module._request("GET", "/test")
+
+        nonfinite = SimpleNamespace(
+            status=200, read=lambda _limit: b'{"value":NaN}')
+        with mock.patch.dict(os.environ, {
+                "TRADING_API_TOKEN": "test-token"}), \
+                mock.patch.object(
+                    self.old_gate_module.urllib.request, "urlopen",
+                    return_value=nonfinite):
+            with self.assertRaises(self.old_gate_module.GateError):
+                self.old_gate_module._request("GET", "/test")
 
     def test_shell_syntax_and_rendered_syntax(self):
         for path in (DEPLOY, EMERGENCY, RECOVER):
@@ -93,6 +128,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertTrue(self.prepare.startswith("#!/usr/bin/python3 -I\n"))
         self.assertIn("sys.flags.isolated", self.prepare)
         self.assertIn('os.path.realpath("/usr/bin/python3")', self.prepare)
+        self.assertIn("os.path.realpath('/usr/bin/python3')", self.old_gate)
         self.assertIn('"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"', self.prepare)
 
     def test_placeholder_is_single_and_consistent(self):
@@ -115,6 +151,52 @@ class DeploymentArtifactTests(unittest.TestCase):
                       self.emergency)
         self.assertIn('"ConditionPathExists=$START_AUTH"', self.emergency)
         self.assertNotIn("touch \"$START_AUTH\"", self.deploy)
+
+    def test_old_runner_boundary_is_proven_before_any_planned_stop(self):
+        old_identity = self.deploy.index(
+            "OLD_MAIN_PID=$(systemctl show trading.service -p MainPID")
+        old_lock = self.deploy.index(
+            "flock --nonblock \"$OLD_LOCK\" true", old_identity)
+        capability = self.deploy.index(
+            "if old_gate_client capability", old_lock)
+        runtime_root = self.deploy.index(
+            "if ! sudo test -e /var/lib/trading-runtime", capability)
+        first_stop = self.deploy.index(
+            '"$EMERGENCY" --graceful-stop-and-arm', runtime_root)
+        self.assertLess(old_identity, old_lock)
+        self.assertLess(old_lock, capability)
+        self.assertLess(capability, runtime_root)
+        self.assertLess(runtime_root, first_stop)
+        self.assertIn("verify-handshake", self.emergency)
+        self.assertIn("credential_mode read_only", self.emergency)
+        boundary = self.emergency.index(
+            'if [[ "$GRACEFUL" -eq 1 ]] && '
+            '! verify_planned_no_open_boundary')
+        install = self.emergency.index("if ! install_start_block; then", boundary)
+        timer_stop = self.emergency.index(
+            "sudo systemctl stop trading-state-backup.timer", install)
+        self.assertLess(boundary, install)
+        self.assertLess(install, timer_stop)
+
+    def test_bootstrap_trade_permission_is_restored_only_under_sentinel(self):
+        first_gate_check = self.deploy.index(
+            "check_maintenance_http_gate\nif [[ \"$OLD_GATE_MODE\" = "
+            "credential_read_only")
+        restore = self.deploy.index(
+            'credential_mode trade "$CONFIG"', first_gate_check)
+        final_stop = self.deploy.index(
+            '"$EMERGENCY" --graceful-stop-and-arm', restore)
+        seal = self.deploy.index("gate seal", final_stop)
+        second_start = self.deploy.index(
+            "sudo systemctl start trading.service", seal)
+        final_permission = self.deploy.index(
+            'credential_mode trade "$CONFIG"', second_start)
+        unblock = self.deploy.index('sudo rm -- "$START_BLOCK"', final_permission)
+        self.assertLess(first_gate_check, restore)
+        self.assertLess(restore, final_stop)
+        self.assertLess(final_permission, unblock)
+        self.assertIn('.permissions==["read_only","trade"]', self.deploy)
+        self.assertIn("禁止 withdraw", self.gate)
 
     def test_only_canonical_seal_commit_state_machine_remains(self):
         combined = self.deploy + self.emergency + self.gate
@@ -145,10 +227,10 @@ class DeploymentArtifactTests(unittest.TestCase):
 
     def test_completed_slot_and_two_quiescence_windows_precede_t0(self):
         schedule = self.deploy.index('SLOT=$(completed_slot "$SOURCE_DATA")')
-        migration = self.deploy.index(
-            '"$RELEASE_TRADING/migrate_single_strategy.py"', schedule)
         cleanup = self.deploy.index(
-            '--config "$SOURCE_DATA/config.json"', migration)
+            '--config "$SOURCE_DATA/config.json"', schedule)
+        migration = self.deploy.index(
+            '"$RELEASE_TRADING/migrate_single_strategy.py"', cleanup)
         runtime = self.deploy.index(
             'if ! sudo test -e /var/lib/trading-runtime')
         stop = self.deploy.index('"$EMERGENCY" --graceful-stop-and-arm')
@@ -158,9 +240,9 @@ class DeploymentArtifactTests(unittest.TestCase):
         phase = self.deploy.index("advance_phase PREPARED QUIESCED", q_order)
         baseline = self.deploy.index("gate baseline", phase)
         self.assertLess(schedule, runtime)
-        self.assertLess(schedule, migration)
-        self.assertLess(migration, cleanup)
-        self.assertLess(cleanup, runtime)
+        self.assertLess(schedule, cleanup)
+        self.assertLess(cleanup, migration)
+        self.assertLess(migration, runtime)
         self.assertLess(runtime, stop)
         self.assertLess(stop, probes)
         self.assertLess(probes, q_order)
@@ -173,7 +255,8 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertEqual(
             2, self.deploy.count('"$EMERGENCY" --graceful-stop-and-arm'))
         self.assertEqual(1, self.deploy.count(
-            '"$EMERGENCY" --stop-and-arm || true'))
+            '"$EMERGENCY" --stop-and-arm "$OLD_GATE_MODE" '
+            '"$OLD_GATE_EVIDENCE" || true'))
         graceful = self.emergency.index("graceful_stop_unit()")
         result = self.emergency.index('[[ "$result" = success ]]', graceful)
         fallback = self.emergency.index(
@@ -253,6 +336,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertIn('"--required-workflow"', self.prepare)
         self.assertIn("validate_driver(args.driver_dir, drivers)", self.prepare)
         self.assertIn("validate_stage(args.stage, descriptor)", self.prepare)
+        self.assertIn('"deployment_old_runner_gate.py"', self.prepare)
         driver_publish = self.prepare.index(
             "os.rename(driver_tmp, args.driver_dir)")
         stage_publish = self.prepare.index("os.rename(stage_tmp, args.stage)")
@@ -315,6 +399,7 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertNotIn("OKX_API_KEY=", combined)
         self.assertNotIn("TRADING_API_TOKEN=", combined)
         self.assertIn("EnvironmentFile=/etc/trading.env", self.deploy)
+        self.assertNotIn("apiSecret", self.old_gate)
 
     def test_evidence_exact_schema_expiry_and_bindings(self):
         module = self.evidence
@@ -477,6 +562,8 @@ class DeploymentArtifactTests(unittest.TestCase):
                 "host_process_inventory_complete": True,
                 "runtime_system_api_only_acknowledged": True,
                 "same_side_size_replacement_unattributable_acknowledged": True,
+                "public_history_okx_keys_revoked_and_activity_audited": True,
+                "public_history_dingtalk_webhooks_rotated": True,
             },
             "writers": [{
                 "id": f"reviewed-{kind}",
@@ -509,6 +596,22 @@ class DeploymentArtifactTests(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(
                     module.EvidenceError):
                 module.validate_writer_inventory_payload(bad, TEST_SHA)
+
+    def test_public_history_credential_gate_precedes_runtime_mutation(self):
+        exposure = self.deploy.index(
+            'credential_exposure "$SOURCE_DATA/config.json"')
+        writer_freeze = self.deploy.index(
+            'write_request writer_freeze', exposure)
+        old_gate = self.deploy.index('OLD_MAIN_PID=$(', writer_freeze)
+        runtime = self.deploy.index(
+            'if ! sudo test -e /var/lib/trading-runtime', old_gate)
+        self.assertLess(exposure, writer_freeze)
+        self.assertLess(writer_freeze, old_gate)
+        self.assertLess(old_gate, runtime)
+        self.assertIn(
+            'history_okx_keys_revoked_and_activity_audited=true',
+            self.deploy)
+        self.assertIn('history_dingtalk_webhooks_rotated=true', self.deploy)
 
     def test_all_python_boundaries_ignore_python_and_loader_injection(self):
         combined = self.deploy + self.emergency + self.recover

@@ -7,16 +7,22 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from equity_tracker import EquityStatePersistenceError, EquityTracker
+from equity_tracker import (
+    EquityStatePersistenceError,
+    EquitySyncCommitDurabilityError,
+    EquityTracker,
+)
+from trade_state import AtomicWriteCommitDurabilityError
 
 
 class EquityStatePersistenceTest(unittest.TestCase):
-    def _tracker(self, data_dir, notifications=None):
+    def _tracker(self, data_dir, notifications=None, system=None):
         notifications = notifications if notifications is not None else []
         return EquityTracker(
             data_dir,
-            SimpleNamespace(),
+            system or SimpleNamespace(),
             notify_failure=lambda label, path: notifications.append((label, path)),
         )
 
@@ -220,6 +226,106 @@ class EquityStatePersistenceTest(unittest.TestCase):
             self.assertEqual(new['qiusuo'], tracker.load_qiusuo_index_state())
             self.assertEqual(new['peak'], tracker.load_peak_equity())
             self.assertEqual(new['history'], tracker.load_equity_history())
+
+    def test_journal_retirement_failure_never_rolls_back_committed_generation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = self._tracker(temp_dir)
+            old = {
+                'peak': {'peak_equity': 1000, 'peak_time': None},
+                'history': {'initial_equity': 1000},
+                'qiusuo': {
+                    'base_index': 1853,
+                    'current_divisor': 1000 / 1853,
+                    'history': [],
+                },
+            }
+            new = {
+                'peak': {'peak_equity': 1500, 'peak_time': None},
+                'history': {'initial_equity': 1500},
+                'qiusuo': {
+                    'base_index': 1853,
+                    'current_divisor': 1500 / 1853,
+                    'history': [],
+                },
+            }
+            error = EquitySyncCommitDurabilityError('journal fsync failed')
+
+            with patch.object(
+                    tracker, '_remove_sync_journal', side_effect=error):
+                with self.assertRaises(EquitySyncCommitDurabilityError):
+                    tracker._commit_equity_sync_generation(old, new)
+
+            for key, (path, _expected) in tracker._equity_sync_targets().items():
+                with open(path, 'r', encoding='utf-8') as handle:
+                    self.assertEqual(new[key], json.load(handle))
+                with open(path + '.bak', 'r', encoding='utf-8') as handle:
+                    self.assertEqual(new[key], json.load(handle))
+            self.assertTrue(os.path.lexists(tracker.EQUITY_SYNC_JOURNAL_FILE))
+
+    def test_precommit_directory_ambiguity_is_finished_in_same_lock_stack(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = self._tracker(temp_dir)
+            old = {
+                'peak': {'peak_equity': 1000, 'peak_time': None},
+                'history': {'initial_equity': 1000},
+                'qiusuo': {
+                    'base_index': 1853,
+                    'current_divisor': 1000 / 1853,
+                    'history': [],
+                },
+            }
+            new = {
+                'peak': {'peak_equity': 1500, 'peak_time': None},
+                'history': {'initial_equity': 1500},
+                'qiusuo': {
+                    'base_index': 1853,
+                    'current_divisor': 1500 / 1853,
+                    'history': [],
+                },
+            }
+            real_write = tracker._atomic_write_json
+            injected = False
+
+            def ambiguous_journal_write(path, data):
+                nonlocal injected
+                written = real_write(path, data)
+                if path == tracker.EQUITY_SYNC_JOURNAL_FILE and not injected:
+                    injected = True
+                    raise AtomicWriteCommitDurabilityError(
+                        path, OSError('directory fsync'))
+                return written
+
+            with patch.object(
+                    tracker, '_atomic_write_json',
+                    side_effect=ambiguous_journal_write):
+                with self.assertRaises(EquitySyncCommitDurabilityError):
+                    tracker._commit_equity_sync_generation(old, new)
+
+            self.assertFalse(os.path.lexists(tracker.EQUITY_SYNC_JOURNAL_FILE))
+            for key, (path, _expected) in tracker._equity_sync_targets().items():
+                with open(path, 'r', encoding='utf-8') as handle:
+                    self.assertEqual(new[key], json.load(handle))
+                with open(path + '.bak', 'r', encoding='utf-8') as handle:
+                    self.assertEqual(new[key], json.load(handle))
+
+    def test_unlink_directory_fsync_failure_latches_and_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            degraded = []
+            system = SimpleNamespace(trade_state=SimpleNamespace(
+                mark_runtime_persistence_degraded=degraded.append))
+            tracker = self._tracker(temp_dir, system=system)
+            with open(
+                    tracker.EQUITY_SYNC_JOURNAL_FILE,
+                    'w', encoding='utf-8') as handle:
+                json.dump({'version': 1}, handle)
+
+            with patch('equity_tracker.os.fsync', side_effect=OSError('disk')):
+                with self.assertRaises(EquitySyncCommitDurabilityError):
+                    tracker._remove_sync_journal()
+
+            self.assertFalse(os.path.lexists(tracker.EQUITY_SYNC_JOURNAL_FILE))
+            self.assertEqual(
+                ['equity_journal_removal_not_durable'], degraded)
 
     def test_nonfinite_json_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

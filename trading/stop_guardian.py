@@ -14,7 +14,10 @@ import math
 import time
 from datetime import date, datetime
 
-from trade_state import TradeStatePersistenceError
+from trade_state import (
+    TradeStateCommitDurabilityError,
+    TradeStatePersistenceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +487,13 @@ class StopGuardianMixin:
                 symbol, stop_price, new_stop_id, stop_order_size=remaining,
                 extra_stop_order_ids=extra_ids,
                 stop_resize_pending=bool(extra_ids))
+        except TradeStateCommitDurabilityError as e:
+            updated = e.committed_result
+            self._notify_trade_state_persistence_issue(
+                symbol, '部分平仓止损缩量', e)
+            # 当前磁盘与内存都是新 ID，但掉电耐久性不可证明；门闩已经禁开仓，
+            # 本轮也不能清理 residue/隔离。
+            return False
         except TradeStatePersistenceError as e:
             updated = self.trade_state.force_runtime_update_stop_loss(
                 symbol, stop_price, new_stop_id, stop_order_size=remaining,
@@ -727,6 +737,10 @@ class StopGuardianMixin:
             closed_position = self.trade_state.close_position(
                 symbol, exit_price, **close_kwargs)
             state_saved = True
+        except TradeStateCommitDurabilityError as e:
+            closed_position = e.committed_result
+            self._notify_trade_state_persistence_issue(symbol, context, e)
+            state_saved = False
         except TradeStatePersistenceError as e:
             closed_position = self.trade_state.force_runtime_close_position(
                 symbol, exit_price, **close_kwargs)
@@ -751,6 +765,15 @@ class StopGuardianMixin:
         try:
             return self.trade_state.update_stop_loss(
                 symbol, new_stop_loss_price, stop_order_id, **kwargs), True
+        except TradeStateCommitDurabilityError as e:
+            position = e.committed_result
+            if notify_on_failure:
+                self._notify_trade_state_persistence_issue(symbol, context, e)
+            else:
+                logger.critical(
+                    f'{symbol} {context}主账本已替换但掉电耐久性不可证明；'
+                    '保留新内存并维持运行时隔离')
+            return position, False
         except TradeStatePersistenceError as e:
             position = self.trade_state.force_runtime_update_stop_loss(
                 symbol, new_stop_loss_price, stop_order_id, **kwargs)
@@ -763,8 +786,14 @@ class StopGuardianMixin:
             return position, False
 
     def _notify_trade_state_persistence_issue(self, symbol, context, exc):
-        msg = (f"{symbol} {context}后本地状态保存失败: {exc}。\n"
-               f"已执行运行时补偿，请立即核对交易所持仓、止损单和本地状态。")
+        if isinstance(exc, TradeStateCommitDurabilityError):
+            msg = (
+                f'{symbol} {context}后主账本已替换，但掉电耐久性不可证明: '
+                f'{exc}。\n已保留新内存且永久禁开仓；没有重放本次状态变更。'
+                '请立即核对磁盘、交易所持仓与止损单。')
+        else:
+            msg = (f"{symbol} {context}后本地状态保存失败: {exc}。\n"
+                   f"已执行运行时补偿，请立即核对交易所持仓、止损单和本地状态。")
         logger.critical(msg)
         self.notifier.notify_error(msg)
         self._quarantine_position_mismatch(

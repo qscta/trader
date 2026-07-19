@@ -3,8 +3,10 @@
 import copy
 import errno
 import fcntl
+import json
 import math
 import os
+import re
 import stat
 from datetime import timedelta
 from pathlib import Path
@@ -15,6 +17,7 @@ _SAFETY_BLOCKER_FIELDS = frozenset({
     'open_intents', 'close_intents',
     'position_quarantines', 'stop_residues',
 })
+DEPLOYMENT_ARM_NONCE_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
 def runtime_data_path(filename, environ=None, default_dir=None):
@@ -44,6 +47,103 @@ def maintenance_sentinel_active(path):
     except OSError:
         return True
     return True
+
+
+def maintenance_sentinel_path(environ=None, base_dir=None, cwd=None):
+    """解析 API 与交易引擎共用的唯一 sentinel 路径；非法输入保持 fail-closed。"""
+    env = os.environ if environ is None else environ
+    path = env.get('TRADING_MAINTENANCE_SENTINEL')
+    if path is None:
+        # 不暗猜进程 cwd：runner 丢失 base_dir 本身就是边界破坏，必须
+        # fail-closed。只有显式传入 cwd 的纯 Web/测试调用才允许该后备值。
+        root = base_dir if base_dir is not None else cwd
+        path = os.path.join(root, '.maintenance_no_open') \
+            if isinstance(root, str) else None
+    if (not isinstance(path, str) or not os.path.isabs(path) or
+            os.path.normpath(path) != path):
+        return None
+    return path
+
+
+def arm_maintenance_sentinel(path, release_sha, nonce, worker_pid):
+    """在持有交易锁时一次性创建并 fsync 旧 runner 实际读取的 sentinel。"""
+    if (maintenance_sentinel_path(
+            {'TRADING_MAINTENANCE_SENTINEL': path}) != path):
+        raise RuntimeError('maintenance sentinel path 必须是规范绝对路径')
+    if (not isinstance(release_sha, str) or
+            re.fullmatch(r'[0-9a-f]{40}', release_sha) is None):
+        raise RuntimeError('release_sha 必须是 40 位小写十六进制')
+    if (not isinstance(nonce, str) or
+            DEPLOYMENT_ARM_NONCE_RE.fullmatch(nonce) is None):
+        raise RuntimeError('deployment arm nonce 必须是 64 位小写十六进制')
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0:
+        raise RuntimeError('worker_pid 非法')
+
+    parent = os.path.dirname(path)
+    parent_info = os.lstat(parent)
+    current_uid = os.geteuid()
+    if (not stat.S_ISDIR(parent_info.st_mode) or
+            os.path.realpath(parent) != parent or
+            parent_info.st_uid != current_uid or
+            stat.S_IMODE(parent_info.st_mode) & 0o022):
+        raise RuntimeError(
+            'maintenance sentinel 父目录必须是当前用户独占写入的规范真实目录')
+    payload = {
+        'schema_version': 1,
+        'kind': 'old_runner_no_open',
+        'release_sha': release_sha,
+        'nonce': nonce,
+        'worker_pid': worker_pid,
+    }
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+             getattr(os, 'O_NOFOLLOW', 0))
+    fd = None
+    written_info = None
+    try:
+        fd = os.open(path, flags, 0o600)
+        with os.fdopen(fd, 'w', encoding='ascii') as handle:
+            fd = None
+            json.dump(payload, handle, sort_keys=True, separators=(',', ':'))
+            handle.write('\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+            written_info = os.fstat(handle.fileno())
+        dir_fd = None
+        try:
+            dir_fd = os.open(
+                parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) |
+                getattr(os, 'O_NOFOLLOW', 0))
+            opened_parent = os.fstat(dir_fd)
+            if ((parent_info.st_dev, parent_info.st_ino) !=
+                    (opened_parent.st_dev, opened_parent.st_ino)):
+                raise RuntimeError(
+                    'maintenance sentinel 父目录在创建期间被替换')
+            os.fsync(dir_fd)
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        # 创建后任何失败都保留对象：任意对象即维护态，删除反而会重新开门。
+        raise
+    info = os.lstat(path)
+    fsynced_identity = (
+        written_info.st_dev, written_info.st_ino, written_info.st_mode,
+        written_info.st_uid, written_info.st_gid, written_info.st_nlink,
+        written_info.st_size, written_info.st_mtime_ns,
+    )
+    visible_identity = (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_size, info.st_mtime_ns,
+    )
+    if (fsynced_identity != visible_identity or
+            not stat.S_ISREG(info.st_mode) or
+            stat.S_IMODE(info.st_mode) != 0o600 or
+            info.st_uid != current_uid or info.st_nlink != 1):
+        raise RuntimeError(
+            'maintenance sentinel 可见身份与已 fsync 文件不一致')
+    return payload, {'dev': info.st_dev, 'ino': info.st_ino}
 
 
 def catchup_schedule_slot(config, now):

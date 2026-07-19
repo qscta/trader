@@ -7,13 +7,15 @@
 
 import argparse
 import copy
+import importlib.util
 import os
 import stat
 import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import (TradeState, atomic_write_json,
+from trade_state import (AtomicWriteCommitDurabilityError, TradeState,
+                         atomic_write_json,
                          is_closed_trade_archive_candidate,
                          is_closed_trade_archive_name, load_strict_json,
                          open_private_text_file, owner_auxiliary_state_paths,
@@ -392,10 +394,34 @@ def _recover_interrupted_migration(data_dir):
         return False
 
 
-def run(data_dir, apply=False, config_path=None):
+def _preview_confirmed_config_cleanup(config_path, cleanup_spec, release_sha):
+    """只加载 release 内固定的受审清理实现，不接受外部可执行文件。"""
+    helper_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'remove-one-confirmed-config-key.py',
+    )
+    module_spec = importlib.util.spec_from_file_location(
+        '_reviewed_confirmed_config_cleanup', helper_path)
+    if module_spec is None or module_spec.loader is None:
+        raise RuntimeError('无法加载 release 内的受审配置清理工具')
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module.preview_config(config_path, cleanup_spec, release_sha)
+
+
+def run(data_dir, apply=False, config_path=None, cleanup_spec=None,
+        release_sha=None):
     data_dir = os.path.abspath(data_dir)
     config_path = os.path.abspath(
         config_path or os.path.join(data_dir, 'config.json'))
+    if bool(cleanup_spec) != bool(release_sha):
+        print('[阻断] cleanup spec 预览必须同时提供 spec 与 release SHA')
+        return EXIT_UNSAFE
+    if apply and cleanup_spec:
+        print('[阻断] cleanup spec 只允许用于只读干跑；apply 必须读已清理的实文件')
+        return EXIT_UNSAFE
+    if cleanup_spec:
+        cleanup_spec = os.path.abspath(cleanup_spec)
     directory_error = _validate_data_dir(data_dir, config_path)
     if directory_error:
         print(f'[阻断] {directory_error}')
@@ -437,12 +463,18 @@ def run(data_dir, apply=False, config_path=None):
     blockers = []
     for kind, path in targets:
         try:
-            original = _load_json(path)
             if kind == 'config':
+                if cleanup_spec:
+                    original = _preview_confirmed_config_cleanup(
+                        path, cleanup_spec, release_sha)
+                else:
+                    original = _load_json(path)
                 result = normalize_config(original)
             elif kind == 'archive':
+                original = _load_json(path)
                 result = normalize_archive(original)
             else:
+                original = _load_json(path)
                 result = normalize_ledger(original)
             cleaned, report, target_blockers = result
             originals[path] = original
@@ -490,7 +522,12 @@ def run(data_dir, apply=False, config_path=None):
     backups = {}
     for path in changed:
         backup = f'{path}.premigrate.{stamp}'
-        if not atomic_write_json(backup, originals[path]):
+        try:
+            backup_saved = atomic_write_json(backup, originals[path])
+        except AtomicWriteCommitDurabilityError as exc:
+            print(f'[失败] 备份已替换但目录耐久性不可证明；原文件未改动: {exc}')
+            return EXIT_BACKUP_FAILED
+        if not backup_saved:
             print(f'[失败] 备份失败，所有原文件均未改动: {backup}')
             return EXIT_BACKUP_FAILED
         backups[path] = backup
@@ -501,12 +538,23 @@ def run(data_dir, apply=False, config_path=None):
         'items': [
             {'target': path, 'backup': backups[path]} for path in changed],
     }
-    if not atomic_write_json(journal_path, journal):
+    try:
+        journal_saved = atomic_write_json(journal_path, journal)
+    except AtomicWriteCommitDurabilityError as exc:
+        print(f'[失败] 迁移 journal 已替换但目录耐久性不可证明: {exc}')
+        return EXIT_BACKUP_FAILED
+    if not journal_saved:
         print('[失败] 无法建立迁移事务日志；所有原文件均未改动。')
         return EXIT_BACKUP_FAILED
 
     for path in changed:
-        if atomic_write_json(path, normalized[path]):
+        try:
+            target_saved = atomic_write_json(path, normalized[path])
+        except AtomicWriteCommitDurabilityError as exc:
+            print(f'[失败] 目标已替换但目录耐久性不可证明，开始整组恢复: {exc}')
+            restore_ok = _recover_interrupted_migration(data_dir)
+            return EXIT_WRITE_FAILED if restore_ok else EXIT_RESTORE_FAILED
+        if target_saved:
             continue
         print(f'[失败] 写入失败，开始恢复已写文件: {path}')
         restore_ok = _recover_interrupted_migration(data_dir)
@@ -527,8 +575,18 @@ def main():
     parser.add_argument('--data-dir', required=True, help='trade_state.json 所在目录')
     parser.add_argument('--config', help='config.json 路径；默认与账本同目录')
     parser.add_argument('--apply', action='store_true', help='备份后实际写入')
+    parser.add_argument(
+        '--cleanup-spec', help='只读干跑时预览受审单键清理 spec')
+    parser.add_argument(
+        '--release-sha', help='cleanup spec 所绑定的完整 release SHA')
     args = parser.parse_args()
-    return run(args.data_dir, apply=args.apply, config_path=args.config)
+    return run(
+        args.data_dir,
+        apply=args.apply,
+        config_path=args.config,
+        cleanup_spec=args.cleanup_spec,
+        release_sha=args.release_sha,
+    )
 
 
 if __name__ == '__main__':

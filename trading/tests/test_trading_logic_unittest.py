@@ -53,6 +53,8 @@ def _prep_system(system, persist=True):
     system._trade_lock = threading.RLock()
     system.persist_config = lambda: persist
     system.config_file = "config.json"
+    if not hasattr(system, 'base_dir'):
+        system.base_dir = str(APP_DIR)
     return system
 
 
@@ -336,6 +338,39 @@ class InstantOpenApiTests(unittest.TestCase):
         self.assertEqual(stop_loss_price, 100)
         self.assertNotIn("strategy", symbol_config)
         fake_system.exchange_api.fetch_ohlcv.assert_called_once_with("BTC/USDT", "1d", limit=300)
+
+    def test_instant_open_reports_central_t1_block_as_conflict(self):
+        self.authenticate()
+        fake_system = self.make_system()
+        fake_system._execute_open = Mock(return_value={'status': 't1_blocked'})
+
+        with patch.object(
+                api_server, 'trading_system', _prep_system(fake_system)), \
+                patch.object(api_server, 'send_dingtalk', Mock()):
+            resp = self.client.post('/api/instant_open', json={
+                'name': 'BTCUSDT', 'risk_per_trade': 0.01})
+
+        self.assertEqual(409, resp.status_code)
+        self.assertEqual('t1_blocked', resp.get_json()['outcome_status'])
+
+    def test_instant_open_reports_runtime_gates_as_unavailable(self):
+        self.authenticate()
+        for outcome_status in ('maintenance_blocked', 'state_blocked'):
+            with self.subTest(outcome_status=outcome_status):
+                fake_system = self.make_system()
+                fake_system._execute_open = Mock(
+                    return_value={'status': outcome_status})
+
+                with patch.object(
+                        api_server, 'trading_system',
+                        _prep_system(fake_system)), patch.object(
+                            api_server, 'send_dingtalk', Mock()):
+                    resp = self.client.post('/api/instant_open', json={
+                        'name': 'BTCUSDT', 'risk_per_trade': 0.01})
+
+                self.assertEqual(503, resp.status_code)
+                self.assertEqual(
+                    outcome_status, resp.get_json()['outcome_status'])
 
     def test_instant_open_uses_single_page_at_capacity_boundary(self):
         self.authenticate()
@@ -851,6 +886,9 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
                 side_effect=add_untracked),
             get_open_position=Mock(return_value=None),
             get_open_intent=Mock(side_effect=get_open_intent),
+            get_runtime_persistence_status=Mock(return_value={
+                'degraded': False, 'context': None}),
+            get_stop_loss_dates=Mock(return_value={}),
             prepare_open_intent=Mock(side_effect=prepare_open_intent),
             is_position_quarantined=Mock(return_value=False),
             has_stop_residue=Mock(return_value=False),
@@ -1558,7 +1596,9 @@ class AccountStatsPersistenceTests(unittest.TestCase):
                 get_balance=Mock(return_value=self.make_balance()),
                 exchange=SimpleNamespace(fetch_ticker=Mock(return_value={"last": 100})),
             ),
-            trade_state=SimpleNamespace(get_all_open_positions=Mock(return_value={})),
+            trade_state=SimpleNamespace(
+                get_all_open_positions=Mock(return_value={}),
+                mark_runtime_persistence_degraded=Mock()),
         )
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -1597,6 +1637,21 @@ class AccountStatsPersistenceTests(unittest.TestCase):
                 tracker.record_daily_equity_snapshot()
 
         self.assertTrue(any("记录权益快照失败" in line for line in logs.output))
+
+    def test_equity_committed_but_not_durable_latches_trading_process(self):
+        tracker = self.make_tracker()
+        failure = trade_state.AtomicWriteCommitDurabilityError(
+            tracker.PEAK_EQUITY_FILE, OSError('directory fsync failed'))
+
+        with patch.object(
+                equity_tracker, 'atomic_write_json', side_effect=failure), \
+                self.assertRaises(
+                    trade_state.AtomicWriteCommitDurabilityError):
+            tracker._atomic_write_json(
+                tracker.PEAK_EQUITY_FILE, {'peak_equity': 10000})
+
+        tracker.system.trade_state.mark_runtime_persistence_degraded.assert_called_once_with(
+            'equity_directory_fsync_failed_after_replace')
 
 
 class TradeStateIsolationTests(unittest.TestCase):

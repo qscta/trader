@@ -32,10 +32,15 @@ readonly DRIVER_DIR="/usr/local/lib/trading-deploy/$RELEASE_SHA"
 readonly EMERGENCY="$DRIVER_DIR/emergency-stop.sh"
 readonly EVIDENCE_HELPER="$DRIVER_DIR/deployment_evidence.py"
 readonly ATTEMPT_HELPER="$DRIVER_DIR/deployment_attempt.py"
+readonly OLD_GATE_HELPER="$DRIVER_DIR/deployment_old_runner_gate.py"
 readonly EVIDENCE_PYTHON='/usr/bin/python3'
 SOURCE_TRADING=''
 SOURCE_DATA=''
 OLD_LOCK=''
+OLD_GATE_MODE=''
+OLD_GATE_EVIDENCE=''
+OLD_GATE_EVIDENCE_SHA=''
+OLD_GATE_FINGERPRINT=''
 readonly RELEASE_LOCK="$RUNTIME_ROOT/.runtime/runner.lock"
 readonly START_BLOCK='/etc/systemd/system/trading.service.d/00-deploy-closed.conf'
 readonly START_AUTH='/run/trading-deploy-authorize-start'
@@ -131,7 +136,7 @@ fail_safe() {
   trap - ERR EXIT HUP INT TERM
   if [[ "$DEPLOY_COMPLETE" -eq 0 && "$FAIL_SAFE_ACTIVE" -eq 0 ]]; then
     FAIL_SAFE_ACTIVE=1
-    "$EMERGENCY" --stop-and-arm || true
+    "$EMERGENCY" --stop-and-arm "$OLD_GATE_MODE" "$OLD_GATE_EVIDENCE" || true
   fi
   exit "$rc"
 }
@@ -273,6 +278,7 @@ verify_reviewed_materials() {
   test "$(sha256 "$EMERGENCY")" = "$REVIEWED_EMERGENCY_SHA"
   test "$(sha256 "$EVIDENCE_HELPER")" = "$REVIEWED_EVIDENCE_SHA"
   test "$(sha256 "$ATTEMPT_HELPER")" = "$REVIEWED_ATTEMPT_SHA"
+  test "$(sha256 "$OLD_GATE_HELPER")" = "$REVIEWED_OLD_GATE_SHA"
   test "$(git -c safe.directory="$RELEASE_ROOT" -C "$RELEASE_ROOT" rev-parse HEAD)" = "$RELEASE_SHA"
   git -c safe.directory="$RELEASE_ROOT" -C "$RELEASE_ROOT" diff --quiet
   git -c safe.directory="$RELEASE_ROOT" -C "$RELEASE_ROOT" diff --cached --quiet
@@ -345,6 +351,35 @@ completed_slot() {
     --config "$data_dir/config.json" --data-dir "$data_dir"
 }
 
+old_gate_client() {
+  sudo systemd-run --quiet --wait --collect --pipe \
+    --property=EnvironmentFile=/etc/trading.env \
+    --property="UnsetEnvironment=$UNSET_ENV" \
+    /usr/bin/python3 -I -B "$OLD_GATE_HELPER" "$@"
+}
+
+credential_mode() {
+  local required=$1 config_path=$2
+  sudo systemd-run --quiet --wait --collect --pipe \
+    --uid=ubuntu --gid=ubuntu \
+    --property="WorkingDirectory=$RELEASE_TRADING" \
+    --property=EnvironmentFile=/etc/trading.env \
+    --property="UnsetEnvironment=$UNSET_ENV" \
+    "$PYTHON" -B -E "$RELEASE_TRADING/deployment_no_open_gate.py" \
+    credential-mode --config "$config_path" --require-mode "$required"
+}
+
+credential_exposure() {
+  local config_path=$1
+  sudo systemd-run --quiet --wait --collect --pipe \
+    --uid=ubuntu --gid=ubuntu \
+    --property="WorkingDirectory=$RELEASE_TRADING" \
+    --property=EnvironmentFile=/etc/trading.env \
+    --property="UnsetEnvironment=$UNSET_ENV" \
+    "$PYTHON" -B -E "$RELEASE_TRADING/deployment_no_open_gate.py" \
+    credential-exposure --config "$config_path"
+}
+
 [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || die 'release SHA placeholder not rendered'
 for command in awk bash flock git grep jq openssl realpath rsync sha256sum \
     ss stat sudo systemctl systemd-analyze systemd-run tar; do
@@ -356,6 +391,7 @@ assert_protected_file "$SELF" 555
 assert_protected_file "$EMERGENCY" 555
 assert_protected_file "$EVIDENCE_HELPER" 555
 assert_protected_file "$ATTEMPT_HELPER" 555
+assert_protected_file "$OLD_GATE_HELPER" 555
 test -x "$EVIDENCE_PYTHON"
 test "$(stat -c '%U:%G' "$DRIVER_DIR")" = root:root
 test "$(( 8#$(stat -c '%a' "$DRIVER_DIR") & 8#022 ))" -eq 0
@@ -363,16 +399,38 @@ assert_protected_dir /opt/trader-releases
 assert_protected_dir "$RELEASE_ROOT"
 test -x "$PYTHON"
 test "$(realpath -e -- "$RELEASE_TRADING")" = "$RELEASE_TRADING"
-test -f "$EVIDENCE_HELPER" && test -f "$ATTEMPT_HELPER"
+test -f "$EVIDENCE_HELPER" && test -f "$ATTEMPT_HELPER" && \
+  test -f "$OLD_GATE_HELPER"
 cd "$RELEASE_TRADING"
 test "$(systemctl show trading.service -p User --value)" = ubuntu
+SOURCE_DIRECT_ENV=$(systemctl show trading.service -p Environment --value)
+case "$SOURCE_DIRECT_ENV" in
+  *TRADING_RUNNER_LOCK_FILE=*|*TRADING_DATA_DIR=*|*TRADING_CONFIG_FILE=*|\
+  *TRADING_MAINTENANCE_SENTINEL=*)
+    die 'old trading.service directly overrides a deployment-owned runtime path'
+    ;;
+esac
 SOURCE_TRADING=$(systemctl show trading.service -p WorkingDirectory --value)
 [[ "$SOURCE_TRADING" = "$LIVE_TRADING" ||
    "$SOURCE_TRADING" =~ ^/opt/trader-releases/[0-9a-f]{40}/trading$ ]]
 test "$(realpath -e -- "$SOURCE_TRADING")" = "$SOURCE_TRADING"
 test -d "$SOURCE_TRADING" && test ! -L "$SOURCE_TRADING"
 SOURCE_DATA="$SOURCE_TRADING"
-if sudo test -f "$RELEASE_ENV" && sudo test ! -L "$RELEASE_ENV"; then
+source_env_count=0
+release_env_attached=0
+while IFS= read -r source_envfile; do
+  [[ -n "$source_envfile" ]] || continue
+  case "$source_envfile" in
+    /etc/trading.env) source_env_count=$((source_env_count + 1)) ;;
+    "$RELEASE_ENV") release_env_attached=$((release_env_attached + 1)) ;;
+    *) die "unreviewed trading.service EnvironmentFile: $source_envfile" ;;
+  esac
+done < <(systemctl show trading.service -p EnvironmentFiles --value | \
+  grep -oE '/[^ ;)]+' || true)
+test "$source_env_count" -eq 1
+test "$release_env_attached" -le 1
+if [[ "$release_env_attached" -eq 1 ]]; then
+  sudo test -f "$RELEASE_ENV" && sudo test ! -L "$RELEASE_ENV"
   sudo "$EVIDENCE_PYTHON" -I -B "$EVIDENCE_HELPER" validate-managed \
     --file "$RELEASE_ENV" --kind release_env
   configured_data=$(sudo sed -n 's/^TRADING_DATA_DIR=//p' "$RELEASE_ENV")
@@ -471,6 +529,7 @@ PREFLIGHT=(
   "emergency_sha256=$(sha256 "$EMERGENCY")"
   "evidence_helper_sha256=$(sha256 "$EVIDENCE_HELPER")"
   "attempt_helper_sha256=$(sha256 "$ATTEMPT_HELPER")"
+  "old_gate_helper_sha256=$(sha256 "$OLD_GATE_HELPER")"
   "tracked_manifest_sha256=$(sudo sha256sum "$DEPLOY_STAGE/reviewed-tracked.sha256"|awk '{print $1}')"
   "assets_manifest_sha256=$(sudo sha256sum "$DEPLOY_STAGE/reviewed-assets.sha256"|awk '{print $1}')"
   "ci_checks_sha256=$(sudo sha256sum "$DEPLOY_STAGE/ci-check-runs.json"|awk '{print $1}')"
@@ -482,7 +541,27 @@ readonly REVIEWED_DEPLOY_SHA="${PREFLIGHT[0]#*=}"
 readonly REVIEWED_EMERGENCY_SHA="${PREFLIGHT[1]#*=}"
 readonly REVIEWED_EVIDENCE_SHA="${PREFLIGHT[2]#*=}"
 readonly REVIEWED_ATTEMPT_SHA="${PREFLIGHT[3]#*=}"
+readonly REVIEWED_OLD_GATE_SHA="${PREFLIGHT[4]#*=}"
 verify_reviewed_materials
+EXPOSURE_TMP=$(mktemp)
+credential_exposure "$SOURCE_DATA/config.json" >"$EXPOSURE_TMP"
+jq -e '
+  type=="object" and
+  keys==["account_domain","current_dingtalk_matches_exposed_history",
+    "current_okx_key_matches_exposed_history","dingtalk_configured",
+    "incident_commit"] and
+  .account_domain=="live" and
+  .incident_commit=="38ac63646d2e18ba9d238856b124594b4691f252" and
+  .current_okx_key_matches_exposed_history==false and
+  .current_dingtalk_matches_exposed_history==false and
+  (.dingtalk_configured|type=="boolean")
+' "$EXPOSURE_TMP" >/dev/null
+readonly EXPOSURE_EVIDENCE="$ATTEMPT_STAGE/public-history-exposure.json"
+sudo test ! -e "$EXPOSURE_EVIDENCE" && sudo test ! -L "$EXPOSURE_EVIDENCE"
+sudo install -o root -g root -m 0600 "$EXPOSURE_TMP" "$EXPOSURE_EVIDENCE"
+rm -f -- "$EXPOSURE_TMP"
+EXPOSURE_EVIDENCE_SHA=$(sudo sha256sum "$EXPOSURE_EVIDENCE" | awk '{print $1}')
+readonly EXPOSURE_EVIDENCE_SHA
 SLOT=$(completed_slot "$SOURCE_DATA") ||
   die 'current schedule day is not complete; production was left running'
 [[ "$SLOT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
@@ -490,12 +569,24 @@ readonly SLOT
 # Reject every already-known migration/config blocker while the old runner is
 # still untouched.  The same checks run again against the stopped copy below
 # so this early screen cannot hide a race.
-sudo -u ubuntu env -i PATH=/usr/bin:/bin "$PYTHON" -B -E \
-  "$RELEASE_TRADING/migrate_single_strategy.py" \
-  --data-dir "$SOURCE_DATA" >/dev/null
 sudo env -i PATH=/usr/bin:/bin "$PYTHON" -B -E "$CLEANUP" \
-  --check --code-dir "$RELEASE_TRADING" \
+  --check --release-sha "$RELEASE_SHA" \
   --config "$SOURCE_DATA/config.json" --spec "$SPEC"
+(
+  # The reviewed spec contains only hashes/key path, never credentials.  Its
+  # root-owned 0644 /run copy is readable but not writable by the live runner;
+  # the subshell EXIT trap removes it on both success and failure.
+  PREVIEW_SPEC=$(sudo mktemp /run/trading-cleanup-preview.XXXXXX)
+  trap 'sudo rm -f -- "$PREVIEW_SPEC"' EXIT
+  sudo install -o root -g root -m 0644 "$SPEC" "$PREVIEW_SPEC"
+  test "$(sudo stat -c '%U:%G:%a:%h' "$PREVIEW_SPEC")" = root:root:644:1
+  test "$(sudo sha256sum "$PREVIEW_SPEC" | awk '{print $1}')" = \
+    "$(sudo sha256sum "$SPEC" | awk '{print $1}')"
+  sudo -u ubuntu env -i PATH=/usr/bin:/bin "$PYTHON" -B -E \
+    "$RELEASE_TRADING/migrate_single_strategy.py" \
+    --data-dir "$SOURCE_DATA" --cleanup-spec "$PREVIEW_SPEC" \
+    --release-sha "$RELEASE_SHA" >/dev/null
+)
 WRITER_FREEZE=(
   "inventory_sha256=$(sudo sha256sum "$DEPLOY_STAGE/writer-inventory.json"|awk '{print $1}')"
   "deploy_sha256=$REVIEWED_DEPLOY_SHA"
@@ -506,11 +597,87 @@ WRITER_FREEZE=(
   "host_process_inventory_complete=true"
   "runtime_system_api_only_acknowledged=true"
   "replacement_identity_limitation_acknowledged=true"
+  "history_okx_keys_revoked_and_activity_audited=true"
+  "history_dingtalk_webhooks_rotated=true"
+  "credential_exposure_sha256=$EXPOSURE_EVIDENCE_SHA"
 )
 write_request writer_freeze "$ATTEMPT_STAGE/writer-freeze.approval.json" \
   "${WRITER_FREEZE[@]}"
 wait_approval writer_freeze "$ATTEMPT_STAGE/writer-freeze.approval.json" \
   "${WRITER_FREEZE[@]}"
+
+# G0 is established while the old service is still the only writer.  A
+# handshake-capable runner takes the same _trade_lock as every open path,
+# creates its actual sentinel, and releases the lock only after fsync.  The
+# one-time bootstrap for older releases is allowed only when OKX itself reports
+# this exact key as read_only; a missing endpoint never falls through to stop.
+OLD_MAIN_PID=$(systemctl show trading.service -p MainPID --value)
+[[ "$OLD_MAIN_PID" =~ ^[1-9][0-9]*$ ]]
+test "$(systemctl show trading.service -p ActiveState --value)" = active
+test "$(sudo realpath -e -- "/proc/$OLD_MAIN_PID/cwd")" = "$SOURCE_TRADING"
+OLD_CGROUP=$(systemctl show trading.service -p ControlGroup --value)
+[[ "$OLD_CGROUP" = /* && -f "/sys/fs/cgroup$OLD_CGROUP/cgroup.procs" ]]
+grep -Fxq "$OLD_MAIN_PID" "/sys/fs/cgroup$OLD_CGROUP/cgroup.procs"
+if sudo -u ubuntu flock --nonblock "$OLD_LOCK" true; then
+  die 'old runner is active but does not hold its attested runner lock'
+else
+  test "$?" -eq 1
+fi
+
+CAPABILITY_TMP=$(mktemp)
+if old_gate_client capability >"$CAPABILITY_TMP"; then
+  sudo jq -e --arg path "$SOURCE_DATA/.maintenance_no_open" '
+    type=="object" and
+    keys==["maintenance_active","protocol","sentinel_path","worker_pid"] and
+    .protocol=="trade-lock-no-open-v1" and
+    .maintenance_active==false and .sentinel_path==$path and
+    (.worker_pid|type=="number" and .>0 and floor==.)
+  ' "$CAPABILITY_TMP" >/dev/null
+  OLD_WORKER_PID=$(jq -r .worker_pid "$CAPABILITY_TMP")
+  grep -Fxq "$OLD_WORKER_PID" "/sys/fs/cgroup$OLD_CGROUP/cgroup.procs"
+  OLD_GATE_NONCE=$(openssl rand -hex 32)
+  ARM_TMP=$(mktemp)
+  old_gate_client arm --release-sha "$RELEASE_SHA" \
+    --nonce "$OLD_GATE_NONCE" >"$ARM_TMP"
+  old_gate_client verify-http >/dev/null
+  test "$(jq -r .sentinel.path "$ARM_TMP")" = \
+    "$SOURCE_DATA/.maintenance_no_open"
+  test "$(sudo stat -c '%d:%i' -- "$SOURCE_DATA/.maintenance_no_open")" = \
+    "$(jq -r '.sentinel.dev|tostring' "$ARM_TMP"):$(jq -r '.sentinel.ino|tostring' "$ARM_TMP")"
+  test "$(sudo stat -c '%U:%a' -- "$SOURCE_DATA/.maintenance_no_open")" = \
+    ubuntu:600
+  OLD_GATE_EVIDENCE="$ATTEMPT_STAGE/old-no-open-boundary.json"
+  sudo test ! -e "$OLD_GATE_EVIDENCE" && sudo test ! -L "$OLD_GATE_EVIDENCE"
+  sudo install -o root -g root -m 0600 "$ARM_TMP" "$OLD_GATE_EVIDENCE"
+  rm -f -- "$ARM_TMP"
+  OLD_GATE_MODE='handshake'
+else
+  CAPABILITY_RC=$?
+  test "$CAPABILITY_RC" -eq 3 || \
+    die 'old runner handshake probe failed ambiguously; production left running'
+  PERMISSION_TMP=$(mktemp)
+  credential_mode read_only "$SOURCE_DATA/config.json" >"$PERMISSION_TMP" || \
+    die 'old release has no handshake and current OKX key is not proven read_only'
+  sudo jq -e '
+    type=="object" and
+    keys==["account_domain","api_fingerprint","mode","permissions"] and
+    .account_domain=="live" and .mode=="read_only" and
+    .permissions==["read_only"] and
+    (.api_fingerprint|test("^[0-9a-f]{64}$"))
+  ' "$PERMISSION_TMP" >/dev/null
+  OLD_GATE_EVIDENCE="$ATTEMPT_STAGE/old-no-open-boundary.json"
+  sudo test ! -e "$OLD_GATE_EVIDENCE" && sudo test ! -L "$OLD_GATE_EVIDENCE"
+  sudo install -o root -g root -m 0600 "$PERMISSION_TMP" "$OLD_GATE_EVIDENCE"
+  OLD_GATE_FINGERPRINT=$(jq -r .api_fingerprint "$PERMISSION_TMP")
+  rm -f -- "$PERMISSION_TMP"
+  OLD_GATE_MODE='credential_read_only'
+fi
+rm -f -- "$CAPABILITY_TMP"
+OLD_GATE_EVIDENCE_SHA=$(sudo sha256sum "$OLD_GATE_EVIDENCE" | awk '{print $1}')
+readonly OLD_GATE_MODE OLD_GATE_EVIDENCE OLD_GATE_EVIDENCE_SHA
+readonly OLD_GATE_FINGERPRINT
+test "$(completed_slot "$SOURCE_DATA")" = "$SLOT" ||
+  die 'schedule completion changed after old no-open boundary'
 
 # The fail-safe can arm an otherwise code-only release before production state
 # is copied.  Initialize its private lock while production is still untouched.
@@ -536,7 +703,7 @@ verify_block
 trap 'fail_safe $?' ERR EXIT
 trap 'fail_safe 129' HUP
 trap 'fail_safe 130' INT TERM
-"$EMERGENCY" --graceful-stop-and-arm
+"$EMERGENCY" --graceful-stop-and-arm "$OLD_GATE_MODE" "$OLD_GATE_EVIDENCE"
 assert_inactive_boundaries
 
 BACKUP_ROOT="/var/backups/trading/$(date -u +%Y%m%dT%H%M%SZ)-$SHORT_SHA-$ATTEMPT_ID"
@@ -582,12 +749,12 @@ test "$(sudo stat -c '%U:%G:%a' "$CONFIG")" = ubuntu:ubuntu:600
 test "$(sudo stat -c '%U:%G:%a' "$STATE")" = ubuntu:ubuntu:600
 
 sudo env -i PATH=/usr/bin:/bin "$PYTHON" -B -E "$CLEANUP" \
-  --check --code-dir "$RELEASE_TRADING" --config "$CONFIG" --spec "$SPEC"
+  --check --release-sha "$RELEASE_SHA" --config "$CONFIG" --spec "$SPEC"
 sudo env -i PATH=/usr/bin:/bin "$PYTHON" -B -E "$CLEANUP" \
-  --apply --code-dir "$RELEASE_TRADING" --config "$CONFIG" --spec "$SPEC" \
+  --apply --release-sha "$RELEASE_SHA" --config "$CONFIG" --spec "$SPEC" \
   --audit "$ATTEMPT_STAGE/confirmed-config-cleanup.audit.json"
 sudo env -i PATH=/usr/bin:/bin "$PYTHON" -B -E "$CLEANUP" \
-  --verify-applied --code-dir "$RELEASE_TRADING" --config "$CONFIG" \
+  --verify-applied --release-sha "$RELEASE_SHA" --config "$CONFIG" \
   --spec "$SPEC" --audit "$ATTEMPT_STAGE/confirmed-config-cleanup.audit.json"
 
 MIGRATION_REPORT="$ATTEMPT_STAGE/migration-dry-run.txt"
@@ -719,7 +886,9 @@ test "$(sudo jq -r .t2_ms "$ATTEMPT_STAGE/quiescence-1.json")" -le \
      "$(sudo jq -r .q0_ms "$ATTEMPT_STAGE/quiescence-2.json")"
 QUIESCENCE_SHA=$(sudo sha256sum "$ATTEMPT_STAGE/quiescence-2.json" | awk '{print $1}')
 advance_phase PREPARED QUIESCED \
-  "slot=$SLOT" "quiescence_sha256=$QUIESCENCE_SHA"
+  "slot=$SLOT" "quiescence_sha256=$QUIESCENCE_SHA" \
+  "old_gate_mode=$OLD_GATE_MODE" \
+  "old_gate_evidence_sha256=$OLD_GATE_EVIDENCE_SHA"
 # T0 is created only after the already-completed pre-stop slot and a second
 # stable visibility window.  The stopped deployment never waits for or runs a
 # formal daily-check slot.
@@ -785,6 +954,37 @@ test "$(sudo sha256sum /etc/trading.env|awk '{print $1}')" = \
 prove_formal_runner
 check_local_health >/dev/null
 check_maintenance_http_gate
+if [[ "$OLD_GATE_MODE" = credential_read_only ]]; then
+  # The operator restores Trade only after the reviewed release is running
+  # behind its durable sentinel.  The approval binds that external change;
+  # the following read-only OKX query proves the exact no-withdraw permission.
+  RESTORE_NONCE=$(openssl rand -hex 32)
+  CREDENTIAL_RESTORE=(
+    "bootstrap_evidence_sha256=$OLD_GATE_EVIDENCE_SHA"
+    "api_fingerprint=$OLD_GATE_FINGERPRINT"
+    "sentinel_identity=$SENTINEL_ID"
+    "request_nonce=$RESTORE_NONCE"
+    "required_permissions=read_only,trade"
+  )
+  write_request credential_restore \
+    "$ATTEMPT_STAGE/credential-restore.approval.json" \
+    "${CREDENTIAL_RESTORE[@]}"
+  wait_approval credential_restore \
+    "$ATTEMPT_STAGE/credential-restore.approval.json" \
+    "${CREDENTIAL_RESTORE[@]}"
+  RESTORED_PERMISSION_TMP=$(mktemp)
+  credential_mode trade "$CONFIG" >"$RESTORED_PERMISSION_TMP"
+  jq -e --arg fingerprint "$OLD_GATE_FINGERPRINT" '
+    type=="object" and
+    keys==["account_domain","api_fingerprint","mode","permissions"] and
+    .account_domain=="live" and .api_fingerprint==$fingerprint and
+    .mode=="trade" and .permissions==["read_only","trade"]
+  ' "$RESTORED_PERMISSION_TMP" >/dev/null
+  sudo install -o root -g root -m 0600 "$RESTORED_PERMISSION_TMP" \
+    "$ATTEMPT_STAGE/credential-trade-restored.json"
+  rm -f -- "$RESTORED_PERMISSION_TMP"
+  check_maintenance_http_gate
+fi
 # Reinstalling the block removes authorization before the second graceful
 # drain. Formal and every auxiliary writer are silent before final verify.
 "$EMERGENCY" --graceful-stop-and-arm
@@ -834,6 +1034,13 @@ test "$(sudo sha256sum "$CONFIG"|awk '{print $1}')" = "$CONFIG_EXTERNAL_SHA"
 test "$(sudo sha256sum /etc/trading.env|awk '{print $1}')" = \
   "$TRADING_ENV_EXTERNAL_SHA"
 test "$(identity "$COMPLETION")" = "$COMPLETION_ID"
+if [[ "$OLD_GATE_MODE" = credential_read_only ]]; then
+  RESTORED_PERMISSION_TMP=$(mktemp)
+  credential_mode trade "$CONFIG" >"$RESTORED_PERMISSION_TMP"
+  sudo cmp -s -- "$RESTORED_PERMISSION_TMP" \
+    "$ATTEMPT_STAGE/credential-trade-restored.json"
+  rm -f -- "$RESTORED_PERMISSION_TMP"
+fi
 
 # Remove the persistent start block and its temporary authorization while the
 # sentinel is still present. Every fallible filesystem/systemd/health action is

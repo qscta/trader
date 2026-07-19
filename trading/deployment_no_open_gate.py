@@ -50,6 +50,19 @@ PROOF_COMPLETION_SAFETY_MS = 5 * 60 * 1000
 RELEASE_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 NONCE_RE = re.compile(r'^[0-9a-f]{64}$')
 SWAP_RE = re.compile(r'^[A-Z0-9]+-(?:USD|USDT|USDC)-SWAP$')
+PUBLIC_HISTORY_INCIDENT_COMMIT = (
+    '38ac63646d2e18ba9d238856b124594b4691f252'
+)
+# Only one-way SHA-256 commitments are retained.  The exposed values themselves
+# must never re-enter the current tree, logs, evidence, or deployment output.
+EXPOSED_OKX_API_KEY_FINGERPRINTS = frozenset({
+    '2ee475ac4106dae8a731bd8625de4d7bac93b3137c3935c3311e8696c382c966',
+    'c4c08afefe20790b12e63678d541bf9d372932c8a66da779dfba39a80bc7f6b7',
+})
+EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS = frozenset({
+    '279f8aa687c7b6c2428d3644e127a304c7e339028adee01dd3638f6dbaf40c1e',
+    '7dba33628cf2cb12b9f410209ceac9e4d4356a2ed3a0c12687cd2fd1d21103dd',
+})
 
 # Complete OKX V5 algo-pending/algo-history ordType surface for SWAP.
 ALGO_ORDER_TYPES = (
@@ -573,6 +586,48 @@ def _account_domain(okx):
     return 'demo' if okx.get('sandbox', False) or okx.get('demo', False) else 'live'
 
 
+def probe_public_history_exposure(config_path, environ=None):
+    """Block reuse of credentials already committed to public Git history."""
+    env = os.environ if environ is None else environ
+    config = _read_private_json_path(config_path, 'config.json')
+    if not isinstance(config, dict):
+        raise GateError('config.json 顶层必须是对象')
+    okx = load_okx_config(config_path, environ=env)
+    if _account_domain(okx) != 'live':
+        raise GateError('生产部署 exposure gate 要求 OKX live 账户域')
+    api_fingerprint = _account_fingerprint(okx)
+    dingtalk = config.get('dingtalk', {})
+    if not isinstance(dingtalk, dict):
+        raise GateError('config.dingtalk 必须是对象')
+    webhook = env.get('DINGTALK_WEBHOOK') or dingtalk.get('webhook_url')
+    if webhook is not None and (
+            not isinstance(webhook, str) or not webhook or
+            webhook != webhook.strip()):
+        raise GateError('DingTalk webhook 配置非法')
+    webhook_fingerprint = (
+        hashlib.sha256(webhook.encode('utf-8')).hexdigest()
+        if webhook else None)
+    api_match = api_fingerprint in EXPOSED_OKX_API_KEY_FINGERPRINTS
+    webhook_match = (
+        webhook_fingerprint in EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS
+        if webhook_fingerprint is not None else False)
+    if api_match or webhook_match:
+        matched = []
+        if api_match:
+            matched.append('OKX API Key')
+        if webhook_match:
+            matched.append('DingTalk webhook')
+        raise GateError(
+            '当前凭据仍命中公开 Git 历史暴露指纹，禁止部署: ' + ', '.join(matched))
+    return {
+        'account_domain': 'live',
+        'incident_commit': PUBLIC_HISTORY_INCIDENT_COMMIT,
+        'current_okx_key_matches_exposed_history': False,
+        'current_dingtalk_matches_exposed_history': False,
+        'dingtalk_configured': webhook_fingerprint is not None,
+    }
+
+
 def create_read_only_exchange(okx, ccxt_module=None):
     if ccxt_module is None:
         try:
@@ -742,6 +797,24 @@ class ReadOnlyOkxGate:
         if result['pos_mode'] != 'net_mode':
             raise GateError('OKX account config.posMode 必须为 net_mode')
         return result
+
+    def api_permissions(self):
+        """读取当前请求 Key 的权限；只返回权限枚举，不返回任何凭据。"""
+        data = _response_data(
+            _call(self.exchange.privateGetAccountConfig, {}, 'OKX API permissions'),
+            'OKX API permissions')
+        if len(data) != 1 or not isinstance(data[0], dict):
+            raise GateError('OKX API permissions 数据数量异常')
+        raw = data[0].get('perm')
+        if not isinstance(raw, str) or not raw:
+            raise GateError('OKX account config.perm 缺失或非法')
+        values = raw.split(',')
+        allowed = {'read_only', 'trade', 'withdraw'}
+        if (any(not value or value != value.strip() for value in values) or
+                len(values) != len(set(values)) or
+                not set(values) <= allowed or 'read_only' not in values):
+            raise GateError('OKX account config.perm 含未知/重复权限')
+        return tuple(sorted(values))
 
     def positions(self):
         data = _response_data(
@@ -1528,6 +1601,30 @@ def run_quiescence(config_path, data_dir, release_sha, exchange=None,
                 return {'q0_ms': probe['t0_ms'], **summary}
 
 
+def probe_api_permission_mode(
+        config_path, required_mode, exchange=None,
+        ccxt_module=None, environ=None):
+    """首次引导门禁：机械证明当前 Key 是只读，或提交前已恢复交易权限。"""
+    if required_mode not in {'read_only', 'trade'}:
+        raise GateError('required_mode 只能是 read_only/trade')
+    okx = load_okx_config(config_path, environ=environ)
+    active_exchange = (
+        exchange if exchange is not None else
+        create_read_only_exchange(okx, ccxt_module=ccxt_module))
+    permissions = ReadOnlyOkxGate(active_exchange).api_permissions()
+    if required_mode == 'read_only' and permissions != ('read_only',):
+        raise GateError('首次引导要求当前 API Key 权限精确为 read_only')
+    if required_mode == 'trade' and permissions != ('read_only', 'trade'):
+        raise GateError(
+            '提交前当前 API Key 权限必须精确为 read_only,trade（禁止 withdraw）')
+    return {
+        'account_domain': _account_domain(okx),
+        'api_fingerprint': _account_fingerprint(okx),
+        'mode': required_mode,
+        'permissions': list(permissions),
+    }
+
+
 def seal(config_path, data_dir, release_sha, exchange=None,
          ccxt_module=None, environ=None):
     """Verify with the runner stopped and write completion, retaining sentinel."""
@@ -1763,6 +1860,12 @@ def _build_parser():
     completed = subparsers.add_parser('completed-slot')
     completed.add_argument('--data-dir', required=True)
     completed.add_argument('--config', required=True)
+    permission = subparsers.add_parser('credential-mode')
+    permission.add_argument('--config', required=True)
+    permission.add_argument(
+        '--require-mode', required=True, choices=('read_only', 'trade'))
+    exposure = subparsers.add_parser('credential-exposure')
+    exposure.add_argument('--config', required=True)
     for command in ('arm', 'baseline', 'verify', 'quiesce', 'seal', 'commit',
                     'abandon'):
         child = subparsers.add_parser(command)
@@ -1782,6 +1885,17 @@ def main(argv=None):
     try:
         if args.command == 'completed-slot':
             print(require_completed_schedule_slot(args.config, args.data_dir))
+        elif args.command == 'credential-mode':
+            summary = probe_api_permission_mode(
+                args.config, args.require_mode)
+            print(json.dumps(
+                summary, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':')))
+        elif args.command == 'credential-exposure':
+            summary = probe_public_history_exposure(args.config)
+            print(json.dumps(
+                summary, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':')))
         elif args.command == 'arm':
             created = arm(args.data_dir, args.release_sha)
             print('[通过] 部署禁开仓哨兵已安全启用' if created else

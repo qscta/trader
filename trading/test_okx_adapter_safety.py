@@ -1289,19 +1289,20 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         ])
         api.close_position = Mock(return_value={
             'id': 'close-full', 'confirmed': True, 'fully_closed': True,
-            'amount': 0.1, 'remaining_amount': 0.0, 'average': 99,
+            'amount': 0.1, 'filled': 10.0,
+            'remaining_amount': 0.0, 'average': 99,
         })
         api._fetch_order_for_confirmation = Mock(
             return_value={
                 'id': 'open-uncertain', 'clientOrderId': 'TESTCID',
                 'symbol': 'BTC/USDT:USDT', 'type': 'market',
-                'side': 'buy', 'amount': 10, 'filled': 0,
-                'remaining': 10, 'reduceOnly': False,
+                'side': 'buy', 'amount': 10, 'filled': 10,
+                'remaining': 0, 'reduceOnly': False,
                 'status': 'canceled', 'info': {
                     'ordId': 'open-uncertain', 'clOrdId': 'TESTCID',
                     'instId': 'BTC-USDT-SWAP', 'instType': 'SWAP',
                     'ordType': 'market', 'side': 'buy', 'sz': '10',
-                    'accFillSz': '0', 'reduceOnly': 'false',
+                    'accFillSz': '10', 'reduceOnly': 'false',
                     'state': 'canceled',
                 }})
 
@@ -1311,7 +1312,42 @@ class MarketOrderConfirmationTest(unittest.TestCase):
         self.assertEqual(result['status'], 'compensated_flat')
         self.assertEqual(result['remaining_amount'], 0.0)
         self.assertEqual(result['compensation']['id'], 'close-full')
-        self.assertNotIn('average', result)
+        self.assertEqual(result['amount'], 0.1)
+
+    def test_full_compensation_rejects_external_position_quantity_mixing(self):
+        api = self._api()
+        api.get_position = Mock(return_value=None)
+        api.exchange.create_order.return_value = {'id': 'open-uncertain'}
+        # 原单实际成交 10 张，但补偿前只剩 5 张：中间有外部减仓，净仓
+        # 已不能作为本系统成交归因证据。
+        api._confirm_market_order = Mock(side_effect=[
+            (None, 5.0), (None, 5.0),
+        ])
+        api.close_position = Mock(return_value={
+            'id': 'close-five', 'confirmed': True, 'fully_closed': True,
+            'amount': 0.05, 'filled': 5.0,
+            'remaining_amount': 0.0, 'average': 99,
+        })
+        api._fetch_order_for_confirmation = Mock(return_value={
+            'id': 'open-uncertain', 'clientOrderId': 'TESTCID',
+            'symbol': 'BTC/USDT:USDT', 'type': 'market',
+            'side': 'buy', 'amount': 10, 'filled': 10,
+            'remaining': 0, 'reduceOnly': False,
+            'status': 'filled', 'info': {
+                'ordId': 'open-uncertain', 'clOrdId': 'TESTCID',
+                'instId': 'BTC-USDT-SWAP', 'instType': 'SWAP',
+                'ordType': 'market', 'side': 'buy', 'sz': '10',
+                'accFillSz': '10', 'reduceOnly': 'false',
+                'state': 'filled',
+            }})
+
+        result = api.open_position('BTC/USDT:USDT', 'long', 0.1)
+
+        self.assertTrue(result['open_execution_attribution_ambiguous'])
+        self.assertFalse(result.get('open_execution_compensated', False))
+        self.assertEqual(
+            'compensation_attribution_ambiguous', result['status'])
+        self.assertEqual(0.0, result['remaining_amount'])
 
     def test_full_compensation_requires_strict_zero_remaining_amount(self):
         for malformed in (None, 0.1, True, float('nan')):
