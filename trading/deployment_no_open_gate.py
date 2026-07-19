@@ -1208,11 +1208,6 @@ def _validate_completed_pair(
         raise GateError('completion 证明窗口超过历史保留安全线')
 
 
-def _validate_completion_standalone(completion, lock_info):
-    if not _same_identity(completion['runner_lock'], lock_info):
-        raise GateError('已完成证据与当前 runner lock inode 不一致')
-
-
 def _require_payload_unchanged(expected, current, context):
     """原 inode 内容也属于证据身份；原位覆盖不得绕过 inode 复核。"""
     if current != expected:

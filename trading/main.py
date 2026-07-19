@@ -902,30 +902,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             decimals = 10
         return f'{number:.{decimals}f}'
 
-    def _recovery_symbol_config(self, symbol):
-        """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
-
-        恢复已有交易所仓位时，即使品种已经退池也必须补账、补止损；但在
-        “本地与交易所都空仓、确认旧请求从未送达”时，退池状态必须阻断任何
-        新 POST。统一在这里构造标记，避免各恢复分支把缺失配置兜成 enabled=True。
-        """
-        configured = next(
-            (cfg for cfg in self.config.get('trading', {}).get('symbols', [])
-             if cfg.get('name') == symbol), None)
-        if configured is None:
-            return {
-                'name': symbol,
-                'enabled': False,
-                'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
-                '_retired_from_pool': True,
-            }, True
-        symbol_config = dict(configured)
-        retired = not symbol_config.get('enabled', True)
-        if retired:
-            symbol_config['_retired_from_pool'] = True
-        return symbol_config, retired
-
-
     @staticmethod
     def _finite_nonnegative(value):
         if value is None or isinstance(value, bool):
