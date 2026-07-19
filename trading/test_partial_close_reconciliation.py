@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import trade_state as trade_state_module
 from trade_executor import TradeExecutorMixin
 from stop_guardian import StopGuardianMixin
 from trade_state import TRADING_FEE_RATE, TradeState, TradeStatePersistenceError
@@ -1228,6 +1229,65 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             self.assertNotIn(
                 'BTCUSDT', system.trade_state.get_stop_loss_dates())
+
+    def test_committed_open_dir_fsync_failure_never_posts_compensation(self):
+        """主账本 rename 已提交时只能继续托管，绝不能误平真实仓位。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = _System()
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.replace_stop_loss_dates({'BTCUSDT': '2026-07-10'})
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'ICOMMITTEDOPEN1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
+            system.trade_state = state
+            system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
+            system.exchange_api = SimpleNamespace(
+                get_position=Mock(return_value={
+                    'side': 'long', 'contracts': 1.0}),
+                _contracts_to_coins=lambda _symbol, contracts: float(contracts),
+                close_position=Mock(),
+                compensation_client_order_id=Mock(
+                    return_value='RCOMMITTEDOPEN1'),
+            )
+            system.notifier = SimpleNamespace(notify_error=Mock())
+            system._notify_trade_state_persistence_issue = Mock()
+
+            # add_open_position 的备份文件 fsync + 目录 fsync、主文件 fsync
+            # 均成功；仅主文件 replace 后的父目录 fsync 失败。
+            with patch.object(
+                    trade_state_module.os, 'fsync',
+                    side_effect=[None, None, None,
+                                 OSError('main directory fsync unavailable')]):
+                saved = system._persist_open_position_or_rollback(
+                    'BTCUSDT', 'BTC/USDT:USDT', 'long', 100.0, 1.0,
+                    90.0, 'stop-1', strategy='ma_cross',
+                    open_order={'id': 'open-1', 'average': 100.0},
+                    open_intent_client_id='ICOMMITTEDOPEN1',
+                    requested_position_size=1.0)
+
+            self.assertTrue(saved)
+            system.exchange_api.close_position.assert_not_called()
+            system.exchange_api.compensation_client_order_id.assert_not_called()
+            self.assertEqual(
+                'stop-1', state.get_open_position('BTCUSDT')['stop_order_id'])
+            self.assertIsNone(state.get_open_intent('BTCUSDT'))
+            self.assertNotIn('BTCUSDT', state.get_stop_loss_dates())
+            self.assertNotIn('BTCUSDT', system.stop_loss_dates)
+            reloaded = TradeState(state.state_file)
+            self.assertEqual(
+                'stop-1', reloaded.get_open_position('BTCUSDT')[
+                    'stop_order_id'])
+            self.assertIsNone(reloaded.get_open_intent('BTCUSDT'))
+            self.assertTrue(
+                state.get_runtime_persistence_status()['degraded'])
+            persistence_call = (
+                system._notify_trade_state_persistence_issue.call_args)
+            self.assertEqual('BTCUSDT', persistence_call.args[0])
+            self.assertEqual(
+                state.get_open_position('BTCUSDT'),
+                persistence_call.args[2].committed_result)
 
 
 class SingleCompensationOrderFinalizationTest(unittest.TestCase):

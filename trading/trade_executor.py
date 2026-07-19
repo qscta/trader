@@ -1966,6 +1966,33 @@ class TradeExecutorMixin:
             if isinstance(in_memory_t1, dict):
                 in_memory_t1.pop(symbol, None)
             return True
+        except TradeStateCommitDurabilityError as exc:
+            # 主账本 rename 已发生，且事务结果已经包含这笔真实持仓并消费
+            # open intent。此时再发 reduce-only 补偿会把交易所仓位平掉，
+            # 却把已提交的新仓留在内存/可见主文件中，制造双重现实。
+            committed = exc.committed_result
+            committed_matches = (
+                isinstance(committed, dict) and
+                committed.get('symbol') == symbol and
+                committed.get('side') == side)
+            if not committed_matches:
+                logger.critical(
+                    f'{symbol} 开仓账本报告已提交但缺少事务结果；'
+                    '保持永久禁开仓且绝不重放补偿订单')
+            in_memory_t1 = getattr(self, 'stop_loss_dates', None)
+            if isinstance(in_memory_t1, dict):
+                in_memory_t1.pop(symbol, None)
+            self._notify_trade_state_persistence_issue(
+                symbol, '开仓持仓落账', exc)
+            if not committed_matches:
+                # 专用异常契约本身若被破坏，也只能向上失败并等待人工核对；
+                # 绝不能掉进下面会发送外部补偿单的普通失败分支。
+                raise TradeStatePersistenceError(
+                    f'{symbol} 已提交开仓缺少可信 committed_result') from exc
+            # 交易所仓、已知 reduce-only 止损和当前进程账本三者一致；上层
+            # 仍须完成止损写入句柄收口并报告 opened。永久 persistence latch
+            # 会在中央边界阻断本进程余下生命期的任何新开仓。
+            return True
         except Exception as e:
             # ValueError＝账本入口拒绝了非法开仓数据（覆盖/NaN/非正数），
             # 与保存失败同责：成交已发生，必须交易所侧回滚而不是裸抛。
