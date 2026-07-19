@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Runtime deliberately refuses to start outside UTC+8 because scheduling,
+# T+1 and daily state all share the host's local clock.  CI must exercise the
+# same explicit deployment contract instead of inheriting ubuntu-latest's UTC.
+env:
+  TZ: Asia/Shanghai
+
 jobs:
   stdlib-tests:
     # 纯标准库测试：不装任何第三方依赖，验证核心逻辑在最小环境可跑
