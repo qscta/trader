@@ -8,11 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import _test_stubs
 import trade_state as trade_state_module
 from trade_executor import TradeExecutorMixin
-from main import TradingSystem
 from stop_guardian import StopGuardianMixin
 from trade_state import TRADING_FEE_RATE, TradeState, TradeStatePersistenceError
+
+TradingSystem = _test_stubs.import_main().TradingSystem
 
 
 class _System(TradeExecutorMixin):
