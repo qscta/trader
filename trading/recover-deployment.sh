@@ -121,6 +121,10 @@ prove_unit_inactive() {
   local unit=$1 cgroup
   test "$(systemctl show "$unit" -p ActiveState --value)" = inactive || \
     return 1
+  if [[ "$unit" = *.timer ]]; then
+    unit_job_absent "$unit" || return 1
+    return 0
+  fi
   test "$(systemctl show "$unit" -p MainPID --value)" = 0 || return 1
   cgroup=$(systemctl show "$unit" -p ControlGroup --value) || return 1
   test "$(cgroup_populated "$cgroup")" = 0 || return 1

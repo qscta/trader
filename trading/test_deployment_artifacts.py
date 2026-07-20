@@ -2331,6 +2331,13 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
     def test_recovery_does_not_require_main_pid_from_timer_unit(self):
         self.assertIn('[[ "$unit" = *.timer ]] && continue', self.recover)
 
+    def test_all_timer_inactive_proofs_skip_service_only_fields(self):
+        self.assertIn('prove_unit_inactive "$unit" || return 1', self.deploy)
+        timer_branch = 'if [[ "$unit" = *.timer ]]; then'
+        for source in (self.deploy, self.recover):
+            self.assertIn(timer_branch, source)
+            self.assertIn('unit_job_absent "$unit" || return 1', source)
+
     def test_backup_script_inode_is_synced_before_atomic_replace(self):
         install = self.deploy.index(
             '"$DEPLOY_STAGE/trading-state-backup.reviewed" '
