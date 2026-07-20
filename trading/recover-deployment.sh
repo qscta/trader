@@ -323,7 +323,8 @@ old_gate_observer() {
   sudo env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -B "$OLD_GATE" "$@"
 }
 verify_blocked_units() {
-  local unit state cgroup conditions jobs
+  local unit state cgroup raw signature count name trigger negate parameter
+  local result extra jobs
   # These predicates are intentionally used from `if`; Bash disables errexit
   # for the whole function in that context.  Every proof step must therefore
   # return explicitly instead of relying on `set -e`.
@@ -336,8 +337,15 @@ verify_blocked_units() {
   test "$(sudo wc -l <"$START_BLOCK")" -eq 2 || return 1
   sudo test ! -e "$START_AUTH" || return 1
   sudo test ! -L "$START_AUTH" || return 1
-  conditions="$(systemctl show trading.service -p Conditions --value)" || return 1
-  grep -Fq "ConditionPathExists=$START_AUTH" <<<"$conditions" || return 1
+  sudo systemd-analyze verify trading.service >/dev/null || return 1
+  raw=$(busctl get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1/unit/trading_2eservice \
+    org.freedesktop.systemd1.Unit Conditions) || return 1
+  read -r signature count name trigger negate parameter result extra <<<"$raw"
+  [[ "$signature" = 'a(sbbsi)' && "$count" = 1 && \
+     "$name" = '"ConditionPathExists"' && "$trigger" = false && \
+     "$negate" = false && "$parameter" = "\"$START_AUTH\"" && \
+     "$result" =~ ^-?[0-9]+$ && -z "$extra" ]] || return 1
   jobs="$(systemctl list-jobs --no-legend --no-pager)" || return 1
   for unit in trading-state-backup.timer trading-state-backup.service \
       cloudflared.service trading-mem-monitor.service trading.service; do

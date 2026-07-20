@@ -2313,6 +2313,21 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
             'if verify_old_lock_contract; then', contain_exit)
         self.assertLess(contain_exit, source_contract)
 
+    def test_start_block_proofs_use_structured_systemd_conditions(self):
+        legacy_text_probe = (
+            'systemctl show trading.service -p Conditions --value')
+        for source in (self.deploy, self.emergency, self.recover):
+            self.assertNotIn(legacy_text_probe, source)
+            self.assertIn(
+                'org.freedesktop.systemd1.Unit Conditions', source)
+            self.assertIn('"$signature" = \'a(sbbsi)\'', source)
+            self.assertIn('"$count" = 1', source)
+            self.assertIn('"$negate" = false', source)
+            self.assertIn('"$parameter" = "\\"$START_AUTH\\""', source)
+        self.assertIn(
+            '"$signature" = \'a(sbbsi)\' && "$count" = 0',
+            self.deploy)
+
     def test_backup_script_inode_is_synced_before_atomic_replace(self):
         install = self.deploy.index(
             '"$DEPLOY_STAGE/trading-state-backup.reviewed" '

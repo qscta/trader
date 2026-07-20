@@ -265,25 +265,30 @@ verify_block() {
 }
 
 verify_loaded_start_block() {
-  local conditions
+  local raw signature count name trigger negate parameter result extra
   sudo systemd-analyze verify trading.service >/dev/null || return 1
-  conditions=$(systemctl show trading.service -p Conditions --value) || return 1
-  grep -Fq "ConditionPathExists=$START_AUTH" <<<"$conditions" || return 1
-  return 0
+  raw=$(busctl get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1/unit/trading_2eservice \
+    org.freedesktop.systemd1.Unit Conditions) || return 1
+  read -r signature count name trigger negate parameter result extra <<<"$raw"
+  [[ "$signature" = 'a(sbbsi)' && "$count" = 1 && \
+     "$name" = '"ConditionPathExists"' && "$trigger" = false && \
+     "$negate" = false && "$parameter" = "\"$START_AUTH\"" && \
+     "$result" =~ ^-?[0-9]+$ && -z "$extra" ]]
 }
 
 verify_start_block_absent() {
-  local conditions
+  local raw signature count extra
   sudo test ! -e "$START_BLOCK" || return 1
   sudo test ! -L "$START_BLOCK" || return 1
   sudo test ! -e "$START_AUTH" || return 1
   sudo test ! -L "$START_AUTH" || return 1
   sudo systemd-analyze verify trading.service >/dev/null || return 1
-  conditions=$(systemctl show trading.service -p Conditions --value) || return 1
-  if grep -Fq "ConditionPathExists=$START_AUTH" <<<"$conditions"; then
-    return 1
-  fi
-  return 0
+  raw=$(busctl get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1/unit/trading_2eservice \
+    org.freedesktop.systemd1.Unit Conditions) || return 1
+  read -r signature count extra <<<"$raw"
+  [[ "$signature" = 'a(sbbsi)' && "$count" = 0 && -z "$extra" ]]
 }
 
 wait_helper_absent() {
