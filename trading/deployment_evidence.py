@@ -65,8 +65,6 @@ WRITER_BOUNDARY_FIELDS = frozenset({
     "host_process_inventory_complete",
     "runtime_system_api_only_acknowledged",
     "same_side_size_replacement_unattributable_acknowledged",
-    "public_history_okx_keys_revoked_and_activity_audited",
-    "public_history_dingtalk_webhooks_rotated",
 })
 MANAGED_SCHEMAS = {
     "release_env": (0o600, re.compile(

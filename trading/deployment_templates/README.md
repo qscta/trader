@@ -26,9 +26,7 @@ single-byte preimage change.
 Copy `writer-inventory.template.json`, replace every `__...__` placeholder,
 and list concrete people, UI surfaces, host processes/units/containers, API
 credentials, and credential consumers.  Do not put credential values in this
-file. The two public-history remediation fields may be `true` only after every
-exposed OKX Key is revoked and audited and every exposed DingTalk webhook is
-rotated, as detailed in `../DEPLOY_NOTES.md`. Validate it with:
+file. Validate it with:
 
 ```text
 /usr/bin/python3 -I -B trading/deployment_evidence.py \

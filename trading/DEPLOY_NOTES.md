@@ -101,23 +101,6 @@ sudo /usr/bin/python3 -I -B "$RELEASE_ROOT/trading/prepare_deployment.py" \
   --required-check 'frontend syntax (app.js)'
 ```
 
-## Public-history credential incident gate
-
-Commit `38ac63646d2e18ba9d238856b124594b4691f252` and its archived state
-snapshots exposed two OKX API Key identities and two DingTalk webhook
-identities. The current tree retains only one-way SHA-256 commitments. Before
-creating a valid `writer-inventory.json`, an operator must revoke both exposed
-OKX Keys, audit the live account's orders/fills/API-Key activity for the public
-window, rotate both webhook identities, and record the concrete review subjects
-in the inventory. Setting the two history-remediation booleans without doing
-that work is a false production attestation.
-
-`deploy.sh` independently hashes the effective current OKX Key and DingTalk
-webhook (environment overrides included) before any runtime mutation. An exact
-match with either exposed identity blocks deployment without printing a value
-or fingerprint. This mechanical mismatch check complements—but cannot replace—
-the human proof that the old identities were actually revoked and audited.
-
 ## Safety sequence
 
 1. Before creating a runtime root, installing a start block, or stopping any

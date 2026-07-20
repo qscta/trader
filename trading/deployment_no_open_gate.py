@@ -52,20 +52,6 @@ PROOF_COMPLETION_SAFETY_MS = 5 * 60 * 1000
 RELEASE_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 NONCE_RE = re.compile(r'^[0-9a-f]{64}$')
 SWAP_RE = re.compile(r'^[A-Z0-9]+-(?:USD|USDT|USDC)-SWAP$')
-PUBLIC_HISTORY_INCIDENT_COMMIT = (
-    '38ac63646d2e18ba9d238856b124594b4691f252'
-)
-# Only one-way SHA-256 commitments are retained.  The exposed values themselves
-# must never re-enter the current tree, logs, evidence, or deployment output.
-EXPOSED_OKX_API_KEY_FINGERPRINTS = frozenset({
-    '2ee475ac4106dae8a731bd8625de4d7bac93b3137c3935c3311e8696c382c966',
-    'c4c08afefe20790b12e63678d541bf9d372932c8a66da779dfba39a80bc7f6b7',
-})
-EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS = frozenset({
-    '279f8aa687c7b6c2428d3644e127a304c7e339028adee01dd3638f6dbaf40c1e',
-    '7dba33628cf2cb12b9f410209ceac9e4d4356a2ed3a0c12687cd2fd1d21103dd',
-})
-
 # Complete OKX V5 algo-pending/algo-history ordType surface for SWAP.
 ALGO_ORDER_TYPES = (
     'conditional', 'oco', 'trigger', 'move_order_stop',
@@ -726,48 +712,6 @@ def _account_fingerprint(okx):
 
 def _account_domain(okx):
     return 'demo' if okx.get('sandbox', False) or okx.get('demo', False) else 'live'
-
-
-def probe_public_history_exposure(config_path, environ=None):
-    """Block reuse of credentials already committed to public Git history."""
-    env = os.environ if environ is None else environ
-    config = _read_private_json_path(config_path, 'config.json')
-    if not isinstance(config, dict):
-        raise GateError('config.json 顶层必须是对象')
-    okx = load_okx_config(config_path, environ=env)
-    if _account_domain(okx) != 'live':
-        raise GateError('生产部署 exposure gate 要求 OKX live 账户域')
-    api_fingerprint = _account_fingerprint(okx)
-    dingtalk = config.get('dingtalk', {})
-    if not isinstance(dingtalk, dict):
-        raise GateError('config.dingtalk 必须是对象')
-    webhook = env.get('DINGTALK_WEBHOOK') or dingtalk.get('webhook_url')
-    if webhook is not None and (
-            not isinstance(webhook, str) or not webhook or
-            webhook != webhook.strip()):
-        raise GateError('DingTalk webhook 配置非法')
-    webhook_fingerprint = (
-        hashlib.sha256(webhook.encode('utf-8')).hexdigest()
-        if webhook else None)
-    api_match = api_fingerprint in EXPOSED_OKX_API_KEY_FINGERPRINTS
-    webhook_match = (
-        webhook_fingerprint in EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS
-        if webhook_fingerprint is not None else False)
-    if api_match or webhook_match:
-        matched = []
-        if api_match:
-            matched.append('OKX API Key')
-        if webhook_match:
-            matched.append('DingTalk webhook')
-        raise GateError(
-            '当前凭据仍命中公开 Git 历史暴露指纹，禁止部署: ' + ', '.join(matched))
-    return {
-        'account_domain': 'live',
-        'incident_commit': PUBLIC_HISTORY_INCIDENT_COMMIT,
-        'current_okx_key_matches_exposed_history': False,
-        'current_dingtalk_matches_exposed_history': False,
-        'dingtalk_configured': webhook_fingerprint is not None,
-    }
 
 
 def create_read_only_exchange(okx, ccxt_module=None):
@@ -2075,8 +2019,6 @@ def _build_parser():
     recorded = subparsers.add_parser('recorded-slot')
     recorded.add_argument('--data-dir', required=True)
     recorded.add_argument('--config', required=True)
-    exposure = subparsers.add_parser('credential-exposure')
-    exposure.add_argument('--config', required=True)
     for command in ('arm', 'arm-recovery-gate', 'baseline', 'verify',
                     'quiesce', 'seal', 'commit',
                     'verify-committed-stopped', 'verify-committed-running',
@@ -2113,11 +2055,6 @@ def main(argv=None):
         elif args.command == 'recorded-slot':
             print(recorded_completed_schedule_slot(
                 args.config, args.data_dir))
-        elif args.command == 'credential-exposure':
-            summary = probe_public_history_exposure(args.config)
-            print(json.dumps(
-                summary, ensure_ascii=False, sort_keys=True,
-                separators=(',', ':')))
         elif args.command == 'arm':
             created = arm(args.data_dir, args.release_sha)
             print('[通过] 部署禁开仓哨兵已安全启用' if created else

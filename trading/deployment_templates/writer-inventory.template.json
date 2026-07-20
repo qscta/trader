@@ -7,9 +7,7 @@
     "all_other_api_credentials_and_consumers_frozen": true,
     "host_process_inventory_complete": true,
     "runtime_system_api_only_acknowledged": true,
-    "same_side_size_replacement_unattributable_acknowledged": true,
-    "public_history_okx_keys_revoked_and_activity_audited": true,
-    "public_history_dingtalk_webhooks_rotated": true
+    "same_side_size_replacement_unattributable_acknowledged": true
   },
   "writers": [
     {

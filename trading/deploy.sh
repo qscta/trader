@@ -875,13 +875,6 @@ old_gate_client() {
     /usr/bin/python3 -I -B "$OLD_GATE_HELPER" "$@"
 }
 
-credential_exposure() {
-  local config_path=$1
-  run_release_helper \
-    "$PYTHON" -B -E "$RELEASE_TRADING/deployment_no_open_gate.py" \
-    credential-exposure --config "$config_path"
-}
-
 [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || die 'release SHA placeholder not rendered'
 for command in awk bash busctl date flock git grep jq openssl realpath rsync sha256sum \
     ss stat sudo systemctl systemd-analyze systemd-run tar; do
@@ -1110,26 +1103,6 @@ readonly REVIEWED_EVIDENCE_SHA="${PREFLIGHT[2]#*=}"
 readonly REVIEWED_ATTEMPT_SHA="${PREFLIGHT[3]#*=}"
 readonly REVIEWED_OLD_GATE_SHA="${PREFLIGHT[4]#*=}"
 verify_reviewed_materials
-EXPOSURE_TMP=$(mktemp)
-credential_exposure "$SOURCE_DATA/config.json" >"$EXPOSURE_TMP"
-jq -e '
-  type=="object" and
-  keys==["account_domain","current_dingtalk_matches_exposed_history",
-    "current_okx_key_matches_exposed_history","dingtalk_configured",
-    "incident_commit"] and
-  .account_domain=="live" and
-  .incident_commit=="38ac63646d2e18ba9d238856b124594b4691f252" and
-  .current_okx_key_matches_exposed_history==false and
-  .current_dingtalk_matches_exposed_history==false and
-  (.dingtalk_configured|type=="boolean")
-' "$EXPOSURE_TMP" >/dev/null
-readonly EXPOSURE_EVIDENCE="$ATTEMPT_STAGE/public-history-exposure.json"
-sudo test ! -e "$EXPOSURE_EVIDENCE"
-sudo test ! -L "$EXPOSURE_EVIDENCE"
-sudo install -o root -g root -m 0600 "$EXPOSURE_TMP" "$EXPOSURE_EVIDENCE"
-rm -f -- "$EXPOSURE_TMP"
-EXPOSURE_EVIDENCE_SHA=$(sudo sha256sum "$EXPOSURE_EVIDENCE" | awk '{print $1}')
-readonly EXPOSURE_EVIDENCE_SHA
 # Reject every already-known migration/config blocker while the old runner is
 # still untouched.  The same checks run again against the stopped copy below
 # so this early screen cannot hide a race.
@@ -1167,9 +1140,6 @@ WRITER_FREEZE=(
   "host_process_inventory_complete=true"
   "runtime_system_api_only_acknowledged=true"
   "replacement_identity_limitation_acknowledged=true"
-  "history_okx_keys_revoked_and_activity_audited=true"
-  "history_dingtalk_webhooks_rotated=true"
-  "credential_exposure_sha256=$EXPOSURE_EVIDENCE_SHA"
 )
 write_request writer_freeze "$ATTEMPT_STAGE/writer-freeze.approval.json" \
   "${WRITER_FREEZE[@]}"

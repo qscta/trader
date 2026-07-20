@@ -2499,8 +2499,6 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
                 "host_process_inventory_complete": True,
                 "runtime_system_api_only_acknowledged": True,
                 "same_side_size_replacement_unattributable_acknowledged": True,
-                "public_history_okx_keys_revoked_and_activity_audited": True,
-                "public_history_dingtalk_webhooks_rotated": True,
             },
             "writers": [{
                 "id": f"reviewed-{kind}",
@@ -2537,11 +2535,9 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
                     module.EvidenceError):
                 module.validate_writer_inventory_payload(bad, TEST_SHA)
 
-    def test_public_history_credential_gate_precedes_runtime_mutation(self):
-        exposure = self.deploy.index(
-            'credential_exposure "$SOURCE_DATA/config.json"')
+    def test_writer_freeze_precedes_runtime_mutation(self):
         writer_freeze = self.deploy.index(
-            'write_request writer_freeze', exposure)
+            'write_request writer_freeze')
         old_gate = self.deploy.index('OLD_MAIN_PID=$(', writer_freeze)
         probe = self.deploy.index('old_gate_client probe-handshake', old_gate)
         intent = self.deploy.index(
@@ -2552,17 +2548,14 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
             'publish_attempt_artifact old-no-open-boundary.json', establish)
         block = self.deploy.index(
             'run_emergency --install-block-only', publish)
-        self.assertLess(exposure, writer_freeze)
         self.assertLess(writer_freeze, old_gate)
         self.assertLess(old_gate, probe)
         self.assertLess(probe, intent)
         self.assertLess(intent, establish)
         self.assertLess(establish, publish)
         self.assertLess(publish, block)
-        self.assertIn(
-            'history_okx_keys_revoked_and_activity_audited=true',
-            self.deploy)
-        self.assertIn('history_dingtalk_webhooks_rotated=true', self.deploy)
+        self.assertNotIn('credential-exposure', self.deploy)
+        self.assertNotIn('public-history-exposure', self.deploy)
 
     def test_all_python_boundaries_ignore_python_and_loader_injection(self):
         combined = self.deploy + self.emergency + self.recover

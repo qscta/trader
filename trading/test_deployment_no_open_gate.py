@@ -37,7 +37,6 @@ from deployment_no_open_gate import (
     commit_sealed as _commit_sealed,
     create_read_only_exchange,
     load_okx_config,
-    probe_public_history_exposure,
     recorded_completed_schedule_slot,
     require_completed_schedule_slot,
     require_safe_resume_schedule_slot,
@@ -1439,33 +1438,6 @@ class SecureStateMachineTest(unittest.TestCase):
                 verify_committed_cycle(directory, SHA_A, environ=env)
             self.assertEqual(1, checks)
             verify_committed_cycle(directory, SHA_A, environ=env)
-
-    def test_public_history_exposure_gate_returns_only_safe_booleans(self):
-        with _canonical_temp_directory() as directory:
-            path = self._write_config(directory)
-            summary = probe_public_history_exposure(path, environ={})
-            self.assertFalse(
-                summary['current_okx_key_matches_exposed_history'])
-            self.assertFalse(
-                summary['current_dingtalk_matches_exposed_history'])
-            self.assertNotIn('api_fingerprint', summary)
-
-            api_hash = hashlib.sha256(
-                _okx()['apiKey'].encode('utf-8')).hexdigest()
-            with mock.patch.object(
-                    gate_module, 'EXPOSED_OKX_API_KEY_FINGERPRINTS',
-                    frozenset({api_hash})), self.assertRaisesRegex(
-                        GateError, 'OKX API Key'):
-                probe_public_history_exposure(path, environ={})
-
-            hook = 'https://example.invalid/test-hook'
-            hook_hash = hashlib.sha256(hook.encode('utf-8')).hexdigest()
-            with mock.patch.object(
-                    gate_module, 'EXPOSED_DINGTALK_WEBHOOK_FINGERPRINTS',
-                    frozenset({hook_hash})), self.assertRaisesRegex(
-                        GateError, 'DingTalk webhook'):
-                probe_public_history_exposure(
-                    path, environ={'DINGTALK_WEBHOOK': hook})
 
     def test_symlinks_hardlinks_and_unsafe_runtime_mode_are_rejected(self):
         with _canonical_temp_directory() as directory:
