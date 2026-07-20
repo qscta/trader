@@ -179,7 +179,7 @@ class ReportingMixin:
             logger.error(f"推送周报失败: {e}")
 
     def _record_equity_tick_with_alert(self):
-        """记录权益采样，连续失败时告警、恢复时通知（各所独立计数）。"""
+        """记录权益采样，连续失败时告警、恢复时通知（当前实例独立计数）。"""
         try:
             ok = bool(self.equity_tracker.record_equity_tick())
             if ok:

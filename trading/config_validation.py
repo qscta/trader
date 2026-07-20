@@ -361,24 +361,25 @@ def validate_okx_legacy_migration_marker(payload):
     """验证旧 runtime 曾写出的完成标记，拒绝任意扩展字段冒充安全收口。"""
     if not isinstance(payload, dict):
         raise ValueError('旧状态迁移标记必须是对象')
-    unknown = sorted(set(payload) - {'exchange', 'completed_at', 'moved'})
-    if unknown:
-        raise ValueError(f'旧状态迁移标记含未知字段: {unknown}')
+    expected = {'exchange', 'completed_at', 'moved'}
+    if set(payload) != expected:
+        raise ValueError(
+            '旧状态迁移标记字段必须精确为 '
+            f'{sorted(expected)}，实际为 '
+            f'{sorted(repr(key) for key in payload)}')
     if payload.get('exchange') != 'okx':
         raise ValueError('旧状态迁移标记 exchange 必须是 okx')
-    if 'completed_at' in payload:
-        value = payload['completed_at']
-        if not isinstance(value, str) or not value:
-            raise ValueError('旧状态迁移标记 completed_at 非法')
-        try:
-            datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError('旧状态迁移标记 completed_at 非法') from exc
-    if 'moved' in payload:
-        moved = payload['moved']
-        if (not isinstance(moved, list) or
-                any(not isinstance(value, str) or not value for value in moved)):
-            raise ValueError('旧状态迁移标记 moved 必须是非空字符串数组')
+    value = payload['completed_at']
+    if not isinstance(value, str) or not value:
+        raise ValueError('旧状态迁移标记 completed_at 非法')
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError('旧状态迁移标记 completed_at 非法') from exc
+    moved = payload['moved']
+    if (not isinstance(moved, list) or
+            any(not isinstance(item, str) or not item for item in moved)):
+        raise ValueError('旧状态迁移标记 moved 必须是字符串数组')
     return payload
 
 
@@ -420,10 +421,9 @@ def canonicalize_single_okx_config(config):
 
 
 def validate_and_normalize_execution_config(config):
-    """生产启动与迁移共用的全部非凭据执行配置校验。"""
+    """校验唯一生产执行布局；旧布局须先由离线迁移显式收敛。"""
     if not isinstance(config, dict):
         raise ValueError('config 顶层必须是对象')
-    canonicalize_single_okx_config(config)
     unknown = sorted(set(config) - EXECUTION_CONFIG_FIELDS)
     if unknown:
         raise ValueError(f'config 顶层含未知字段: {unknown}')

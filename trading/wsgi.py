@@ -1,8 +1,17 @@
+import os
+
+from gunicorn.arbiter import Arbiter
+
 import api_server as srv
 from api_server import app, logger, _bootstrap, start_runner_thread
 from runtime_guard import acquire_runner_lock
 
 _lock_path = None
+
+
+def _halt_gunicorn_master(_standalone_exit_code):
+    """用 Gunicorn 的保留退出码结束 worker，并让 master 一并失败退出。"""
+    os._exit(Arbiter.WORKER_BOOT_ERROR)
 
 
 def _try_start_runner_once():
@@ -18,7 +27,8 @@ def _try_start_runner_once():
         raise RuntimeError('检测到重复 runner：请使用 gunicorn -c gunicorn.conf.py')
 
     _bootstrap()
-    start_runner_thread(srv.trading_system)
+    start_runner_thread(
+        srv.trading_system, fatal_exit=_halt_gunicorn_master)
     logger.info(f'WSGI 模式: 欧易交易线程已启动（runner lock: {_lock_path}）')
 
 

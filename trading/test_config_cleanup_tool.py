@@ -101,6 +101,25 @@ class ConfigCleanupToolTest(unittest.TestCase):
             with self.assertRaises(self.tool.CleanupError):
                 self.tool.check(str(config), str(spec), SHA)
 
+    def test_spec_schema_version_requires_an_exact_json_integer(self):
+        temporary, directory = self._directory()
+        with temporary:
+            config = directory / 'config.json'
+            spec = directory / 'cleanup.spec.json'
+            self._config(config)
+            self.tool.generate_spec(
+                str(config), str(spec), SHA,
+                ('strategy', 'confirmed_obsolete_key'), 'reviewed removal')
+            original = json.loads(spec.read_text(encoding='utf-8'))
+            for version in (True, 1.0):
+                with self.subTest(version=version):
+                    payload = dict(original, schema_version=version)
+                    spec.write_text(json.dumps(payload), encoding='utf-8')
+                    os.chmod(spec, 0o600)
+                    with self.assertRaisesRegex(
+                            self.tool.CleanupError, '版本不兼容'):
+                        self.tool.check(str(config), str(spec), SHA)
+
     def test_retry_repairs_exact_after_state_when_audit_write_was_interrupted(self):
         temporary, directory = self._directory()
         with temporary:
@@ -127,6 +146,11 @@ class ConfigCleanupToolTest(unittest.TestCase):
             recovered = self.tool.apply(
                 str(config), str(spec), str(audit), SHA)
             self.assertEqual('recovered_applied', recovered['status'])
+            self.assertEqual(
+                'already_applied',
+                self.tool.check(str(config), str(spec), SHA)['status'])
+            preview = self.tool.preview_config(str(config), str(spec), SHA)
+            self.assertNotIn('confirmed_obsolete_key', preview['strategy'])
             already = self.tool.apply(
                 str(config), str(spec), str(audit), SHA)
             self.assertEqual('already_applied', already['status'])

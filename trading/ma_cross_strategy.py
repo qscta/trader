@@ -7,7 +7,7 @@ class MaCrossStrategy:
         初始化双均线交叉策略
         short_period: EMA短期周期（默认7）
         long_period: EMA长期周期（默认28）
-        stop_loss_period: 止损用N天收盘价高低点周期（默认28）
+        stop_loss_period: 止损用信号日前N根已完成日线收盘价高低点（默认28）
         """
         self.short_period = short_period
         self.long_period = long_period
@@ -43,15 +43,15 @@ class MaCrossStrategy:
 
     def calculate_stop_levels(self, df):
         """
-        计算N天收盘价高低点（用于止损）
-        做多止损 = 前N天收盘价最低值
-        做空止损 = 前N天收盘价最高值
+        计算信号日前N根已完成日线的收盘价高低点（用于止损，不含信号日）
+        做多止损 = 信号日前N根收盘价最低值
+        做空止损 = 信号日前N根收盘价最高值
         """
         if (len(df) < self.stop_loss_period + 1 or
                 not self._has_valid_closes(df, self.stop_loss_period + 1)):
             return None, None
 
-        # 前stop_loss_period根K线的收盘价（不含当前K线）
+        # 信号日前 stop_loss_period 根已完成日线的收盘价（不含信号日）
         close_prices = df.iloc[-(self.stop_loss_period + 1):-1]['close'].astype(float)
 
         upper_stop = close_prices.max()
@@ -86,7 +86,6 @@ class MaCrossStrategy:
         previous_ema_long = df['ema_long'].iloc[-2]
 
         current_close = df['close'].iloc[-1]
-        previous_close = df['close'].iloc[-2]
 
         # 计算止损高低点
         upper_stop, lower_stop = self.calculate_stop_levels(df)
@@ -96,10 +95,9 @@ class MaCrossStrategy:
         signal = {
             'ema_short': current_ema_short,
             'ema_long': current_ema_long,
-            'upper_stop': upper_stop,    # N天最高收盘价（空单止损）
-            'lower_stop': lower_stop,    # N天最低收盘价（多单止损）
+            'upper_stop': upper_stop,    # 信号日前N根最高收盘价（空单止损）
+            'lower_stop': lower_stop,    # 信号日前N根最低收盘价（多单止损）
             'current_close': current_close,
-            'previous_close': previous_close,
             'action': None
         }
 
@@ -117,9 +115,6 @@ class MaCrossStrategy:
         elif death_cross:
             # 死叉：做空信号（如果有多仓会先平多再开空）
             signal['action'] = 'short'
-
-        # 当前EMA相对位置（用于止损后重入判断）
-        signal['ema_bullish'] = current_ema_short > current_ema_long
 
         return signal
 
@@ -153,7 +148,6 @@ class MaCrossStrategy:
             'upper_stop': upper_stop,
             'lower_stop': lower_stop,
             'current_close': current_close,
-            'ema_bullish': current_ema_short > current_ema_long
         }
 
     def check_current_state(self, df):

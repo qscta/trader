@@ -2,8 +2,8 @@ from flask import Flask, jsonify, request, send_from_directory, session
 from contextlib import contextmanager
 from functools import wraps
 from werkzeug.middleware.proxy_fix import ProxyFix
-import json
 import ipaddress
+import json
 import logging
 import threading
 import time
@@ -19,7 +19,9 @@ from runtime_guard import (
     arm_maintenance_sentinel,
     assess_runtime_health,
     maintenance_sentinel_active,
+    maintenance_sentinel_identity,
     maintenance_sentinel_path,
+    opening_supervision_ready,
     runtime_data_path,
 )
 
@@ -170,18 +172,43 @@ def _prune_login_failures(now):
         _login_failures.pop(next(iter(_login_failures)), None)
 
 
-def start_runner_thread(system):
-    """启动并登记交易 runner；异常被记录，供 /api/status fail-loud。"""
+def start_runner_thread(system, fatal_exit=None):
+    """启动并登记交易 runner；意外退出交回进程监督器重启。"""
     global _runner_thread, _runner_started_at, _runner_failure
+    if fatal_exit is None:
+        fatal_exit = os._exit
 
     def run():
         global _runner_failure
+        failure = None
         try:
             system.start()
         except BaseException as exc:
+            failure = f'{type(exc).__name__}: {exc}'
+            logger.critical('交易 runner 已异常退出', exc_info=True)
+        else:
+            stop_event = getattr(system, '_stop_event', None)
+            try:
+                stopping = bool(stop_event is not None and stop_event.is_set())
+            except Exception:
+                stopping = False
+            if not stopping:
+                failure = 'RuntimeError: trading runner returned unexpectedly'
+                logger.critical('交易 runner 未收到停止请求却已退出')
+        if failure is not None:
             with _runner_guard:
-                _runner_failure = f'{type(exc).__name__}: {exc}'
-            logger.critical('交易 runner 已退出', exc_info=True)
+                _runner_failure = failure
+            stop_event = getattr(system, '_stop_event', None)
+            try:
+                stopping = bool(stop_event is not None and stop_event.is_set())
+            except Exception:
+                stopping = False
+            if not stopping:
+                # 仅记录故障会留下 Web 正常、调度/巡检永久死亡的半活进程。
+                # standalone 默认整进程非零退出；Gunicorn 入口注入其
+                # WORKER_BOOT_ERROR，使 master 也退出并由 systemd 按
+                # RestartSec 节流重启，不能用普通 SIGTERM 制造 worker 风暴。
+                fatal_exit(1)
 
     with _runner_guard:
         if _runner_thread is not None and _runner_thread.is_alive():
@@ -283,9 +310,9 @@ def _runner_health(system):
         'scheduler_running': runtime_health['scheduler_running'],
         'scheduler_thread_alive': runtime_health['scheduler_thread_alive'],
         'runner_started_at': started_at,
-        'heartbeat_age_seconds': (
-            round(runtime_health['heartbeat_age_seconds'], 1)
-            if runtime_health['heartbeat_age_seconds'] is not None else None),
+        # 保留原始年龄供开仓边界裁决；展示舍入不能把 150.001 秒洗成
+        # 150.0 秒并越过严格超时线。
+        'heartbeat_age_seconds': runtime_health['heartbeat_age_seconds'],
         'persistence_degraded': runtime_health['persistence_degraded'],
         'persistence_degraded_context': runtime_health[
             'persistence_degraded_context'],
@@ -295,9 +322,21 @@ def _runner_health(system):
         'daily_check_overdue': runtime_health['daily_check_overdue'],
         'expected_daily_check_date': runtime_health[
             'expected_daily_check_date'],
+        'stopping': runtime_health['stopping'],
         'failure': failure,
         'issues': issues,
     }
+
+
+def _opening_runtime_ready(system):
+    """只裁决新开仓所需的窄运行边界，不混入日检逾期等修复信号。"""
+    health = _runner_health(system)
+    ready = (
+        health['runner_thread_alive'] is True and
+        health['failure'] is None and
+        opening_supervision_ready(health)
+    )
+    return ready, health
 
 
 @contextmanager
@@ -403,7 +442,7 @@ def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_messag
     except AtomicWriteCommitDurabilityError:
         # 文件已经 rename；回滚内存会制造配置双重现实。保留新配置并同步
         # 策略对象，但明确返回降级，中央开仓门闩已经由 persist_config 拉起。
-        system.reload_strategies()
+        system.reload_ma_strategy()
         return jsonify({
             'error': ('配置文件已替换，但目录耐久性不可证明；已保留新内存配置、'
                       '系统已禁开仓，请修复存储并完整重启对账'),
@@ -414,7 +453,7 @@ def _commit_config_or_rollback(system, section_key, sub_key, backup, fail_messag
         else:
             system.config[section_key][sub_key] = backup
         return jsonify({'error': fail_message}), 500
-    system.reload_strategies()
+    system.reload_ma_strategy()
     return None
 
 
@@ -431,7 +470,7 @@ def _request_is_loopback():
 @app.route('/api/deployment/no-open-capability', methods=['GET'])
 @require_auth
 def deployment_no_open_capability():
-    """只读声明旧 runner 是否支持同锁禁开仓握手。"""
+    """只读声明 runner 是否支持同锁禁开仓握手。"""
     system, err = _require_system()
     if err:
         return err
@@ -452,7 +491,7 @@ def deployment_no_open_capability():
 @app.route('/api/deployment/arm-no-open', methods=['POST'])
 @require_auth
 def deployment_arm_no_open():
-    """持有与全部交易路径相同的锁，落盘 sentinel 后才释放在途边界。"""
+    """持有与全部交易路径相同的锁，落盘 sentinel 后才释放边界。"""
     system, err = _require_system()
     if err:
         return err
@@ -462,13 +501,15 @@ def deployment_arm_no_open():
     if not isinstance(data, dict) or set(data) != {'release_sha', 'nonce'}:
         return jsonify({'error': '部署握手字段必须精确为 release_sha / nonce'}), 400
     if not system._trade_lock.acquire(timeout=120):
-        return jsonify({'error': '交易锁在 120 秒内未排空，拒绝部署握手'}), 503
+        return jsonify({
+            'error': '交易锁在 120 秒内未排空，拒绝部署握手',
+        }), 503
     try:
         path = maintenance_sentinel_path(
             base_dir=getattr(system, 'base_dir', None))
         if maintenance_sentinel_active(path):
             return jsonify({
-                'error': '旧 runner sentinel 已存在、路径非法或状态不可确认',
+                'error': 'runner sentinel 已存在、路径非法或状态不可确认',
             }), 409
         payload, identity = arm_maintenance_sentinel(
             path, data.get('release_sha'), data.get('nonce'), os.getpid())
@@ -489,12 +530,50 @@ def deployment_arm_no_open():
             },
         })
     except Exception as exc:
-        logger.exception(f'旧 runner 禁开仓握手失败: {exc}')
+        logger.exception(f'runner 禁开仓握手失败: {exc}')
         return jsonify({
             'error': '禁开仓握手失败；任意已创建 sentinel 将继续保持维护态',
         }), 503
     finally:
         system._trade_lock.release()
+
+
+@app.route('/api/deployment/drain-no-open', methods=['GET'])
+@require_auth
+def deployment_drain_no_open():
+    """在既有 sentinel 下再次排空同一交易锁，并绑定稳定 inode。"""
+    system, err = _require_system()
+    if err:
+        return err
+    if not _request_is_loopback():
+        return jsonify({'error': '部署排空只接受本机回环请求'}), 403
+    if not system._trade_lock.acquire(timeout=120):
+        return jsonify({'error': '交易锁在 120 秒内未排空'}), 503
+    try:
+        path = maintenance_sentinel_path(
+            base_dir=getattr(system, 'base_dir', None))
+        before = maintenance_sentinel_identity(path)
+        gate = system._maintenance_open_gate_status()
+        after = maintenance_sentinel_identity(path)
+        if (before != after or not isinstance(gate, dict) or
+                gate.get('status') != 'maintenance_blocked' or
+                gate.get('sentinel_path') != path):
+            raise RuntimeError('同锁排空期间 maintenance boundary 不稳定')
+        return jsonify({
+            'protocol': 'trade-lock-no-open-v1',
+            'status': 'maintenance_blocked',
+            'inflight_open_boundary_drained': True,
+            'worker_pid': os.getpid(),
+            'sentinel': after,
+        })
+    except Exception as exc:
+        logger.exception(f'runner 最终禁开仓排空失败: {exc}')
+        return jsonify({
+            'error': '最终禁开仓排空失败；sentinel 继续保持维护态',
+        }), 503
+    finally:
+        system._trade_lock.release()
+
 
 @app.route('/')
 def index():
@@ -696,6 +775,19 @@ def add_symbol():
                 return jsonify({'error': '交易对已存在'}), 400
             if system.trade_state.get_open_intent(new_symbol['name']):
                 return jsonify({'error': f"{new_symbol['name']} 存在未收口开仓意图，禁止重新加入/改配"}), 409
+            # 删除配置与旧元数据无法跨文件原子提交；若上次删除在两步间崩溃，
+            # 重加必须先清掉可安全清理的旧信号/T+1。该事务会自行拒绝有仓、
+            # intent 或止损残留的品种，并始终保留真钱 quarantine。
+            system.trade_state.remove_symbol_metadata(new_symbol['name'])
+            if (system.trade_state.get_signal_metadata(new_symbol['name']) or
+                    system.trade_state.get_stop_loss_date(
+                        new_symbol['name']) is not None):
+                return jsonify({
+                    'error': (
+                        f"{new_symbol['name']} 的旧信号/T+1 元数据仍受未收口"
+                        '交易生命周期保护，禁止重新加入；请先完成持仓、意图或'
+                        '止损残留对账'),
+                }), 409
             backup_symbols = json.loads(json.dumps(system.config['trading']['symbols']))
             system.config['trading']['symbols'].append(new_symbol)
             err_resp = _commit_config_or_rollback(system, 'trading', 'symbols', backup_symbols, '配置写入失败，交易对未添加')
@@ -810,17 +902,23 @@ def delete_symbol(symbol):
             # 清理也必须留在同一 trade lock 内；否则锁释放后即时开仓可插入，清理线程
             # 还拿旧的 exchange-flat 结论删除新仓的信号/T+1 元数据。
             if not held:
+                clear_quarantine = False
                 try:
-                    clear_quarantine = False
                     ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_u)
                     exchange_position = system.exchange_api.get_position(ccxt_symbol)
-                    clear_quarantine = not exchange_position or float(
-                        exchange_position.get('contracts') or 0) == 0
+                    clear_quarantine = not system._exchange_position_has_contracts(
+                        exchange_position)
+                except Exception as e:
+                    # 查询失败/响应畸形时保留真钱隔离，但退池信号与 T+1
+                    # 仍须清除，避免删除后重加继承旧策略状态。
+                    logger.warning(
+                        f'删除 {symbol_u} 后无法严格证明交易所空仓，隔离记录保留: {e}')
+                try:
                     system.trade_state.remove_symbol_metadata(
                         symbol_u, clear_quarantine=clear_quarantine)
                 except Exception as e:
-                    # 查询失败时 fail-closed：不清 quarantine；配置删除本身已成功。
-                    logger.warning(f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')
+                    logger.warning(
+                        f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')
         send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
         return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
     except Exception as e:
@@ -1139,7 +1237,8 @@ def update_strategy_params():
             sp = system.config.setdefault('strategy', {})
 
             label_map = {'ma_short_period': 'EMA短期周期',
-                         'ma_long_period': 'EMA长期周期', 'ma_stop_period': 'EMA止损周期'}
+                         'ma_long_period': 'EMA长期周期',
+                         'ma_stop_period': '收盘极值止损回看周期'}
             for key, v in parsed.items():
                 sp[key] = v
                 if key == 'default_risk_per_trade':
@@ -1188,6 +1287,26 @@ def instant_open():
         if not system._trade_lock.acquire(blocking=False):
             return jsonify({'error': '交易检查/巡检正在执行中，请稍后再试'}), 409
         try:
+            runtime_ready, runtime_health = _opening_runtime_ready(system)
+            if not runtime_ready:
+                return jsonify({
+                    'error': '交易 runner/调度器未处于可托管状态，禁止即时开仓',
+                    'runtime_issues': runtime_health['issues'],
+                }), 503
+
+            # 禁用是权威配置中的“只平不开”边界。即时请求可为新品种临时
+            # 指定风险，但不能用自行构造的 enabled=true 覆盖现有禁用项。
+            with system._config_lock:
+                configured = next((
+                    item for item in system.config['trading']['symbols']
+                    if item['name'] == symbol_name
+                ), None)
+                if (configured is not None and
+                        configured.get('enabled', True) is not True):
+                    return jsonify({
+                        'error': f'{symbol_name} 已在权威配置中禁用，禁止即时开仓',
+                    }), 409
+
             if system.trade_state.get_open_position(symbol_name):
                 return jsonify({'error': f'{symbol_name} 已有持仓，无法重复开仓'}), 400
 
@@ -1420,8 +1539,6 @@ def close_position():
                 exit_price_source=close_order.get('exit_price_source'))
             if not state_saved:
                 return jsonify({'error': f'{symbol_name} 已在交易所平仓，但本地状态保存失败，请立即检查'}), 500
-            system._sync_stop_trigger_date(symbol_name, stop_loss_date)
-
             direction_text = '做多' if position['side'] == 'long' else '做空'
             send_dingtalk(f'[{system.label}-手动平仓] {symbol_name} {direction_text}\n'
                           f'出场价: {actual_price}\n'
@@ -1462,6 +1579,12 @@ def manual_check():
         return jsonify({
             'error': f'未知字段: {sorted(data)}；手动检查只接受空对象 {{}}',
         }), 400
+    runtime_ready, runtime_health = _opening_runtime_ready(system)
+    if not runtime_ready:
+        return jsonify({
+            'error': '交易 runner/调度器未处于可托管状态，禁止手动交易检查',
+            'runtime_issues': runtime_health['issues'],
+        }), 503
     if not _set_manual_check_running(True):
         return jsonify({'status': 'busy', 'message': '已有手动检查在执行中，请稍后再试'}), 409
     try:
@@ -1470,6 +1593,14 @@ def manual_check():
         def run_check():
             global _manual_check_thread, _manual_check_running
             try:
+                # HTTP 检查与后台线程启动之间仍可能发生 runner/scheduler
+                # 故障；真正进入可开仓检查前必须再次裁决。
+                runtime_ready, runtime_health = _opening_runtime_ready(system)
+                if not runtime_ready:
+                    logger.critical(
+                        '[%s] 手动交易检查启动前运行边界已失效: %s',
+                        system.label, runtime_health['issues'])
+                    return
                 system.check_and_execute_trades(manual_run=True)
                 logger.info(f"[{system.label}] 手动触发的交易检查执行完毕")
             except Exception as e:

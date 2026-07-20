@@ -1,16 +1,15 @@
 """交易所适配层抽象基类。
 
-设计目标：上层（main.py / api_server.py / 策略）只依赖本接口，不感知具体交易所。
-每个交易所（币安、欧易……）实现一个子类，把"符号格式、合约张数、止损/算法单、
-杠杆与保证金模式"等差异全部封装在子类内部。
+当前唯一生产实现是 OkxApi。基类集中 OHLCV、余额等共享边界并显式声明
+适配器契约，让上层（main.py / api_server.py / 策略）不直接依赖 ccxt 细节。
 
-内部符号约定：统一用 `BTCUSDT`（无斜杠）。各子类负责把它映射成自己的 ccxt 永续符号：
-  - 币安：BTC/USDT      （defaultType=future 下即为 U 本位永续）
-  - 欧易：BTC/USDT:USDT （现货才是 BTC/USDT）
+内部符号约定：统一用 `BTCUSDT`（无斜杠），OkxApi 在交易所边界映射为
+`BTC/USDT:USDT` 永续符号（现货才是 `BTC/USDT`）。
 
-仓位单位约定：上层与本地状态始终以"币的数量"为单位（如 0.5 BTC）。
-张数（合约面值）的换算只发生在子类下单边界内部，绝不外泄给上层，
-从而保证风控/盈亏/名义价值的计算口径在所有交易所下保持一致。
+仓位单位约定：业务参数与本地状态始终以"币的数量"为单位（如 0.5 BTC）。
+`get_position()` 是只读交易所观测边界，其 ccxt `contracts` 字段仍为张数；
+适配器对账代码必须先显式换算成币数，业务层不得直接拿它与本地币数比较。
+下单接口的张数换算同样只发生在子类边界内部。
 """
 
 import ccxt
@@ -61,7 +60,7 @@ class ExchangeApi:
     close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
     round_quantity、get_quantity_precision、find_stop_order_state、
     list_position_symbols、find_existing_open_order、
-    compensation_client_order_id、find_compensation_close_evidence、setup_symbol。
+    compensation_client_order_id、find_compensation_close_progress、setup_symbol。
 
     通用且与交易所无关的实现（K 线读取、收盘过滤、余额/持仓/挂单读取）在基类提供。
     """
@@ -87,12 +86,12 @@ class ExchangeApi:
         raise NotImplementedError
 
     def get_position(self, symbol):
-        """获取单个交易对的持仓（ccxt 统一结构，无持仓返回 None 或 contracts=0）。"""
+        """返回 ccxt 持仓；contracts 是张数，无持仓返回 None 或零张。"""
         raise NotImplementedError
 
     def open_position(
             self, symbol, side, amount, client_order_id=None, *,
-            require_existing=False):
+            require_existing=False, pre_submit_guard=None):
         """市价开仓；require_existing=True 时只允许找回旧单，禁止 POST。"""
         raise NotImplementedError
 
@@ -135,8 +134,10 @@ class ExchangeApi:
         """开仓前显式完成该品种的杠杆/保证金准备。"""
         raise NotImplementedError
 
-    def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
-        """检查止损：intact/adoptable/mismatch/missing 四种结果。"""
+    def find_stop_order_state(
+            self, symbol, side, amount, stop_price, stop_order_id=None,
+            known_extra_stop_order_ids=None):
+        """检查止损；仅额外允许严格已知的部分平仓旧止损清理态。"""
         raise NotImplementedError
 
     def list_position_symbols(self):
@@ -152,19 +153,13 @@ class ExchangeApi:
         """
         raise NotImplementedError
 
-    def find_compensation_close_evidence(self, symbol, side, amount,
-                                         open_client_order_id):
-        """已确认空仓后，只读找回由开仓句柄派生的单笔补偿平仓订单。
-
-        契约：明确无补偿订单或证据不完整返回 None；完整证据返回单笔订单结果；
-        查询不确定必须抛出。本方法永不创建订单——「查询」绝不允许用可
-        下单的 close_position 模拟。
-        """
-        raise NotImplementedError
-
     def find_compensation_close_progress(self, symbol, side, amount,
                                          open_client_order_id):
-        """只读返回单笔补偿订单 absent/full/terminal-partial 终态。"""
+        """只读返回单笔补偿订单 absent/full/terminal-partial 终态。
+
+        ``amount=None`` 只用于崩溃恢复：按确定性 clOrdId 找回订单后
+        从已严格绑定的订单本身取请求量；仍然绝不创建订单。
+        """
         raise NotImplementedError
 
     def confirm_stop_execution(

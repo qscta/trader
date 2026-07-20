@@ -34,6 +34,14 @@ def _absent_compensation_progress(
     }
 
 
+def _absent_compensation_discovery(client_order_id):
+    """Mirror the amount-unknown deterministic-ID absent contract."""
+    progress = _absent_compensation_progress(client_order_id, 1.0)
+    progress['requested_amount'] = None
+    progress['remaining_amount'] = None
+    return progress
+
+
 def _terminal_compensation_progress(
         client_order_id, requested_contracts, requested_amount,
         filled_contracts, *, order_id='compensation-order',
@@ -531,6 +539,259 @@ class OpenIntentStateTest(unittest.TestCase):
 
 
 class PartialOpenCrashRecoveryTest(unittest.TestCase):
+    def _orphan_recovery_system(self, tmp, unresolved_kind):
+        system = TradingSystem.__new__(TradingSystem)
+        system.trade_state = TradeState(
+            os.path.join(tmp, 'trade_state.json'))
+        system.trade_state.prepare_open_intent(
+            'BTCUSDT', 'ma_cross', 'long', 'ILateFillCrash1',
+            {'side': 'long', 'entry_price': 100.0,
+             'stop_loss_price': 90.0},
+            planned_position_size=10.0)
+        compensation_id = 'RLateFillCrash1'
+        if unresolved_kind is None:
+            pass
+        elif unresolved_kind == 'open':
+            system.trade_state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ILateFillCrash1', 'open', 10.0)
+        elif unresolved_kind == 'open_compensation':
+            system.trade_state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ILateFillCrash1', 'open_compensation', 5.0,
+                compensation_client_order_id=compensation_id)
+        elif unresolved_kind == 'open_attribution':
+            system.trade_state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ILateFillCrash1', 'open_attribution', 10.0)
+        else:
+            self.fail(f'unsupported unresolved kind: {unresolved_kind}')
+        open_post = Mock()
+        close_post = Mock()
+        system.exchange_api = SimpleNamespace(
+            to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
+            _coin_to_contracts=lambda _symbol, amount: float(amount),
+            _contracts_to_coins=lambda _symbol, amount: float(amount),
+            find_existing_open_order=Mock(return_value={
+                'id': 'open-late-fill', 'status': 'canceled',
+                'amount': 10.0, 'filled': 5.0, 'remaining': 5.0,
+                'average': 100.0,
+            }),
+            find_compensation_close_progress=Mock(return_value=(
+                _absent_compensation_progress(compensation_id, 5.0))),
+            compensation_client_order_id=(
+                lambda value: f'R{value[1:]}'),
+            get_position=Mock(return_value={
+                'side': 'long', 'contracts': 5.0}),
+            open_position=open_post,
+            close_position=close_post,
+        )
+        system._quarantine_position_mismatch = Mock()
+        system._protect_unresolved_lifecycle_position = Mock(
+            return_value=False)
+        return system, open_post, close_post
+
+    def test_live_partial_fill_builds_provisional_and_invokes_protection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, open_post, close_post = (
+                self._orphan_recovery_system(tmp, None))
+            system.exchange_api.find_existing_open_order.return_value.update({
+                'status': 'open',
+            })
+            system.exchange_api.find_compensation_close_progress.return_value = (
+                _absent_compensation_discovery('RLateFillCrash1'))
+            intent = system.trade_state.get_open_intent('BTCUSDT')
+
+            recovered = system._resume_open_intent_position(
+                'BTCUSDT', intent)
+
+            self.assertFalse(recovered)
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system.exchange_api.find_compensation_close_progress.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', None, 'ILateFillCrash1')
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(5.0, position['position_size'])
+            unresolved = system.trade_state.get_open_intent(
+                'BTCUSDT')['unresolved_execution']
+            self.assertEqual('open', unresolved['kind'])
+            self.assertEqual(5.0, unresolved['expected_position_size'])
+            system._quarantine_position_mismatch.assert_not_called()
+            system._protect_unresolved_lifecycle_position.assert_called_once()
+
+    def test_late_fill_after_open_marker_builds_provisional_without_close_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, open_post, close_post = (
+                self._orphan_recovery_system(tmp, 'open'))
+            intent = system.trade_state.get_open_intent('BTCUSDT')
+
+            recovered = system._resume_open_intent_position(
+                'BTCUSDT', intent)
+
+            self.assertFalse(recovered)
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system.exchange_api.find_existing_open_order.assert_called_once()
+            system.exchange_api.find_compensation_close_progress.assert_not_called()
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(5.0, position['position_size'])
+            unresolved = system.trade_state.get_open_intent(
+                'BTCUSDT')['unresolved_execution']
+            self.assertEqual('open', unresolved['kind'])
+            self.assertEqual(5.0, unresolved['expected_position_size'])
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+            system._quarantine_position_mismatch.assert_not_called()
+            system._protect_unresolved_lifecycle_position.assert_called_once()
+
+    def test_late_fill_after_prior_compensation_uses_distinct_request_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(
+                os.path.join(tmp, 'trade_state.json'))
+            system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'ILateCompResidual1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=10.0)
+            system.trade_state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ILateCompResidual1', 'open_compensation', 10.0,
+                compensation_client_order_id='RLateCompResidual1',
+                compensation_requested_size=5.0)
+            progress = _terminal_compensation_progress(
+                'RLateCompResidual1', 5.0, 5.0, 5.0,
+                order_id='compensation-five')
+            open_post = Mock()
+            close_post = Mock()
+            system.exchange_api = SimpleNamespace(
+                to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
+                _coin_to_contracts=lambda _symbol, amount: float(amount),
+                _contracts_to_coins=lambda _symbol, amount: float(amount),
+                find_existing_open_order=Mock(return_value={
+                    'id': 'open-ten', 'status': 'closed',
+                    'amount': 10.0, 'filled': 10.0, 'remaining': 0.0,
+                    'average': 100.0,
+                }),
+                find_compensation_close_progress=Mock(return_value=progress),
+                compensation_client_order_id=(
+                    lambda value: f'R{value[1:]}'),
+                get_position=Mock(return_value={
+                    'side': 'long', 'contracts': 5.0}),
+                open_position=open_post, close_position=close_post,
+            )
+            system._quarantine_position_mismatch = Mock()
+            system._protect_unresolved_lifecycle_position = Mock(
+                return_value=True)
+            intent = system.trade_state.get_open_intent('BTCUSDT')
+
+            self.assertFalse(system._resume_open_intent_position(
+                'BTCUSDT', intent))
+
+            system.exchange_api.find_compensation_close_progress.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', 5.0, 'ILateCompResidual1')
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(5.0, position['position_size'])
+            unresolved = system.trade_state.get_open_intent(
+                'BTCUSDT')['unresolved_execution']
+            self.assertEqual(10.0, unresolved['expected_position_size'])
+            self.assertEqual(5.0, unresolved['compensation_requested_size'])
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system._quarantine_position_mismatch.assert_not_called()
+
+    def test_crash_after_compensation_post_discovers_request_before_late_fill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = TradeState(
+                os.path.join(tmp, 'trade_state.json'))
+            intent = system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'ICrashAfterComp1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=10.0)
+            progress = _terminal_compensation_progress(
+                'RCrashAfterComp1', 5.0, 5.0, 5.0,
+                order_id='compensation-before-crash')
+            open_post = Mock()
+            close_post = Mock()
+            system.exchange_api = SimpleNamespace(
+                to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
+                _coin_to_contracts=lambda _symbol, amount: float(amount),
+                _contracts_to_coins=lambda _symbol, amount: float(amount),
+                find_existing_open_order=Mock(return_value={
+                    'id': 'open-late-ten', 'status': 'closed',
+                    'amount': 10.0, 'filled': 10.0, 'remaining': 0.0,
+                    'average': 100.0,
+                }),
+                find_compensation_close_progress=Mock(return_value=progress),
+                compensation_client_order_id=(
+                    lambda value: f'R{value[1:]}'),
+                get_position=Mock(return_value={
+                    'side': 'long', 'contracts': 5.0}),
+                open_position=open_post, close_position=close_post,
+            )
+            system._quarantine_position_mismatch = Mock()
+            system._protect_unresolved_lifecycle_position = Mock(
+                return_value=True)
+
+            self.assertFalse(system._resume_open_intent_position(
+                'BTCUSDT', intent))
+
+            system.exchange_api.find_compensation_close_progress.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', None, 'ICrashAfterComp1')
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(5.0, position['position_size'])
+            unresolved = system.trade_state.get_open_intent(
+                'BTCUSDT')['unresolved_execution']
+            self.assertEqual('open_compensation', unresolved['kind'])
+            self.assertEqual(10.0, unresolved['expected_position_size'])
+            self.assertEqual(5.0, unresolved['compensation_requested_size'])
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system._quarantine_position_mismatch.assert_not_called()
+
+    def test_restart_after_compensation_marker_builds_provisional_without_post(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, open_post, close_post = (
+                self._orphan_recovery_system(tmp, 'open_compensation'))
+            intent = system.trade_state.get_open_intent('BTCUSDT')
+
+            recovered = system._resume_open_intent_position(
+                'BTCUSDT', intent)
+
+            self.assertFalse(recovered)
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system.exchange_api.find_existing_open_order.assert_called_once()
+            system.exchange_api.find_compensation_close_progress.assert_called_once()
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(5.0, position['position_size'])
+            unresolved = system.trade_state.get_open_intent(
+                'BTCUSDT')['unresolved_execution']
+            self.assertEqual('open_compensation', unresolved['kind'])
+            self.assertEqual(5.0, unresolved['expected_position_size'])
+            system._quarantine_position_mismatch.assert_not_called()
+            system._protect_unresolved_lifecycle_position.assert_called_once()
+
+    def test_attribution_marker_remains_manual_without_any_order_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, open_post, close_post = (
+                self._orphan_recovery_system(tmp, 'open_attribution'))
+            intent = system.trade_state.get_open_intent('BTCUSDT')
+
+            self.assertFalse(system._resume_open_intent_position(
+                'BTCUSDT', intent))
+
+            open_post.assert_not_called()
+            close_post.assert_not_called()
+            system.exchange_api.find_existing_open_order.assert_not_called()
+            system.exchange_api.find_compensation_close_progress.assert_not_called()
+            self.assertIsNone(
+                system.trade_state.get_open_position('BTCUSDT'))
+            self.assertEqual(
+                'open_attribution',
+                system.trade_state.get_open_intent(
+                    'BTCUSDT')['unresolved_execution']['kind'])
+            system._quarantine_position_mismatch.assert_called_once()
+            system._protect_unresolved_lifecycle_position.assert_not_called()
+
     def test_existing_stop_post_anchor_wins_over_older_intent_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = TradeState(os.path.join(tmp, 'trade_state.json'))
@@ -569,6 +830,9 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                 system = TradingSystem.__new__(TradingSystem)
                 system.trade_state = TradeState(
                     os.path.join(tmp, 'trade_state.json'))
+                system.trade_state.replace_stop_loss_dates({
+                    'BTCUSDT': '2000-01-01',
+                })
                 intent = system.trade_state.prepare_open_intent(
                     'BTCUSDT', 'ma_cross', 'long', 'IPartialCrash123',
                     {'side': 'long', 'entry_price': 100.0,
@@ -584,7 +848,7 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                 close_post = Mock()
                 compensation_id = 'RPartialCrash123'
                 progress = (
-                    _absent_compensation_progress(compensation_id, 5.0)
+                    _absent_compensation_discovery(compensation_id)
                     if progress_kind == 'absent' else
                     _terminal_compensation_progress(
                         compensation_id, 5.0, 5.0,
@@ -619,16 +883,17 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                 open_post.assert_not_called()
                 close_post.assert_not_called()
                 system.exchange_api.find_compensation_close_progress.assert_called_once_with(
-                    'BTC/USDT:USDT', 'long', 5.0, 'IPartialCrash123')
+                    'BTC/USDT:USDT', 'long', None, 'IPartialCrash123')
                 position = system.trade_state.get_open_position('BTCUSDT')
                 self.assertEqual(fresh_contracts, position['position_size'])
                 self.assertTrue(position['recovered_unresolved_open'])
                 self.assertFalse(position['execution_recovery_finalized'])
                 self.assertEqual([], position.get('partial_closes', []))
-                self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
-                self.assertEqual(
-                    old_anchor,
-                    system.trade_state.get_stop_residues()['BTCUSDT'])
+                self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+                self.assertNotIn(
+                    'BTCUSDT', system.trade_state.get_stop_loss_dates())
+                self.assertNotIn(
+                    'BTCUSDT', system.trade_state.get_stop_residues())
                 unresolved = system.trade_state.get_open_intent(
                     'BTCUSDT')['unresolved_execution']
                 self.assertEqual(5.0, unresolved['expected_position_size'])
@@ -646,8 +911,7 @@ class PartialOpenCrashRecoveryTest(unittest.TestCase):
                  'stop_loss_price': 90.0},
                 planned_position_size=10.0)
             compensation_id = 'RPartialCrashBad1'
-            malformed = _absent_compensation_progress(
-                compensation_id, 5.0)
+            malformed = _absent_compensation_discovery(compensation_id)
             malformed['terminal'] = True
             open_post = Mock()
             close_post = Mock()
@@ -715,6 +979,7 @@ class CompensationProgressOrchestrationTest(unittest.TestCase):
             to_ccxt_symbol=lambda symbol: symbol,
             _get_contract_size=lambda _symbol: 1.0,
             _coin_to_contracts=lambda _symbol, amount: float(amount),
+            _contracts_to_coins=lambda _symbol, amount: float(amount),
             find_existing_open_order=Mock(return_value={
                 'id': 'open-reconciled', 'status': 'closed',
                 'amount': 1.0, 'filled': 1.0, 'remaining': 0.0,
@@ -965,7 +1230,10 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
 
         def open_position(
                 _symbol, _side, amount, client_order_id=None, *,
-                require_existing=False):
+                require_existing=False, pre_submit_guard=None):
+            if (pre_submit_guard is not None and
+                    pre_submit_guard() is not True):
+                return None
             seen_client_ids.append(client_order_id)
             seen_require_existing.append(require_existing)
             exchange_state['position'] = {
@@ -1001,8 +1269,11 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
                 side_effect=find_existing_open_order),
             find_compensation_close_progress=Mock(side_effect=(
                 lambda _symbol, _side, amount, open_client_order_id:
-                _absent_compensation_progress(
-                    f'R{open_client_order_id[1:]}', amount))),
+                (_absent_compensation_discovery(
+                    f'R{open_client_order_id[1:]}')
+                 if amount is None else
+                 _absent_compensation_progress(
+                    f'R{open_client_order_id[1:]}', amount)))),
             compensation_client_order_id=lambda value: f'R{value[1:]}',
         )
         system.config = {
@@ -1018,8 +1289,15 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
         system.notifier = SimpleNamespace(
             notify_error=Mock(), send_message=Mock())
         system._pending_trade_open_notifications = []
+        system.health_snapshot = lambda: {
+            'scheduler_running': True,
+            'scheduler_thread_alive': True,
+            'heartbeat_age_seconds': 0.0,
+            'persistence_degraded': False,
+            'guardian_failure': None,
+            'stopping': False,
+        }
         system._stop_anomalies = {}
-        system.stop_loss_dates = {}
         system._seen_require_existing = seen_require_existing
         system._exchange_position_state = exchange_state
         return system, seen_client_ids
@@ -1172,19 +1450,18 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 {'BTCUSDT'}, system._reconcile_all_open_intents('test'))
 
-            # 崩溃恢复只读找回原始 clOrdId 与确定性补偿 ID，
-            # 绝不重放旧开仓请求。先建无财务 provisional，由下一轮
-            # lifecycle 用权威终态收口。
+            # 崩溃恢复只读找回原始 clOrdId，并按确定性补偿
+            # ID 证明未发单；绝不重放旧开仓请求。
             self.assertEqual([], seen_client_ids)
             system.risk_manager.calculate_position_size.assert_not_called()
             intent = system.trade_state.get_open_intent('BTCUSDT')
             self.assertEqual(
-                'open_compensation', intent['unresolved_execution']['kind'])
+                'open', intent['unresolved_execution']['kind'])
             position = system.trade_state.get_open_position('BTCUSDT')
             self.assertEqual('long', position['side'])
             self.assertTrue(position['recovered_unresolved_open'])
             self.assertFalse(position['execution_recovery_finalized'])
-            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
             self.assertEqual([], system._seen_require_existing)
 
     def test_orphan_recovery_never_replays_open_and_keeps_failed_intent(self):
@@ -1993,7 +2270,6 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system._pending_trade_open_notifications = []
         system._pending_trade_close_notifications = []
         system._stop_anomalies = {}
-        system.stop_loss_dates = {}
         system.equity_tracker = SimpleNamespace(
             record_daily_equity_snapshot=lambda: None,
             refresh_account_stats_state=lambda: None)
@@ -2032,7 +2308,8 @@ class MaMarkerIntegrationTest(unittest.TestCase):
     def test_same_day_stop_block_consumes_cross_without_failure_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)
-            system.stop_loss_dates['BTCUSDT'] = date.today().isoformat()
+            system.trade_state.replace_stop_loss_dates({
+                'BTCUSDT': date.today().isoformat()})
             system._ma_signal_with_catchup = (
                 lambda *args, **kwargs: (self._signal(), 't5'))
             system._execute_open = Mock(
@@ -2046,10 +2323,28 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             system._execute_open.assert_not_called()
             system.notifier.notify_signal_missed.assert_not_called()
 
+    def test_future_stop_date_is_fail_closed_in_signal_handler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            future = (date.today() + timedelta(days=1)).isoformat()
+            system.trade_state.replace_stop_loss_dates({
+                'BTCUSDT': future})
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5'))
+            system._execute_open = Mock(
+                side_effect=AssertionError('未来 T+1 日期不得开仓'))
+
+            system.check_and_execute_trades()
+
+            self.assertEqual(
+                future, system.trade_state.get_stop_loss_date('BTCUSDT'))
+            system._execute_open.assert_not_called()
+
     def test_failed_t1_reentry_keeps_candle_and_day_pending_for_intraday_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)
-            system.stop_loss_dates['BTCUSDT'] = '2000-01-01'
+            system.trade_state.replace_stop_loss_dates({
+                'BTCUSDT': '2000-01-01'})
             system.ma_cross_strategy.check_reentry_condition = Mock(
                 return_value=(True, 'long', self._signal(action=None)))
             system._ma_signal_with_catchup = (
@@ -2061,7 +2356,9 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             metadata = system.trade_state.get_signal_metadata('BTCUSDT')
             self.assertEqual('t3', metadata['last_processed_candle'])
             self.assertIsNone(system._last_check_date)
-            self.assertEqual('2000-01-01', system.stop_loss_dates['BTCUSDT'])
+            self.assertEqual(
+                '2000-01-01',
+                system.trade_state.get_stop_loss_date('BTCUSDT'))
             system.notifier.notify_signal_missed.assert_called_once()
 
     def test_invalid_ma_state_keeps_day_incomplete_for_retry(self):
@@ -2400,7 +2697,7 @@ class MigrationAndT1FailClosedTest(unittest.TestCase):
             system = TradingSystem.__new__(TradingSystem)
             system.base_dir = tmp
             with self.assertRaises(RuntimeError):
-                system._migrate_okx_legacy_state()
+                system._validate_okx_legacy_state_gate()
             with open(root, encoding='utf-8') as handle:
                 self.assertEqual({}, json.load(handle)['open_positions'])
 
@@ -2430,6 +2727,33 @@ class MigrationAndT1FailClosedTest(unittest.TestCase):
             with self.assertRaises(TradeStatePersistenceError):
                 system._load_stop_loss_dates()
             self.assertFalse(state.stop_loss_dates_migrated())
+
+    def test_noncanonical_legacy_t1_symbol_refuses_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            state.claim_owner_exchange('okx')
+            t1_path = os.path.join(tmp, 'stop_loss_dates.json')
+            with open(t1_path, 'w', encoding='utf-8') as handle:
+                json.dump({'btcusdt': '2099-01-01'}, handle)
+            os.chmod(t1_path, 0o600)
+            system = TradingSystem.__new__(TradingSystem)
+            system.trade_state = state
+            system.stop_loss_file = t1_path
+
+            with self.assertRaises((TradeStatePersistenceError, ValueError)):
+                system._load_stop_loss_dates()
+            self.assertFalse(state.stop_loss_dates_migrated())
+            self.assertIsNone(state.get_stop_loss_date('BTCUSDT'))
+
+    def test_trade_state_rejects_noncanonical_t1_key_and_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = TradeState(os.path.join(tmp, 'trade_state.json'))
+            for dates in (
+                    {'btcusdt': '2099-01-01'},
+                    {'BTCUSDT': '2099-1-1'}):
+                with self.subTest(dates=dates), self.assertRaises(ValueError):
+                    state.replace_stop_loss_dates(dates)
+            self.assertEqual({}, state.get_stop_loss_dates())
 
 
 class ConfigSecretPersistenceTest(unittest.TestCase):

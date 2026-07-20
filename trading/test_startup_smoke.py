@@ -1,7 +1,7 @@
 """启动装配链路冒烟测试（本机可运行）。
 
 其余测试均用 TradingSystem.__new__ 绕过构造——本文件专门端到端验证 __init__ 全链：
-load_config（含旧格式拍平/环境变量/凭据校验）→ 状态迁移 → 归属护栏 → 策略构建 →
+load_config（旧布局拒绝/环境变量/凭据校验）→ 离线迁移门禁 → 归属护栏 → 策略构建 →
 TradeState/EquityTracker 装配 → 权益获取 → RiskManager → 启动持仓同步 → 定时任务注册。
 """
 import json
@@ -63,9 +63,6 @@ class _FakeOkxApi:
         return f'R{str(open_client_order_id)[1:]}'
 
     def find_existing_open_order(self, *args, **kwargs):
-        return None
-
-    def find_compensation_close_evidence(self, *args, **kwargs):
         return None
 
     def find_compensation_close_progress(
@@ -274,7 +271,6 @@ class StartupSmokeTest(unittest.TestCase):
             'cancel_stop_order_only', 'cancel_order', 'cancel_all_orders',
             'round_quantity', 'get_quantity_precision',
             'find_stop_order_state', 'find_existing_open_order',
-            'find_compensation_close_evidence',
             'find_compensation_close_progress',
             'confirm_stop_execution',
         )
@@ -370,8 +366,7 @@ class StartupSmokeTest(unittest.TestCase):
             system = self._boot(tmp)
             system.register_jobs(system.config.get('scheduler', {}))  # 不应抛异常
 
-    def test_legacy_nested_config_flattened(self):
-        """旧多所格式 {exchanges:{okx:...}} 自动拍平后可正常启动。"""
+    def test_legacy_nested_config_requires_offline_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = {'exchanges': {'okx': {'label': '欧易', 'apiKey': 'k', 'secret': 's', 'password': 'p',
                                           'strategy': {'default_risk_per_trade': 0.01},
@@ -380,11 +375,9 @@ class StartupSmokeTest(unittest.TestCase):
             path = os.path.join(tmp, 'config.json')
             with open(path, 'w') as f:
                 json.dump(cfg, f)
-            with patch.object(main, 'OkxApi', _FakeOkxApi):
-                system = TradingSystem(config_file=path)
-            self.assertIn('okx', system.config)
-            self.assertNotIn('exchanges', system.config)
-            self.assertEqual(system.config['okx']['apiKey'], 'k')
+            with patch.object(main, 'OkxApi', _FakeOkxApi), \
+                    self.assertRaisesRegex(ValueError, '离线单策略迁移'):
+                TradingSystem(config_file=path)
 
     def test_dual_okx_config_sources_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,7 +386,7 @@ class StartupSmokeTest(unittest.TestCase):
             config['exchanges'] = {'okx': {'sandbox': False}}
             _jdump(config, path)
             with patch.object(main, 'OkxApi', _FakeOkxApi), \
-                    self.assertRaisesRegex(ValueError, '双源'):
+                    self.assertRaisesRegex(ValueError, '旧 config.exchanges'):
                 TradingSystem(config_file=path)
 
     def test_duplicate_config_fields_are_rejected_instead_of_last_wins(self):

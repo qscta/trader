@@ -126,7 +126,7 @@ class DingTalkNotifier:
         )
         if signal:
             # 双均线 EMA 是唯一在役策略：展示其信号字段（收盘价、双 EMA、
-            # N 日高低止损参考）。
+            # 信号日前 N 根已完成日线（不含信号日）的收盘极值止损参考）。
             current_close = signal.get('current_close')
             ema_short = signal.get('ema_short')
             ema_long = signal.get('ema_long')
@@ -137,7 +137,9 @@ class DingTalkNotifier:
             if ema_short is not None and ema_long is not None:
                 content += f"EMA短/长: {ema_short} / {ema_long}\n\n"
             if upper_stop is not None and lower_stop is not None:
-                content += f"止损参考(N日高/低): {upper_stop} / {lower_stop}\n\n"
+                content += (
+                    '止损参考(信号日前N根已完成日线，不含信号日，收盘最高/最低): '
+                    f'{upper_stop} / {lower_stop}\n\n')
         return self.send_message(f"[交易系统] 信号未成交 - {symbol}", content)
 
     def notify_position_summary(self, positions, total_equity):

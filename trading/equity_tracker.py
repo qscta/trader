@@ -1,9 +1,8 @@
-"""按交易所隔离的权益 / 求索指数追踪器。
+"""权益 / 求索指数追踪器。
 
 原本这些逻辑以模块级函数 + 全局文件常量的形式散落在 api_server.py 里，
-只能服务单一交易所。多交易所并行后，每个交易所需要**完全独立**的权益历史、
-峰值、每日快照、日内采样和求索指数——因此抽成本类，每个 TradingSystem 持有一份，
-所有状态文件落在该交易所自己的 data_dir 下，互不串扰。
+现抽成为由 TradingSystem 显式持有的类，使权益历史、峰值、每日快照、
+日内采样和求索指数都绑定到当前运行实例的 data_dir。
 
 逻辑与原 api_server 实现保持一致，仅做了：路径实例化、全局单例改为 self.system 反向引用、
 锁实例化、以及持久化失败/消息推送改为回调。
@@ -158,7 +157,9 @@ class EquityTracker:
         try:
             with open_private_text_file(self.EQUITY_SYNC_JOURNAL_FILE) as handle:
                 journal = load_strict_json(handle)
-            if not isinstance(journal, dict) or journal.get('version') != 1:
+            if (not isinstance(journal, dict) or
+                    type(journal.get('version')) is not int or
+                    journal['version'] != 1):
                 raise ValueError('权益同步 journal 版本非法')
             old_generation = journal.get('old')
             new_generation = journal.get('new')
@@ -478,7 +479,10 @@ class EquityTracker:
         if not old_peak_time:
             return
         try:
-            closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
+            parsed_peak_time = _parse_equity_tick_timestamp(old_peak_time)
+            if parsed_peak_time is None:
+                raise ValueError('峰值时间不是合法 ISO 时间')
+            closed_gap = max(0, (now - parsed_peak_time).days)
         except Exception as exc:
             logger.debug('结算未创新高周期时跳过坏峰值时间 %r: %s', old_peak_time, exc)
             return
@@ -573,7 +577,10 @@ class EquityTracker:
             days_since_peak = 0
             if peak_time:
                 try:
-                    days_since_peak = max(0, (now - datetime.fromisoformat(peak_time)).days)
+                    parsed_peak_time = _parse_equity_tick_timestamp(peak_time)
+                    if parsed_peak_time is None:
+                        raise ValueError('峰值时间不是合法 ISO 时间')
+                    days_since_peak = max(0, (now - parsed_peak_time).days)
                 except Exception:
                     days_since_peak = 0
 
@@ -582,8 +589,12 @@ class EquityTracker:
             provisional_closed_gap = 0
             if made_new_high and old_peak_time:
                 try:
+                    parsed_old_peak_time = _parse_equity_tick_timestamp(
+                        old_peak_time)
+                    if parsed_old_peak_time is None:
+                        raise ValueError('旧峰值时间不是合法 ISO 时间')
                     provisional_closed_gap = max(
-                        0, (now - datetime.fromisoformat(old_peak_time)).days)
+                        0, (now - parsed_old_peak_time).days)
                 except Exception as exc:
                     logger.debug('展示用未创新高周期结算跳过: %s', exc)
 

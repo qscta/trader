@@ -96,10 +96,11 @@ class ConcurrencyChaosTest(unittest.TestCase):
 
 class DisasterRecoveryTest(unittest.TestCase):
     """状态文件灾难场景（fail-closed 账本语义）：
-    主文件损坏 → .bak 恢复；主备全毁 → 拒绝启动；主文件被删但 .bak 在 → 拒绝启动；
+    主文件损坏 → 拒绝自动提升上一代 .bak；主备全毁 → 拒绝启动；
+    主文件被删但 .bak 在 → 拒绝启动；
     主备都不存在 → 全新部署正常启动；人工仓/账本彻底丢失 → 孤儿仓告警兜底。"""
 
-    def test_corrupted_main_recovers_from_backup(self):
+    def test_corrupted_main_refuses_stale_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             ts = TradeState(path)
@@ -108,10 +109,27 @@ class DisasterRecoveryTest(unittest.TestCase):
             with open(path, 'w') as f:
                 f.write('{“损坏的JSON')
 
-            recovered = TradeState(path)
-            pos = recovered.get_open_position('BTCUSDT')
-            self.assertIsNotNone(pos)  # 从 .bak 恢复
-            self.assertEqual(pos['entry_price'], 60000.0)
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '不自动提升'):
+                TradeState(path)
+
+    def test_corrupt_main_never_drops_newer_open_intent_from_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trade_state.json')
+            state = TradeState(path)
+            state.save_state()
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'INewerIntent1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
+            with open(path + '.bak', encoding='utf-8') as handle:
+                self.assertEqual({}, json.load(handle)['open_intents'])
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('{broken')
+
+            with self.assertRaises(TradeStatePersistenceError):
+                TradeState(path)
 
     def test_foreign_owner_main_is_never_overwritten_by_okx_backup(self):
         """主账本可严格解析且显式属于 Binance 时，归属冲突不是损坏。

@@ -211,7 +211,7 @@ class CompleteExecutionConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             cv.validate_and_normalize_execution_config(config)
 
-    def test_legacy_okx_layout_is_canonicalized_but_dual_source_rejected(self):
+    def test_legacy_layout_is_only_canonicalized_by_explicit_migration_helper(self):
         config = self._config()
         old = {
             'exchanges': {'okx': dict(
@@ -220,14 +220,23 @@ class CompleteExecutionConfigTest(unittest.TestCase):
             'scheduler': {},
         }
 
+        self.assertTrue(cv.canonicalize_single_okx_config(old))
         cv.validate_and_normalize_execution_config(old)
 
         self.assertNotIn('exchanges', old)
         self.assertIn('okx', old)
         dual = self._config()
         dual['exchanges'] = {'okx': {'sandbox': True}}
-        with self.assertRaisesRegex(ValueError, '双源'):
+        with self.assertRaisesRegex(ValueError, 'exchanges'):
             cv.validate_and_normalize_execution_config(dual)
+
+        legacy = {
+            'exchanges': {'okx': dict(config['okx'])},
+            'strategy': config['strategy'], 'trading': config['trading'],
+            'scheduler': {},
+        }
+        with self.assertRaisesRegex(ValueError, 'exchanges'):
+            cv.validate_and_normalize_execution_config(legacy)
 
 
 if __name__ == '__main__':

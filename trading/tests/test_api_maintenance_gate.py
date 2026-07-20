@@ -69,7 +69,7 @@ class ApiMaintenanceGateTest(unittest.TestCase):
                     client.post('/api/close_position', json={}).status_code,
                 )
 
-    def test_old_runner_handshake_arms_under_trade_lock_then_blocks_http(self):
+    def test_runner_handshake_arms_under_trade_lock_then_blocks_http(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = os.path.realpath(directory)
             sentinel = Path(directory) / '.maintenance_no_open'
@@ -118,6 +118,130 @@ class ApiMaintenanceGateTest(unittest.TestCase):
                 blocked = client.post('/api/instant_open', json={})
                 self.assertEqual(503, blocked.status_code)
 
+    def test_trade_lock_timeout_does_not_create_an_undrained_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            sentinel = Path(directory) / '.maintenance_no_open'
+            lock = SimpleNamespace(
+                acquire=mock.Mock(return_value=False),
+                release=mock.Mock())
+
+            system = SimpleNamespace(
+                base_dir=directory,
+                _trade_lock=lock,
+                _maintenance_open_gate_status=mock.Mock(),
+            )
+            with mock.patch.object(self.api, 'trading_system', system), \
+                    mock.patch.dict(os.environ, {
+                        'TRADING_MAINTENANCE_SENTINEL': str(sentinel),
+                    }):
+                client = self.api.app.test_client()
+                response = client.post(
+                    '/api/deployment/arm-no-open',
+                    headers={'X-API-Token': 'test-token-not-production'},
+                    json={'release_sha': 'a' * 40, 'nonce': 'b' * 64})
+
+            self.assertEqual(503, response.status_code)
+            self.assertFalse(os.path.lexists(sentinel))
+            system._maintenance_open_gate_status.assert_not_called()
+            lock.release.assert_not_called()
+
+    def test_final_drain_rechecks_same_sentinel_under_trade_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            sentinel = Path(directory) / '.maintenance_no_open'
+            sentinel.write_text('{}\n', encoding='utf-8')
+            os.chmod(sentinel, 0o600)
+            lock = threading.Lock()
+            observations = []
+
+            def engine_gate():
+                observations.append(lock.locked())
+                return {
+                    'status': 'maintenance_blocked',
+                    'sentinel_path': str(sentinel),
+                }
+
+            system = SimpleNamespace(
+                base_dir=directory,
+                _trade_lock=lock,
+                _maintenance_open_gate_status=engine_gate,
+            )
+            with mock.patch.object(self.api, 'trading_system', system), \
+                    mock.patch.dict(os.environ, {
+                        'TRADING_MAINTENANCE_SENTINEL': str(sentinel),
+                    }):
+                response = self.api.app.test_client().get(
+                    '/api/deployment/drain-no-open',
+                    headers={'X-API-Token': 'test-token-not-production'})
+
+            self.assertEqual(200, response.status_code)
+            body = response.get_json()
+            self.assertEqual({
+                'protocol', 'status', 'inflight_open_boundary_drained',
+                'worker_pid', 'sentinel'}, set(body))
+            self.assertTrue(body['inflight_open_boundary_drained'])
+            self.assertEqual(str(sentinel), body['sentinel']['path'])
+            self.assertEqual(sentinel.stat().st_ino, body['sentinel']['ino'])
+            self.assertEqual([True], observations)
+            self.assertFalse(lock.locked())
+
+    def test_final_drain_fails_closed_when_sentinel_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            sentinel = Path(directory) / '.maintenance_no_open'
+            lock = threading.Lock()
+            system = SimpleNamespace(
+                base_dir=directory,
+                _trade_lock=lock,
+                _maintenance_open_gate_status=mock.Mock(),
+            )
+            with mock.patch.object(self.api, 'trading_system', system), \
+                    mock.patch.dict(os.environ, {
+                        'TRADING_MAINTENANCE_SENTINEL': str(sentinel),
+                    }):
+                response = self.api.app.test_client().get(
+                    '/api/deployment/drain-no-open',
+                    headers={'X-API-Token': 'test-token-not-production'})
+
+            self.assertEqual(503, response.status_code)
+            system._maintenance_open_gate_status.assert_not_called()
+            self.assertFalse(lock.locked())
+
+    def test_partial_sentinel_write_stays_fail_closed_after_lock_drain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = os.path.realpath(directory)
+            sentinel = Path(directory) / '.maintenance_no_open'
+            lock = threading.Lock()
+            lock_observations = []
+
+            def partial_dump(_payload, handle, **_kwargs):
+                lock_observations.append(lock.locked())
+                handle.write('{"schema_version":1')
+                raise OSError('injected short write')
+
+            system = SimpleNamespace(
+                base_dir=directory,
+                _trade_lock=lock,
+                _maintenance_open_gate_status=lambda: None,
+            )
+            with mock.patch.object(self.api, 'trading_system', system), \
+                    mock.patch.dict(os.environ, {
+                        'TRADING_MAINTENANCE_SENTINEL': str(sentinel),
+                    }), mock.patch(
+                        'runtime_guard.json.dump', side_effect=partial_dump):
+                response = self.api.app.test_client().post(
+                    '/api/deployment/arm-no-open',
+                    headers={'X-API-Token': 'test-token-not-production'},
+                    json={'release_sha': 'a' * 40, 'nonce': 'b' * 64})
+                blocked = self.api.app.test_client().post(
+                    '/api/instant_open', json={})
+
+            self.assertEqual(503, response.status_code)
+            self.assertEqual([True], lock_observations)
+            self.assertEqual(b'{"schema_version":1', sentinel.read_bytes())
+            self.assertEqual(503, blocked.status_code)
+
     def test_handshake_rejects_group_writable_sentinel_parent(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = os.path.realpath(directory)
@@ -139,7 +263,6 @@ class ApiMaintenanceGateTest(unittest.TestCase):
 
             self.assertEqual(503, response.status_code)
             self.assertFalse(os.path.lexists(sentinel))
-
 
 if __name__ == '__main__':
     unittest.main()

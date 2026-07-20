@@ -9,16 +9,20 @@ network I/O.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import stat
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 SCHEMA_VERSION = 1
 MAX_BYTES = 64 * 1024
+MAX_VENV_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_VENV_MANIFEST_ENTRIES = 200_000
 MAX_LIFETIME_SECONDS = 24 * 60 * 60
 RELEASE_RE = re.compile(r"^[0-9a-f]{40}$")
 KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -133,6 +137,7 @@ MANAGED_SCHEMAS = {
         r"EnvironmentFile=/etc/trading-mem-monitor\.env\n"
         r"Environment=TRADING_DATA_DIR=/var/lib/trading-runtime/(?P=sha)\n"
         r"Environment=TRADING_CONFIG_FILE=/var/lib/trading-runtime/(?P=sha)/config\.json\n"
+        r"Environment=TRADING_MEM_MONITOR_LOG=/var/log/trading-mem-monitor/mem_monitor\.log\n"
         r"PassEnvironment=\n"
         r"PAMName=\n"
         r"RootDirectory=\n"
@@ -281,7 +286,9 @@ def validate_writer_inventory_payload(payload, release_sha):
     }
     if not isinstance(payload, dict) or set(payload) != expected:
         raise EvidenceError("writer inventory top-level schema is not exact")
-    if payload["schema_version"] != 2 or payload["release_sha"] != release_sha:
+    if (type(payload["schema_version"]) is not int or
+            payload["schema_version"] != 2 or
+            payload["release_sha"] != release_sha):
         raise EvidenceError("writer inventory release/schema does not match")
     if payload["all_other_writers_frozen"] is not True:
         raise EvidenceError("writer inventory has unfrozen external writers")
@@ -413,7 +420,8 @@ def validate_payload(payload, *, kind, release_sha, bindings, now=None):
     }
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise EvidenceError("approval schema fields are not exact")
-    if payload["schema_version"] != SCHEMA_VERSION:
+    if (type(payload["schema_version"]) is not int or
+            payload["schema_version"] != SCHEMA_VERSION):
         raise EvidenceError("approval schema version is unsupported")
     if not isinstance(kind, str) or KIND_RE.fullmatch(kind) is None:
         raise EvidenceError("expected approval kind is invalid")
@@ -451,7 +459,9 @@ def validate_payload(payload, *, kind, release_sha, bindings, now=None):
     return payload
 
 
-def _read_root_owned(path):
+def _read_root_owned(path, *, max_bytes=MAX_BYTES):
+    if (type(max_bytes) is not int or max_bytes <= 0):
+        raise EvidenceError("read size limit is invalid")
     if not isinstance(path, str) or not os.path.isabs(path):
         raise EvidenceError("approval path must be absolute")
     if os.path.normpath(path) != path:
@@ -489,17 +499,17 @@ def _read_root_owned(path):
         after_identity = _metadata_identity(after)
         if before_identity != after_identity:
             raise EvidenceError("approval changed while opening")
-        if after.st_size > MAX_BYTES:
+        if after.st_size > max_bytes:
             raise EvidenceError("approval is too large")
         chunks = []
-        remaining = MAX_BYTES + 1
+        remaining = max_bytes + 1
         while remaining:
             chunk = os.read(fd, min(remaining, 65536))
             if not chunk:
                 break
             chunks.append(chunk)
             remaining -= len(chunk)
-        if sum(len(chunk) for chunk in chunks) > MAX_BYTES:
+        if sum(len(chunk) for chunk in chunks) > max_bytes:
             raise EvidenceError("approval is too large")
         try:
             text = b"".join(chunks).decode("utf-8")
@@ -512,6 +522,102 @@ def _read_root_owned(path):
         return text
     finally:
         os.close(fd)
+
+
+def _venv_manifest_entry(release_root, path):
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode):
+        kind = "symlink"
+        digest = hashlib.sha256(
+            b"symlink\0" + os.fsencode(os.readlink(path))).hexdigest()
+    elif stat.S_ISREG(before.st_mode):
+        kind = "file"
+        value = hashlib.sha256()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if _metadata_identity(opened) != _metadata_identity(before):
+                raise EvidenceError("venv file changed while opening")
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                value.update(chunk)
+            if _metadata_identity(os.fstat(fd)) != _metadata_identity(opened):
+                raise EvidenceError("venv file changed while hashing")
+        finally:
+            os.close(fd)
+        digest = value.hexdigest()
+    else:
+        raise EvidenceError("venv manifest entry has an unsafe type")
+    if _metadata_identity(os.lstat(path)) != _metadata_identity(before):
+        raise EvidenceError("venv entry changed while hashing")
+    return {
+        "path": path.relative_to(release_root).as_posix(),
+        "kind": kind,
+        "mode": stat.S_IMODE(before.st_mode),
+        "sha256": digest,
+    }
+
+
+def verify_venv_manifest(release_root, manifest):
+    if (not isinstance(release_root, str) or
+            not os.path.isabs(release_root) or
+            os.path.normpath(release_root) != release_root or
+            os.path.realpath(release_root) != release_root):
+        raise EvidenceError("release root must be canonical and symlink-free")
+    venv = os.path.join(release_root, "trading", ".venv")
+    validate_venv_tree(venv)
+    payload = loads_strict(_read_root_owned(
+        manifest, max_bytes=MAX_VENV_MANIFEST_BYTES))
+    if (not isinstance(payload, dict) or
+            set(payload) != {"schema_version", "entries"} or
+            payload.get("schema_version") != 1 or
+            isinstance(payload.get("schema_version"), bool)):
+        raise EvidenceError("venv manifest top-level schema is invalid")
+    entries = payload.get("entries")
+    if (not isinstance(entries, list) or not entries or
+            len(entries) > MAX_VENV_MANIFEST_ENTRIES):
+        raise EvidenceError("venv manifest entries are invalid")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+                "path", "kind", "mode", "sha256"}:
+            raise EvidenceError("venv manifest entry schema is invalid")
+        relative = entry.get("path")
+        if (not isinstance(relative, str) or not relative or "\0" in relative or
+                Path(relative).is_absolute() or
+                Path(relative).as_posix() != relative or
+                Path(relative).parts[:2] != ("trading", ".venv") or
+                any(part in ("", ".", "..") for part in Path(relative).parts) or
+                relative in seen):
+            raise EvidenceError("venv manifest path is invalid or duplicated")
+        seen.add(relative)
+        if entry.get("kind") not in {"file", "symlink"}:
+            raise EvidenceError("venv manifest kind is invalid")
+        mode = entry.get("mode")
+        if type(mode) is not int or not (0 <= mode <= 0o7777):
+            raise EvidenceError("venv manifest mode is invalid")
+        if (not isinstance(entry.get("sha256"), str) or
+                SHA256_RE.fullmatch(entry["sha256"]) is None):
+            raise EvidenceError("venv manifest digest is invalid")
+    if entries != sorted(entries, key=lambda item: item["path"]):
+        raise EvidenceError("venv manifest entries are not sorted")
+
+    release = Path(release_root)
+    observed = []
+    for directory, dirnames, names in os.walk(venv, followlinks=False):
+        directory_path = Path(directory)
+        for name in [*dirnames, *names]:
+            path = directory_path / name
+            info = os.lstat(path)
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                continue
+            observed.append(_venv_manifest_entry(release, path))
+    observed.sort(key=lambda item: item["path"])
+    if observed != entries:
+        raise EvidenceError("venv tree does not match the reviewed manifest")
+    return True
 
 
 def verify_file(path, *, kind, release_sha, bindings, now=None):
@@ -660,6 +766,7 @@ def _parser():
     trading_env = sub.add_parser("validate-trading-env")
     monitor_env = sub.add_parser("validate-monitor-env")
     venv = sub.add_parser("validate-venv")
+    venv_manifest = sub.add_parser("verify-venv-manifest")
     writers = sub.add_parser("validate-writer-inventory")
     for item in (verify, issue):
         item.add_argument("--file", required=True)
@@ -672,6 +779,8 @@ def _parser():
     trading_env.add_argument("--file", required=True)
     monitor_env.add_argument("--file", required=True)
     venv.add_argument("--venv", required=True)
+    venv_manifest.add_argument("--release-root", required=True)
+    venv_manifest.add_argument("--manifest", required=True)
     writers.add_argument("--file", required=True)
     writers.add_argument("--release-sha", required=True)
     return parser
@@ -691,6 +800,9 @@ def main(argv=None):
             return 0
         if args.command == "validate-venv":
             validate_venv_tree(args.venv)
+            return 0
+        if args.command == "verify-venv-manifest":
+            verify_venv_manifest(args.release_root, args.manifest)
             return 0
         if args.command == "validate-writer-inventory":
             validate_writer_inventory(args.file, args.release_sha)

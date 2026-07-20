@@ -19,6 +19,7 @@ import _test_stubs
 TradingSystem = _test_stubs.import_main().TradingSystem
 import trade_state as trade_state_module  # noqa: E402
 from trade_state import TradeState, TradeStatePersistenceError  # noqa: E402  真实现（纯标准库）
+from runtime_guard import opening_supervision_ready  # noqa: E402
 
 
 def _build_system(tmpdir, config_symbols):
@@ -141,6 +142,16 @@ class OperationalHealthLatchTest(unittest.TestCase):
             self.assertEqual(
                 'guardian_failures', system._last_guardian_failure['kind'])
             self.assertFalse(system.health_snapshot()['healthy'])
+
+            system._trade_lock.acquire()
+            try:
+                self.assertFalse(system.reconcile_intraday_stop_losses())
+            finally:
+                system._trade_lock.release()
+            self.assertEqual(
+                'guardian_failures', system._last_guardian_failure['kind'])
+            self.assertFalse(opening_supervision_ready(
+                system.health_snapshot()))
 
             system.exchange_api.list_position_symbols = lambda: []
             self.assertTrue(system.reconcile_intraday_stop_losses())
@@ -371,8 +382,6 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             'ETHUSDT', 'short', 3000.0, 1.0, 3200.0, 'stop-1', strategy='ma_cross')
         system._stop_anomalies = {}
         system._pending_trade_close_notifications = []
-        system.stop_loss_file = os.path.join(tmp, 'stop_loss_dates.json')
-        system.stop_loss_dates = {}
         system.notifier = SimpleNamespace(notify_error=lambda *a, **k: True,
                                           notify_signal_missed=lambda *a, **k: True)
         system.exchange_api = SimpleNamespace(
@@ -407,8 +416,9 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             system._flip_position('ETHUSDT', signal, position, 'long', {'name': 'ETHUSDT'})
 
             self.assertEqual(opened, [])  # 不反手开新仓
-            self.assertEqual(system.stop_loss_dates.get('ETHUSDT'),
-                             date.today().strftime('%Y-%m-%d'))  # 已记 T+1，次日按 EMA 方向重入
+            self.assertEqual(
+                system.trade_state.get_stop_loss_date('ETHUSDT'),
+                date.today().strftime('%Y-%m-%d'))  # 已记 T+1，次日按 EMA 方向重入
             self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))  # 残留标记阻断开仓
 
     def test_confirmed_cancel_flips_without_t1(self):
@@ -420,7 +430,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             system._flip_position('ETHUSDT', signal, position, 'long', {'name': 'ETHUSDT'})
 
             self.assertEqual(len(opened), 1)  # 正常反手
-            self.assertEqual(system.stop_loss_dates, {})  # 不记 T+1
+            self.assertEqual(system.trade_state.get_stop_loss_dates(), {})  # 不记 T+1
             self.assertFalse(system.trade_state.has_stop_residue('ETHUSDT'))
 
     def test_retired_symbol_closes_without_reopening_or_t1(self):
@@ -436,7 +446,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
 
             self.assertEqual(opened, [])
             self.assertIsNone(system.trade_state.get_open_position('ETHUSDT'))
-            self.assertEqual(system.stop_loss_dates, {})
+            self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
 
     def test_retired_symbol_cancel_uncertain_never_creates_t1(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -450,7 +460,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
                 {'name': 'ETHUSDT', '_retired_from_pool': True})
 
             self.assertEqual(opened, [])
-            self.assertEqual(system.stop_loss_dates, {})
+            self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
             self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))
 
 
@@ -465,7 +475,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
             system.trade_state.add_open_position(
                 'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
                 'stop-1', strategy='ma_cross')
-            system.stop_loss_dates = {}
             system._stop_anomalies = {}
             system._cancel_stop_order_confirmed = Mock(return_value=True)
 
@@ -480,7 +489,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
             self.assertEqual('estimated_stop', closed['exit_price_source'])
             self.assertIs(True, closed['exit_price_estimated'])
             self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
-            self.assertEqual(system.stop_loss_dates, {})
 
     def test_disabled_in_pool_ma_flat_close_does_not_create_t1(self):
         """在池但已禁用的持仓品种：外部平仓（止损）按只平不开处理，不得记 T+1，
@@ -493,7 +501,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
             system.trade_state.add_open_position(
                 'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
                 'stop-1', strategy='ma_cross')
-            system.stop_loss_dates = {}
             system._stop_anomalies = {}
             system._cancel_stop_order_confirmed = Mock(return_value=True)
 
@@ -505,7 +512,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
             self.assertIsNotNone(closed)
             self.assertTrue(saved)
             self.assertEqual(system.trade_state.get_stop_loss_dates(), {})
-            self.assertEqual(system.stop_loss_dates, {})
 
     def test_enabled_in_pool_ma_flat_close_still_records_t1(self):
         """对照：在池且启用的正常品种，外部平仓仍记 T+1；禁用收口不得误伤正常品种。"""
@@ -517,7 +523,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
             system.trade_state.add_open_position(
                 'ETHUSDT', 'long', 3000.0, 1.0, 2800.0,
                 'stop-1', strategy='ma_cross')
-            system.stop_loss_dates = {}
             system._stop_anomalies = {}
             system._cancel_stop_order_confirmed = Mock(return_value=True)
 
@@ -830,7 +835,7 @@ class MigrationGuardTest(unittest.TestCase):
             self._write(os.path.join(tmp, 'data', 'okx', 'trade_state.json'), legacy)
 
             with self.assertRaisesRegex(RuntimeError, '禁止.*自动导入'):
-                self._system(tmp)._migrate_okx_legacy_state()
+                self._system(tmp)._validate_okx_legacy_state_gate()
 
             with open(os.path.join(tmp, 'trade_state.json')) as f:
                 self.assertEqual({}, json.load(f)['open_positions'])
@@ -841,7 +846,7 @@ class MigrationGuardTest(unittest.TestCase):
     def test_empty_legacy_directory_is_harmless(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, 'data', 'okx'))
-            self._system(tmp)._migrate_okx_legacy_state()
+            self._system(tmp)._validate_okx_legacy_state_gate()
 
     def test_completed_marker_makes_legacy_directory_inert(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -854,9 +859,13 @@ class MigrationGuardTest(unittest.TestCase):
             marker = os.path.join(
                 tmp, '.okx_legacy_migration_complete.json')
             with open(marker, 'w', encoding='utf-8') as handle:
-                json.dump({'exchange': 'okx'}, handle)
+                json.dump({
+                    'exchange': 'okx',
+                    'completed_at': '2026-07-18T08:00:00',
+                    'moved': ['trade_state.json'],
+                }, handle)
 
-            self._system(tmp)._migrate_okx_legacy_state()
+            self._system(tmp)._validate_okx_legacy_state_gate()
 
             self.assertFalse(os.path.exists(os.path.join(tmp, 'trade_state.json')))
 
@@ -868,7 +877,7 @@ class MigrationGuardTest(unittest.TestCase):
             with open(marker, 'w', encoding='utf-8') as handle:
                 json.dump({'exchange': 'other'}, handle)
             with self.assertRaisesRegex(RuntimeError, '迁移标记非法'):
-                self._system(tmp)._migrate_okx_legacy_state()
+                self._system(tmp)._validate_okx_legacy_state_gate()
 
 
 class StopSelfHealTest(unittest.TestCase):
@@ -882,15 +891,25 @@ class StopSelfHealTest(unittest.TestCase):
         system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
                                              stop_order_id='stop-1', strategy='ma_cross')
         self.created, self.find_calls = [], []
+        created_stop_live = {'value': False}
 
         def find_state(s, side, amount, price, oid=None):
             self.find_calls.append((side, amount, price, oid))
             if state_error:
                 raise state_error
+            # A successful POST must be followed by the same authoritative
+            # full-list result production receives before clearing its write
+            # marker.  Returning the pre-POST ``missing`` forever would model
+            # an unconfirmed write, not a successful self-heal.
+            if state == 'missing' and created_stop_live['value']:
+                return 'intact'
             return state
 
         def create_stop(s, side, amount, price):
             self.created.append((side, amount, price))
+            created_stop_live['value'] = (
+                isinstance(create_result, dict) and
+                bool(create_result.get('id')))
             return create_result
 
         system.exchange_api = SimpleNamespace(
@@ -1101,7 +1120,6 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
             clear_stop_residue=lambda s: None,
             mark_stop_residue=lambda s: None)
         system._execute_open = lambda *a, **k: self.fail("落盘失败后不得重入开仓")
-        system.record_stop_loss = lambda s: self.fail("落盘失败后不得记录 T+1")
         return system, cancel_calls
 
     @staticmethod

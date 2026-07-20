@@ -8,7 +8,7 @@ import math
 import os
 import re
 import stat
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -18,6 +18,7 @@ _SAFETY_BLOCKER_FIELDS = frozenset({
     'position_quarantines', 'stop_residues',
 })
 DEPLOYMENT_ARM_NONCE_RE = re.compile(r'^[0-9a-f]{64}$')
+MAX_MAINTENANCE_SENTINEL_BYTES = 64 * 1024
 
 
 def runtime_data_path(filename, environ=None, default_dir=None):
@@ -65,10 +66,45 @@ def maintenance_sentinel_path(environ=None, base_dir=None, cwd=None):
     return path
 
 
+def maintenance_sentinel_identity(path):
+    """Return a stable identity for the exact regular sentinel read by this worker."""
+    if maintenance_sentinel_path(
+            {'TRADING_MAINTENANCE_SENTINEL': path}) != path:
+        raise RuntimeError('maintenance sentinel path 必须是规范绝对路径')
+    try:
+        before = os.lstat(path)
+        if (not stat.S_ISREG(before.st_mode) or
+                before.st_uid != os.geteuid() or
+                before.st_gid != os.getegid() or
+                stat.S_IMODE(before.st_mode) != 0o600 or
+                before.st_nlink != 1 or
+                before.st_size > MAX_MAINTENANCE_SENTINEL_BYTES):
+            raise RuntimeError(
+                'maintenance sentinel 必须是当前用户 0600 单链接普通文件')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError('maintenance sentinel 无法安全打开') from exc
+    try:
+        opened = os.fstat(fd)
+        after = os.lstat(path)
+    finally:
+        os.close(fd)
+    stable_fields = (
+        'st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink',
+        'st_size', 'st_mtime_ns')
+    if any(getattr(before, field) != getattr(opened, field) or
+           getattr(before, field) != getattr(after, field)
+           for field in stable_fields):
+        raise RuntimeError('maintenance sentinel 在身份检查期间被替换或修改')
+    return {'path': path, 'dev': before.st_dev, 'ino': before.st_ino}
+
+
 def arm_maintenance_sentinel(path, release_sha, nonce, worker_pid):
-    """在持有交易锁时一次性创建并 fsync 旧 runner 实际读取的 sentinel。"""
-    if (maintenance_sentinel_path(
-            {'TRADING_MAINTENANCE_SENTINEL': path}) != path):
+    """在持有交易锁时一次性创建并 fsync runner 实际读取的 sentinel。"""
+    if maintenance_sentinel_path(
+            {'TRADING_MAINTENANCE_SENTINEL': path}) != path:
         raise RuntimeError('maintenance sentinel path 必须是规范绝对路径')
     if (not isinstance(release_sha, str) or
             re.fullmatch(r'[0-9a-f]{40}', release_sha) is None):
@@ -76,7 +112,8 @@ def arm_maintenance_sentinel(path, release_sha, nonce, worker_pid):
     if (not isinstance(nonce, str) or
             DEPLOYMENT_ARM_NONCE_RE.fullmatch(nonce) is None):
         raise RuntimeError('deployment arm nonce 必须是 64 位小写十六进制')
-    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or worker_pid <= 0:
+    if (isinstance(worker_pid, bool) or not isinstance(worker_pid, int) or
+            worker_pid <= 0):
         raise RuntimeError('worker_pid 非法')
 
     parent = os.path.dirname(path)
@@ -125,7 +162,7 @@ def arm_maintenance_sentinel(path, release_sha, nonce, worker_pid):
     except BaseException:
         if fd is not None:
             os.close(fd)
-        # 创建后任何失败都保留对象：任意对象即维护态，删除反而会重新开门。
+        # 创建后任何失败都保留对象：任意对象即维护态，删除会重新开门。
         raise
     info = os.lstat(path)
     fsynced_identity = (
@@ -141,9 +178,25 @@ def arm_maintenance_sentinel(path, release_sha, nonce, worker_pid):
             not stat.S_ISREG(info.st_mode) or
             stat.S_IMODE(info.st_mode) != 0o600 or
             info.st_uid != current_uid or info.st_nlink != 1):
-        raise RuntimeError(
-            'maintenance sentinel 可见身份与已 fsync 文件不一致')
+        raise RuntimeError('maintenance sentinel 可见身份与已 fsync 文件不一致')
     return payload, {'dev': info.st_dev, 'ino': info.st_ino}
+
+
+def t1_reentry_blocked(stopped_on, today):
+    """Only a stop date strictly before today permits MA re-entry."""
+    if stopped_on is None:
+        return False
+    if not isinstance(stopped_on, str) or not isinstance(today, str):
+        raise ValueError('T+1 date must be an ISO date string')
+    try:
+        stopped_date = datetime.strptime(stopped_on, '%Y-%m-%d').date()
+        current_date = datetime.strptime(today, '%Y-%m-%d').date()
+    except ValueError as exc:
+        raise ValueError('T+1 date must use YYYY-MM-DD') from exc
+    if (stopped_date.isoformat() != stopped_on or
+            current_date.isoformat() != today):
+        raise ValueError('T+1 date must use canonical YYYY-MM-DD')
+    return stopped_date >= current_date
 
 
 def catchup_schedule_slot(config, now):
@@ -308,6 +361,30 @@ def assess_runtime_health(raw_snapshot, now):
         'stopping': stopping,
         'issues': issues,
     }
+
+
+def opening_supervision_ready(health):
+    """裁决新仓能否被活着的 scheduler/guardian 持续托管。"""
+    if not isinstance(health, dict):
+        return False
+    age = health.get('heartbeat_age_seconds')
+    guardian_failure = health.get('guardian_failure', {'kind': 'missing'})
+    # guardian 与日检因同一交易锁短暂重叠，只表示本轮 guardian 被正常
+    # 串行化；其它失败均说明止损自愈能力不可证明。
+    guardian_ready = (
+        guardian_failure is None or
+        (isinstance(guardian_failure, dict) and
+         guardian_failure.get('kind') == 'trade_lock_busy')
+    )
+    return (
+        health.get('scheduler_running') is True and
+        health.get('scheduler_thread_alive') is True and
+        not isinstance(age, bool) and isinstance(age, (int, float)) and
+        math.isfinite(age) and 0 <= age <= RUNNER_HEARTBEAT_MAX_AGE_SECONDS and
+        health.get('stopping') is False and
+        health.get('persistence_degraded') is False and
+        guardian_ready
+    )
 
 
 class RunnerAlreadyActiveError(RuntimeError):

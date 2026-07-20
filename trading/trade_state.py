@@ -10,6 +10,8 @@ import threading
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
+from config_validation import SYMBOL_RE
+
 logger = logging.getLogger(__name__)
 
 _file_lock = threading.RLock()
@@ -77,6 +79,7 @@ OPEN_INTENT_PAYLOAD_FIELDS = frozenset({
 })
 UNRESOLVED_EXECUTION_FIELDS = frozenset({
     'kind', 'open_client_order_id', 'compensation_client_order_id',
+    'compensation_requested_size',
     'side', 'expected_position_size', 'created_at', 'updated_at',
     'protective_stop_order_id', 'protective_stop_order_size',
 })
@@ -88,6 +91,7 @@ QUARANTINE_FIELDS = frozenset({
 })
 ARCHIVE_NAME_RE = re.compile(
     r'^closed_trades_archive(?:_(?:[0-9]{4}|undated))?\.json$')
+ORDER_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 OWNER_AUXILIARY_STATE_NAMES = (
     'closed_trades_archive.json', 'stop_loss_dates.json',
     'peak_equity.json', 'equity_history.json', 'daily_equity.json',
@@ -158,6 +162,82 @@ def validate_okx_owner_manifest(payload):
         except ValueError as exc:
             raise ValueError('数据目录归属标记 claimed_at 非法') from exc
     return True
+
+
+def positive_amounts_equal(left, right):
+    """Compare two positive finite coin amounts with the ledger tolerance."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    try:
+        left = float(left)
+        right = float(right)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (not math.isfinite(left) or left <= 0 or
+            not math.isfinite(right) or right <= 0):
+        return False
+    tolerance = max(1e-15, math.ulp(left) * 8, math.ulp(right) * 8)
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=tolerance)
+
+
+def position_stop_coverage_valid(position):
+    """Validate the ledger relation between live size and protective-stop size."""
+    if not isinstance(position, dict):
+        return False
+    pending = position.get('stop_resize_pending', False)
+    if not isinstance(pending, bool):
+        return False
+    try:
+        position_size = float(position.get('position_size'))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (not math.isfinite(position_size) or position_size <= 0):
+        return False
+    stop_size = position.get('stop_order_size')
+    if stop_size is None:
+        # Legacy records without the advisory size remain safe: the guardian
+        # verifies the exchange order against the full live position size.
+        return True
+    if isinstance(stop_size, bool):
+        return False
+    try:
+        stop_size = float(stop_size)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(stop_size) or stop_size <= 0:
+        return False
+    equal = positive_amounts_equal(stop_size, position_size)
+    # During make-before-break resizing, an old oversized reduce-only stop is
+    # valid temporary protection. Under-coverage is never a valid state.
+    return equal or (pending and stop_size > position_size)
+
+
+def validate_stop_order_identity(
+        stop_order_id, extra_stop_order_ids, stop_resize_pending, context):
+    """Validate the one primary + known-old protective-order identity set."""
+    if stop_order_id is not None and (
+            not isinstance(stop_order_id, str) or
+            ORDER_ID_RE.fullmatch(stop_order_id) is None):
+        raise ValueError(f'{context}.stop_order_id 不是 canonical 订单 ID 或 null')
+    if extra_stop_order_ids is None:
+        extra_stop_order_ids = []
+    if (not isinstance(extra_stop_order_ids, list) or
+            any(not isinstance(value, str) or
+                ORDER_ID_RE.fullmatch(value) is None
+                for value in extra_stop_order_ids)):
+        raise ValueError(
+            f'{context}.extra_stop_order_ids 必须是 canonical 订单 ID 数组')
+    if len(extra_stop_order_ids) != len(set(extra_stop_order_ids)):
+        raise ValueError(f'{context}.extra_stop_order_ids 含重复订单 ID')
+    if stop_order_id in extra_stop_order_ids:
+        raise ValueError(f'{context} 主止损 ID 与旧止损 ID 集合冲突')
+    if not isinstance(stop_resize_pending, bool):
+        raise ValueError(f'{context}.stop_resize_pending 必须是 bool')
+    if extra_stop_order_ids and (
+            stop_order_id is None or stop_resize_pending is not True):
+        raise ValueError(
+            f'{context} 已知旧止损必须同时具备主止损并处于缩量待清理态')
+    return stop_order_id, list(extra_stop_order_ids), stop_resize_pending
 
 
 def validate_partial_close_record(record, context, normalize=False):
@@ -824,8 +904,7 @@ class TradeState:
         - 主文件与 .bak 都不存在：全新部署，返回默认空状态；
         - 主文件不存在但 .bak 仍在：疑似误删，拒绝启动（人工恢复备份或删 .bak 确认重置）；
         - 主文件可读：正常加载；
-        - 主文件损坏、备份可读：从 .bak 恢复；
-        - 主文件损坏、备份也不可读：抛 TradeStatePersistenceError 拒绝启动。
+        - 主文件解析/schema 损坏：拒绝启动，不自动提升 .bak。
 
         账本无法确认时绝不「失忆」运行：不仅会漏管旧仓，日检还会把有真实仓位的
         品种当空仓重复开仓（单向模式下同向叠加敞口/反向误减仓）。
@@ -846,8 +925,11 @@ class TradeState:
             with open_private_text_file(self.state_file) as f:
                 state = load_strict_json(f)
         except Exception as e:
-            logger.error(f'读取交易状态失败({self.state_file}): {e}，尝试从备份恢复')
-            return self._recover_state_from_backup(backup, e)
+            raise TradeStatePersistenceError(
+                f'主账本 {self.state_file} 无法严格解析: {e}。'
+                f'{backup} 是上一代状态，可能缺少已发出订单的 '
+                'lifecycle intent；不自动提升，请停机后人工对账修复'
+            ) from e
 
         # 归属冲突不是“账本损坏”：主账本已经是可以严格解析的
         # 对象，且显式声明它属于另一个交易所。此时若用 .bak 覆盖，
@@ -863,28 +945,11 @@ class TradeState:
             self.validate_state(state)
             return state
         except Exception as e:
-            logger.error(f'读取交易状态失败({self.state_file}): {e}，尝试从备份恢复')
-            return self._recover_state_from_backup(backup, e)
-
-    def _recover_state_from_backup(self, backup, main_error):
-        """仅对主账本损坏执行备份恢复；显式归属冲突不会进入此路径。"""
-        try:
-            with open_private_text_file(backup) as f:
-                recovered = load_strict_json(f)
-            self.validate_state(recovered)
-            # 不能只恢复到内存：下一次保存会先把仍损坏的主文件复制到 .bak，
-            # 反而摧毁唯一好备份。恢复成功后必须先原子修复主文件。
-            if not atomic_write_json(self.state_file, recovered):
-                raise TradeStatePersistenceError(
-                    f'备份可读，但无法原子修复主账本 {self.state_file}')
-            logger.warning(f'交易状态已从备份恢复并修复主文件: {backup}')
-            return recovered
-        except Exception as backup_error:
             raise TradeStatePersistenceError(
-                f'交易状态主文件损坏且备份不可恢复（主: {main_error}；'
-                f'备: {backup_error}）。拒绝以空状态启动，请人工修复 '
-                f'{self.state_file} 或其 .bak 后重启'
-            ) from main_error
+                f'主账本 {self.state_file} schema 损坏: {e}。'
+                f'{backup} 是上一代状态，可能缺少已发出订单的 '
+                'lifecycle intent；不自动提升，请停机后人工对账修复'
+            ) from e
 
     @staticmethod
     def get_default_state():
@@ -936,6 +1001,16 @@ class TradeState:
                 raise ValueError(
                     f'账本字段 {key} 必须是 {expected.__name__}，'
                     f'实际为 {type(state[key]).__name__}')
+        for field in (
+                'open_positions', 'signal_states', 'open_intents',
+                'stop_residues', 'stop_loss_dates',
+                'position_quarantines'):
+            for symbol in (state.get(field) or {}):
+                if (not isinstance(symbol, str) or
+                        SYMBOL_RE.fullmatch(symbol) is None):
+                    raise ValueError(
+                        f'{field} 的键必须是规范大写 USDT 交易对: '
+                        f'{symbol!r}')
         if ('stop_loss_dates_migrated' in state and
                 not isinstance(state['stop_loss_dates_migrated'], bool)):
             raise ValueError('账本字段 stop_loss_dates_migrated 必须是 bool')
@@ -984,12 +1059,14 @@ class TradeState:
                  if key != 'close_intent'},
                 f'{symbol} 持仓', normalize=False,
                 require_closed_fields=False)
-            order_id = position.get('stop_order_id')
-            if order_id is not None and not isinstance(order_id, str):
-                raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 null')
-            if ('stop_resize_pending' in position and
-                    not isinstance(position['stop_resize_pending'], bool)):
-                raise ValueError(f'{symbol}.stop_resize_pending 必须是 bool')
+            validate_stop_order_identity(
+                position.get('stop_order_id'),
+                position.get('extra_stop_order_ids'),
+                position.get('stop_resize_pending', False), symbol)
+            if not position_stop_coverage_valid(position):
+                raise ValueError(
+                    f'{symbol}.stop_order_size 未完整覆盖当前仓位，或在非缩量态'
+                    '与 position_size 不一致')
             if ('execution_recovery_finalized' in position and
                     not isinstance(
                         position['execution_recovery_finalized'], bool)):
@@ -1165,6 +1242,7 @@ class TradeState:
                 except ValueError as exc:
                     raise ValueError(
                         f'{symbol}.open_intent.payload.{field} 非法') from exc
+            planned = None
             if 'planned_position_size' in intent:
                 if isinstance(intent['planned_position_size'], bool):
                     raise ValueError(
@@ -1226,6 +1304,32 @@ class TradeState:
                     raise ValueError(
                         f'{symbol}.open_intent.unresolved_execution '
                         '缺少补偿句柄')
+                raw_compensation_size = unresolved_execution.get(
+                    'compensation_requested_size')
+                if raw_compensation_size is not None:
+                    if kind != 'open_compensation':
+                        raise ValueError(
+                            f'{symbol}.open_intent.unresolved_execution '
+                            '只有 open_compensation 可携带补偿请求量')
+                    try:
+                        compensation_size = _require_positive_finite(
+                            raw_compensation_size,
+                            f'{symbol}.open_intent.unresolved_execution.'
+                            'compensation_requested_size')
+                        expected_size = _require_positive_finite(
+                            unresolved_execution['expected_position_size'],
+                            f'{symbol}.open_intent.unresolved_execution.'
+                            'expected_position_size')
+                    except ValueError as exc:
+                        raise ValueError(
+                            f'{symbol}.open_intent.unresolved_execution '
+                            '补偿请求量非法') from exc
+                    tolerance = max(
+                        1e-15, math.ulp(max(expected_size, 1.0)) * 8)
+                    if compensation_size > expected_size + tolerance:
+                        raise ValueError(
+                            f'{symbol}.open_intent.unresolved_execution '
+                            '补偿请求量不得超过开仓执行上界')
                 protective_stop_id = unresolved_execution.get(
                     'protective_stop_order_id')
                 protective_stop_size = unresolved_execution.get(
@@ -1252,7 +1356,7 @@ class TradeState:
                             f'{symbol}.open_intent.unresolved_execution '
                             '保护止损数量非法') from exc
                 try:
-                    _require_positive_finite(
+                    expected_size = _require_positive_finite(
                         unresolved_execution['expected_position_size'],
                         f'{symbol}.open_intent.unresolved_execution.'
                         'expected_position_size')
@@ -1260,6 +1364,17 @@ class TradeState:
                     raise ValueError(
                         f'{symbol}.open_intent.unresolved_execution '
                         '预期数量非法') from exc
+                if kind in ('open', 'open_compensation'):
+                    if planned is None:
+                        raise ValueError(
+                            f'{symbol}.open_intent.unresolved_execution '
+                            '缺少开仓计划量')
+                    tolerance = max(
+                        1e-15, math.ulp(max(planned, 1.0)) * 8)
+                    if expected_size > planned + tolerance:
+                        raise ValueError(
+                            f'{symbol}.open_intent.unresolved_execution '
+                            '执行上界超过开仓计划量')
                 for field in ('created_at', 'updated_at'):
                     try:
                         datetime.fromisoformat(unresolved_execution[field])
@@ -1309,9 +1424,11 @@ class TradeState:
             if not isinstance(symbol, str) or not isinstance(day, str):
                 raise ValueError('stop_loss_dates 必须是 品种→日期字符串')
             try:
-                datetime.strptime(day, '%Y-%m-%d')
+                parsed_day = datetime.strptime(day, '%Y-%m-%d').date()
             except ValueError as exc:
                 raise ValueError(f'{symbol} T+1 日期非法: {day!r}') from exc
+            if parsed_day.isoformat() != day:
+                raise ValueError(f'{symbol} T+1 日期必须是规范 YYYY-MM-DD')
         for symbol, marked_at in (state.get('stop_residues') or {}).items():
             if (not isinstance(symbol, str) or not symbol or
                     not isinstance(marked_at, str) or not marked_at):
@@ -1368,8 +1485,8 @@ class TradeState:
                 raise TradeStatePersistenceError(
                     f'拒绝保存 schema 非法的交易状态: {exc}') from exc
             if private_file_exists(self.state_file):
-                # 备份也必须是已解析、schema 合法、原子落盘的上一版本。静默忽略 copy
-                # 失败会让“有 .bak 即可恢复”的承诺失效，且 copy2 中断可留下半截备份。
+                # .bak 是供停机人工对账的上一版本，仍必须可解析、
+                # schema 合法并原子落盘；启动路径不会自动提升它。
                 try:
                     with open_private_text_file(self.state_file) as f:
                         previous = load_strict_json(f)
@@ -1711,8 +1828,10 @@ class TradeState:
         # 但 force_runtime（仅内存）路径不落盘，NaN/bool 会直接住进账本。
         new_stop_price = _require_positive_finite(
             new_stop_price, f'{symbol}.stop_loss_price')
-        if new_stop_order_id is not None and not isinstance(new_stop_order_id, str):
-            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
+        new_stop_order_id, extra_stop_order_ids, stop_resize_pending = (
+            validate_stop_order_identity(
+                new_stop_order_id, extra_stop_order_ids,
+                stop_resize_pending, symbol))
         if stop_order_size is not None:
             stop_order_size = _require_positive_finite(
                 stop_order_size, f'{symbol}.stop_order_size')
@@ -1721,9 +1840,8 @@ class TradeState:
         position['stop_order_id'] = new_stop_order_id
         position['stop_order_size'] = (
             position['position_size'] if stop_order_size is None else stop_order_size)
-        position['extra_stop_order_ids'] = [
-            str(value) for value in (extra_stop_order_ids or []) if value]
-        position['stop_resize_pending'] = bool(stop_resize_pending)
+        position['extra_stop_order_ids'] = extra_stop_order_ids
+        position['stop_resize_pending'] = stop_resize_pending
         position['last_stop_update'] = datetime.now().isoformat()
         return copy.deepcopy(position)
 
@@ -1759,6 +1877,10 @@ class TradeState:
                                     close_intent_client_id=None):
         if symbol not in self.state['open_positions']:
             return None
+        new_stop_order_id, extra_stop_order_ids, stop_resize_pending = (
+            validate_stop_order_identity(
+                new_stop_order_id, extra_stop_order_ids,
+                stop_resize_pending, symbol))
         position = self.state['open_positions'][symbol]
         current_size = float(position['position_size'])
         closed_size = _require_positive_finite(closed_size, '部分平仓数量')
@@ -1805,9 +1927,8 @@ class TradeState:
         position['stop_order_size'] = (
             remaining if stop_order_size is None else
             _require_positive_finite(stop_order_size, f'{symbol}.stop_order_size'))
-        position['extra_stop_order_ids'] = [
-            str(value) for value in (extra_stop_order_ids or []) if value]
-        position['stop_resize_pending'] = bool(stop_resize_pending)
+        position['extra_stop_order_ids'] = extra_stop_order_ids
+        position['stop_resize_pending'] = stop_resize_pending
         position['last_partial_close'] = partial['close_time']
         self._consume_close_intent_locked(
             position, close_intent_client_id)
@@ -2356,17 +2477,26 @@ class TradeState:
             overflow_count = len(closed) - self.keep_recent_closed
             if overflow_count <= 0:
                 return 0
-            archive, ok = self._read_archive()
+            _archive, ok = self._read_archive()
             if not ok:
                 return 0  # 史书损坏：保留账本全部记录等人工修复，_read_archive 已记日志
             overflow = closed[:overflow_count]
-            # 上轮可能崩溃在“史书已追加、账本尚未收缩”。只能跳过
-            # archive 后缀与 overflow 前缀的最大有序重叠；集合式 `t not in tail`
-            # 会把两笔内容恰好相同的真实成交误删掉。
-            overlap = self._ordered_archive_overlap(archive, overflow)
-            to_append = overflow[overlap:]
+            # 旧版本只写单文件。若它在“史书已追加、账本未收缩”后升级，
+            # 先按旧文件的真实追加顺序消除一次全局前缀；展示层的时间排序
+            # 绝不能参与事务去重。
+            try:
+                legacy = (
+                    self._read_archive_file(self.archive_file)
+                    if private_file_exists(self.archive_file) else [])
+            except Exception as exc:
+                logger.error(
+                    f'读取旧平仓史书失败，本轮跳过（账本保留全部记录）: '
+                    f'{self.archive_file}: {exc}')
+                return 0
+            legacy_overlap = self._ordered_archive_overlap(legacy, overflow)
+            pending = overflow[legacy_overlap:]
             grouped = {}
-            for record in to_append:
+            for record in pending:
                 grouped.setdefault(self._archive_year(record), []).append(record)
             for year, records in sorted(grouped.items()):
                 path = os.path.join(
@@ -2380,6 +2510,13 @@ class TradeState:
                         f'读取年度平仓史书失败，本轮跳过（账本保留全部记录）: '
                         f'{path}: {exc}')
                     return 0
+                # 每个年度文件都是独立写入边界。只比较该文件的原始追加
+                # 后缀，不能使用 _read_archive() 的展示排序结果；否则非单调
+                # close_time 会把刚追加记录移离尾部并在重试时制造重复。
+                overlap = self._ordered_archive_overlap(existing, records)
+                records = records[overlap:]
+                if not records:
+                    continue
                 try:
                     archive_saved = atomic_write_json(path, existing + records)
                 except AtomicWriteCommitDurabilityError as exc:
@@ -2615,7 +2752,8 @@ class TradeState:
 
     def _mark_open_intent_unresolved_execution_locked(
             self, symbol, client_order_id, kind, expected_position_size,
-            compensation_client_order_id, protective_stop_order_id,
+            compensation_client_order_id, compensation_requested_size,
+            protective_stop_order_id,
             protective_stop_order_size, reason, details):
         intent = (self.state.get('open_intents') or {}).get(symbol)
         if (not isinstance(intent, dict) or
@@ -2626,6 +2764,15 @@ class TradeState:
             raise ValueError('未决执行 kind 非法')
         expected_position_size = _require_positive_finite(
             expected_position_size, '未决执行预期数量')
+        planned_position_size = _require_positive_finite(
+            intent.get('planned_position_size'), 'open intent 计划数量')
+        planned_tolerance = max(
+            1e-15, math.ulp(max(planned_position_size, 1.0)) * 8)
+        if (kind in ('open', 'open_compensation') and
+                expected_position_size >
+                planned_position_size + planned_tolerance):
+            raise TradeStatePersistenceError(
+                '未决执行上界不得超过持久化开仓计划量')
         open_client_order_id = str(client_order_id)
         if (not (1 <= len(open_client_order_id) <= 32) or
                 not open_client_order_id.isascii() or
@@ -2637,8 +2784,64 @@ class TradeState:
                     not compensation_client_order_id.isascii() or
                     not compensation_client_order_id.isalnum()):
                 raise ValueError('未决执行补偿句柄非法')
+        previous = intent.get('unresolved_execution')
+        if previous is not None:
+            if (not isinstance(previous, dict) or
+                    previous.get('kind') != kind):
+                raise TradeStatePersistenceError(
+                    '不得改写既有未决执行种类')
+            previous_expected = _require_positive_finite(
+                previous.get('expected_position_size'),
+                '既有未决执行预期数量')
+            if kind == 'open':
+                previous_tolerance = max(
+                    1e-15,
+                    math.ulp(max(previous_expected, 1.0)) * 8)
+                if expected_position_size > (
+                        previous_expected + previous_tolerance):
+                    raise TradeStatePersistenceError(
+                        '未补偿开仓的执行上界不得扩大')
+            if kind == 'open_compensation':
+                previous_compensation_id = previous.get(
+                    'compensation_client_order_id')
+                previous_compensation_size = previous.get(
+                    'compensation_requested_size', previous_expected)
+                if compensation_client_order_id != previous_compensation_id:
+                    raise TradeStatePersistenceError(
+                        '不得改写既有补偿执行句柄')
+                if compensation_requested_size is None:
+                    compensation_requested_size = previous_compensation_size
+                elif not positive_amounts_equal(
+                        compensation_requested_size,
+                        previous_compensation_size):
+                    raise TradeStatePersistenceError(
+                        '不得改写既有补偿请求量')
+            previous_stop_id = previous.get('protective_stop_order_id')
+            previous_stop_size = previous.get('protective_stop_order_size')
+            if previous_stop_id is not None:
+                if protective_stop_order_id is None:
+                    protective_stop_order_id = previous_stop_id
+                    protective_stop_order_size = previous_stop_size
+                elif (str(protective_stop_order_id) != previous_stop_id or
+                      not positive_amounts_equal(
+                          protective_stop_order_size,
+                          previous_stop_size)):
+                    raise TradeStatePersistenceError(
+                        '不得改写既有保护止损句柄/数量')
         if kind == 'open_compensation' and not compensation_client_order_id:
             raise ValueError('open_compensation 缺少补偿句柄')
+        if kind == 'open_compensation':
+            if compensation_requested_size is None:
+                # 兼容调用者在同量补偿场景下的简写；落盘后始终显式保存。
+                compensation_requested_size = expected_position_size
+            compensation_requested_size = _require_positive_finite(
+                compensation_requested_size, '补偿平仓请求数量')
+            tolerance = max(
+                1e-15, math.ulp(max(expected_position_size, 1.0)) * 8)
+            if compensation_requested_size > expected_position_size + tolerance:
+                raise ValueError('补偿平仓请求量不得超过开仓执行上界')
+        elif compensation_requested_size is not None:
+            raise ValueError('只有 open_compensation 可携带补偿请求量')
         if ((protective_stop_order_id is None) !=
                 (protective_stop_order_size is None)):
             raise ValueError('保护止损句柄/数量必须成对')
@@ -2651,7 +2854,7 @@ class TradeState:
             protective_stop_order_size = _require_positive_finite(
                 protective_stop_order_size, '保护止损数量')
         now = datetime.now().isoformat()
-        previous = intent.get('unresolved_execution') or {}
+        previous = previous or {}
         unresolved = {
             'kind': kind,
             'open_client_order_id': open_client_order_id,
@@ -2661,6 +2864,9 @@ class TradeState:
             'created_at': previous.get('created_at') or now,
             'updated_at': now,
         }
+        if kind == 'open_compensation':
+            unresolved['compensation_requested_size'] = (
+                compensation_requested_size)
         if protective_stop_order_id is not None:
             unresolved['protective_stop_order_id'] = protective_stop_order_id
             unresolved['protective_stop_order_size'] = protective_stop_order_size
@@ -2674,6 +2880,7 @@ class TradeState:
     def mark_open_intent_unresolved_execution(
             self, symbol, client_order_id, kind, expected_position_size, *,
             compensation_client_order_id=None,
+            compensation_requested_size=None,
             protective_stop_order_id=None, protective_stop_order_size=None,
             reason='open intent 执行终态未决', details=None):
         """原子固化未决真钱执行句柄与隔离；可与真实余仓账本共存。"""
@@ -2681,26 +2888,145 @@ class TradeState:
             return self._transact_locked(
                 lambda: self._mark_open_intent_unresolved_execution_locked(
                     symbol, client_order_id, kind, expected_position_size,
-                    compensation_client_order_id, protective_stop_order_id,
+                    compensation_client_order_id, compensation_requested_size,
+                    protective_stop_order_id,
                     protective_stop_order_size, reason, details))
 
     def force_runtime_mark_open_intent_unresolved_execution(
             self, symbol, client_order_id, kind, expected_position_size, *,
             compensation_client_order_id=None,
+            compensation_requested_size=None,
             protective_stop_order_id=None, protective_stop_order_size=None,
             reason='open intent 执行终态未决', details=None):
         with self.lock:
             return self._transact_locked(
                 lambda: self._mark_open_intent_unresolved_execution_locked(
                     symbol, client_order_id, kind, expected_position_size,
-                    compensation_client_order_id, protective_stop_order_id,
+                    compensation_client_order_id, compensation_requested_size,
+                    protective_stop_order_id,
                     protective_stop_order_size, reason, details),
+                save=False)
+
+    def _adopt_unresolved_open_position_locked(
+            self, symbol, client_order_id, kind, expected_position_size,
+            compensation_client_order_id, compensation_requested_size,
+            reason, details,
+            position_kwargs):
+        """在一个账本事务内更新执行责任人并建立受托余仓。"""
+        if kind not in ('open', 'open_compensation'):
+            raise TradeStatePersistenceError(
+                '只有 open/open_compensation 可自动建立受托余仓')
+        if not isinstance(position_kwargs, dict):
+            raise TypeError('position_kwargs 必须是对象')
+        forbidden = {'symbol', 'open_intent_client_id',
+                     'preserve_open_intent'} & set(position_kwargs)
+        if forbidden:
+            raise TypeError(
+                f'position_kwargs 不得覆盖 lifecycle 字段: {sorted(forbidden)}')
+
+        intent = (self.state.get('open_intents') or {}).get(symbol)
+        if (not isinstance(intent, dict) or
+                intent.get('client_order_id') != str(client_order_id)):
+            raise TradeStatePersistenceError(
+                f'{symbol} 受托余仓与 pending open intent 不匹配')
+        expected_position_size = _require_positive_finite(
+            expected_position_size, '受托余仓未决执行预期数量')
+        planned_position_size = _require_positive_finite(
+            intent.get('planned_position_size'), 'open intent 计划数量')
+        planned_tolerance = max(
+            1e-15, math.ulp(max(planned_position_size, 1.0)) * 8)
+        if expected_position_size > planned_position_size + planned_tolerance:
+            raise TradeStatePersistenceError(
+                f'{symbol} 受托余仓开仓成交量超过持久化计划量')
+        previous = intent.get('unresolved_execution')
+        if previous is not None:
+            if not isinstance(previous, dict) or previous.get('kind') != kind:
+                raise TradeStatePersistenceError(
+                    f'{symbol} 不得改写既有未决执行种类')
+            previous_expected = _require_positive_finite(
+                previous.get('expected_position_size'),
+                '既有未决执行预期数量')
+            if kind == 'open':
+                previous_tolerance = max(
+                    1e-15,
+                    math.ulp(max(previous_expected, 1.0)) * 8)
+                if expected_position_size > (
+                        previous_expected + previous_tolerance):
+                    raise TradeStatePersistenceError(
+                        f'{symbol} 未补偿开仓的执行上界不得扩大')
+                if (previous.get('compensation_client_order_id') is not None or
+                        compensation_client_order_id is not None):
+                    raise TradeStatePersistenceError(
+                        f'{symbol} 未补偿开仓不得携带补偿句柄')
+            else:
+                previous_compensation_size = previous.get(
+                    'compensation_requested_size', previous_expected)
+                if compensation_requested_size is None:
+                    compensation_requested_size = previous_compensation_size
+                if (previous.get('compensation_client_order_id') !=
+                        compensation_client_order_id or
+                        not positive_amounts_equal(
+                            previous_compensation_size,
+                            compensation_requested_size)):
+                    raise TradeStatePersistenceError(
+                        f'{symbol} 既有补偿执行句柄/请求量与恢复证据冲突')
+        if kind == 'open_compensation':
+            if compensation_requested_size is None:
+                compensation_requested_size = expected_position_size
+            compensation_requested_size = _require_positive_finite(
+                compensation_requested_size, '受托余仓补偿请求量')
+            tolerance = max(
+                1e-15, math.ulp(max(expected_position_size, 1.0)) * 8)
+            if compensation_requested_size > expected_position_size + tolerance:
+                raise TradeStatePersistenceError(
+                    f'{symbol} 补偿请求量超过终态开仓成交量')
+
+        self._mark_open_intent_unresolved_execution_locked(
+            symbol, client_order_id, kind, expected_position_size,
+            compensation_client_order_id, compensation_requested_size,
+            None, None, reason, details)
+        return self._add_untracked_open_position_locked(
+            symbol=symbol,
+            open_intent_client_id=str(client_order_id),
+            preserve_open_intent=True,
+            **copy.deepcopy(position_kwargs))
+
+    def adopt_unresolved_open_position(
+            self, symbol, client_order_id, kind, expected_position_size, *,
+            compensation_client_order_id=None,
+            compensation_requested_size=None,
+            reason='崩溃恢复受托余仓', details=None,
+            position_kwargs):
+        """原子建立未决执行、provisional 余仓、隔离与残留标记。"""
+        with self.lock:
+            return self._transact_locked(
+                lambda: self._adopt_unresolved_open_position_locked(
+                    symbol, client_order_id, kind, expected_position_size,
+                    compensation_client_order_id, compensation_requested_size,
+                    reason, details,
+                    position_kwargs))
+
+    def force_runtime_adopt_unresolved_open_position(
+            self, symbol, client_order_id, kind, expected_position_size, *,
+            compensation_client_order_id=None,
+            compensation_requested_size=None,
+            reason='崩溃恢复受托余仓', details=None,
+            position_kwargs):
+        """磁盘失效时仍以同一原子变更反映真实未决余仓。"""
+        with self.lock:
+            return self._transact_locked(
+                lambda: self._adopt_unresolved_open_position_locked(
+                    symbol, client_order_id, kind, expected_position_size,
+                    compensation_client_order_id, compensation_requested_size,
+                    reason, details,
+                    position_kwargs),
                 save=False)
 
     def _finalize_unresolved_open_execution_locked(
             self, symbol, client_order_id, entry_price,
             expected_remaining_size, compensation_close,
-            entry_fee, entry_fee_currency, entry_order_id):
+            entry_fee, entry_fee_currency, entry_order_id,
+            actual_open_size):
         intent = (self.state.get('open_intents') or {}).get(symbol)
         position = self.state['open_positions'].get(symbol)
         if (not isinstance(intent, dict) or not isinstance(position, dict) or
@@ -2740,8 +3066,30 @@ class TradeState:
                 'provisional 余仓不得含未归因的历史缩量')
         entry_price = _require_positive_finite(
             entry_price, '未决执行权威入场价')
-        expected_open_size = _require_positive_finite(
+        marker_open_size = _require_positive_finite(
             unresolved.get('expected_position_size'), '未决执行原始成交量')
+        if actual_open_size is None:
+            expected_open_size = marker_open_size
+        else:
+            expected_open_size = _require_positive_finite(
+                actual_open_size, '未决执行终态开仓成交量')
+            planned_open_size = _require_positive_finite(
+                intent.get('planned_position_size'), 'open intent 计划量')
+            planned_tolerance = max(
+                1e-15, math.ulp(max(planned_open_size, 1.0)) * 8)
+            if expected_open_size > planned_open_size + planned_tolerance:
+                raise TradeStatePersistenceError(
+                    '终态开仓成交量超过持久化计划量')
+            if unresolved_kind == 'open_compensation':
+                compensation_requested = _require_positive_finite(
+                    unresolved.get(
+                        'compensation_requested_size', marker_open_size),
+                    '未决执行补偿请求量')
+                if compensation_requested > expected_open_size + max(
+                        1e-15,
+                        math.ulp(max(expected_open_size, 1.0)) * 8):
+                    raise TradeStatePersistenceError(
+                        '补偿请求量超过终态开仓成交量')
         if isinstance(expected_remaining_size, bool):
             raise ValueError('未决执行余仓不能是 bool')
         try:
@@ -2785,6 +3133,15 @@ class TradeState:
                 'amount': amount, 'price': price, 'id': order_id,
                 'fee': fee,
             }
+            compensation_requested = _require_positive_finite(
+                unresolved.get(
+                    'compensation_requested_size', marker_open_size),
+                '未决执行补偿请求量')
+            if amount > compensation_requested + max(
+                    1e-15,
+                    math.ulp(max(compensation_requested, 1.0)) * 8):
+                raise TradeStatePersistenceError(
+                    '单笔补偿订单成交量超过持久化请求量')
         compensated_size = (
             normalized_close['amount'] if normalized_close else 0.0)
         if not math.isclose(
@@ -2880,14 +3237,16 @@ class TradeState:
     def finalize_unresolved_open_execution(
             self, symbol, client_order_id, entry_price,
             expected_remaining_size, compensation_close, *,
-            entry_order_id, entry_fee=None, entry_fee_currency=None):
+            entry_order_id, entry_fee=None, entry_fee_currency=None,
+            actual_open_size=None):
         """用原开仓与单笔补偿订单终态原子收口 provisional。"""
         with self.lock:
             return self._transact_locked(
                 lambda: self._finalize_unresolved_open_execution_locked(
                     symbol, client_order_id, entry_price,
                     expected_remaining_size, compensation_close,
-                    entry_fee, entry_fee_currency, entry_order_id))
+                    entry_fee, entry_fee_currency, entry_order_id,
+                    actual_open_size))
 
     def resolve_open_intent(self, symbol, client_order_id):
         with self.lock:
@@ -2983,11 +3342,30 @@ class TradeState:
         with self.lock:
             return copy.deepcopy(self.state.get('stop_loss_dates') or {})
 
+    def get_stop_loss_date(self, symbol):
+        if (not isinstance(symbol, str) or
+                SYMBOL_RE.fullmatch(symbol) is None):
+            raise ValueError('T+1 品种必须是规范大写 USDT 交易对')
+        with self.lock:
+            return (self.state.get('stop_loss_dates') or {}).get(symbol)
+
     def replace_stop_loss_dates(self, dates):
-        if not isinstance(dates, dict) or any(
-                not isinstance(k, str) or not isinstance(v, str)
-                for k, v in dates.items()):
+        if not isinstance(dates, dict):
             raise ValueError('stop_loss_dates 必须是 {symbol: YYYY-MM-DD} 对象')
+        for symbol, day in dates.items():
+            if (not isinstance(symbol, str) or
+                    SYMBOL_RE.fullmatch(symbol) is None or
+                    not isinstance(day, str)):
+                raise ValueError(
+                    'stop_loss_dates 必须使用规范大写 USDT 交易对和日期字符串')
+            try:
+                parsed_day = datetime.strptime(day, '%Y-%m-%d').date()
+            except ValueError as exc:
+                raise ValueError(
+                    f'{symbol} T+1 日期必须是规范 YYYY-MM-DD') from exc
+            if parsed_day.isoformat() != day:
+                raise ValueError(
+                    f'{symbol} T+1 日期必须是规范 YYYY-MM-DD')
         with self.lock:
             snapshot = self._snapshot_locked()
             self.state['stop_loss_dates'] = copy.deepcopy(dates)

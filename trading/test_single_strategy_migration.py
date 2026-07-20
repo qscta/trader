@@ -1,7 +1,9 @@
 """单策略部署预检的失败原子性、阻断与幂等回归。"""
 
 import copy
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -376,6 +378,27 @@ class NormalizeTest(unittest.TestCase):
                     migration.TradeState.validate_state(ledger)
                 self.assertTrue(migration.normalize_ledger(ledger)[2])
 
+    def test_migration_blocks_conflicting_stop_identity_set(self):
+        ledger = _ledger()
+        ledger['signal_states'] = {}
+        ledger['open_positions']['BTCUSDT'] = {
+            'symbol': 'BTCUSDT', 'side': 'long',
+            'entry_price': 100.0, 'position_size': 1.0,
+            'stop_loss_price': 90.0, 'stop_order_id': 'stop-new',
+            'stop_order_size': 1.0, 'extra_stop_order_ids': ['stop-new'],
+            'stop_resize_pending': True, 'strategy': 'ma_cross',
+        }
+
+        with self.assertRaises(ValueError):
+            migration.TradeState.validate_state(ledger)
+        self.assertTrue(migration.normalize_ledger(ledger)[2])
+
+    def test_active_position_partial_financials_must_be_consistent(self):
+        base_position = {
+            'symbol': 'BTCUSDT', 'side': 'long',
+            'entry_price': 100.0, 'position_size': 1.0,
+            'stop_loss_price': 90.0, 'strategy': 'ma_cross',
+        }
         bad_partials = (
             {
                 'position_size': 0.4, 'exit_price': 105.0,
@@ -524,6 +547,9 @@ class RunTest(unittest.TestCase):
 
     def test_legacy_completion_marker_has_a_strict_shared_schema(self):
         bad_markers = (
+            {'exchange': 'okx'},
+            {'exchange': 'okx', 'completed_at': '2026-07-18T08:00:00'},
+            {'exchange': 'okx', 'moved': []},
             {'exchange': 'okx', 'obsolete': True},
             {'exchange': 'okx', 'completed_at': 123},
             {'exchange': 'okx', 'moved': ['trade_state.json', 2]},
@@ -748,6 +774,122 @@ class RunTest(unittest.TestCase):
                 {'last_processed_candle', 'last_update'},
                 set(_read(state_path)['signal_states']['BTCUSDT']))
             self.assertFalse(os.path.exists(journal))
+
+    def test_recover_only_rolls_back_without_continuing_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state_path = self._paths(tmp)
+            originals = (_read(config_path), _read(state_path))
+            real_write = migration.atomic_write_json
+            target_writes = []
+
+            def die_on_second_target(path, payload):
+                if path in (config_path, state_path):
+                    target_writes.append(path)
+                    if len(target_writes) == 2:
+                        raise SystemExit(99)
+                return real_write(path, payload)
+
+            with patch.object(
+                    migration, 'atomic_write_json', side_effect=die_on_second_target):
+                with self.assertRaises(SystemExit):
+                    migration.run(tmp, apply=True)
+
+            journal = os.path.join(
+                tmp, migration.cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+            self.assertTrue(os.path.exists(journal))
+            self.assertNotEqual(originals, (_read(config_path), _read(state_path)))
+
+            self.assertEqual(
+                migration.EXIT_OK, migration.run(tmp, recover_only=True))
+            self.assertEqual(originals, (_read(config_path), _read(state_path)))
+            self.assertTrue(
+                'strategy' in _read(config_path)['trading']['symbols'][0])
+            self.assertFalse(os.path.exists(journal))
+
+            # Crash retries are harmless: after the durable rollback this mode
+            # remains a no-op and still never starts a new migration.
+            self.assertEqual(
+                migration.EXIT_OK, migration.run(tmp, recover_only=True))
+            self.assertEqual(originals, (_read(config_path), _read(state_path)))
+
+    def test_recover_only_rejects_migration_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._paths(tmp)
+            self.assertEqual(
+                migration.EXIT_UNSAFE,
+                migration.run(tmp, apply=True, recover_only=True))
+
+    def test_migration_journal_version_requires_exact_json_integer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'config.json')
+            item = {
+                'target': target,
+                'backup': target + '.premigrate.0001',
+            }
+            for version in (True, 1.0):
+                with self.subTest(version=version), self.assertRaisesRegex(
+                        ValueError, '版本或结构无效'):
+                    migration._validate_journal_items(
+                        tmp, {'version': version, 'items': [item]})
+
+    def test_classify_state_distinguishes_complete_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state_path = self._paths(tmp)
+            originals = (_read(config_path), _read(state_path))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = migration.run(tmp, classify_state=True)
+            self.assertEqual(migration.EXIT_OK, result)
+            self.assertEqual('requires_migration\n', output.getvalue())
+            self.assertEqual(originals, (_read(config_path), _read(state_path)))
+
+            self.assertEqual(migration.EXIT_OK, migration.run(tmp, apply=True))
+            migrated = (_read(config_path), _read(state_path))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = migration.run(tmp, classify_state=True)
+            self.assertEqual(migration.EXIT_OK, result)
+            self.assertEqual('migration_complete\n', output.getvalue())
+            self.assertEqual(migrated, (_read(config_path), _read(state_path)))
+
+    def test_classify_promotes_commit_before_phase_write_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, state_path = self._paths(tmp)
+            real_remove = migration._remove_journal
+
+            def die_after_transaction_commit(path):
+                real_remove(path)
+                raise SystemExit(99)
+
+            with patch.object(
+                    migration, '_remove_journal',
+                    side_effect=die_after_transaction_commit):
+                with self.assertRaises(SystemExit):
+                    migration.run(tmp, apply=True)
+
+            journal = os.path.join(
+                tmp, migration.cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+            self.assertFalse(os.path.exists(journal))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = migration.run(tmp, classify_state=True)
+            self.assertEqual(migration.EXIT_OK, result)
+            self.assertEqual('migration_complete\n', output.getvalue())
+            self.assertNotIn(
+                'strategy', _read(config_path)['trading']['symbols'][0])
+            self.assertEqual(
+                {'last_processed_candle', 'last_update'},
+                set(_read(state_path)['signal_states']['BTCUSDT']))
+
+    def test_classify_state_never_relabels_blocked_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _config_path, state_path = self._paths(tmp)
+            state = _read(state_path)
+            state['open_intents'] = {'BTCUSDT': {'status': 'pending'}}
+            _write(state_path, state)
+            self.assertEqual(
+                migration.EXIT_UNSAFE,
+                migration.run(tmp, classify_state=True))
 
     def test_runtime_refuses_unfinished_migration_journal(self):
         with tempfile.TemporaryDirectory() as tmp:

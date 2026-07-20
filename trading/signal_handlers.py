@@ -5,15 +5,16 @@ T+1 止损重入。
 
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
-宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
-stop_loss_dates / is_stop_loss_today / record_stop_loss / clear_stop_loss /
+宿主须提供：exchange_api / trade_state（含 T+1） / notifier / ma_cross_strategy /
 _handle_exchange_flat_close / _get_strategy_display_name /
 _notify_missing_position_after_signal / _execute_open /
-_flip_position。
+_flip_position / _exchange_position_has_contracts。
 """
 
 import logging
 from datetime import date
+
+from runtime_guard import t1_reentry_blocked
 
 logger = logging.getLogger(__name__)
 
@@ -38,43 +39,38 @@ class SignalHandlersMixin:
         """双均线策略：处理没有开仓头寸的情况"""
         logger.info(f"{symbol} [双均线] 没有开仓头寸，检查信号...")
 
-        if self.is_stop_loss_today(symbol):
+        stop_loss_date = self.trade_state.get_stop_loss_date(symbol)
+        today = date.today().strftime('%Y-%m-%d')
+        if t1_reentry_blocked(stop_loss_date, today):
             logger.info(f"{symbol} [双均线] 今天已止损，检查T+1重入条件...")
             logger.info(f"{symbol} [双均线] T+1限制：今天止损过，等待次日重入")
             return NO_POSITION_T1_BLOCKED
 
-        if signal['action'] == 'long':
-            logger.info(f"{symbol} [双均线] 金叉信号，准备做多...")
+        action = signal['action']
+        if action in ('long', 'short'):
+            direction = (
+                '金叉信号，准备做多' if action == 'long'
+                else '死叉信号，准备做空')
+            logger.info(f"{symbol} [双均线] {direction}...")
             entry_price = signal['current_close']
-            stop_loss_price = signal['lower_stop']
-            self._execute_open(symbol, 'long', entry_price, stop_loss_price, symbol_config)
-            if not self.trade_state.get_open_position(symbol):
+            stop_loss_price = (
+                signal['lower_stop'] if action == 'long'
+                else signal['upper_stop'])
+            self._execute_open(
+                symbol, action, entry_price, stop_loss_price, symbol_config)
+            post_position = self.trade_state.get_open_position(symbol)
+            if not post_position or post_position.get('side') != action:
+                direction = '做多' if action == 'long' else '做空'
                 self._mark_ma_cross_reentry_pending(
                     symbol,
-                    'long',
+                    action,
                     signal,
-                    '双均线做多信号已出现，但本轮检查结束后仍无持仓；保留本根 K 线等待日内重试'
-                )
-            return
-        elif signal['action'] == 'short':
-            logger.info(f"{symbol} [双均线] 死叉信号，准备做空...")
-            entry_price = signal['current_close']
-            stop_loss_price = signal['upper_stop']
-            self._execute_open(symbol, 'short', entry_price, stop_loss_price, symbol_config)
-            if not self.trade_state.get_open_position(symbol):
-                self._mark_ma_cross_reentry_pending(
-                    symbol,
-                    'short',
-                    signal,
-                    '双均线做空信号已出现，但本轮检查结束后仍无持仓；保留本根 K 线等待日内重试'
+                    f'双均线{direction}信号已出现，但本轮检查结束后未形成同向持仓；'
+                    '保留本根 K 线等待日内重试'
                 )
             return
         else:
-            yesterday_str = None
-            if symbol in self.stop_loss_dates:
-                yesterday_str = self.stop_loss_dates[symbol]
-
-            if yesterday_str and yesterday_str != date.today().strftime('%Y-%m-%d'):
+            if stop_loss_date:
                 logger.info(f"{symbol} [双均线] 检查止损后重入条件...")
                 should_reenter, side, reentry_signal = self.ma_cross_strategy.check_reentry_condition(df)
                 if should_reenter and side:
@@ -87,8 +83,7 @@ class SignalHandlersMixin:
                     self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
                     post_position = self.trade_state.get_open_position(symbol)
                     if post_position and post_position.get('side') == side:
-                        # 重入成功：解除 T+1 标记，回归常规「永远在市」
-                        self.clear_stop_loss(symbol)
+                        # 新仓与旧 T+1 标记已由 TradeState 在同一事务中收口。
                         return
                     else:
                         # 重入开仓未成功（价格已穿止损/超时未确认/残留阻断等）：**保留** T+1 标记，
@@ -112,7 +107,7 @@ class SignalHandlersMixin:
         # 优先检查交易所端持仓状态（止损可能已触发）
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
         exchange_position = self.exchange_api.get_position(ccxt_symbol)
-        if exchange_position is None or exchange_position.get('contracts', 0) == 0:
+        if not self._exchange_position_has_contracts(exchange_position):
             if self.trade_state.get_open_position(symbol):
                 logger.warning(f"{symbol} [双均线] 检测到交易所端已无持仓，止损单可能已触发")
                 exit_price = position.get('stop_loss_price', signal['current_close'])

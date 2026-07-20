@@ -24,7 +24,7 @@ class PositionModeError(RuntimeError):
 class OkxApi(ExchangeApi):
     """欧易（OKX）U 本位永续适配器。
 
-    与币安的关键差异，全部封装在本类内部：
+    OKX U 本位永续的边界约束全部封装在本类内部：
       1. 凭据多一个 passphrase（config['password']）。
       2. defaultType = 'swap'；永续 ccxt 符号是 BASE/USDT:USDT（BASE/USDT 是现货）。
       3. 下单单位是“张”。每张 = contractSize 个币。上层传进来的是“币数”，
@@ -436,7 +436,7 @@ class OkxApi(ExchangeApi):
         """获取特定交易对的持仓（单向模式下只有一条）。
 
         无实仓时返回 None。OKX 可能返回 contracts=None/0 的空仓条目，
-        若原样外泄，上层（币安时代写下的）`contracts == 0` / `contracts > 0`
+        若原样外泄，上层旧版的 `contracts == 0` / `contracts > 0`
         判断会因 None 误判甚至 TypeError——统一在适配层归一化掉。
 
         「无法确定」绝不当「空仓」：响应 None/非列表、contracts 缺失但原始
@@ -599,8 +599,13 @@ class OkxApi(ExchangeApi):
                 self._raw_candle_number(raw[5], 'volume', positive=False),
             ])
         rows.sort(key=lambda row: row[0])
+        # OKX 单页最多 300 根，而正常响应会用 1 根承载当前未完成 K。
+        # 即使边界瞬间该 K 尚未出现，也固定保留这个槽位；否则同一组最近
+        # 299 根已完成 K 会因响应时序被喂成 299/300 根，EMA 的最老 seed
+        # 随之改变，极限情况下会让同一信号日产生不同交叉动作。
+        confirmed_limit = min(requested, raw_limit - 1)
         return self.validate_ohlcv(
-            rows[-requested:], ccxt_symbol, timeframe='1d')
+            rows[-confirmed_limit:], ccxt_symbol, timeframe='1d')
 
     def fetch_ohlcv(self, symbol, timeframe='1d', limit=100):
         """日 K 以 OKX ``confirm=1`` 为收盘证据；其余周期沿用通用读取。"""
@@ -647,16 +652,6 @@ class OkxApi(ExchangeApi):
         读不到一律 False——不可证明 reduce-only 的订单绝不当保护性止损。
         """
         return OkxApi._order_reduce_only_value(order) is True
-
-    @staticmethod
-    def _reduce_only_unknown(order):
-        """reduceOnly 在标准字段与原生 info 中都读不到 → 未知。
-
-        未知 ≠ 否：未知订单不能证明是保护（不参与 intact 匹配），但也
-        不能隐身——四态裁决必须把它当候选计入，宁可 mismatch 交人工，
-        绝不因看不见而判 missing 再挂第二张止损。
-        """
-        return OkxApi._order_reduce_only_value(order) is None
 
     def _fetch_order_for_confirmation(self, ccxt_symbol, order_id, client_order_id):
         """查询订单并严格绑定所用身份；缺失/错配一律不可裁决。"""
@@ -742,7 +737,12 @@ class OkxApi(ExchangeApi):
             if len(set(observed_order_ids)) != 1:
                 raise RuntimeError(
                     f'{ccxt_symbol} clOrdId 查询返回冲突 ordId')
-        return order
+        # 身份已经逐字段严格验证；在唯一边界归一到公共字段，避免下游
+        # 丢弃真实 info.ordId 后再制造占位 ID。
+        canonical = dict(order)
+        canonical['id'] = observed_order_ids[0]
+        canonical['clientOrderId'] = client_order_id
+        return canonical
 
     def _fetch_order_tristate(
             self, ccxt_symbol, client_order_id, *,
@@ -960,7 +960,8 @@ class OkxApi(ExchangeApi):
                 observed_amount = info.get('sz')
             observed_amount = self._finite_nonnegative(observed_amount)
             if (observed_amount is None or observed_amount <= tolerance or
-                    abs(observed_amount - requested_contracts) > tolerance or
+                    (requested_contracts is not None and
+                     abs(observed_amount - requested_contracts) > tolerance) or
                     not self._existing_order_matches_request(
                         candidate, ccxt_symbol, close_side,
                         observed_amount, reduce_only=True)):
@@ -1190,6 +1191,24 @@ class OkxApi(ExchangeApi):
             # 有成交的调用方必须把这视为未完成财务证据，
             # 不得用当前行情/信号价伪装成真实成交均价。
             result['financial_evidence_incomplete'] = True
+        else:
+            # 标准字段可能为空而原生 OKX 字段完整。证据已在上方做过
+            # 冲突校验，此处只归一一次，账本层不再猜原生字段。
+            result['average'] = prices[0]
+            if top_fee_cost is not None:
+                result['fee'] = {
+                    'cost': top_fee_cost,
+                    'currency': (
+                        top_fee_currency or
+                        (native_currency if native_fee is not None else None)),
+                }
+            elif native_fee is not None:
+                result['fee'] = {
+                    'cost': native_fee,
+                    'currency': (
+                        native_currency
+                        if native_currency not in (None, '') else None),
+                }
         return result
 
     def _confirm_market_order(self, ccxt_symbol, initial_order, client_order_id, *,
@@ -1371,8 +1390,6 @@ class OkxApi(ExchangeApi):
             pre_contracts=0.0, requested_contracts=contracts)
         if retry_result:
             retry_result['clientOrderId'] = client_order_id
-            if not retry_result.get('id'):
-                retry_result['id'] = 'timeout_confirmed'
             logger.info(
                 f"开仓撤余量后成交已确认: {ccxt_symbol} {side} "
                 f"{retry_result['amount']}币, 完整成交={retry_result['fully_filled']}")
@@ -1462,6 +1479,56 @@ class OkxApi(ExchangeApi):
                     'remaining_amount': 0.0,
                     'compensation': compensation,
                     'info': '原开仓已终态且 reduce-only 补偿后同轮确认全平',
+                }
+                for key in ('average', 'cost', 'fee', 'fees',
+                            'execution_ambiguous'):
+                    if key in authoritative:
+                        result[key] = authoritative[key]
+                return result
+            residual_contracts = None
+            residual_conserved = False
+            if (terminal and final_position and
+                    original_filled is not None and
+                    compensation_filled is not None):
+                try:
+                    raw_final_contracts = final_position.get('contracts')
+                    if (isinstance(raw_final_contracts, bool) or
+                            raw_final_contracts is None):
+                        raise ValueError('fresh contracts 缺失/非法')
+                    observed_final_contracts = abs(
+                        float(raw_final_contracts))
+                    residual_contracts = max(
+                        0.0, original_filled - compensation_filled)
+                    residual_conserved = bool(
+                        math.isfinite(observed_final_contracts) and
+                        final_position.get('side') == side and
+                        original_filled + tolerance >= compensation_filled and
+                        abs(compensation_filled - last_contracts) <= tolerance and
+                        residual_contracts > tolerance and
+                        abs(observed_final_contracts - residual_contracts) <=
+                        tolerance)
+                except (TypeError, ValueError, OverflowError):
+                    residual_conserved = False
+            if residual_conserved:
+                # The deterministic reduce-only compensation closed exactly the
+                # quantity seen before it was submitted; the original order then
+                # reached a larger terminal fill, and fresh net position equals
+                # open_filled - compensation_filled.  This is a system residual,
+                # not an unowned position: return it for immediate ledger/stop
+                # protection while retaining the lifecycle blocker.
+                authoritative = self._sanitize_financial_evidence(final_order)
+                result = {
+                    'id': authoritative.get('id') or cancel_ref,
+                    'clientOrderId': client_order_id,
+                    'status': 'post_compensation_residual',
+                    'confirmed': False,
+                    'open_execution_unresolved': True,
+                    'amount': self._contracts_to_coins(
+                        ccxt_symbol, original_filled),
+                    'remaining_amount': self._contracts_to_coins(
+                        ccxt_symbol, residual_contracts),
+                    'compensation': compensation,
+                    'info': '原开仓迟到成交量与单笔补偿及 fresh 余仓严格守恒',
                 }
                 for key in ('average', 'cost', 'fee', 'fees',
                             'execution_ambiguous'):
@@ -1575,7 +1642,7 @@ class OkxApi(ExchangeApi):
 
     def open_position(
             self, symbol, side, amount, client_order_id=None, *,
-            require_existing=False):
+            require_existing=False, pre_submit_guard=None):
         """安全开仓（市价单）。amount 单位为币数。
 
         开仓前必须可证明交易所为空仓；下单 ACK 后必须确认订单终态与仓位
@@ -1593,6 +1660,9 @@ class OkxApi(ExchangeApi):
             return None
         if not isinstance(require_existing, bool):
             logger.error('require_existing 必须是严格布尔值')
+            return None
+        if pre_submit_guard is not None and not callable(pre_submit_guard):
+            logger.error('pre_submit_guard 必须可调用')
             return None
         if require_existing and client_order_id is None:
             logger.error('只读恢复开仓必须提供已持久化 clOrdId')
@@ -1683,6 +1753,18 @@ class OkxApi(ExchangeApi):
                 '拒绝叠加/对冲开仓')
             return None
 
+        if pre_submit_guard is not None:
+            try:
+                submit_allowed = pre_submit_guard()
+            except Exception as exc:
+                logger.critical(
+                    f'{ccxt_symbol} 发单紧前运行时门禁异常，拒绝开仓: {exc}')
+                return None
+            if submit_allowed is not True:
+                logger.warning(
+                    f'{ccxt_symbol} 发单紧前运行时门禁已关闭，未发送开仓 POST')
+                return None
+
         params = self._order_params(extra={'clOrdId': client_order_id})
         ack = None
 
@@ -1710,9 +1792,6 @@ class OkxApi(ExchangeApi):
             pre_contracts=0.0, requested_contracts=contracts)
         if result:
             result['clientOrderId'] = client_order_id
-            if not result.get('id'):
-                result['id'] = 'timeout_confirmed'
-                result['clientOrderId'] = client_order_id
             logger.info(
                 f"开仓成交已确认: {ccxt_symbol} {side} "
                 f"{result['amount']}币, 订单ID={result.get('id') or client_order_id}, "
@@ -1889,6 +1968,18 @@ class OkxApi(ExchangeApi):
         if existing_order is not None:
             target_contracts = requested_contracts
             recovered_filled = existing_order[3]
+            if require_existing and recovered_filled <= tolerance:
+                # 唯一持久化 close 单已严格证明为终态零成交。此时仓位
+                # 可能已被已知保护止损归零，不能先用净仓差额否定这份
+                # 零成交事实；上层只消费 close intent，账本/止损另行归因。
+                return {
+                    'confirmed': True, 'zero_fill_terminal': True,
+                    'fully_closed': False, 'fully_filled': False,
+                    'amount': 0.0, 'requested_amount': amount,
+                    'remaining_amount': amount,
+                    'clientOrderId': client_order_id,
+                    'status': 'no_fill', 'read_only_evidence': True,
+                }
             observed_delta = max(0.0, requested_contracts - pre_contracts)
             if abs(recovered_filled - observed_delta) > tolerance:
                 logger.critical(
@@ -1915,16 +2006,6 @@ class OkxApi(ExchangeApi):
             close_execution = None
 
         if require_existing:
-            if (existing_order is not None and
-                    total_filled_contracts <= tolerance):
-                return {
-                    'confirmed': True, 'zero_fill_terminal': True,
-                    'fully_closed': False, 'fully_filled': False,
-                    'amount': 0.0, 'requested_amount': amount,
-                    'remaining_amount': amount,
-                    'clientOrderId': client_order_id,
-                    'status': 'no_fill', 'read_only_evidence': True,
-                }
             if close_execution is None:
                 logger.critical(
                     f'{ccxt_symbol} 历史 close intent 的确定性订单查无；'
@@ -2041,8 +2122,6 @@ class OkxApi(ExchangeApi):
                         f"平仓成交无法确认: {ccxt_symbol} {side}")
                     return None
             order_result['clientOrderId'] = order_client_id
-            if not order_result.get('id'):
-                order_result['id'] = 'timeout_confirmed'
             actual_filled_contracts = max(
                 0.0, order_pre_contracts - last_contracts)
             if actual_filled_contracts <= tolerance:
@@ -2115,17 +2194,26 @@ class OkxApi(ExchangeApi):
 
     def find_compensation_close_progress(self, symbol, side, amount,
                                          open_client_order_id):
-        """只读返回唯一补偿订单进度；absent 与 terminal-partial 明确区分。"""
+        """只读返回唯一补偿订单进度；absent 与 terminal-partial 明确区分。
+
+        ``amount=None`` 是崩溃窗的发现模式：只按确定性 clOrdId
+        查找，命中后才从已核对 symbol/side/market/reduceOnly 的订单
+        读取请求量；不得发单。
+        """
         if side not in ('long', 'short'):
             raise ValueError(f'查询补偿平仓进度时方向非法: {side!r}')
-        self._positive_coin_amount(amount, '查询补偿平仓进度币数')
+        discovery_mode = amount is None
+        if not discovery_mode:
+            self._positive_coin_amount(amount, '查询补偿平仓进度币数')
         if open_client_order_id is None:
             raise ValueError('查询补偿平仓进度必须提供开仓 clOrdId')
         ccxt_symbol = self._resolve_symbol(symbol)
         close_side = 'sell' if side == 'long' else 'buy'
         base_client_id = self.compensation_client_order_id(open_client_order_id)
-        requested_contracts = self._coin_to_contracts(ccxt_symbol, amount)
-        if requested_contracts <= 0:
+        requested_contracts = (
+            None if discovery_mode else
+            self._coin_to_contracts(ccxt_symbol, amount))
+        if requested_contracts is not None and requested_contracts <= 0:
             raise ValueError(
                 f"{ccxt_symbol} 查询补偿平仓进度时预期张数无效: {amount}")
         existing_order = self._find_existing_close_order(
@@ -2137,8 +2225,8 @@ class OkxApi(ExchangeApi):
                 # 是否仍在交易所留存证明窗内只能由持久化 lifecycle 时间裁决。
                 'terminal': None, 'absent': True, 'confirmed': False,
                 'filled': 0.0, 'amount': 0.0,
-                'requested_amount': amount,
-                'remaining_amount': amount,
+                'requested_amount': None if discovery_mode else amount,
+                'remaining_amount': None if discovery_mode else amount,
                 'clientOrderId': base_client_id,
                 'ids': [], 'read_only_evidence': True,
                 'order': None,
@@ -2148,6 +2236,10 @@ class OkxApi(ExchangeApi):
                     'filled': None,
                 },
             }
+        if discovery_mode:
+            requested_contracts = existing_order[2]
+            amount = self._contracts_to_coins(
+                ccxt_symbol, requested_contracts)
         tolerance = self._contracts_tolerance(ccxt_symbol)
         raw_filled_contracts = existing_order[3]
         # _terminal_fill 允许的只是交易所精度噪声。必须在公共 progress
@@ -2210,31 +2302,15 @@ class OkxApi(ExchangeApi):
         })
         return result
 
-    def find_compensation_close_evidence(self, symbol, side, amount,
-                                         open_client_order_id):
-        """只读找回由开仓句柄派生的唯一补偿订单；绝不发送下单请求。
-
-        前置条件：调用方已确认交易所该品种净持仓为零。用途是判断历史补偿
-        平仓是否真实发生过，以便用真实退出价补记往返——此前该场景误用可
-        下单的 close_position()，极端竞态下（确认空仓后用户人工开出同方向
-        同数量仓位）会把人工仓平掉。返回：
-          - None — 可见性宽限后仍明确不存在补偿订单，或成交未覆盖请求量；
-          - dict — 唯一订单终态且覆盖请求量的结果（average/fees/ids）。
-        查询不确定或订单内容与请求不一致一律抛出。
-        """
-        progress = self.find_compensation_close_progress(
-            symbol, side, amount, open_client_order_id)
-        if progress.get('absent') or progress.get('status') != 'closed':
-            return None
-        return progress
-
-    @staticmethod
-    def _algo_order_matches(order, stop_side, stop_price, contracts, expected_order_id=None):
+    def _algo_order_matches(
+            self, order, stop_side, stop_price, contracts,
+            expected_order_id=None, allow_oversized=False):
         """严格判断算法单是否为本地记录的保护性止损。
 
         必须同时满足：记录 ID（若有）、conditional 类型、reduceOnly、触发后市价
         (slOrdPx=-1)、state=live、slTriggerPxType=last（与本系统创建口径一致）、
-        非对冲 posSide、方向、触发价、张数。任何字段读不到一律视为不匹配——
+        SWAP 产品、当前 tdMode、净仓 posSide、方向、触发价、张数。
+        任何字段读不到一律视为不匹配——
         已暂停/已触发/已撤销或触发价类型不同的算法单都不是完整保护。
         """
         if not order or order.get('side') != stop_side:
@@ -2250,13 +2326,15 @@ class OkxApi(ExchangeApi):
         info = order.get('info') or {}
         if not OkxApi._order_reduce_only(order):
             return False
+        if (info.get('instType') != 'SWAP' or
+                info.get('tdMode') != self.margin_mode or
+                info.get('posSide') != 'net'):
+            return False
         if info.get('ordType') != 'conditional':
             return False
         if info.get('state') != 'live':
             return False
         if info.get('slTriggerPxType') != 'last':
-            return False
-        if info.get('posSide') in ('long', 'short'):
             return False
         try:
             if float(info.get('slOrdPx')) != -1.0:
@@ -2292,7 +2370,10 @@ class OkxApi(ExchangeApi):
         if (not (math.isfinite(amount) and math.isfinite(contracts)) or
                 amount <= 0 or contracts <= 0):
             return False
-        return abs(amount - contracts) <= max(math.ulp(amount), math.ulp(contracts)) * 4
+        tolerance = max(math.ulp(amount), math.ulp(contracts)) * 4
+        if allow_oversized:
+            return amount + tolerance >= contracts
+        return abs(amount - contracts) <= tolerance
 
     @classmethod
     def _algo_client_order_id(cls, order):
@@ -2307,22 +2388,6 @@ class OkxApi(ExchangeApi):
             return cls._client_order_id(value)
         except ValueError as exc:
             raise RuntimeError('算法单返回非法 algoClOrdId') from exc
-
-    @staticmethod
-    def _is_protective_stop_candidate(order, stop_side):
-        """识别任何可能平掉当前/未来同方向净仓的算法单。
-
-        系统自己的精确保护仍由 ``_algo_order_matches`` 限定为 conditional
-        市价止损；这里故意更宽：人工/旧版本留下的 trigger、OCO、移动止损
-        同样可能在未来仓位上触发，必须把“唯一正常止损 + 另一张未知算法单”
-        判成 mismatch，而不能因类型不同就隐身。
-        """
-        if not order or order.get('side') != stop_side:
-            return False
-        info = order.get('info') or {}
-        return (
-            OkxApi._order_reduce_only(order) and
-            info.get('ordType') in {'conditional', 'oco', 'trigger', 'move_order_stop'})
 
     def assert_no_stale_protective_orders(self, symbol):
         """新开仓前证明该品种没有任何遗留普通/算法挂单。"""
@@ -2685,16 +2750,25 @@ class OkxApi(ExchangeApi):
             symbols.append(internal)
         return symbols
 
-    def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
+    def find_stop_order_state(
+            self, symbol, side, amount, stop_price, stop_order_id=None,
+            known_extra_stop_order_ids=None):
         """检查与「本地持仓记录」对应的止损算法单状态（供主层止损自愈巡检使用）。
 
         amount 为币数，张数换算在本方法内部完成（张数不外泄）。返回：
-          'intact'   — 存在方向+触发价+张数与本地记录严格一致的算法单（保护完整）；
+          'intact'   — 不存在普通挂单，且方向+触发价+张数与本地记录严格一致的
+                       唯一算法单仍在（保护完整）；
           'mismatch' — 本地记录的 stop_order_id 还在列表里，但内容与本地记录不符
                        或出现多张/内容歧义（自动补挂会造成双止损，须人工核对）；
           'missing'  — 列表中不存在匹配的止损单（需要补挂）。
           {'state': 'adoptable', 'order_id': ...} — 原 ID 不在，但交易所仅有一张
                        内容完全匹配的新保护单；调用方应原子收养 ID，绝不补挂。
+          {'state': 'resize_cleanup', 'order_ids': [...]} — 仅在调用方给出已落账的
+                       旧止损 ID 集合，不存在普通挂单，且新主止损完整覆盖余仓、
+                       其余活动算法单与该集合逐张严格一致时，允许只撤这些已知旧单。
+          {'state': 'resize_needed'} — 仅在主止损及全部旧止损 ID 都已知、没有其它
+                       活动委托，且每张已知单都是同向同价并至少覆盖余仓的
+                       oversized reduce-only 单时，允许调用方先挂精确余仓止损再清旧单。
         查询/换算失败向上抛出，调用方按 fail-safe 跳过本轮。
         """
         if side not in ('long', 'short'):
@@ -2702,28 +2776,92 @@ class OkxApi(ExchangeApi):
         self._positive_coin_amount(amount, '止损状态查询币数')
         if stop_order_id is not None:
             stop_order_id = self._public_order_id(stop_order_id)
+        known_extra_ids = None
+        if known_extra_stop_order_ids is not None:
+            if not isinstance(known_extra_stop_order_ids, list):
+                raise ValueError('已知旧止损 ID 必须是列表')
+            if stop_order_id is None:
+                raise ValueError('清理旧止损必须提供主止损 ID')
+            known_extra_ids = [
+                self._public_order_id(value)
+                for value in known_extra_stop_order_ids]
+            if (len(known_extra_ids) != len(set(known_extra_ids)) or
+                    stop_order_id in known_extra_ids):
+                raise ValueError('已知旧止损 ID 重复或与主止损 ID 冲突')
         ccxt_symbol = self._resolve_symbol(symbol)
         stop_side = 'sell' if side == 'long' else 'buy'
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
         # 本地记录价与交易所存储价须同一口径：交易所按 tick 取整存储，
         # 比对前用同一对齐函数归一本地价（详见 _align_stop_price）
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
-        algos = self._fetch_algo_orders(ccxt_symbol)
-        # reduceOnly 未知的算法单必须可见：它可能就是真实保护单（字段暂缺），
-        # 计入候选会把裁决推向 mismatch（fail-safe），绝不会推向补挂双止损。
-        reduce_only_algos = [
-            order for order in algos
-            if self._order_reduce_only(order) or self._reduce_only_unknown(order)]
-        protective = [
-            order for order in reduce_only_algos
-            if self._is_protective_stop_candidate(order, stop_side)]
+        normal_orders, algos = self._fetch_pending_snapshot(ccxt_symbol)
+        # 单策略账户的健康稳定态只允许权威止损集合；同品种任何额外活动
+        # 普通单或算法单都可能改变净仓，不能从止损覆盖核对中隐身。
+        if normal_orders:
+            return 'mismatch'
         expected = None
         if stop_order_id:
             expected = next((
                 order for order in algos
                 if self._public_order_id(order.get('id')) == stop_order_id), None)
         if expected is not None:
-            if (len(protective) == 1 and len(reduce_only_algos) == 1 and
+            if known_extra_ids is not None:
+                try:
+                    algo_by_id = {
+                        self._public_order_id(order.get('id')): order
+                        for order in algos
+                    }
+                except ValueError:
+                    return 'mismatch'
+                expected_ids = {stop_order_id, *known_extra_ids}
+                cleanable = (
+                    len(algo_by_id) == len(algos) and
+                    set(algo_by_id) <= expected_ids and
+                    self._algo_order_matches(
+                        expected, stop_side, stop_price, contracts,
+                        expected_order_id=stop_order_id))
+                for order_id in known_extra_ids:
+                    old_order = algo_by_id.get(order_id)
+                    if old_order is not None:
+                        cleanable = cleanable and self._algo_order_matches(
+                            old_order, stop_side, stop_price, contracts,
+                            expected_order_id=order_id,
+                            allow_oversized=True)
+                    elif cleanable:
+                        # 上轮撤单可能已实际成功，只是终态查询瞬时失败。只有
+                        # 精确详情证明零成交 canceled，才把该账本旧 ID 重新送入
+                        # 现有验证式清理；查无/触发/部分成交仍保持 mismatch。
+                        detail = self._fetch_algo_order_raw(
+                            ccxt_symbol, order_id)
+                        cleanable = self._algo_order_safely_cancelled(detail)
+                if cleanable:
+                    return {
+                        'state': 'resize_cleanup',
+                        'order_ids': list(known_extra_ids),
+                    }
+                # 连续部分成交可能让上一轮“新主止损”也相对最新余仓变成 oversized。
+                # 只有完整清单严格等于账本已知集合，且每张仍是同向同价、至少
+                # 覆盖余仓的 reduce-only 保护时，才开放重新缩量；未知/欠覆盖/
+                # 错方向/错价格仍保持 mismatch，绝不借恢复态放宽。
+                resize_needed = (
+                    len(algo_by_id) == len(algos) and
+                    set(algo_by_id) <= expected_ids)
+                for order_id in expected_ids:
+                    known_order = algo_by_id.get(order_id)
+                    if known_order is not None:
+                        resize_needed = (
+                            resize_needed and self._algo_order_matches(
+                                known_order, stop_side, stop_price, contracts,
+                                expected_order_id=order_id,
+                                allow_oversized=True))
+                    elif resize_needed:
+                        detail = self._fetch_algo_order_raw(
+                            ccxt_symbol, order_id)
+                        resize_needed = self._algo_order_safely_cancelled(detail)
+                if resize_needed:
+                    return {'state': 'resize_needed'}
+                return 'mismatch'
+            if (len(algos) == 1 and
                     self._algo_order_matches(
                         expected, stop_side, stop_price, contracts,
                         expected_order_id=stop_order_id)):
@@ -2740,17 +2878,15 @@ class OkxApi(ExchangeApi):
                 return 'mismatch'
 
         content_matches = [
-            order for order in protective
+            order for order in algos
             if self._algo_order_matches(
                 order, stop_side, stop_price, contracts)]
-        if (len(content_matches) == 1 and len(protective) == 1 and
-                len(reduce_only_algos) == 1):
+        if len(content_matches) == 1 and len(algos) == 1:
             # 原 ID 已不可见，但唯一一张新单完整覆盖当前仓位：安全收养其 ID，
             # 不得把它当 missing 再补挂第二张。
             return {'state': 'adoptable', 'order_id': content_matches[0].get('id')}
-        if reduce_only_algos:
-            # 一张内容错误、多张保护候选，或另一方向/类型的 reduce-only
-            # 算法单都不能自动裁决/补挂。
+        if algos:
+            # 任意内容错误或额外活动算法单都不能自动裁决/补挂。
             return 'mismatch'
         return 'missing'
 

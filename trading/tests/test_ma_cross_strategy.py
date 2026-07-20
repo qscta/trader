@@ -41,14 +41,17 @@ class MaCrossStrategyTest(unittest.TestCase):
             self.frame([1, 2, 3, 4, 5, 6, 7, 8]))
 
         self.assertIsNone(signal['action'])
-        self.assertTrue(signal['ema_bullish'])
+        self.assertGreater(signal['ema_short'], signal['ema_long'])
 
     def test_stop_window_excludes_current_candle(self):
-        upper, lower = self.strategy.calculate_stop_levels(
-            self.frame([1, 2, 3, 4, 5, 6, 7, 100]))
+        for current_signal_close in (100, 0.1):
+            with self.subTest(current_signal_close=current_signal_close):
+                upper, lower = self.strategy.calculate_stop_levels(
+                    self.frame([1, 2, 3, 4, 5, 6, 7,
+                                current_signal_close]))
 
-        self.assertEqual(7.0, upper)
-        self.assertEqual(5.0, lower)
+                self.assertEqual(7.0, upper)
+                self.assertEqual(5.0, lower)
 
     def test_minimum_history_is_enforced_consistently(self):
         short = self.frame([1, 2, 3, 4, 5, 6, 7])

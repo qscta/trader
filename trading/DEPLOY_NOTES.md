@@ -2,7 +2,7 @@
 
 Production deployment has one canonical state path:
 
-`PREPARED -> QUIESCED -> T0 -> VALIDATED -> SEALED -> COMMIT_READY -> COMMITTED`
+`PREPARED -> G0 -> RUNTIME_READY -> QUIESCED -> T0 -> VALIDATED -> SEALED -> COMMIT_READY -> COMMITTED`
 
 `COMMITTED` is derived, not written after the fact: the root phase journal is
 `COMMIT_READY`, the sealed baseline/completion pair is valid, and the sentinel
@@ -15,8 +15,10 @@ is absent. The sentinel unlink performed by `gate commit` is the only commit.
 - `emergency-stop.sh` synchronously blocks and stops every known writer.
 - `recover-deployment.sh` abandons one failed attempt and creates a fresh ID.
 - `deployment_attempt.py` owns the write-once root phase journal.
-- `deployment_no_open_gate.py` owns OKX read-only proof and sentinel evidence.
-- `deployment_old_runner_gate.py` proves the old process's same-lock handoff.
+- `deployment_no_open_gate.py` owns read-only exchange snapshots and release
+  sentinel evidence.
+- `deployment_old_runner_gate.py` binds the old runner's same-trade-lock
+  sentinel handshake to the actual kernel-reported FLOCK holder.
 - `deployment_evidence.py` validates short-lived root approvals and managed files.
 - `remove-one-confirmed-config-key.py` is the only executable config cleanup;
   host input supplies hashes and a path, never code.
@@ -28,6 +30,25 @@ set of successful CI records is insufficient. Preparation reads no trading
 credential. It constructs stage and driver directories in their respective
 protected parents, fsyncs them, publishes driver first and stage second by atomic
 rename, and validates an already-published identical pair on retry.
+All rendered deploy and recovery drivers, regardless of release SHA, run in the
+same fixed transient operation unit and hold the same kernel `flock` for their
+complete lifetime before touching attempt state. A public emergency writes a
+boot-scoped, fsynced request marker, contains that unit and its bound helper
+cgroup, and only then takes the lease; an incomplete same-boot emergency leaves
+its marker fail-closed. Reboot safety after G0 comes from the old runner's
+fsynced runtime sentinel, then the persistent start block and release
+sentinel—not from `/run` or an API permission change.
+
+If the primary `00-deploy-closed.conf` is present but damaged, hard emergency
+containment preserves it as evidence and atomically installs
+`zzzz-deploy-emergency-closed.conf`. That fallback clears prior systemd
+conditions and installs the permanently false `ConditionPathExists=!/`; its
+loaded D-Bus condition tuple and an empty writer cgroup must both be proven.
+Deploy and recovery then contain the writer and refuse to advance any attempt.
+Repair is deliberately manual: preserve the damaged primary, atomically restore
+and reload the exact normal primary block, prove it loaded, and only then remove
+the fallback, fsync the systemd directories and reload again. No driver removes
+the fallback automatically.
 
 The reviewed workflow is `.github/workflows/tests.yml`, whose workflow name is
 `tests`.  Its required check-run names are:
@@ -40,10 +61,16 @@ The reviewed workflow is `.github/workflows/tests.yml`, whose workflow name is
 - `frontend syntax (app.js)`
 
 After the frozen release SHA has those exact successful checks, collect and
-prepare the immutable stage with the following canonical command shape.  The
-release root must already be a clean checkout at that SHA with its reviewed
-`.venv`; the protected input directory must contain the three files described
-in `deployment_templates/README.md`.
+prepare the immutable stage with the following canonical command shape. The
+release root, including `.git` and the reviewed `.venv`, must be a newly created,
+independent checkout already owned by `root:root`, free of mounts and hardlinks,
+and not group/world writable. Preparation only verifies that boundary; it never
+recursively repairs a mutable checkout. Every untracked or Git-ignored release
+entry is rejected except `trading/.venv/**`, whose complete file/symlink set is
+hash-bound separately; this also prevents ignored bytecode or `config.json`
+credentials from executing outside the reviewed manifest. `deploy.sh` repeats
+that closure proof before its first release-Python execution. The protected input directory must
+contain the three files described in `deployment_templates/README.md`.
 
 ```bash
 RELEASE_SHA='<40-hex-frozen-sha>'
@@ -104,22 +131,39 @@ the human proof that the old identities were actually revoked and audited.
    reviewed host process/unit inventory. During deployment nobody and no other
    program may open, close, amend, or cancel managed SWAP orders. During normal
    runtime, managed instruments may be changed only through the system API.
-3. Before the first stop, an already-upgraded runner must create and fsync its
-   actual sentinel while holding the same `_trade_lock` as every open path;
-   the driver rechecks its inode, worker cgroup, and HTTP 503.  A legacy runner
-   without that endpoint may proceed only after OKX reports this exact live Key
-   as `read_only` and the emergency driver repeats that proof immediately
-   before stopping.  Missing or ambiguous proof leaves production running.
-4. Install and reload a persistent `ConditionPathExists` start block, cut the
-   external tunnel, and gracefully drain backup/monitor/trading units. Gunicorn
+3. Before the first deployment mutation, prove that the real worker actually
+   holding `runner.lock` exposes `trade-lock-no-open-v1` on loopback. Install the
+   root-owned, fsynced, write-once `arm-intent`, then call the authenticated
+   endpoint. The endpoint first acquires the same in-process trade lock used by
+   every open path, thereby draining admitted operations. While still holding
+   that lock it creates and fsyncs the runner's actual sentinel, verifies the
+   engine gate, and only then releases the lock. Publish and
+   revalidate the returned root evidence, and only then install fail-safe traps
+   and the persistent `ConditionPathExists` start block. The response worker
+   must remain the same kernel FLOCK owner across probe, arm, and revalidation.
+   Deployment never asks the operator to change the live Key's permissions; an
+   incompatible runner fails before the intent, sentinel, or start block.
+4. With the same-lock sentinel proven, cut the external tunnel and gracefully
+   drain backup/monitor/trading units. Gunicorn
    stops accepting requests and waits for the scheduler/active trade thread.
    A timeout or failed drain is hard-contained with cgroup freeze/SIGKILL but
    returns failure and enters recovery; it never continues into migration.
-5. Arm the release sentinel and take stable inactive/PID/cgroup/lock samples.
-   Run two complete Q0-to-Q2 read-only visibility probes. The second Q0 must not
-   precede the first Q2. Baseline then proves history continuously from the
-   second Q2 through authoritative T0, takes its snapshot after T0, and persists
-   the T0 evidence. There is no Q2-to-T0 or snapshot-to-T0 blind interval.
+5. Arm the release sentinel, take stable inactive/PID/cgroup/lock samples, fsync
+   the complete migrated runtime tree, and bind its stable payload digest in
+   `RUNTIME_READY`. The current attempt's sentinel, later baseline/completion
+   and abandon audit/archive are validated by their own gate state machine and
+   excluded from that attempt's payload digest; prior attempt evidence remains
+   hashed. Run two complete
+   Q0-to-Q2 read-only visibility probes. The
+   second Q0 must not precede the first Q2. Baseline then proves history
+   continuously from the second Q2 through authoritative T0, takes its snapshot
+   after T0, and persists the T0 evidence. There is no Q2-to-T0 or
+   snapshot-to-T0 blind interval. Successful migration originals, plus the
+   retired `data/okx` snapshot and its completion marker, are moved out of the
+   active runtime into the existing root-only rollback directory only after the
+   migration journal is absent and file digests are preserved. The stopped
+   source snapshot remains in `current-data.tar`; MA runtime never consumes
+   these retired bytes.
 6. Keep the sentinel active while the exact formal service, memory monitor,
    explicit backup (including its formal-service restart), backup timer, and
    external tunnel are exercised. Every HTTP write returns 503; authenticated
@@ -127,22 +171,32 @@ the human proof that the old identities were actually revoked and audited.
    entry returns before any side effect while the sentinel exists; health and
    guardian duties remain live. External approval binds the sentinel, baseline,
    local health, nonce, config and exact environment hashes.
-7. For a legacy read-only bootstrap only, the driver now requests a bound human
-   approval to restore this same Key to exactly `read_only,trade`; `withdraw`
-   is forbidden.  The reviewed release is already running behind its durable
-   sentinel, all HTTP writes still return 503, and the permission is queried
-   again before commit.  Then gracefully drain the whole stack again. With the
-   runner lock proven free,
+7. Gracefully drain the whole stack again. With the runner lock proven free,
    require migration dry-run and the same completed slot again, run the sole
    final `verify`, recheck reviewed code/venv/CI/writer approval, and `seal`.
    Seal writes completion but retains the sentinel.
 8. Restart the already-validated formal stack under the sentinel. Prove the exact
    unit is active/running, its MainPID is in its cgroup, its working directory is
-   the immutable release, and that PID holds the exact runner-lock inode.
+   the immutable release, and the actual worker in that cgroup holds the exact
+   runner-lock inode.
 9. While the sentinel still exists, remove both start block and temporary `/run`
-   authorization, daemon-reload, and repeat health, HTTP-gate, identity, and hash
-   checks. Write `COMMIT_READY`, disable fail-safe traps, then execute `gate commit`.
-   No fallible filesystem, service, evidence, health, or network action follows.
+   authorization, daemon-reload, and settle any backup catch-up. Then stop and
+   prove inactive both the backup timer and its worker; a future timer timestamp
+   is not used as an exclusion lock because the backup is allowed to restart the
+   formal service. Stop the tunnel, obtain a final authenticated same-trade-lock
+   drain, then freeze the exact healthy worker. `gate commit` re-evaluates the
+   current scheduler slot inside the unique unlink operation and remains covered
+   by a boundary-aware trap: pre-unlink failure preserves/rearms the sentinel;
+   post-unlink failure preserves committed absence and installs stop-only
+   containment. After unlink, the exact runner remains frozen and backup stays
+   inactive while the monitor, tunnel and scheduler slot are re-proved. Final
+   thaw is the sole post-commit live/open boundary; only afterward is the normal
+   backup timer restored and runner health re-proved under the same failure trap.
+   Recovery first quiesces the backup restart trigger, before even stopping the
+   tunnel, then applies the same freeze/thaw/restore ordering. Both deployment
+   and recovery reject a queued `trading.service` job as an unstable runner
+   proof, and contain every failed committed proof with `stop-only ->
+   verify-committed-stopped -> absent-sentinel proof`.
 
 Runtime JSON, locks, sentinel, baseline and completion live under
 `/var/lib/trading-runtime/<sha>`. Reviewed code and its complete virtual
@@ -166,18 +220,50 @@ such a replacement to a particular actor.
 
 ## Failure and same-SHA retry
 
-Never restart `deploy.sh` for the same attempt ID. Before commit, any ordinary
-failure invokes the emergency boundary and leaves the system stopped, persistently
-blocked and sentinel-protected. Run the rendered `recover-deployment.sh` instead.
+Never restart `deploy.sh` for the same attempt ID. Before the runtime boundary is
+published, a failure either leaves production untouched or leaves the newly
+fsynced sentinel in place; it does not install a start block first. After that
+boundary, ordinary failures invoke the emergency path and leave the system
+stopped, persistently blocked and sentinel-protected. Run the rendered
+`recover-deployment.sh` instead.
 
-Recovery first refuses `COMMIT_READY + missing sentinel` and any ambiguous
-sentinel-missing durable evidence, so it cannot reinterpret a committed release as
-failed. It then writes `abandoned.json` in the old root attempt journal, completes
-the gate's journal-first evidence archive (retryable after interruption), atomically
-switches `active-attempt` to a fresh four-digit ID, fsyncs it, and arms a fresh
-sentinel. Human approvals and reports are attempt-local and cannot be reused.
+Recovery recognizes `COMMIT_READY + missing sentinel` only after validating the
+durable baseline/completion pair and exact runner lock; any other missing-sentinel
+evidence remains damaged and fail-closed. A PREPARED failure with no G0,
+`arm-intent`, boundary, or start-block evidence is metadata-only recovery:
+production remains active and no block, stop, or sentinel is introduced. A
+write-once `arm-intent` means the crash may straddle sentinel creation or the
+response. The v1 sentinel inode is created only after the old runner acquires
+its trade lock, so a lost response—or a crash that leaves its JSON incomplete—
+does not erase the drain proof. Recovery binds a complete sentinel, or a partial
+ubuntu-owned v1 inode plus the root intent, to the current FLOCK worker and HTTP
+gate without inventing creator fields. Before accepting a lost-response or
+partial object, recovery reopens the exact same inode without following links,
+fsyncs it and its canonical parent directory, and rechecks stable metadata; it
+does not infer crash durability merely from visibility. If the service died
+before creating any sentinel, recovery creates a release sentinel while holding the exact runner
+FLOCK and then proves the service stably inactive. Both paths avoid systemd
+mutation until a durable gate plus an in-flight-drain or empty-cgroup proof is
+present. Recovery never fabricates a lost creator response as
+new evidence. Only after that proof may it hard-contain the old writer and
+normalize to the inactive release boundary. At or after G0,
+recovery must revalidate the durable
+runtime-sentinel/release-sentinel boundary before stopping an active writer. It then
+abandons the old journal and gate evidence, writes a fresh inactive recovery
+seed, arms and verifies the new sentinel plus stopped/blocked/lock-free state,
+and only then atomically switches `active-attempt`. A retry consumes that seed
+instead of requiring a fictional active old runner. Human approvals and reports
+remain attempt-local.
+
+A public pre-G0 hard emergency also takes the exact external source
+`runner.lock` before publishing a new write-once source contract and retains that
+lease until exit. Failure to acquire or revalidate the lease blocks publication;
+an end-of-run free-lock probe is not treated as a substitute.
 
 Deployment is authorized only after the required three full adversarial reviews,
 with the final two consecutive reviews reporting no issue, plus the final strongest
-model judgment. The live API key may remain configured because every stage before
-the unique commit is mechanically no-open and all HTTP writes are denied.
+model judgment. Deployment does not require or perform any live Key permission
+change. The kernel-reported legacy FLOCK owner must instead complete and retain
+the same-trade-lock runtime-sentinel handshake.
+Every stage after G0 and before the unique commit is mechanically no-open, and
+all HTTP writes are denied while the reviewed release is exercised.

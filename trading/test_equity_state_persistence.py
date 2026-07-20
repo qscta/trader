@@ -199,6 +199,19 @@ class EquityStatePersistenceTest(unittest.TestCase):
             self.assertEqual(new['qiusuo'], recovered.load_qiusuo_index_state())
             self.assertFalse(os.path.lexists(recovered.EQUITY_SYNC_JOURNAL_FILE))
 
+            for version in (True, 1.0):
+                with self.subTest(version=version):
+                    with open(
+                            tracker.EQUITY_SYNC_JOURNAL_FILE,
+                            'w', encoding='utf-8') as handle:
+                        json.dump({
+                            'version': version, 'old': old, 'new': new,
+                        }, handle)
+                    with self.assertRaisesRegex(
+                            EquityStatePersistenceError, 'journal 版本非法'):
+                        self._tracker(temp_dir)
+                    os.unlink(tracker.EQUITY_SYNC_JOURNAL_FILE)
+
     def test_completed_sync_backups_remain_on_same_generation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = self._tracker(temp_dir)

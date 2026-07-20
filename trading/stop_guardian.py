@@ -6,7 +6,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / record_stop_loss / _get_strategy_display_name。
+_stop_anomalies / _get_strategy_display_name / _exchange_position_has_contracts。
 """
 
 import logging
@@ -17,6 +17,8 @@ from datetime import date, datetime
 from trade_state import (
     TradeStateCommitDurabilityError,
     TradeStatePersistenceError,
+    positive_amounts_equal,
+    position_stop_coverage_valid,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,8 +49,14 @@ class StopGuardianMixin:
     def reconcile_intraday_stop_losses(self):
         """盘中巡检：发现本地有仓而交易所端已无仓时，立即按止损/外部平仓处理并通知。"""
         if not self._trade_lock.acquire(blocking=False):
-            self._last_guardian_failure = {
-                'at': time.time(), 'kind': 'trade_lock_busy'}
+            previous = getattr(self, '_last_guardian_failure', None)
+            # 正常串行冲突不能洗掉尚未被一次完整成功巡检清除的真实故障。
+            # 若此前只有 busy/无故障，则保留最新冲突时间供健康快照展示。
+            if (previous is None or
+                    (isinstance(previous, dict) and
+                     previous.get('kind') == 'trade_lock_busy')):
+                self._last_guardian_failure = {
+                    'at': time.time(), 'kind': 'trade_lock_busy'}
             logger.info("交易检查执行中，跳过盘中止损巡检")
             return False
 
@@ -165,22 +173,15 @@ class StopGuardianMixin:
             logger.warning(f"{symbol} [{strategy_name}] 盘中止损巡检查询持仓失败: {e}")
             return False
 
-        exchange_contracts = 0.0
-        if exchange_position is not None:
-            raw_contracts = exchange_position.get('contracts')
-            if raw_contracts is None or isinstance(raw_contracts, bool):
-                logger.warning(
-                    f'{symbol} [{strategy_name}] 盘中持仓数量非法: '
-                    f'{raw_contracts!r}')
-                return False
-            try:
-                exchange_contracts = abs(float(raw_contracts))
-            except (TypeError, ValueError, OverflowError):
-                return False
-            if not math.isfinite(exchange_contracts):
-                return False
+        try:
+            position_present = self._exchange_position_has_contracts(
+                exchange_position)
+        except Exception as exc:
+            logger.warning(
+                f'{symbol} [{strategy_name}] 盘中持仓响应非法: {exc}')
+            return False
 
-        if exchange_position is not None and exchange_contracts > 0:
+        if position_present:
             if not self._verify_existing_position_or_quarantine(
                     symbol, position, exchange_position, clear_on_match=False):
                 return False
@@ -307,22 +308,114 @@ class StopGuardianMixin:
         stop_price = position.get('stop_loss_price')
         if not stop_price:
             return False
+        if not position_stop_coverage_valid(position):
+            self._stop_anomalies[symbol] = 'stop_undercoverage'
+            self._quarantine_position_mismatch(
+                symbol, '本地止损数量未完整覆盖当前仓位', {
+                    'position_size': position.get('position_size'),
+                    'stop_order_size': position.get('stop_order_size'),
+                    'stop_resize_pending': position.get(
+                        'stop_resize_pending'),
+                })
+            return False
+        position, recovery_ok = self._recover_pending_resize_stop(
+            symbol, ccxt_symbol, position, strategy_name, residue_present)
+        if not recovery_ok:
+            return False
         stop_order_id = position.get('stop_order_id')
+        known_extra_ids = None
+        if position.get('stop_resize_pending'):
+            values = position.get('extra_stop_order_ids') or []
+            if values:
+                known_extra_ids = list(values)
         try:
-            # 四态裁决下沉到适配层：intact / adoptable / mismatch / missing。
-            state_result = self.exchange_api.find_stop_order_state(
-                ccxt_symbol, position.get('side'),
-                position.get('stop_order_size') or position.get('position_size'),
-                stop_price, stop_order_id)
+            # 常规四态裁决下沉到适配层；部分平仓仅额外开放两个严格窄态：
+            # cleanup 清已知旧 ID，needed 对完整已知 oversized 集合换保护。
+            inspection_amount = (
+                position.get('position_size') if known_extra_ids is not None
+                else (position.get('stop_order_size') or
+                      position.get('position_size')))
+            if known_extra_ids is None:
+                state_result = self.exchange_api.find_stop_order_state(
+                    ccxt_symbol, position.get('side'), inspection_amount,
+                    stop_price, stop_order_id)
+            else:
+                state_result = self.exchange_api.find_stop_order_state(
+                    ccxt_symbol, position.get('side'), inspection_amount,
+                    stop_price, stop_order_id,
+                    known_extra_stop_order_ids=known_extra_ids)
         except Exception as e:
             logger.warning(f"{symbol} [{strategy_name}] 止损存在性检查失败，跳过本轮: {e}")
             return False
         if isinstance(state_result, dict):
             state = state_result.get('state')
             discovered_order_id = state_result.get('order_id')
+            expected_fields = (
+                {'state', 'order_id'} if state == 'adoptable'
+                else {'state', 'order_ids'} if state == 'resize_cleanup'
+                else {'state'} if state == 'resize_needed'
+                else None)
+            missing_adoptable_id = (
+                state == 'adoptable' and set(state_result) == {'state'})
+            if (expected_fields is None or
+                    (set(state_result) != expected_fields and
+                     not missing_adoptable_id)):
+                logger.warning(
+                    f'{symbol} [{strategy_name}] 止损状态响应结构非法: '
+                    f'{state_result!r}')
+                return False
         else:
             state = state_result
             discovered_order_id = None
+            if not isinstance(state, str):
+                logger.warning(
+                    f'{symbol} [{strategy_name}] 止损状态响应值非法: '
+                    f'{state!r}')
+                return False
+            if state in {'adoptable', 'resize_cleanup', 'resize_needed'}:
+                logger.warning(
+                    f'{symbol} [{strategy_name}] 止损状态 {state!r} '
+                    '缺少专用证据对象，拒绝裁决')
+                return False
+        if state not in {
+                'intact', 'adoptable', 'resize_cleanup', 'resize_needed',
+                'mismatch', 'missing'}:
+            logger.warning(
+                f'{symbol} [{strategy_name}] 止损状态响应值非法: {state!r}')
+            return False
+        exact_resize_already_protected = (
+            position.get('stop_resize_pending') is True and
+            not (position.get('extra_stop_order_ids') or []) and
+            positive_amounts_equal(
+                inspection_amount, position.get('position_size')))
+        if state == 'resize_cleanup':
+            cleanup_ids = state_result.get('order_ids')
+            if residue_present and self._defer_stop_residue_release(
+                    symbol, strategy_name, state):
+                return True
+            return self._retry_partial_stop_cleanup(
+                symbol, ccxt_symbol, position, strategy_name,
+                cleanup_ids)
+        if state == 'resize_needed':
+            if (position.get('stop_resize_pending') is not True or
+                    not (position.get('extra_stop_order_ids') or [])):
+                logger.critical(
+                    f'{symbol} [{strategy_name}] resize_needed 与本地缩量账本矛盾')
+                return False
+            if residue_present:
+                if self._defer_stop_residue_release(
+                        symbol, strategy_name, state):
+                    # 全部已知 oversized reduce-only 单仍覆盖余仓；跨可见窗前
+                    # 保留 marker，不重复 POST，但继续视为受保护。
+                    return True
+                try:
+                    self.trade_state.clear_stop_residue(symbol)
+                except Exception as exc:
+                    self._notify_trade_state_persistence_issue(
+                        symbol, '连续部分平仓缩量前残留清除', exc)
+                    return False
+            return self._retry_partial_stop_resize(
+                symbol, ccxt_symbol, position, strategy_name)
         if state == 'intact':
             if residue_present:
                 if self._defer_stop_residue_release(
@@ -339,6 +432,21 @@ class StopGuardianMixin:
                         symbol, '止损残留验证清除', exc)
                     return False
                 residue_present = False
+            if exact_resize_already_protected:
+                updated, state_saved = (
+                    self._update_trade_state_stop_with_runtime_fallback(
+                        symbol, stop_price, stop_order_id,
+                        '权威止损清单确认余仓尺寸',
+                        stop_order_size=position.get('position_size'),
+                        extra_stop_order_ids=[],
+                        stop_resize_pending=False))
+                if not updated or not state_saved:
+                    return False
+                self._stop_anomalies.pop(symbol, None)
+                logger.warning(
+                    f'{symbol} [{strategy_name}] 唯一止损已精确覆盖余仓；'
+                    '仅收口本地缩量标记，未重复挂单或撤单')
+                return True
             if position.get('stop_resize_pending'):
                 return self._retry_partial_stop_resize(
                     symbol, ccxt_symbol, position, strategy_name)
@@ -348,12 +456,21 @@ class StopGuardianMixin:
             if not discovered_order_id:
                 state = 'mismatch'
             else:
+                residue_deferred = (
+                    residue_present and self._defer_stop_residue_release(
+                        symbol, strategy_name, state))
                 updated, _saved = self._update_trade_state_stop_with_runtime_fallback(
                     symbol, stop_price, discovered_order_id, "巡检收养唯一止损",
-                    stop_order_size=(position.get('stop_order_size')
-                                     or position.get('position_size')),
+                    stop_order_size=(
+                        position.get('position_size')
+                        if exact_resize_already_protected else
+                        (position.get('stop_order_size') or
+                         position.get('position_size'))),
                     extra_stop_order_ids=position.get('extra_stop_order_ids') or [],
-                    stop_resize_pending=bool(position.get('stop_resize_pending')))
+                    stop_resize_pending=(
+                        bool(position.get('stop_resize_pending')) and
+                        (not exact_resize_already_protected or
+                         residue_deferred)))
                 if not updated:
                     msg = (f"{symbol} 发现唯一完整止损单 {discovered_order_id}，"
                            f"但本地收养失败；已暂停补挂，请立即核对")
@@ -362,9 +479,12 @@ class StopGuardianMixin:
                         self.notifier.notify_error(msg)
                     self._stop_anomalies[symbol] = 'adoption_failed'
                     return False
+                if not _saved:
+                    # 共用持久化降级路径已经告警并隔离；这里只停止
+                    # 本轮，避免对同一次写盘故障重复通知。
+                    return False
                 if residue_present:
-                    if self._defer_stop_residue_release(
-                            symbol, strategy_name, state):
+                    if residue_deferred:
                         logger.warning(
                             f'{symbol} [{strategy_name}] 已收养当前唯一完整止损 '
                             f'{discovered_order_id}，但未知迟到单窗口尚未结束')
@@ -448,12 +568,100 @@ class StopGuardianMixin:
         if not updated:
             return False
         if not state_saved or not self._complete_stop_write(
-                symbol, '巡检补挂止损'):
+                symbol, ccxt_symbol, '巡检补挂止损'):
             return False
         self.notifier.send_message(
             f"[{self.label}] 止损已自动补挂",
             f"{symbol} 检测到持仓缺少止损单，已按本地止损价 {stop_price} 补挂\n"
             f"新止损单ID: {stop_order.get('id')}\n请顺手核对欧易当前委托")
+        return True
+
+    def _recover_pending_resize_stop(
+            self, symbol, ccxt_symbol, position, strategy_name,
+            residue_present):
+        """只读找回缩量 POST 的确定性迟到单，并把旧主单降为已知待清理单。"""
+        old_stop_id = position.get('stop_order_id')
+        if (not residue_present or
+                position.get('stop_resize_pending') is not True or
+                not old_stop_id or
+                positive_amounts_equal(
+                    position.get('stop_order_size'),
+                    position.get('position_size'))):
+            return position, True
+
+        recovered = self._create_stop_with_write_intent(
+            symbol, ccxt_symbol, position.get('side'),
+            position.get('position_size'), position.get('stop_loss_price'),
+            require_existing=True)
+        if not recovered:
+            return position, True
+
+        recovered_id = recovered.get('id')
+        prior_ids = [old_stop_id] + list(
+            position.get('extra_stop_order_ids') or [])
+        extra_ids = list(dict.fromkeys(
+            value for value in prior_ids
+            if value and str(value) != str(recovered_id)))
+        updated, state_saved = (
+            self._update_trade_state_stop_with_runtime_fallback(
+                symbol, position.get('stop_loss_price'), recovered_id,
+                '只读找回部分平仓迟到止损',
+                stop_order_size=position.get('position_size'),
+                extra_stop_order_ids=extra_ids,
+                stop_resize_pending=True))
+        if not updated or not state_saved:
+            return position, False
+        logger.warning(
+            f'{symbol} [{strategy_name}] 已按确定性幂等 ID 只读找回迟到余仓止损 '
+            f'{recovered_id}；等待完整清单证明后清理旧止损')
+        return updated, True
+
+    def _retry_partial_stop_cleanup(
+            self, symbol, ccxt_symbol, position, strategy_name,
+            cleanup_ids):
+        """新余仓止损已严格确认时，只清理账本中精确匹配的旧止损。"""
+        ledger_ids = position.get('extra_stop_order_ids') or []
+        if (not isinstance(ledger_ids, list) or
+                any(not isinstance(value, str) or not value
+                    for value in ledger_ids) or
+                len(ledger_ids) != len(set(ledger_ids)) or
+                not isinstance(cleanup_ids, list) or
+                any(not isinstance(value, str) or not value
+                    for value in cleanup_ids) or
+                len(cleanup_ids) != len(set(cleanup_ids)) or
+                set(cleanup_ids) != set(ledger_ids)):
+            self._quarantine_position_mismatch(
+                symbol, '止损缩量清理证据与账本旧 ID 集合不一致',
+                {'ledger_ids': ledger_ids, 'observed_ids': cleanup_ids},
+                stop_residue_possible=True)
+            return False
+
+        uncleared = self._cancel_active_stop_ids_only(
+            symbol, ccxt_symbol, cleanup_ids)
+        updated, state_saved = self._update_trade_state_stop_with_runtime_fallback(
+            symbol, position.get('stop_loss_price'),
+            position.get('stop_order_id'), '部分平仓旧止损清理',
+            stop_order_size=position.get('position_size'),
+            extra_stop_order_ids=uncleared,
+            stop_resize_pending=bool(uncleared))
+        if not updated or not state_saved:
+            return False
+        if uncleared:
+            self._stop_anomalies[symbol] = 'partial_stop_cleanup_pending'
+            logger.critical(
+                f'{symbol} [{strategy_name}] 旧止损 {uncleared} '
+                '仍未确认撤销；保留缩量重试标记')
+            return False
+
+        if not self._complete_stop_write(
+                symbol, ccxt_symbol, '部分平仓旧止损清理'):
+            self._quarantine_position_mismatch(
+                symbol, '旧止损清理后二次完整清单未证明仅剩主止损',
+                stop_residue_possible=True)
+            return False
+        self._stop_anomalies.pop(symbol, None)
+        logger.warning(
+            f'{symbol} [{strategy_name}] 已验证撤清旧止损，仅保留余仓主止损')
         return True
 
     def _retry_partial_stop_resize(self, symbol, ccxt_symbol, position, strategy_name):
@@ -510,10 +718,9 @@ class StopGuardianMixin:
                 f'{symbol} [{strategy_name}] 新余仓止损已在，但旧止损 {extra_ids} '
                 '仍未确认撤销；保留重试标记')
             return False
-        if not self._complete_stop_write(symbol, '部分平仓止损缩量'):
+        if not self._complete_stop_write(
+                symbol, ccxt_symbol, '部分平仓止损缩量'):
             return False
-        # 本地 extra_ids 为空不等于交易所没有 POST 超时留下的未知单。
-        # 调用方紧接着用完整算法单清单确认，只有 intact/adoptable 才清 residue。
         self._stop_anomalies.pop(symbol, None)
         logger.warning(f'{symbol} [{strategy_name}] 部分平仓余仓止损已缩量为 {remaining}')
         return True
@@ -617,7 +824,8 @@ class StopGuardianMixin:
             if marked_at is None:
                 return True
             marked = datetime.fromisoformat(str(marked_at))
-            return ((datetime.now() - marked).total_seconds() >=
+            now = datetime.now(marked.tzinfo) if marked.tzinfo else datetime.now()
+            return ((now - marked).total_seconds() >=
                     self.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS)
         except Exception as exc:
             logger.warning(f'{symbol} 止损残留时间不可验证，继续保留阻断: {exc}')
@@ -634,7 +842,8 @@ class StopGuardianMixin:
             try:
                 ccxt_sym = self.exchange_api.to_ccxt_symbol(residue_symbol)
                 # 交易所端有仓（可能是人工手动开的仓）时绝不盲撤：手动仓的止损单也会被一并撤掉
-                if self.exchange_api.get_position(ccxt_sym):
+                exchange_position = self.exchange_api.get_position(ccxt_sym)
+                if self._exchange_position_has_contracts(exchange_position):
                     all_ok = False
                     logger.warning(f"{residue_symbol} 残留清理跳过：交易所端存在持仓（疑似人工仓位），请人工处理该品种挂单")
                     continue
@@ -699,12 +908,6 @@ class StopGuardianMixin:
             exit_price_source=exit_price_source)
         if not closed_position:
             return None, False, False
-        if stop_loss_date is not None:
-            # stop_loss_dates 是主账本的只读镜像；磁盘事务（或 force-runtime
-            # 补偿）已经先完成，这里只同步当前进程视图，不再二次落盘。
-            in_memory_dates = getattr(self, 'stop_loss_dates', None)
-            if isinstance(in_memory_dates, dict):
-                in_memory_dates[symbol] = stop_loss_date
         stop_cleared = self._cancel_stop_order_confirmed(
             symbol, ccxt_symbol, position.get('stop_order_id'),
             position.get('extra_stop_order_ids'),

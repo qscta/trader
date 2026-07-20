@@ -225,6 +225,89 @@ class ArchiveFailSafeTest(unittest.TestCase):
                 _symbols(ts.get_closed_trades()),
                 ['OLDUSDT', 'NEWUSDT', 'RECENTUSDT'])
 
+    def test_partial_multi_year_retry_with_newer_history_is_idempotent(self):
+        """较新年度已有历史时，旧年度已写/新年度失败的重试也不得重复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            preexisting = _closed_trade(
+                'PREUSDT', '2026-01-01T00:00:00')
+            with open(_year_archive(ts, '2026'), 'w', encoding='utf-8') as handle:
+                json.dump([preexisting], handle)
+            ts.state['closed_trades'] = [
+                _closed_trade('OLDUSDT', '2025-12-31T00:00:00'),
+                _closed_trade('NEWUSDT', '2026-01-02T00:00:00'),
+                _closed_trade('RECENTUSDT', '2026-02-01T00:00:00'),
+            ]
+            ts.save_state()
+            real_write = trade_state_module.atomic_write_json
+
+            def fail_second_year(filepath, data):
+                if filepath == _year_archive(ts, '2026'):
+                    return False
+                return real_write(filepath, data)
+
+            with patch.object(
+                    trade_state_module, 'atomic_write_json', fail_second_year):
+                self.assertEqual(0, ts.compact_closed_trades())
+            self.assertEqual(2, ts.compact_closed_trades())
+
+            with open(_year_archive(ts, '2025'), encoding='utf-8') as handle:
+                self.assertEqual(['OLDUSDT'], _symbols(json.load(handle)))
+            with open(_year_archive(ts, '2026'), encoding='utf-8') as handle:
+                self.assertEqual(
+                    ['PREUSDT', 'NEWUSDT'], _symbols(json.load(handle)))
+
+    def test_retry_uses_year_file_append_order_not_display_sort_order(self):
+        """非单调 close_time 不得让展示排序破坏分卷写入的幂等边界。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            preexisting = _closed_trade(
+                'PREUSDT', '2025-12-31T00:00:00')
+            with open(_year_archive(ts, '2025'), 'w', encoding='utf-8') as handle:
+                json.dump([preexisting], handle)
+            ts.state['closed_trades'] = [
+                _closed_trade('BACKUSDT', '2025-01-01T00:00:00'),
+                _closed_trade('NEWUSDT', '2026-01-01T00:00:00'),
+                _closed_trade('RECENTUSDT', '2026-02-01T00:00:00'),
+            ]
+            ts.save_state()
+            real_write = trade_state_module.atomic_write_json
+
+            def fail_second_year(filepath, data):
+                if filepath == _year_archive(ts, '2026'):
+                    return False
+                return real_write(filepath, data)
+
+            with patch.object(
+                    trade_state_module, 'atomic_write_json', fail_second_year):
+                self.assertEqual(0, ts.compact_closed_trades())
+            self.assertEqual(2, ts.compact_closed_trades())
+
+            with open(_year_archive(ts, '2025'), encoding='utf-8') as handle:
+                self.assertEqual(
+                    ['PREUSDT', 'BACKUSDT'], _symbols(json.load(handle)))
+
+    def test_legacy_single_file_partial_commit_survives_yearly_upgrade(self):
+        """旧单文件已追加但账本未收缩时，升级后不得跨分卷重复史料。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=1)
+            old = _closed_trade('OLDUSDT', '2025-12-31T00:00:00')
+            new = _closed_trade('NEWUSDT', '2026-01-01T00:00:00')
+            with open(ts.archive_file, 'w', encoding='utf-8') as handle:
+                json.dump([old, new], handle)
+            ts.state['closed_trades'] = [
+                copy.deepcopy(old), copy.deepcopy(new),
+                _closed_trade('RECENTUSDT', '2026-02-01T00:00:00'),
+            ]
+            ts.save_state()
+
+            self.assertEqual(2, ts.compact_closed_trades())
+            self.assertFalse(os.path.exists(_year_archive(ts, '2025')))
+            self.assertFalse(os.path.exists(_year_archive(ts, '2026')))
+            self.assertEqual(
+                ['OLDUSDT', 'NEWUSDT', 'RECENTUSDT'],
+                _symbols(ts.get_closed_trades()))
+
 
 class DailyCheckCompactionWiringTest(unittest.TestCase):
     def test_daily_check_triggers_compaction(self):

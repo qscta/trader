@@ -146,7 +146,7 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
         """反例：extra_stop_order_ids 非法时，止损价/ID 不得留下半截修改。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             state = self._state(temp_dir)
-            with self.assertRaises(TypeError):
+            with self.assertRaises(ValueError):
                 state.update_stop_loss(
                     'BTCUSDT', 95.0, 'stop-2', extra_stop_order_ids=42)
             position = state.get_open_position('BTCUSDT')
@@ -236,7 +236,7 @@ class ForceRuntimeInputBoundaryTest(unittest.TestCase):
         """force-runtime 也必须拒绝 writer 未局部检查的非法止损 ID。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             state = self._state(temp_dir)
-            with self.assertRaises(TradeStatePersistenceError):
+            with self.assertRaises(ValueError):
                 state.force_runtime_apply_partial_close(
                     'BTCUSDT', 2.0, 105.0, new_stop_order_id=123)
             position = state.get_open_position('BTCUSDT')
@@ -253,6 +253,115 @@ class ForceRuntimeInputBoundaryTest(unittest.TestCase):
                     stop_order_id=123, strategy='ma_cross')
             self.assertEqual({}, state.get_all_open_positions())
             self.assertEqual({}, state.get_position_quarantines())
+            TradeState.validate_state(state.state)
+
+    def test_unresolved_adoption_rolls_back_all_fields_on_save_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IAtomicAdopt1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=10.0)
+            before = copy.deepcopy(state.state)
+            position_kwargs = {
+                'side': 'long', 'entry_price': 100.0,
+                'position_size': 5.0, 'stop_loss_price': 90.0,
+                'stop_order_id': None, 'stop_order_size': 5.0,
+                'strategy': 'ma_cross', 'stop_resize_pending': True,
+                'quarantine_reason': 'atomic recovery test',
+                'stop_residue_possible': True,
+                'requested_position_size': 10.0,
+            }
+
+            with patch.object(
+                    state, 'save_state', side_effect=MemoryError('fault')):
+                with self.assertRaises(MemoryError):
+                    state.adopt_unresolved_open_position(
+                        'BTCUSDT', 'IAtomicAdopt1',
+                        'open_compensation', 5.0,
+                        compensation_client_order_id='RAtomicAdopt1',
+                        position_kwargs=position_kwargs)
+
+            self.assertEqual(before, state.state)
+            self.assertEqual(before, TradeState(state.state_file).state)
+
+            position = state.adopt_unresolved_open_position(
+                'BTCUSDT', 'IAtomicAdopt1', 'open_compensation', 5.0,
+                compensation_client_order_id='RAtomicAdopt1',
+                position_kwargs=position_kwargs)
+            self.assertEqual(5.0, position['position_size'])
+            self.assertEqual(
+                5.0, state.get_open_intent(
+                    'BTCUSDT')['unresolved_execution'][
+                        'expected_position_size'])
+            self.assertTrue(state.is_position_quarantined('BTCUSDT'))
+            self.assertTrue(state.has_stop_residue('BTCUSDT'))
+            TradeState.validate_state(state.state)
+
+    def test_existing_open_marker_cannot_expand_during_adoption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IOpenBound1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=10.0)
+            state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'IOpenBound1', 'open', 5.0)
+
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '上界不得扩大'):
+                state.adopt_unresolved_open_position(
+                    'BTCUSDT', 'IOpenBound1', 'open', 10.0,
+                    position_kwargs={
+                        'side': 'long', 'entry_price': 100.0,
+                        'position_size': 10.0, 'stop_loss_price': 90.0,
+                        'stop_order_id': None, 'stop_order_size': 10.0,
+                        'strategy': 'ma_cross',
+                        'stop_resize_pending': True,
+                        'requested_position_size': 10.0,
+                    })
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+    def test_repeated_compensation_marker_keeps_original_request_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'ICompImmutable1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=10.0)
+            state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ICompImmutable1', 'open_compensation', 5.0,
+                compensation_client_order_id='RCompImmutable1',
+                compensation_requested_size=5.0)
+
+            repeated = state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'ICompImmutable1', 'open_compensation', 10.0,
+                compensation_client_order_id='RCompImmutable1')
+
+            self.assertEqual(5.0, repeated['compensation_requested_size'])
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '不得改写既有补偿请求量'):
+                state.mark_open_intent_unresolved_execution(
+                    'BTCUSDT', 'ICompImmutable1', 'open_compensation', 10.0,
+                    compensation_client_order_id='RCompImmutable1',
+                    compensation_requested_size=10.0)
+
+    def test_attribution_marker_can_record_real_overfill(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'IOverfillBlock1',
+                {'side': 'long', 'entry_price': 100.0,
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
+
+            marker = state.mark_open_intent_unresolved_execution(
+                'BTCUSDT', 'IOverfillBlock1', 'open_attribution', 1.5)
+
+            self.assertEqual(1.5, marker['expected_position_size'])
             TradeState.validate_state(state.state)
 
     def test_force_runtime_close_books_entry_price_instead_of_nan(self):
@@ -657,14 +766,14 @@ class ReadOnlyCompensationEvidenceTest(unittest.TestCase):
             'remaining_amount': 0.0,
             'average': 50000.5, 'ids': ['1']}
         api = Mock(
-            spec=['close_position', 'find_compensation_close_evidence'])
-        api.find_compensation_close_evidence.return_value = evidence
+            spec=['close_position', 'find_compensation_close_progress'])
+        api.find_compensation_close_progress.return_value = evidence
         host = _EvidenceHost(api)
         result = host._recover_flat_compensation_evidence(
             'BTC/USDT:USDT', 'long', 0.5, 'OPENID1')
         self.assertEqual(evidence, result)
         api.close_position.assert_not_called()
-        api.find_compensation_close_evidence.assert_called_once_with(
+        api.find_compensation_close_progress.assert_called_once_with(
             'BTC/USDT:USDT', 'long', 0.5, 'OPENID1')
 
     def test_incomplete_or_ambiguous_evidence_is_discarded(self):
@@ -678,8 +787,8 @@ class ReadOnlyCompensationEvidenceTest(unittest.TestCase):
                     {'confirmed': False, 'fully_closed': True},
                     'not-a-dict'):
             api = Mock(
-                spec=['close_position', 'find_compensation_close_evidence'])
-            api.find_compensation_close_evidence.return_value = bad
+                spec=['close_position', 'find_compensation_close_progress'])
+            api.find_compensation_close_progress.return_value = bad
             host = _EvidenceHost(api)
             with self.subTest(bad=bad):
                 self.assertIsNone(host._recover_flat_compensation_evidence(
@@ -688,11 +797,11 @@ class ReadOnlyCompensationEvidenceTest(unittest.TestCase):
 
     def test_missing_open_client_id_short_circuits_without_queries(self):
         api = Mock(
-            spec=['close_position', 'find_compensation_close_evidence'])
+            spec=['close_position', 'find_compensation_close_progress'])
         host = _EvidenceHost(api)
         self.assertIsNone(host._recover_flat_compensation_evidence(
             'BTC/USDT:USDT', 'long', 0.5, None))
-        api.find_compensation_close_evidence.assert_not_called()
+        api.find_compensation_close_progress.assert_not_called()
         api.close_position.assert_not_called()
 
 

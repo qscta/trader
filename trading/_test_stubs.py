@@ -34,8 +34,8 @@ _EXCHANGE_API_METHODS = (
     'compensation_client_order_id', 'create_stop_loss_order',
     'cancel_stop_order_only', 'cancel_order', 'cancel_all_orders',
     'round_quantity', 'get_quantity_precision', 'find_stop_order_state',
-    'find_existing_open_order', 'find_compensation_close_evidence',
-    'find_compensation_close_progress', 'confirm_stop_execution',
+    'find_existing_open_order', 'find_compensation_close_progress',
+    'confirm_stop_execution',
 )
 ExchangeApiStub = type(
     'ExchangeApi', (),

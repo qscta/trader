@@ -39,7 +39,7 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
             with self.assertRaises(TradeStatePersistenceError):
                 TradeState(path)
 
-    def test_invalid_main_recovers_backup_and_repairs_main(self):
+    def test_invalid_main_never_promotes_stale_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'trade_state.json')
             with open(path, 'w', encoding='utf-8') as f:
@@ -51,12 +51,11 @@ class TradeStateSchemaSafetyTest(unittest.TestCase):
             with open(path + '.bak', 'w', encoding='utf-8') as f:
                 json.dump(expected, f)
 
-            state = TradeState(path)
-
-            self.assertEqual(state.get_all_open_positions(), {})
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '不自动提升'):
+                TradeState(path)
             with open(path, 'r', encoding='utf-8') as f:
-                self.assertEqual(json.load(f), expected)
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                self.assertEqual('{broken', f.read())
 
     def test_nonfinite_json_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

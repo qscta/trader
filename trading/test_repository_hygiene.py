@@ -19,10 +19,13 @@ SENSITIVE_RUNTIME_PATHS = {
     'trading/deployment_no_open_baseline.json',
     'trading/deployment_no_open_completion.json',
 }
+VENDORED_TEXT_EXCLUSIONS = {'trading/static/lwc.js'}
 
 
 def _is_forbidden_tracked_path(path):
     name = Path(path).name
+    if name.endswith(('.pyc', '.pyo')) or '__pycache__' in Path(path).parts:
+        return True
     if '.premigrate.' in name:
         return True
     if (path.startswith('trading/closed_trades_archive_') and
@@ -54,6 +57,9 @@ class RepositoryHygieneTest(unittest.TestCase):
         tracked = [item for item in result.stdout.decode().split('\0') if item]
         markers = (
             'tur' + 'tle', 'don' + 'chian',
+            'break' + 'out', 'pyr' + 'amid',
+            'average true' + ' range',
+            'channel_' + 'period', 'mid_line_' + 'crossed',
             ''.join(chr(code) for code in (0x6d77, 0x9f9f)),
             ''.join(chr(code) for code in (0x5510, 0x5947, 0x5b89)),
         )
@@ -63,6 +69,8 @@ class RepositoryHygieneTest(unittest.TestCase):
             path_text = relative.casefold()
             if any(marker.casefold() in path_text for marker in markers):
                 violations.append(f'{relative}:path')
+                continue
+            if relative in VENDORED_TEXT_EXCLUSIONS:
                 continue
             try:
                 content = (root / relative).read_text(encoding='utf-8')

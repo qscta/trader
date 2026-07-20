@@ -156,7 +156,8 @@ def _validate_path(value):
 def _validate_spec(value, release_sha):
     if not isinstance(value, dict) or set(value) != SPEC_FIELDS:
         raise CleanupError('清理 spec schema 字段不精确')
-    if value['schema_version'] != 1:
+    if (type(value['schema_version']) is not int or
+            value['schema_version'] != 1):
         raise CleanupError('清理 spec 版本不兼容')
     if value['release_sha'] != release_sha:
         raise CleanupError('清理 spec 未绑定当前 release SHA')
@@ -336,6 +337,15 @@ def _validate_applied_config(config_raw, spec):
 def check(config_path, spec_path, release_sha):
     config_raw, _info, _spec_raw, spec = _read_inputs(
         config_path, spec_path, release_sha)
+    if _digest(config_raw) == spec['after_sha256']:
+        _validate_applied_config(config_raw, spec)
+        return {
+            'status': 'already_applied',
+            'release_sha': release_sha,
+            'path': spec['path'],
+            'before_sha256': spec['before_sha256'],
+            'after_sha256': spec['after_sha256'],
+        }
     _assess(config_raw, spec)
     return {
         'status': 'ready',
@@ -350,6 +360,9 @@ def preview_config(config_path, spec_path, release_sha):
     """返回已受审单键清理后的内存对象，绝不写入 config。"""
     config_raw, _info, _spec_raw, spec = _read_inputs(
         config_path, spec_path, release_sha)
+    if _digest(config_raw) == spec['after_sha256']:
+        _validate_applied_config(config_raw, spec)
+        return _loads(config_raw, '已清理 config')
     return _loads(_assess(config_raw, spec), '清理预览 config')
 
 

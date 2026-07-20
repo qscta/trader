@@ -20,6 +20,7 @@ from trade_state import (
     TradeStateCommitDurabilityError, TradeStatePersistenceError,
     atomic_write_json,
     load_strict_json, open_private_text_file, owner_auxiliary_state_paths,
+    position_stop_coverage_valid,
     private_file_exists, state_has_lifecycle_data,
     validate_okx_owner_manifest,
 )
@@ -31,8 +32,8 @@ from signal_handlers import (
 )
 from trade_executor import TradeExecutorMixin
 from runtime_guard import (
-    acquire_runner_lock, assess_runtime_health, catchup_schedule_slot,
-    runtime_data_path,
+    RUNNER_HEARTBEAT_MAX_AGE_SECONDS, acquire_runner_lock,
+    assess_runtime_health, catchup_schedule_slot, runtime_data_path,
 )
 import config_validation as cfgv
 
@@ -56,6 +57,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
+SCHEDULER_HEARTBEAT_START_TIMEOUT_SECONDS = 10
+
+
+class SchedulerSupervisionError(RuntimeError):
+    """APScheduler 管理线程或执行器已失去持续托管能力。"""
+
 # OKX 的已撤未成交订单官方只承诺约 2 小时留存。不在边界上
 # 赌交易所/本机时钟和索引延迟：只在严格小于 90 分钟时消费 absent。
 # 只使用首次外部写之前固化且永不刷新的 created_at，updated_at 不能延寿。
@@ -69,6 +76,8 @@ _REQUIRED_TRADE_STATE_RUNTIME_METHODS = (
     'prepare_open_intent', 'resolve_open_intent',
     'mark_open_intent_unresolved_execution',
     'force_runtime_mark_open_intent_unresolved_execution',
+    'adopt_unresolved_open_position',
+    'force_runtime_adopt_unresolved_open_position',
     'finalize_unresolved_open_execution',
     'finalize_open_intent_round_trip',
     'add_open_position', 'add_open_after_partial_rollback',
@@ -89,7 +98,7 @@ _REQUIRED_TRADE_STATE_RUNTIME_METHODS = (
     'has_stop_residue', 'get_stop_residues', 'clear_stop_residue',
     'get_runtime_persistence_status',
     'mark_runtime_persistence_degraded',
-    'replace_stop_loss_dates', 'get_stop_loss_dates',
+    'replace_stop_loss_dates', 'get_stop_loss_dates', 'get_stop_loss_date',
     'stop_loss_dates_migrated',
     'remove_symbol_metadata', 'prune_inactive_symbol_metadata',
 )
@@ -104,11 +113,13 @@ _REQUIRED_EXCHANGE_API_OVERRIDES = (
     'create_stop_loss_order', 'cancel_stop_order_only',
     'cancel_order', 'cancel_all_orders',
     'round_quantity', 'get_quantity_precision', 'find_stop_order_state',
-    'find_existing_open_order', 'find_compensation_close_evidence',
-    'find_compensation_close_progress', 'confirm_stop_execution',
+    'find_existing_open_order', 'find_compensation_close_progress',
+    'confirm_stop_execution',
 )
 _REQUIRED_SYSTEM_RUNTIME_METHODS = (
     '_execute_open', '_maintenance_open_gate_status',
+    '_opening_runtime_block',
+    'health_snapshot',
     '_submit_persisted_close', '_handle_partial_close',
     '_cancel_stop_order_confirmed',
     '_close_trade_state_with_runtime_fallback',
@@ -124,7 +135,7 @@ _REQUIRED_SYSTEM_RUNTIME_METHODS = (
     '_finalize_open_intent_rollback',
     '_classify_close_execution', '_handle_unproven_close_execution',
     '_protect_exact_position_during_unresolved_close',
-    '_stop_trigger_close_date', '_sync_stop_trigger_date',
+    '_stop_trigger_close_date',
 )
 
 
@@ -181,7 +192,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             raise RuntimeError(
                 f'检测到未完成的单策略迁移事务，拒绝启动: {migration_journal}；'
                 '请先停机运行 migrate_single_strategy.py '
-                f'--data-dir {self.data_dir} --apply 完成自动恢复')
+                f'--data-dir {self.data_dir} --recover-only 回滚未完成事务，'
+                '再重新 dry-run 审核；确需迁移时另行 --apply')
         self.config = self.load_config(config_file)
         self.exchange_id = 'okx'
         self.label = self.config.get('okx', {}).get('label') or '欧易'
@@ -209,18 +221,20 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._assert_runtime_class_contract()
 
         # 旧 data/okx 若未由离线迁移明确收口则拒绝启动；runtime 绝不自动导入。
-        self._migrate_okx_legacy_state()
+        self._validate_okx_legacy_state_gate()
 
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
-            # 账本损坏且备份不可恢复（fail-closed）：广播后拒绝启动，绝不失忆运行——
+            # 账本无法权威读取（fail-closed）：上一代 .bak 可能
+            # 缺少已 POST 订单的 intent，不自动提升；广播后拒绝启动。
             # 失忆不仅漏管旧仓，日检还会把有真实仓位的品种当空仓重复开仓
-            logger.critical(f'交易状态账本不可恢复，拒绝启动: {e}')
+            logger.critical(f'交易状态账本不可权威读取，拒绝启动: {e}')
             try:
                 self.notifier.notify_error(
-                    f'[{self.label}] 交易状态账本损坏且备份不可恢复，系统已拒绝启动，'
-                    f'请立即人工修复 trade_state.json！\n{e}')
+                    f'[{self.label}] 交易状态账本损坏/不可权威读取，'
+                    '系统已拒绝启动；请停机对账后人工修复 '
+                    f'trade_state.json，勿盲目覆盖上一代 .bak！\n{e}')
             except Exception as exc:
                 # 账本损坏是主错误（下方 raise 拒绝启动）；二次告警失败仅留痕。
                 logger.debug('账本损坏告警发送失败: %s', exc)
@@ -230,7 +244,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         # 双均线 T+1 是交易状态而非展示数据，必须在启动仓位同步之前就可用，
         # 并且与主账本共享事务性落盘。旧的独立 JSON 只用于一次性迁移。
         self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
-        self.stop_loss_dates = self._load_stop_loss_dates()
+        self._load_stop_loss_dates()
 
         self.ma_cross_strategy = MaCrossStrategy(
             self.config['strategy'].get('ma_short_period', 7),
@@ -262,6 +276,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._stop_event = threading.Event()
         self._heartbeat_lock = threading.Lock()
         self._runner_heartbeat_ts = None
+        self._runner_heartbeat_monotonic = None
+        self._scheduler_heartbeat_ready = threading.Event()
 
         self.equity_tracker = EquityTracker(
             self.data_dir, self,
@@ -349,17 +365,17 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 f'真钱运行接口不完整，拒绝启动: {", ".join(missing)}')
 
     def load_config(self, config_file):
-        """加载欧易单所配置：{okx:{凭据...}, strategy, trading, scheduler, dingtalk}。
-        兼容旧多所格式（exchanges.okx）自动展平；环境变量可覆盖凭据。"""
+        """加载唯一生产布局：{okx, strategy, trading, scheduler, dingtalk}。"""
         # 配置可能直接含 API 密钥；与命脉账本使用同一套 O_NOFOLLOW +
         # fstat/inode/owner 校验，消除 lstat/chmod/open 之间的替换窗口。
         with open_private_text_file(config_file) as f:
             config = load_strict_json(f)
         if not isinstance(config, dict):
             raise ValueError('config 顶层必须是对象')
-        # 旧多所格式只允许存在一份 exchanges.okx；收敛后立即删除旧容器，
-        # 避免 runner、验证脚本与持久化路径各自读取不同账户配置。
-        cfgv.canonicalize_single_okx_config(config)
+        if 'exchanges' in config:
+            raise ValueError(
+                '生产 runner 不接受旧 config.exchanges 布局；'
+                '请先运行受审离线单策略迁移')
         okx = config.setdefault('okx', {})
         if not isinstance(okx, dict):
             raise ValueError('config.okx 必须是对象')
@@ -403,7 +419,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             raise RuntimeError(
                 f'{context}读取 {path} 失败({exc})，状态不明拒绝启动。') from exc
 
-    def _migrate_okx_legacy_state(self):
+    def _validate_okx_legacy_state_gate(self):
         """拒绝在 MA-only 运行时自动导入未经单策略门禁审查的旧状态。"""
         legacy_dir = os.path.join(self.base_dir, 'data', 'okx')
         if not os.path.lexists(legacy_dir):
@@ -526,7 +542,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     'config_directory_fsync_failed_after_replace')
                 raise
 
-    def reload_strategies(self):
+    def reload_ma_strategy(self):
         """重新加载策略参数"""
         self.ma_cross_strategy = MaCrossStrategy(
             self.config['strategy'].get('ma_short_period', 7),
@@ -536,7 +552,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         logger.info(f"策略参数已重新加载: "
                     f"EMA短期={self.config['strategy'].get('ma_short_period', 7)}, "
                     f"EMA长期={self.config['strategy'].get('ma_long_period', 28)}, "
-                    f"EMA止损周期={self.config['strategy'].get('ma_stop_period', 28)}")
+                    f"止损回看周期={self.config['strategy'].get('ma_stop_period', 28)}")
 
     @staticmethod
     def _normalise_position_side(position):
@@ -563,7 +579,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             raise RuntimeError('持仓 contracts 非数值') from exc
         if not math.isfinite(contracts):
             raise RuntimeError('持仓 contracts 非有限数')
-        return contracts > 0
+        if contracts == 0:
+            raise RuntimeError('持仓对象 contracts 为零；空仓必须规范化为 None')
+        return True
 
     def _position_reconciliation_details(self, symbol, local_position, exchange_position):
         """生成本地/交易所仓位方向与张数对账结果。"""
@@ -676,7 +694,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return False
         if position and (
                 not position.get('stop_order_id') or
-                position.get('stop_resize_pending')):
+                position.get('stop_resize_pending') or
+                not position_stop_coverage_valid(position)):
             return False
         if stop_residue:
             return False
@@ -744,7 +763,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         symbol, f'启动对账查询交易所持仓失败: {exc}')
                     continue
 
-                if position is None or position.get('contracts', 0) == 0:
+                if not self._exchange_position_has_contracts(position):
                     logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
                     # 进程离线期间仓位消失时，重启后的当前市价与真实退出时刻没有
                     # 因果关系：止损后若已反弹/回落，用裸市价会把亏损记成盈利。
@@ -846,44 +865,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if legacy:
             logger.warning(f"已把旧 stop_loss_dates.json 迁入主账本: {legacy}")
         return self.trade_state.get_stop_loss_dates()
-
-    def _save_stop_loss_dates(self):
-        """保存 T+1：主账本落盘失败向上抛出，由交易调用链 fail-closed。"""
-        self.stop_loss_dates = self.trade_state.replace_stop_loss_dates(
-            self.stop_loss_dates)
-        return True
-
-    def is_stop_loss_today(self, symbol):
-        """检查该交易对今天是否已经止损过（T+1限制）"""
-        if symbol in self.stop_loss_dates:
-            today_str = date.today().strftime('%Y-%m-%d')
-            if self.stop_loss_dates[symbol] == today_str:
-                return True
-        return False
-
-    def record_stop_loss(self, symbol):
-        """记录止损日期（与主账本事务性持久化）。"""
-        previous = dict(self.stop_loss_dates)
-        self.stop_loss_dates[symbol] = date.today().strftime('%Y-%m-%d')
-        try:
-            self._save_stop_loss_dates()
-        except Exception:
-            self.stop_loss_dates = previous
-            raise
-        return True
-
-    def clear_stop_loss(self, symbol):
-        """事务性清除某品种 T+1 标记。"""
-        if symbol not in self.stop_loss_dates:
-            return False
-        previous = dict(self.stop_loss_dates)
-        del self.stop_loss_dates[symbol]
-        try:
-            self._save_stop_loss_dates()
-        except Exception:
-            self.stop_loss_dates = previous
-            raise
-        return True
 
     @staticmethod
     def _format_indicator_price(value):
@@ -1131,10 +1112,22 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if (side not in ('long', 'short') or not math.isfinite(planned) or
                 planned <= 0):
             return False
-        if isinstance(intent.get('unresolved_execution'), dict):
-            # 已有责任人却丢了 local provisional，不得猜测重建。
+        existing_unresolved = intent.get('unresolved_execution')
+        if existing_unresolved is not None and not isinstance(
+                existing_unresolved, dict):
             self._quarantine_position_mismatch(
-                symbol, '未决 lifecycle 存在但 provisional 余仓缺失')
+                symbol, '未决 lifecycle 结构非法，拒绝恢复')
+            return False
+        existing_kind = (
+            existing_unresolved.get('kind')
+            if existing_unresolved is not None else None)
+        if existing_kind == 'open_attribution':
+            self._quarantine_position_mismatch(
+                symbol, '开仓归因歧义仍需人工裁决，拒绝自动托管')
+            return False
+        if existing_kind not in (None, 'open', 'open_compensation'):
+            self._quarantine_position_mismatch(
+                symbol, '未决 lifecycle 种类非法，拒绝恢复')
             return False
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
         open_client_id = intent.get('client_order_id')
@@ -1145,8 +1138,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if order is None:
                 raise RuntimeError('原开仓 clOrdId 连续查无')
             terminal, open_filled = self._pending_order_resolution(order)
-            if not terminal or open_filled is None:
-                raise RuntimeError('原开仓未终态/成交量不可证明')
+            if open_filled is None:
+                raise RuntimeError('原开仓成交量不可证明')
             planned_contracts = float(self.exchange_api._coin_to_contracts(
                 ccxt_symbol, planned))
             if (not math.isfinite(planned_contracts) or
@@ -1168,24 +1161,95 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     actual_open_amount > planned + max(
                         1e-12, math.ulp(max(abs(planned), 1.0)) * 8)):
                 raise RuntimeError('原开仓实际成交币数非法')
-            compensation_id = self.exchange_api.compensation_client_order_id(
-                open_client_id)
-            raw_progress = (
-                self.exchange_api.find_compensation_close_progress(
-                    ccxt_symbol, side, actual_open_amount, open_client_id))
-            progress = self._normalize_compensation_close_progress(
-                raw_progress,
-                expected_client_order_id=compensation_id,
-                expected_contracts=open_filled,
-                expected_amount=actual_open_amount)
-            if progress['presence'] == 'absent':
-                conclusive, reason = self._pending_order_absence_is_conclusive(
-                    intent)
-                if not conclusive:
-                    raise RuntimeError(
-                        f'补偿订单历史 absent 已不可证明零成交: '
-                        f'{reason}')
-            expected_remaining_contracts = progress['remaining_contracts']
+            compensation_id = None
+            compensation_requested_amount = None
+            if existing_kind == 'open':
+                # ``open`` 只由“当前零仓、原单仍可能迟到成交”产生；该路径
+                # 从未提交补偿 POST。只读原 clOrdId 即可，不凭空查询/假设
+                # 一张不存在的补偿单。
+                if existing_unresolved.get(
+                        'compensation_client_order_id') is not None:
+                    raise RuntimeError('未补偿开仓错误携带补偿句柄')
+                recovery_kind = 'open'
+                expected_remaining_contracts = open_filled
+            else:
+                compensation_id = (
+                    self.exchange_api.compensation_client_order_id(
+                        open_client_id))
+                if (existing_kind == 'open_compensation' and
+                        existing_unresolved.get(
+                            'compensation_client_order_id') != compensation_id):
+                    raise RuntimeError('既有补偿句柄不是由原开仓句柄确定性派生')
+                if existing_kind == 'open_compensation':
+                    compensation_requested_amount = float(
+                        existing_unresolved.get(
+                            'compensation_requested_size',
+                            existing_unresolved.get('expected_position_size')))
+                    raw_progress = (
+                        self.exchange_api.find_compensation_close_progress(
+                            ccxt_symbol, side,
+                            compensation_requested_amount,
+                            open_client_id))
+                else:
+                    # 补偿 POST 成功到上层落 marker 之间也可能崩溃。
+                    # 此时只能按确定性 clOrdId 找单，不能用最终开仓
+                    # 成交量猜早先补偿请求量。
+                    raw_progress = (
+                        self.exchange_api.find_compensation_close_progress(
+                            ccxt_symbol, side, None, open_client_id))
+                    if (isinstance(raw_progress, dict) and
+                            raw_progress.get('absent') is True):
+                        self._validate_absent_compensation_discovery(
+                            raw_progress, compensation_id)
+                        conclusive, reason = (
+                            self._pending_order_absence_is_conclusive(intent))
+                        if not conclusive:
+                            raise RuntimeError(
+                                '补偿订单发现 absent 已不足以证明未发单: '
+                                f'{reason}')
+                        recovery_kind = 'open'
+                        compensation_id = None
+                        expected_remaining_contracts = open_filled
+                        raw_progress = None
+                    else:
+                        raw_requested_amount = (
+                            raw_progress.get('requested_amount')
+                            if isinstance(raw_progress, dict) else None)
+                        if isinstance(raw_requested_amount, bool):
+                            raise RuntimeError('发现的补偿请求量不能是 bool')
+                        compensation_requested_amount = float(
+                            raw_requested_amount)
+                if raw_progress is None:
+                    progress = None
+                else:
+                    recovery_kind = 'open_compensation'
+                    if (not math.isfinite(compensation_requested_amount) or
+                            compensation_requested_amount <= 0 or
+                            compensation_requested_amount >
+                            actual_open_amount + max(
+                                1e-12,
+                                math.ulp(max(
+                                    abs(actual_open_amount), 1.0)) * 8)):
+                        raise RuntimeError(
+                            '持久化补偿请求量不在终态开仓成交范围内')
+                    compensation_requested_contracts = float(
+                        self.exchange_api._coin_to_contracts(
+                            ccxt_symbol, compensation_requested_amount))
+                    progress = self._normalize_compensation_close_progress(
+                        raw_progress,
+                        expected_client_order_id=compensation_id,
+                        expected_contracts=compensation_requested_contracts,
+                        expected_amount=compensation_requested_amount)
+                    if progress['presence'] == 'absent':
+                        conclusive, reason = (
+                            self._pending_order_absence_is_conclusive(
+                                existing_unresolved))
+                        if not conclusive:
+                            raise RuntimeError(
+                                '补偿订单历史 absent 已不可证明零成交: '
+                                f'{reason}')
+                    expected_remaining_contracts = (
+                        open_filled - progress['filled_contracts'])
             if (not math.isfinite(expected_remaining_contracts) or
                     expected_remaining_contracts <= tolerance or
                     expected_remaining_contracts >
@@ -1200,18 +1264,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 raise RuntimeError('终态订单与 fresh 净仓无法唯一归因')
             remaining_amount = float(self.exchange_api._contracts_to_coins(
                 ccxt_symbol, expected_remaining_contracts))
-            if not self._mark_unresolved_open_execution(
-                    symbol, open_client_id, 'open_compensation',
-                    actual_open_amount,
-                    '崩溃后已只读找回原开仓/单笔补偿订单，建立受托余仓',
-                    {'planned_position_size': planned,
-                     'actual_open_amount': actual_open_amount,
-                     'remaining_amount': remaining_amount},
-                    compensation_client_order_id=compensation_id):
-                raise RuntimeError('未决执行 blocker 无法原子落盘')
+            recovery_details = {
+                'planned_position_size': planned,
+                'actual_open_amount': actual_open_amount,
+                'remaining_amount': remaining_amount,
+            }
+            if compensation_id is not None:
+                recovery_details['compensation_client_order_id'] = (
+                    compensation_id)
+                recovery_details['compensation_requested_size'] = (
+                    compensation_requested_amount)
             provisional_entry = self._safe_fill_price(order, entry_price)
             kwargs = dict(
-                symbol=symbol, side=side, entry_price=provisional_entry,
+                side=side, entry_price=provisional_entry,
                 position_size=remaining_amount,
                 stop_loss_price=stop_price, stop_order_id=None,
                 stop_order_size=remaining_amount, strategy='ma_cross',
@@ -1223,18 +1288,24 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     'compensation_client_order_id': compensation_id,
                     'remaining_amount': remaining_amount,
                 },
-                # 崩溃点可能在保护单 POST 之后；未查完整算法单
-                # 清单前严禁自动补挂第二张。
-                stop_residue_possible=True,
-                # 不能把重启时间当成未知保护单的新可见性起点；open intent
-                # 在首次外部写之前已落盘，是安全且更早的保守锚点。
-                stop_residue_marked_at=intent.get('created_at'),
-                open_intent_client_id=open_client_id,
-                requested_position_size=planned,
-                preserve_open_intent=True)
+                # 所有生产止损 POST 都先持久化独立 stop-residue 句柄；
+                # 这里不能凭恢复时间伪造一个新句柄并把真实裸仓再延迟五分钟。
+                # 若旧 POST 确实存在，原 marker 会由同一事务原样保留。
+                stop_residue_possible=False,
+                requested_position_size=planned)
             try:
-                recovered_position = self.trade_state.add_untracked_open_position(
-                    **kwargs)
+                recovered_position = (
+                    self.trade_state.adopt_unresolved_open_position(
+                        symbol, open_client_id, recovery_kind,
+                        actual_open_amount,
+                        compensation_client_order_id=compensation_id,
+                        compensation_requested_size=
+                        compensation_requested_amount,
+                        reason=(
+                            '崩溃后已只读找回原开仓及其确定性执行边界，'
+                            '建立受托余仓'),
+                        details=recovery_details,
+                        position_kwargs=kwargs))
             except TradeStateCommitDurabilityError as exc:
                 # rename 已提交，新内存不能再 force 重放；进程门闩已禁开仓。
                 recovered_position = exc.committed_result
@@ -1243,8 +1314,17 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     '保留新内存并继续同栈建立风险保护')
             except TradeStatePersistenceError:
                 recovered_position = (
-                    self.trade_state.force_runtime_add_untracked_open_position(
-                        **kwargs))
+                    self.trade_state.force_runtime_adopt_unresolved_open_position(
+                        symbol, open_client_id, recovery_kind,
+                        actual_open_amount,
+                        compensation_client_order_id=compensation_id,
+                        compensation_requested_size=
+                        compensation_requested_amount,
+                        reason=(
+                            '崩溃后已只读找回原开仓及其确定性执行边界，'
+                            '建立受托余仓'),
+                        details=recovery_details,
+                        position_kwargs=kwargs))
             if not recovered_position:
                 raise RuntimeError('provisional 余仓未能进入运行时账本')
             logger.critical(
@@ -1308,17 +1388,29 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 symbol, '原开仓订单仍未终态或成交量证据不完整')
             return False
         try:
-            raw_expected_open_amount = unresolved['expected_position_size']
-            if isinstance(raw_expected_open_amount, bool):
+            raw_marker_open_amount = unresolved['expected_position_size']
+            if (isinstance(raw_marker_open_amount, bool) or
+                    isinstance(planned, bool)):
                 raise ValueError('未决执行预期币数不能是 bool')
-            expected_open_amount = float(raw_expected_open_amount)
-            expected_open_contracts = float(
+            marker_open_amount = float(raw_marker_open_amount)
+            planned_open_amount = float(planned)
+            planned_open_contracts = float(
                 self.exchange_api._coin_to_contracts(
-                    ccxt_symbol, expected_open_amount))
-            if (not math.isfinite(expected_open_amount) or
-                    expected_open_amount <= 0 or
-                    not math.isfinite(expected_open_contracts) or
-                    expected_open_contracts <= 0):
+                    ccxt_symbol, planned_open_amount))
+            actual_open_amount = float(
+                self.exchange_api._contracts_to_coins(
+                    ccxt_symbol, open_filled_contracts))
+            if (not math.isfinite(marker_open_amount) or
+                    marker_open_amount <= 0 or
+                    not math.isfinite(planned_open_amount) or
+                    planned_open_amount <= 0 or
+                    marker_open_amount > planned_open_amount + max(
+                        1e-12,
+                        math.ulp(max(abs(planned_open_amount), 1.0)) * 8) or
+                    not math.isfinite(planned_open_contracts) or
+                    planned_open_contracts <= 0 or
+                    not math.isfinite(actual_open_amount) or
+                    actual_open_amount <= 0):
                 raise ValueError('未决执行预期币数/张数必须是有限正数')
         except Exception as exc:
             self._quarantine_position_mismatch(
@@ -1326,10 +1418,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return False
         tolerance = max(
             1e-12,
-            math.ulp(max(abs(expected_open_contracts), 1.0)) * 8)
-        if abs(open_filled_contracts - expected_open_contracts) > tolerance:
+            math.ulp(max(abs(planned_open_contracts), 1.0)) * 8)
+        if (open_filled_contracts <= tolerance or
+                open_filled_contracts > planned_open_contracts + tolerance):
             self._quarantine_position_mismatch(
-                symbol, '原开仓终态成交量与未决执行预期不一致')
+                symbol, '原开仓终态成交量超出持久化计划范围')
             return False
 
         normalized_progress = None
@@ -1341,16 +1434,31 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 if (derived_compensation_id !=
                         unresolved.get('compensation_client_order_id')):
                     raise RuntimeError('补偿句柄不是由原开仓句柄确定性派生')
+                compensation_requested_amount = float(
+                    unresolved.get(
+                        'compensation_requested_size', marker_open_amount))
+                compensation_requested_contracts = float(
+                    self.exchange_api._coin_to_contracts(
+                        ccxt_symbol, compensation_requested_amount))
+                if (not math.isfinite(compensation_requested_amount) or
+                        compensation_requested_amount <= 0 or
+                        compensation_requested_amount > actual_open_amount + max(
+                            1e-12,
+                            math.ulp(max(abs(actual_open_amount), 1.0)) * 8) or
+                        not math.isfinite(compensation_requested_contracts) or
+                        compensation_requested_contracts <= 0):
+                    raise RuntimeError(
+                        '补偿请求量不在终态开仓成交范围内')
                 raw_progress = (
                     self.exchange_api.find_compensation_close_progress(
-                        ccxt_symbol, side, expected_open_amount,
+                        ccxt_symbol, side, compensation_requested_amount,
                         open_client_id))
                 normalized_progress = (
                     self._normalize_compensation_close_progress(
                         raw_progress,
                         expected_client_order_id=derived_compensation_id,
-                        expected_contracts=expected_open_contracts,
-                        expected_amount=expected_open_amount))
+                        expected_contracts=compensation_requested_contracts,
+                        expected_amount=compensation_requested_amount))
             except Exception as exc:
                 self._quarantine_position_mismatch(
                     symbol, f'未决单笔补偿订单终态查询不确定: {exc}')
@@ -1365,9 +1473,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         f'{absence_reason}')
                     return False
         expected_remaining = (
-            normalized_progress['remaining_contracts']
+            open_filled_contracts - normalized_progress['filled_contracts']
             if normalized_progress is not None else
             max(0.0, open_filled_contracts))
+        if expected_remaining < -tolerance:
+            self._quarantine_position_mismatch(
+                symbol, '补偿成交量超过终态开仓成交量')
+            return False
+        expected_remaining = max(0.0, expected_remaining)
         # 上述只读查询可能等待多个可见性窗口；裁决紧前重读净仓。
         try:
             exchange_position = self.exchange_api.get_position(ccxt_symbol)
@@ -1443,17 +1556,17 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     'price': close_evidence['price'], 'fee': close_fee,
                 }
         entry_fee, entry_fee_currency = self._extract_usdt_fee(order)
-        expected_remaining_amount = (
-            normalized_progress['remaining_amount']
-            if normalized_progress is not None else
-            expected_open_amount)
+        expected_remaining_amount = float(
+            self.exchange_api._contracts_to_coins(
+                ccxt_symbol, expected_remaining))
         try:
             finalized = self.trade_state.finalize_unresolved_open_execution(
                 symbol, open_client_id, entry_price,
                 expected_remaining_amount, authoritative_close,
                 entry_fee=entry_fee,
                 entry_fee_currency=entry_fee_currency,
-                entry_order_id=open_evidence['order_ids'][0])
+                entry_order_id=open_evidence['order_ids'][0],
+                actual_open_size=actual_open_amount)
         except Exception as exc:
             self._quarantine_position_mismatch(
                 symbol, f'未决执行权威账本原子收口失败: {exc}')
@@ -1706,12 +1819,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             try:
                 exchange_position = self.exchange_api.get_position(
                     self.exchange_api.to_ccxt_symbol(symbol))
+                position_present = self._exchange_position_has_contracts(
+                    exchange_position)
             except Exception as exc:
                 self._quarantine_position_mismatch(
                     symbol, f'{context} open intent 持仓查询不确定: {exc}')
                 unresolved.add(symbol)
                 continue
-            if exchange_position:
+            if position_present:
                 resolved = self._resume_open_intent_position(symbol, intent)
             else:
                 resolved = self._adjudicate_flat_open_intent(symbol, intent)
@@ -1733,7 +1848,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             for v in df['timestamp'].tolist()
         ]
         current_id = candle_ids[-1]
-        current_state = self.ma_cross_strategy.check_current_state(df)
+        # check_signal 已同时返回当前 EMA/止损与“最新一根是否交叉”；同一份
+        # dataframe 不再先算 current_state、再完整重算一次 EMA。
+        current_state = self.ma_cross_strategy.check_signal(df)
         if current_state is None:
             return None, current_id
 
@@ -1743,9 +1860,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return current_state, current_id
 
         rebaseline, _, _, gap = self._history_requires_rebaseline(symbol, df)
-        latest_signal = self.ma_cross_strategy.check_signal(df)
-        latest_action = (
-            latest_signal.get('action') if isinstance(latest_signal, dict) else None)
+        latest_action = current_state.get('action')
         current_state['action'] = (
             latest_action if latest_action in ('long', 'short') else None)
 
@@ -1921,12 +2036,15 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             continue
                     try:
                         exchange_position = self.exchange_api.get_position(ccxt_symbol)
+                        exchange_position_present = (
+                            self._exchange_position_has_contracts(
+                                exchange_position))
                     except Exception as exc:
                         self._quarantine_position_mismatch(
                             symbol, f'日检持仓对账查询失败: {exc}')
                         failed_symbols.append(symbol)
                         continue
-                    if local_position and exchange_position:
+                    if local_position and exchange_position_present:
                         if not self._verify_existing_position_or_quarantine(
                                 symbol, local_position, exchange_position,
                                 clear_on_match=False):
@@ -1940,7 +2058,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             failed_symbols.append(symbol)
                             continue
                         self._clear_position_quarantine_after_reconcile(symbol)
-                    elif local_position and not exchange_position:
+                    elif local_position and not exchange_position_present:
                         exit_price = (
                             local_position.get('stop_loss_price') or
                             local_position.get('entry_price'))
@@ -1961,12 +2079,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             f'{symbol} [双均线] 日检记平与 T+1 已同事务落盘')
                         self._clear_position_quarantine_after_reconcile(symbol)
                         local_position = None
-                    elif not local_position and exchange_position:
+                    elif not local_position and exchange_position_present:
                         self._quarantine_position_mismatch(
                             symbol, '交易所有仓但本地无记录（日检发现孤儿仓）')
                         failed_symbols.append(symbol)
                         continue
-                    elif not local_position and not exchange_position:
+                    elif not local_position and not exchange_position_present:
                         self._clear_position_quarantine_after_reconcile(symbol)
 
                     required_closed_candles = cfgv.required_closed_candles(
@@ -2028,8 +2146,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         f"{symbol} [双均线指标] 收盘价={fmt_price(current_close)}, "
                         f"EMA短={fmt_price(signal.get('ema_short'))}, "
                         f"EMA长={fmt_price(signal.get('ema_long'))}, "
-                        f"N日高={fmt_price(signal.get('upper_stop'))}, "
-                        f"N日低={fmt_price(signal.get('lower_stop'))}, "
+                        f"信号日前N根已完成日线(不含信号日)收盘最高={fmt_price(signal.get('upper_stop'))}, "
+                        f"信号日前N根已完成日线(不含信号日)收盘最低={fmt_price(signal.get('lower_stop'))}, "
                         f"信号={signal.get('action', '无')}")
 
                     position = self.trade_state.get_open_position(symbol)
@@ -2216,25 +2334,39 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if self._stop_event.is_set():
             logger.warning("启动前已收到停止请求，runner 不再启动")
             return
+        scheduler_shutdown_wait = True
         try:
             # 注册、启动与启动补跑也必须在 finally 保护内：任一阶段抛异常时都要
             # 关闭已部分启动的 scheduler 并清空心跳，不能留下 Web 正常但后台残活。
+            self._scheduler_heartbeat_ready.clear()
             self.register_jobs(self.config.get('scheduler', {}))
             self.scheduler.start()
-            self._update_runner_heartbeat()
+            self._require_scheduler_liveness(require_heartbeat=False)
+            if not self._scheduler_heartbeat_ready.wait(
+                    SCHEDULER_HEARTBEAT_START_TIMEOUT_SECONDS):
+                raise SchedulerSupervisionError(
+                    'APScheduler 执行器未在启动期限内派发心跳任务')
+            self._require_scheduler_liveness()
             logger.info(f"[{self.label}] 调度已启动，等待定时任务...")
             if not self._stop_event.is_set():
                 self._run_startup_catchup_check()
             elif self._stop_event.is_set():
                 logger.info(f"[{self.label}] runner 已收到停止请求，跳过启动补跑")
             while not self._stop_event.wait(60):
-                self._update_runner_heartbeat()
+                # 管理线程存活不等于 executor 还能派发；独占 scheduler job
+                # 的 monotonic 心跳同时监督实际任务执行能力。
+                self._require_scheduler_liveness()
+        except SchedulerSupervisionError:
+            # 永久卡住/已关闭的 executor 不能再用 wait=True 收尾，否则原始
+            # 监督异常可能永远到不了 Gunicorn/systemd 的重启链。
+            scheduler_shutdown_wait = False
+            raise
         except KeyboardInterrupt:
             logger.info("收到中断信号，关闭交易系统...")
         finally:
             try:
                 if getattr(self.scheduler, 'running', False):
-                    self.scheduler.shutdown(wait=True)
+                    self.scheduler.shutdown(wait=scheduler_shutdown_wait)
             finally:
                 self._update_runner_heartbeat(stopped=True)
 
@@ -2243,8 +2375,57 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._stop_event.set()
 
     def _update_runner_heartbeat(self, stopped=False):
+        wall_clock = None if stopped else time.time()
+        monotonic_clock = None if stopped else time.monotonic()
         with self._heartbeat_lock:
-            self._runner_heartbeat_ts = None if stopped else time.time()
+            self._runner_heartbeat_ts = wall_clock
+            self._runner_heartbeat_monotonic = monotonic_clock
+        if stopped:
+            self._scheduler_heartbeat_ready.clear()
+        else:
+            self._scheduler_heartbeat_ready.set()
+
+    def _scheduler_liveness(self):
+        """读取 APScheduler 原始监督事实；异常值绝不按真值猜测。"""
+        try:
+            running = getattr(self.scheduler, 'running', None)
+        except Exception:
+            running = None
+        try:
+            thread = getattr(self.scheduler, '_thread', None)
+            thread_alive = False if thread is None else thread.is_alive()
+        except Exception:
+            thread_alive = None
+        return running, thread_alive
+
+    def _require_scheduler_liveness(self, require_heartbeat=True):
+        """让管理线程/执行器半活故障沿 runner 监督链触发重启。"""
+        running, thread_alive = self._scheduler_liveness()
+        if running is not True or thread_alive is not True:
+            raise SchedulerSupervisionError(
+                'APScheduler 监督事实失效: '
+                f'running={running!r}, thread_alive={thread_alive!r}')
+        if not require_heartbeat:
+            return
+        try:
+            with self._heartbeat_lock:
+                heartbeat = self._runner_heartbeat_monotonic
+            now = time.monotonic()
+            if (isinstance(heartbeat, bool) or heartbeat is None or
+                    isinstance(now, bool)):
+                raise ValueError('monotonic heartbeat missing')
+            heartbeat = float(heartbeat)
+            now = float(now)
+            age = now - heartbeat
+            if (not math.isfinite(heartbeat) or not math.isfinite(now) or
+                    not math.isfinite(age) or age < 0):
+                raise ValueError('monotonic heartbeat invalid')
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise SchedulerSupervisionError(
+                'APScheduler 执行器心跳监督事实非法') from exc
+        if age > RUNNER_HEARTBEAT_MAX_AGE_SECONDS:
+            raise SchedulerSupervisionError(
+                f'APScheduler 执行器心跳超时: age={age:.3f}s')
 
     def health_snapshot(self):
         """Web 层可用的真实 runner/scheduler/心跳快照。"""
@@ -2253,19 +2434,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 heartbeat = self._runner_heartbeat_ts
         except Exception:
             heartbeat = None
-        try:
-            # 保留探针的原始类型给共享裁决器；``bool('false')``
-            # 会把明确的契约漂移洗成健康。
-            scheduler_running = getattr(self.scheduler, 'running', None)
-        except Exception:
-            scheduler_running = None
-        try:
-            scheduler_thread = getattr(self.scheduler, '_thread', None)
-            scheduler_thread_alive = (
-                False if scheduler_thread is None else
-                scheduler_thread.is_alive())
-        except Exception:
-            scheduler_thread_alive = None
+        # 保留探针的原始类型给共享裁决器；``bool('false')`` 会把明确的
+        # 契约漂移洗成健康。runner 主循环也复用同一事实源主动监督。
+        scheduler_running, scheduler_thread_alive = self._scheduler_liveness()
         try:
             persistence = self.trade_state.get_runtime_persistence_status()
         except Exception:
@@ -2329,7 +2500,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         # 日内权益采样（间隔与 EquityTracker 分桶常量同源）用于前端求索指数
         self.scheduler.add_job(self._update_runner_heartbeat, 'interval',
                               id=f'{ex}_runner_heartbeat', max_instances=1, coalesce=True,
-                              misfire_grace_time=120, minutes=1)
+                              misfire_grace_time=120, minutes=1,
+                              next_run_time=datetime.now())
         equity_tick_interval = EquityTracker.EQUITY_TICK_INTERVAL_MINUTES
         self.scheduler.add_job(self._record_equity_tick_with_alert, 'cron',
                               id=f'{ex}_equity_tick', max_instances=1, coalesce=True, misfire_grace_time=120,

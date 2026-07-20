@@ -33,22 +33,32 @@ from deployment_no_open_gate import (
     _verify,
     abandon_cycle,
     arm,
-    commit_sealed,
+    arm_recovery_gate,
+    commit_sealed as _commit_sealed,
     create_read_only_exchange,
     load_okx_config,
-    probe_api_permission_mode,
     probe_public_history_exposure,
+    recorded_completed_schedule_slot,
     require_completed_schedule_slot,
+    require_safe_resume_schedule_slot,
     run_baseline,
     run_quiescence,
     run_verify,
     seal,
+    verify_committed_cycle,
 )
 
 
 SHA_A = 'a' * 40
 SHA_B = 'b' * 40
 NONCE = 'c' * 64
+
+
+def commit_sealed(config_path, data_dir, release_sha, environ=None):
+    """Test adapter: production CLI always supplies the frozen worker PID."""
+    return _commit_sealed(
+        config_path, data_dir, release_sha, os.getpid(), '2026-07-19',
+        environ=environ, now=datetime(2026, 7, 19, 9, 0))
 
 
 def _canonical_temp_directory():
@@ -60,14 +70,12 @@ def _envelope(data):
     return {'code': '0', 'msg': '', 'data': data}
 
 
-def _account(uid='1001', main_uid='1001', acct_lv='2', pos_mode='net_mode',
-             perm='read_only,trade'):
+def _account(uid='1001', main_uid='1001', acct_lv='2', pos_mode='net_mode'):
     return {
         'uid': uid,
         'mainUid': main_uid,
         'acctLv': acct_lv,
         'posMode': pos_mode,
-        'perm': perm,
     }
 
 
@@ -511,21 +519,6 @@ class ProofWindowTest(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(GateError):
                 ReadOnlyOkxGate(FakeExchange(account_configs=[config])).account_config()
 
-    def test_api_permission_parser_is_exact_and_never_returns_credentials(self):
-        self.assertEqual(
-            ('read_only',),
-            ReadOnlyOkxGate(FakeExchange(account_configs=[
-                _account(perm='read_only')])).api_permissions())
-        self.assertEqual(
-            ('read_only', 'trade'),
-            ReadOnlyOkxGate(FakeExchange(account_configs=[
-                _account(perm='read_only,trade')])).api_permissions())
-        for malformed in ('', 'trade', 'read_only, trade',
-                          'read_only,read_only', 'read_only,admin'):
-            with self.subTest(perm=malformed), self.assertRaises(GateError):
-                ReadOnlyOkxGate(FakeExchange(account_configs=[
-                    _account(perm=malformed)])).api_permissions()
-
     def test_account_identity_change_during_window_fails(self):
         exchange = FakeExchange(account_configs=[
             _account(), _account(uid='2002', main_uid='2002')])
@@ -625,6 +618,9 @@ class ProofWindowTest(unittest.TestCase):
         wrong_schema = _baseline()
         wrong_schema['schema_version'] = 1
         malformed.append(wrong_schema)
+        float_schema = _baseline()
+        float_schema['schema_version'] = 2.0
+        malformed.append(float_schema)
         wrong_account = _baseline()
         wrong_account['account']['pos_mode'] = 'long_short_mode'
         malformed.append(wrong_account)
@@ -638,8 +634,106 @@ class ProofWindowTest(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(GateError):
                 _validate_baseline(payload)
 
+    def test_all_gate_schema_versions_require_exact_json_integers(self):
+        for schema in (True, 1.0):
+            with self.subTest(kind='sentinel', schema=schema), \
+                    self.assertRaisesRegex(GateError, 'schema_version'):
+                gate_module._validate_sentinel({
+                    'schema_version': schema,
+                    'nonce': NONCE,
+                    'release_sha': SHA_A,
+                })
+
+        summary = {
+            't1_ms': 1100,
+            't2_ms': 1200,
+            'history_verified_through_ms': 1200,
+            'positions': 0,
+            'pending_normal': 0,
+            'pending_algo': 0,
+            'new_pending': 0,
+            'orders_checked': 0,
+            'fills_checked': 0,
+            'fill_orders_checked': 0,
+            'algo_orders_checked': 0,
+        }
+        completion = gate_module._make_completion(
+            _baseline(), {'dev': 1, 'ino': 4},
+            {'dev': 1, 'ino': 2}, {'dev': 1, 'ino': 3}, summary)
+        completion['schema_version'] = 2.0
+        with self.assertRaisesRegex(GateError, 'schema_version'):
+            gate_module._validate_completion(completion)
+
+
+class ExpectedRunnerLockOwnerTest(unittest.TestCase):
+    @staticmethod
+    def _lock_fd(raw):
+        directory = tempfile.TemporaryDirectory()
+        path = os.path.join(directory.name, 'runner.lock')
+        with open(path, 'wb') as handle:
+            handle.write(raw)
+        return directory, os.open(path, os.O_RDONLY)
+
+    def test_exact_pid_content_held_lock_and_kernel_owner_are_required(self):
+        directory, lock_fd = self._lock_fd(b'4321\n')
+        self.addCleanup(directory.cleanup)
+        self.addCleanup(os.close, lock_fd)
+        with mock.patch.object(
+                gate_module, '_require_runner_lock_held_elsewhere') as held, \
+                mock.patch.object(
+                    gate_module, '_flock_owner', return_value=4321) as owner:
+            gate_module._require_expected_runner_lock_owner(lock_fd, 4321)
+        held.assert_called_once_with(lock_fd)
+        owner.assert_called_once()
+
+    def test_invalid_expected_pid_and_lock_content_fail_closed(self):
+        for expected in (True, 0, -1, 4321.0, '4321'):
+            with self.subTest(expected=expected):
+                directory, lock_fd = self._lock_fd(b'4321\n')
+                try:
+                    with self.assertRaisesRegex(GateError, 'PID 非法'):
+                        gate_module._require_expected_runner_lock_owner(
+                            lock_fd, expected)
+                finally:
+                    os.close(lock_fd)
+                    directory.cleanup()
+        for raw in (b'4322\n', b'4321', b'4321\njunk'):
+            with self.subTest(raw=raw):
+                directory, lock_fd = self._lock_fd(raw)
+                try:
+                    with self.assertRaisesRegex(GateError, 'owner PID 已换代'):
+                        gate_module._require_expected_runner_lock_owner(
+                            lock_fd, 4321)
+                finally:
+                    os.close(lock_fd)
+                    directory.cleanup()
+
+    def test_unheld_or_different_kernel_owner_fails_closed(self):
+        directory, lock_fd = self._lock_fd(b'4321\n')
+        self.addCleanup(directory.cleanup)
+        self.addCleanup(os.close, lock_fd)
+        with mock.patch.object(
+                gate_module, '_require_runner_lock_held_elsewhere',
+                side_effect=GateError('runner 未持有')):
+            with self.assertRaisesRegex(GateError, 'runner 未持有'):
+                gate_module._require_expected_runner_lock_owner(lock_fd, 4321)
+        with mock.patch.object(
+                gate_module, '_require_runner_lock_held_elsewhere'), \
+                mock.patch.object(
+                    gate_module, '_flock_owner', return_value=9999):
+            with self.assertRaisesRegex(GateError, '内核 FLOCK owner 已换代'):
+                gate_module._require_expected_runner_lock_owner(lock_fd, 4321)
+
 
 class SecureStateMachineTest(unittest.TestCase):
+    def setUp(self):
+        # macOS 没有 Linux /proc/locks；其他 PID/内容/持锁语义仍走真实
+        # production helper，只替换平台特定的内核 owner 观测。
+        patcher = mock.patch.object(
+            gate_module, '_flock_owner', return_value=os.getpid())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def _write_config(directory):
         path = os.path.join(directory, 'config.json')
@@ -672,7 +766,7 @@ class SecureStateMachineTest(unittest.TestCase):
         os.mkdir(runtime, 0o700)
         path = os.path.join(runtime, 'runner.lock')
         with open(path, 'w', encoding='ascii') as handle:
-            handle.write('stopped\n')
+            handle.write(f'{os.getpid()}\n')
         os.chmod(path, 0o600)
         return os.path.realpath(path)
 
@@ -682,6 +776,7 @@ class SecureStateMachineTest(unittest.TestCase):
 
     def _prepare(self, directory):
         config = self._write_config(directory)
+        self._write_state(directory, '2026-07-19')
         lock = self._runner_lock(directory)
         env = self._env(lock)
         self.assertTrue(arm(directory, SHA_A, environ=env))
@@ -708,6 +803,40 @@ class SecureStateMachineTest(unittest.TestCase):
                 require_completed_schedule_slot(
                     config, directory, datetime(2026, 7, 19, 8, 2)))
 
+            # Recovery carries the already-proven slot across midnight.  It
+            # verifies ledger immutability without demanding that a stopped
+            # runner somehow complete the next day's schedule.
+            self.assertEqual(
+                '2026-07-19',
+                require_completed_schedule_slot(
+                    config, directory, datetime(2026, 7, 20, 8, 2),
+                    expected_slot='2026-07-19'))
+            self.assertEqual(
+                '2026-07-19',
+                recorded_completed_schedule_slot(config, directory))
+            with self.assertRaisesRegex(GateError, '冻结调度日'):
+                require_completed_schedule_slot(
+                    config, directory, expected_slot='2026-07-18')
+
+            self.assertEqual(
+                '2026-07-19',
+                require_safe_resume_schedule_slot(
+                    config, directory, '2026-07-19',
+                    datetime(2026, 7, 20, 7, 0)))
+            with self.assertRaisesRegex(GateError, '未完成调度日'):
+                require_safe_resume_schedule_slot(
+                    config, directory, '2026-07-19',
+                    datetime(2026, 7, 20, 7, 53))
+
+            self._write_state(directory, '2099-01-01')
+            with self.assertRaisesRegex(GateError, '未来'):
+                recorded_completed_schedule_slot(
+                    config, directory, datetime(2026, 7, 19, 8, 2))
+            with self.assertRaisesRegex(GateError, '未来'):
+                require_completed_schedule_slot(
+                    config, directory, datetime(2026, 7, 19, 8, 2),
+                    expected_slot='2099-01-01')
+
     def test_arm_requires_actual_lock_free_and_creates_random_json_sentinel(self):
         with _canonical_temp_directory() as directory:
             lock = self._runner_lock(directory)
@@ -717,6 +846,8 @@ class SecureStateMachineTest(unittest.TestCase):
             try:
                 with self.assertRaisesRegex(GateError, 'runner 仍持锁'):
                     arm(directory, SHA_A, environ=env)
+                with self.assertRaisesRegex(GateError, 'runner 仍持锁'):
+                    arm_recovery_gate(directory, SHA_A, environ=env)
                 self.assertFalse(os.path.lexists(os.path.join(directory, SENTINEL_NAME)))
             finally:
                 fcntl.flock(held, fcntl.LOCK_UN)
@@ -818,6 +949,74 @@ class SecureStateMachineTest(unittest.TestCase):
                 arm(directory, SHA_B, environ=self._env(lock))
             self.assertTrue(os.path.exists(os.path.join(directory, BASELINE_NAME)))
             self.assertTrue(os.path.exists(os.path.join(directory, COMPLETION_NAME)))
+            self.assertTrue(
+                arm_recovery_gate(directory, SHA_B, environ=self._env(lock)))
+            self.assertTrue(os.path.exists(os.path.join(directory, SENTINEL_NAME)))
+            self.assertTrue(os.path.exists(os.path.join(directory, BASELINE_NAME)))
+            self.assertTrue(os.path.exists(os.path.join(directory, COMPLETION_NAME)))
+
+    def test_commit_refuses_a_newly_matured_schedule_slot(self):
+        with _canonical_temp_directory() as directory:
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]),
+                environ=env,
+            )
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with self.assertRaisesRegex(GateError, '尚未成功完成'):
+                    _commit_sealed(
+                        config, directory, SHA_A, os.getpid(),
+                        '2026-07-19', environ=env,
+                        now=datetime(2026, 7, 20, 8, 2),
+                    )
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+            self.assertTrue(os.path.exists(
+                os.path.join(directory, SENTINEL_NAME)))
+
+    def test_committed_cycle_is_locally_verifiable_running_or_stopped(self):
+        with _canonical_temp_directory() as directory:
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]), environ=env)
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                commit_sealed(config, directory, SHA_A, environ=env)
+                running = verify_committed_cycle(
+                    directory, SHA_A, runner_active=True, environ=env)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+            stopped = verify_committed_cycle(directory, SHA_A, environ=env)
+            self.assertEqual(running, stopped)
+
+    def test_partial_pending_sentinel_never_becomes_authoritative(self):
+        with _canonical_temp_directory() as directory:
+            lock = self._runner_lock(directory)
+            env = self._env(lock)
+
+            def fail_after_partial_write(fd, payload):
+                os.write(fd, payload[:7])
+                raise OSError('injected partial write')
+
+            with mock.patch.object(
+                    gate_module, '_write_all', side_effect=fail_after_partial_write), \
+                    self.assertRaisesRegex(GateError, '持久化'):
+                arm(directory, SHA_A, environ=env)
+            final = os.path.join(directory, SENTINEL_NAME)
+            self.assertFalse(os.path.lexists(final))
+            self.assertFalse(any(
+                name.startswith(f'.{SENTINEL_NAME}.pending.')
+                for name in os.listdir(directory)))
+            self.assertTrue(arm(directory, SHA_A, environ=env))
+            with open(final, encoding='utf-8') as handle:
+                self.assertEqual(SHA_A, json.load(handle)['release_sha'])
 
     def test_quiescence_proves_q0_through_q2_without_writing_t0(self):
         with _canonical_temp_directory() as directory:
@@ -851,6 +1050,30 @@ class SecureStateMachineTest(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(
                     directory, f'.abandoned.0001.{name}')))
                 self.assertFalse(os.path.exists(os.path.join(directory, name)))
+
+    def test_abandon_retry_preserves_durable_successor_sentinel(self):
+        with _canonical_temp_directory() as directory:
+            lock = self._runner_lock(directory)
+            env = self._env(lock)
+            self.assertTrue(arm(directory, SHA_A, environ=env))
+            first = abandon_cycle(directory, SHA_A, '0001', environ=env)
+            self.assertTrue(arm(directory, SHA_A, environ=env))
+            with open(
+                    os.path.join(directory, SENTINEL_NAME),
+                    encoding='utf-8') as handle:
+                successor = json.load(handle)
+
+            second = abandon_cycle(directory, SHA_A, '0001', environ=env)
+
+            self.assertEqual(first, second)
+            self.assertTrue(os.path.exists(os.path.join(
+                directory, SENTINEL_NAME)))
+            with open(
+                    os.path.join(directory, SENTINEL_NAME),
+                    encoding='utf-8') as handle:
+                self.assertEqual(successor, json.load(handle))
+            self.assertTrue(os.path.exists(os.path.join(
+                directory, f'.abandoned.0001.{SENTINEL_NAME}')))
 
     def test_baseline_is_v2_binds_every_identity_and_is_write_once(self):
         with _canonical_temp_directory() as directory:
@@ -975,6 +1198,13 @@ class SecureStateMachineTest(unittest.TestCase):
                         environ=env)
 
             self.assertTrue(os.path.exists(os.path.join(directory, SENTINEL_NAME)))
+            self.assertFalse(os.path.exists(os.path.join(directory, COMPLETION_NAME)))
+            self.assertFalse(any(
+                name.startswith(f'.{COMPLETION_NAME}.pending.')
+                for name in os.listdir(directory)))
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2200, 2300]), environ=env)
             self.assertTrue(os.path.exists(os.path.join(directory, COMPLETION_NAME)))
             audit = abandon_cycle(directory, SHA_A, '0002', environ=env)
             self.assertIn(COMPLETION_NAME, audit['archived_sha256'])
@@ -1062,25 +1292,153 @@ class SecureStateMachineTest(unittest.TestCase):
             with self.assertRaisesRegex(GateError, '值不一致'):
                 load_okx_config(path, environ=dict(env, OKX_PASSWORD='other'))
 
-    def test_bootstrap_permission_probe_requires_exact_read_only_then_trade(self):
+    def test_commit_rechecks_content_after_final_path_check(self):
         with _canonical_temp_directory() as directory:
-            path = self._write_config(directory)
-            read_only = probe_api_permission_mode(
-                path, 'read_only', exchange=FakeExchange(
-                    account_configs=[_account(perm='read_only')]), environ={})
-            self.assertEqual(['read_only'], read_only['permissions'])
-            with self.assertRaisesRegex(GateError, '精确为 read_only'):
-                probe_api_permission_mode(
-                    path, 'read_only', exchange=FakeExchange(
-                        account_configs=[_account()]), environ={})
-            restored = probe_api_permission_mode(
-                path, 'trade', exchange=FakeExchange(
-                    account_configs=[_account()]), environ={})
-            self.assertIn('trade', restored['permissions'])
-            with self.assertRaisesRegex(GateError, '禁止 withdraw'):
-                probe_api_permission_mode(
-                    path, 'trade', exchange=FakeExchange(account_configs=[
-                        _account(perm='read_only,trade,withdraw')]), environ={})
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]), environ=env)
+            sentinel_path = os.path.join(directory, SENTINEL_NAME)
+            original = gate_module._recheck_data_directory_path
+            injected = False
+
+            def mutate_after_path_check(data_dir, held_fd):
+                nonlocal injected
+                result = original(data_dir, held_fd)
+                if not injected:
+                    injected = True
+                    with open(sentinel_path, encoding='utf-8') as handle:
+                        payload = json.load(handle)
+                    payload['nonce'] = 'f' * 64
+                    with open(sentinel_path, 'w', encoding='utf-8') as handle:
+                        json.dump(payload, handle)
+                    os.chmod(sentinel_path, 0o600)
+                return result
+
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(
+                        gate_module, '_recheck_data_directory_path',
+                        side_effect=mutate_after_path_check), \
+                        self.assertRaisesRegex(GateError, '原位修改'):
+                    commit_sealed(config, directory, SHA_A, environ=env)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+            self.assertTrue(os.path.exists(sentinel_path))
+
+    def test_commit_rechecks_content_after_last_entry_identity_check(self):
+        with _canonical_temp_directory() as directory:
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]), environ=env)
+            sentinel_path = os.path.join(directory, SENTINEL_NAME)
+            original = gate_module._recheck_held_entry
+            sentinel_checks = 0
+
+            def mutate_after_last_sentinel_identity(dir_fd, name, fd, context):
+                nonlocal sentinel_checks
+                result = original(dir_fd, name, fd, context)
+                if name == SENTINEL_NAME:
+                    sentinel_checks += 1
+                    if sentinel_checks == 3:
+                        with open(sentinel_path, encoding='utf-8') as handle:
+                            payload = json.load(handle)
+                        payload['nonce'] = 'c' * 64
+                        with open(sentinel_path, 'w', encoding='utf-8') as handle:
+                            json.dump(payload, handle)
+                        os.chmod(sentinel_path, 0o600)
+                return result
+
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with mock.patch.object(
+                        gate_module, '_recheck_held_entry',
+                        side_effect=mutate_after_last_sentinel_identity), \
+                        self.assertRaisesRegex(GateError, '原位修改'):
+                    commit_sealed(config, directory, SHA_A, environ=env)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+            self.assertTrue(os.path.exists(sentinel_path))
+
+    def test_committed_verify_rechecks_content_after_final_path_check(self):
+        with _canonical_temp_directory() as directory:
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]), environ=env)
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                commit_sealed(config, directory, SHA_A, environ=env)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            completion_path = os.path.join(directory, COMPLETION_NAME)
+            original = gate_module._recheck_data_directory_path
+            injected = False
+
+            def mutate_after_path_check(data_dir, held_fd):
+                nonlocal injected
+                result = original(data_dir, held_fd)
+                if not injected:
+                    injected = True
+                    with open(completion_path, encoding='utf-8') as handle:
+                        payload = json.load(handle)
+                    payload['nonce'] = 'e' * 64
+                    with open(completion_path, 'w', encoding='utf-8') as handle:
+                        json.dump(payload, handle)
+                    os.chmod(completion_path, 0o600)
+                return result
+
+            with mock.patch.object(
+                    gate_module, '_recheck_data_directory_path',
+                    side_effect=mutate_after_path_check), \
+                    self.assertRaisesRegex(GateError, '原位修改'):
+                verify_committed_cycle(directory, SHA_A, environ=env)
+
+    def test_committed_verify_has_no_path_callback_after_final_payload_read(self):
+        with _canonical_temp_directory() as directory:
+            config, lock, env = self._prepare(directory)
+            seal(
+                config, directory, SHA_A,
+                exchange=FakeExchange(server_times=[2000, 2100]), environ=env)
+            held = os.open(lock, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                commit_sealed(config, directory, SHA_A, environ=env)
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            completion_path = os.path.join(directory, COMPLETION_NAME)
+            original = gate_module._recheck_data_directory_path
+            checks = 0
+
+            def mutate_on_second_path_check(data_dir, held_fd):
+                nonlocal checks
+                result = original(data_dir, held_fd)
+                checks += 1
+                if checks == 2:
+                    with open(completion_path, encoding='utf-8') as handle:
+                        payload = json.load(handle)
+                    payload['nonce'] = 'b' * 64
+                    with open(completion_path, 'w', encoding='utf-8') as handle:
+                        json.dump(payload, handle)
+                    os.chmod(completion_path, 0o600)
+                return result
+
+            with mock.patch.object(
+                    gate_module, '_recheck_data_directory_path',
+                    side_effect=mutate_on_second_path_check):
+                verify_committed_cycle(directory, SHA_A, environ=env)
+            self.assertEqual(1, checks)
+            verify_committed_cycle(directory, SHA_A, environ=env)
 
     def test_public_history_exposure_gate_returns_only_safe_booleans(self):
         with _canonical_temp_directory() as directory:
@@ -1133,7 +1491,14 @@ class SecureStateMachineTest(unittest.TestCase):
                 parser.parse_args(['arm', '--data-dir', '/tmp'])
             with self.assertRaises(SystemExit):
                 parser.parse_args([
+                    'arm-recovery-gate', '--data-dir', '/tmp'])
+            with self.assertRaises(SystemExit):
+                parser.parse_args([
                     'seal', '--data-dir', '/tmp', '--release-sha', SHA_A])
+            with self.assertRaises(SystemExit):
+                parser.parse_args([
+                    'commit', '--config', '/tmp/config.json',
+                    '--data-dir', '/tmp', '--release-sha', SHA_A])
 
     def test_only_locked_ccxt_constructor_and_read_methods_are_used(self):
         calls = []

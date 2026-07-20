@@ -351,7 +351,9 @@ def _directory_has_unowned_state(data_dir):
 
 
 def _validate_journal_items(data_dir, journal):
-    if not isinstance(journal, dict) or journal.get('version') != 1:
+    if (not isinstance(journal, dict) or
+            type(journal.get('version')) is not int or
+            journal['version'] != 1):
         raise ValueError('迁移事务日志版本或结构无效')
     items = journal.get('items')
     if not isinstance(items, list) or not items:
@@ -410,10 +412,16 @@ def _preview_confirmed_config_cleanup(config_path, cleanup_spec, release_sha):
 
 
 def run(data_dir, apply=False, config_path=None, cleanup_spec=None,
-        release_sha=None):
+        release_sha=None, recover_only=False, classify_state=False):
     data_dir = os.path.abspath(data_dir)
     config_path = os.path.abspath(
         config_path or os.path.join(data_dir, 'config.json'))
+    if recover_only and (apply or cleanup_spec or release_sha):
+        print('[阻断] recover-only 只能单独用于回滚未完成迁移事务')
+        return EXIT_UNSAFE
+    if classify_state and (apply or cleanup_spec or release_sha or recover_only):
+        print('[阻断] classify-state 只能单独用于只读数据状态分类')
+        return EXIT_UNSAFE
     if bool(cleanup_spec) != bool(release_sha):
         print('[阻断] cleanup spec 预览必须同时提供 spec 与 release SHA')
         return EXIT_UNSAFE
@@ -426,6 +434,14 @@ def run(data_dir, apply=False, config_path=None, cleanup_spec=None,
     if directory_error:
         print(f'[阻断] {directory_error}')
         return EXIT_UNSAFE
+    journal_path = os.path.join(
+        data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
+    if recover_only:
+        if not private_file_exists(journal_path):
+            print('[通过] 没有未完成的单策略迁移事务。')
+            return EXIT_OK
+        return (EXIT_OK if _recover_interrupted_migration(data_dir)
+                else EXIT_RESTORE_FAILED)
     legacy_error = _validate_legacy_state_gate(data_dir)
     if legacy_error:
         print(f'[阻断] {legacy_error}')
@@ -438,13 +454,12 @@ def run(data_dir, apply=False, config_path=None, cleanup_spec=None,
     if owner_error:
         print(f'[阻断] {owner_error}')
         return EXIT_UNSAFE
-    journal_path = os.path.join(
-        data_dir, cfgv.SINGLE_STRATEGY_MIGRATION_JOURNAL)
     if private_file_exists(journal_path):
         if not apply:
             print(
                 f'[阻断] 检测到未完成迁移事务: {journal_path}；'
-                '干跑保持只读，请加 --apply 执行整组恢复后重新迁移')
+                '干跑保持只读；请先单独运行 --recover-only 回滚事务，'
+                '再重新 dry-run 审核，确需迁移时另行 --apply')
             return EXIT_UNSAFE
         if not _recover_interrupted_migration(data_dir):
             return EXIT_RESTORE_FAILED
@@ -507,6 +522,9 @@ def run(data_dir, apply=False, config_path=None, cleanup_spec=None,
 
     changed = [path for _kind, path in targets
                if originals[path] != normalized[path]]
+    if classify_state:
+        print('requires_migration' if changed else 'migration_complete')
+        return EXIT_OK
     for path in changed:
         print(f'—— {path} ——')
         for item in reports[path]:
@@ -579,6 +597,12 @@ def main():
         '--cleanup-spec', help='只读干跑时预览受审单键清理 spec')
     parser.add_argument(
         '--release-sha', help='cleanup spec 所绑定的完整 release SHA')
+    parser.add_argument(
+        '--recover-only', action='store_true',
+        help='只回滚未完成事务，不执行规范化或迁移')
+    parser.add_argument(
+        '--classify-state', action='store_true',
+        help='严格只读分类为 requires_migration 或 migration_complete')
     args = parser.parse_args()
     return run(
         args.data_dir,
@@ -586,6 +610,8 @@ def main():
         config_path=args.config,
         cleanup_spec=args.cleanup_spec,
         release_sha=args.release_sha,
+        recover_only=args.recover_only,
+        classify_state=args.classify_state,
     )
 
 

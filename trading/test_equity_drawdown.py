@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -55,6 +55,27 @@ class CoercePositiveFloatTest(unittest.TestCase):
 
 
 class DrawdownStatsTest(unittest.TestCase):
+    def test_aware_peak_time_is_normalized_for_streak_statistics(self):
+        tmp, tracker = _make(
+            equity=90, peak=100, peak_days_ago=5, longest=3)
+        aware_peak = (
+            datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        _jdump(
+            {'peak_equity': 100, 'peak_time': aware_peak},
+            os.path.join(tmp, 'peak_equity.json'),
+        )
+
+        stats = tracker.build_account_stats(persist=False)
+        self.assertGreaterEqual(stats['days_since_peak'], 4)
+        self.assertGreaterEqual(stats['longest_drawdown_days'], 4)
+
+        tracker._settle_drawdown_streak(aware_peak, datetime.now())
+        self.assertGreaterEqual(
+            _jload(os.path.join(tmp, 'equity_history.json'))[
+                'longest_drawdown_days'],
+            4,
+        )
+
     def test_not_new_high_includes_current_streak(self):
         """当前未创新高：历史最长 = max(历史已记录, 当前未创新高天数)。"""
         _, t = _make(equity=90, peak=100, peak_days_ago=5, longest=3)

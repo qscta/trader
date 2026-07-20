@@ -2,7 +2,7 @@
 
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import trade_state as trade_state_module
 from trade_executor import TradeExecutorMixin
+from main import TradingSystem
 from stop_guardian import StopGuardianMixin
 from trade_state import TRADING_FEE_RATE, TradeState, TradeStatePersistenceError
 
@@ -42,10 +43,50 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 return_value={'id': 'stop-new'} if new_stop else None),
             cancel_stop_order_only=Mock(return_value=old_cancel),
             cancel_order=Mock(return_value=old_cancel),
+            find_stop_order_state=Mock(return_value='intact'),
         )
         system.notifier = SimpleNamespace(notify_error=Mock())
         system._stop_anomalies = {}
         system._notify_trade_state_persistence_issue = Mock()
+        return system
+
+    def test_aware_stop_residue_timestamp_can_leave_visibility_grace(self):
+        guardian = _GuardianSystem()
+        marked_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        guardian.trade_state = SimpleNamespace(
+            get_stop_residues=lambda: {'BTCUSDT': marked_at})
+        guardian._stop_residue_runtime_not_before = {}
+        guardian.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 1
+
+        self.assertTrue(guardian._stop_residue_grace_elapsed('BTCUSDT'))
+
+    @staticmethod
+    def _guardian_with_pending_stop(
+            temp_dir, *, stop_order_id='stop-old', stop_size=0.6,
+            residue=False):
+        system = _GuardianSystem()
+        system.trade_state = TradeState(
+            str(Path(temp_dir) / 'trade_state.json'))
+        system.trade_state.add_open_position(
+            'BTCUSDT', 'long', 100.0, 0.6, 90.0, stop_order_id,
+            strategy='ma_cross')
+        system.trade_state.update_stop_loss(
+            'BTCUSDT', 90.0, stop_order_id,
+            stop_order_size=stop_size, stop_resize_pending=True)
+        if residue:
+            system.trade_state.mark_stop_residue('BTCUSDT')
+        system._stop_anomalies = {}
+        system.label = '测试'
+        system.notifier = SimpleNamespace(
+            notify_error=Mock(), send_message=Mock())
+        system._notify_trade_state_persistence_issue = Mock()
+        system._quarantine_position_mismatch = Mock()
+        system.exchange_api = SimpleNamespace(
+            create_stop_loss_order=Mock(return_value={'id': 'stop-new'}),
+            cancel_stop_order_only=Mock(return_value=True),
+            find_stop_order_state=Mock(return_value='intact'),
+        )
         return system
 
     def test_partial_close_replaces_stop_and_atomically_shrinks_ledger(self):
@@ -71,6 +112,82 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             system.exchange_api.cancel_stop_order_only.assert_called_once_with(
                 'BTC/USDT:USDT', 'stop-old')
             system.exchange_api.cancel_order.assert_not_called()
+
+    def test_stop_size_invariant_rejects_undercoverage_and_stable_oversize(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old',
+                strategy='ma_cross')
+            for stop_size, pending in ((0.5, False), (0.5, True), (1.5, False)):
+                with self.subTest(stop_size=stop_size, pending=pending), \
+                        self.assertRaises(TradeStatePersistenceError):
+                    state.update_stop_loss(
+                        'BTCUSDT', 90.0, 'stop-old',
+                        stop_order_size=stop_size,
+                        stop_resize_pending=pending)
+            updated = state.update_stop_loss(
+                'BTCUSDT', 90.0, 'stop-old', stop_order_size=1.5,
+                stop_resize_pending=True)
+            self.assertEqual(1.5, updated['stop_order_size'])
+            TradeState.validate_state(TradeState(state.state_file).state)
+
+    def test_stop_identity_set_rejects_conflicts_without_mutating_ledger(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old',
+                strategy='ma_cross')
+            original = state.get_open_position('BTCUSDT')
+
+            bad_inputs = (
+                (' stop-new', [], True),
+                ('stop-new', ['stop-new'], True),
+                ('stop-new', ['stop-old', 'stop-old'], True),
+                ('stop-new', ['stop-old'], False),
+            )
+            for primary, extras, pending in bad_inputs:
+                with self.subTest(primary=primary, extras=extras, pending=pending), \
+                        self.assertRaises(ValueError):
+                    state.update_stop_loss(
+                        'BTCUSDT', 90.0, primary,
+                        extra_stop_order_ids=extras,
+                        stop_resize_pending=pending)
+                self.assertEqual(original, state.get_open_position('BTCUSDT'))
+
+    def test_guardian_never_accepts_or_releases_undercovered_stop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = _GuardianSystem()
+            system.trade_state = TradeState(
+                str(Path(temp_dir) / 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old',
+                strategy='ma_cross')
+            system.trade_state.mark_position_quarantine(
+                'BTCUSDT', 'seed quarantine')
+            with system.trade_state.lock:
+                system.trade_state.state['open_positions'][
+                    'BTCUSDT']['stop_order_size'] = 0.5
+            system.exchange_api = SimpleNamespace(
+                find_stop_order_state=Mock(return_value='intact'))
+            system.notifier = SimpleNamespace(notify_error=Mock())
+            system._stop_anomalies = {}
+            system._quarantine_position_mismatch = Mock()
+
+            position = system.trade_state.get_open_position('BTCUSDT')
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT', position, '双均线 EMA')
+            cleared = TradingSystem._clear_position_quarantine_after_reconcile(
+                system, 'BTCUSDT')
+
+            self.assertFalse(protected)
+            self.assertFalse(cleared)
+            self.assertTrue(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
+            system.exchange_api.find_stop_order_state.assert_not_called()
+            system._quarantine_position_mismatch.assert_called_once()
+            with self.assertRaisesRegex(ValueError, '未完整覆盖'):
+                TradeState.validate_state(system.trade_state.state)
 
     def test_partial_fill_non_usdt_fee_falls_back_to_estimate_and_persists(self):
         """POST 已成交后收到 BTC 手续费，也必须安全收口为 estimated。"""
@@ -121,6 +238,25 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 system.trade_state.get_open_position('BTCUSDT'),
                 '测试平仓'))
             self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+
+    def test_partial_close_keeps_write_marker_when_full_stop_list_is_unproven(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._system(temp_dir)
+            system.exchange_api.find_stop_order_state.return_value = 'mismatch'
+            order = {
+                'id': 'close-1', 'average': 110.0, 'amount': 0.4,
+                'remaining_amount': 0.6, 'fully_closed': False,
+            }
+
+            self.assertFalse(system._handle_partial_close(
+                'BTCUSDT', order,
+                system.trade_state.get_open_position('BTCUSDT'),
+                '完整清单失败测试'))
+
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-new', position['stop_order_id'])
+            self.assertEqual(0.6, position['position_size'])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
 
     def test_submit_close_persists_intent_before_exchange_call(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -210,7 +346,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             system.config = {
                 'trading': {'symbols': [
                     {'name': 'BTCUSDT', 'enabled': True}]}}
-            system.stop_loss_dates = {}
             system.exchange_api = SimpleNamespace(
                 to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
                 close_position=Mock(return_value={
@@ -247,7 +382,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             today = date.today().strftime('%Y-%m-%d')
             self.assertEqual(
                 today, system.trade_state.get_stop_loss_dates()['BTCUSDT'])
-            self.assertEqual(today, system.stop_loss_dates['BTCUSDT'])
 
     def test_resume_stop_triggered_before_close_post_atomically_records_t1(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -262,7 +396,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             system.config = {
                 'trading': {'symbols': [
                     {'name': 'BTCUSDT', 'enabled': True}]}}
-            system.stop_loss_dates = {}
             system.exchange_api = SimpleNamespace(
                 to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
                 close_position=Mock(return_value={
@@ -293,7 +426,47 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             today = date.today().strftime('%Y-%m-%d')
             self.assertEqual(
                 today, system.trade_state.get_stop_loss_dates()['BTCUSDT'])
-            self.assertEqual(today, system.stop_loss_dates['BTCUSDT'])
+
+    def test_resume_flip_with_uncleared_old_stop_atomically_records_t1(self):
+        """崩溃恢复不能在记平后、另写 T+1 前留下可立即重开的窗口。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = _GuardianSystem()
+            system.trade_state = TradeState(
+                str(Path(temp_dir) / 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 1.0, 90.0, 'stop-old',
+                strategy='ma_cross')
+            intent = system.trade_state.prepare_close_intent(
+                'BTCUSDT', 'CloseUnclearedStop1', '双均线翻转平仓')
+            system.config = {
+                'trading': {'symbols': [
+                    {'name': 'BTCUSDT', 'enabled': True}]}}
+            system.exchange_api = SimpleNamespace(
+                to_ccxt_symbol=lambda _symbol: 'BTC/USDT:USDT',
+                close_position=Mock(return_value={
+                    'id': 'close-real', 'average': 107.0,
+                    'confirmed': True, 'fully_closed': True,
+                    'amount': 1.0, 'remaining_amount': 0.0,
+                }),
+            )
+            system.notifier = SimpleNamespace(notify_error=Mock())
+            system._stop_anomalies = {}
+            system._cancel_stop_order_confirmed = Mock(return_value=False)
+            system._notify_trade_state_persistence_issue = Mock()
+
+            status = system._resume_persisted_close_intent(
+                'BTCUSDT',
+                system.trade_state.get_open_position('BTCUSDT'),
+                '启动对账')
+
+            self.assertEqual('closed', status)
+            system.exchange_api.close_position.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', 1.0,
+                client_order_id=intent['client_order_id'],
+                require_existing=True)
+            self.assertEqual(
+                date.today().strftime('%Y-%m-%d'),
+                system.trade_state.get_stop_loss_date('BTCUSDT'))
 
     def test_recent_close_intent_absent_consumes_only_intent_and_ends_action(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -332,6 +505,33 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 client_order_id=intent['client_order_id'],
                 require_existing=True)
             system._ensure_stop_order_alive.assert_not_called()
+
+    def test_terminal_zero_fill_consumes_only_close_intent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._system(temp_dir)
+            intent = system.trade_state.prepare_close_intent(
+                'BTCUSDT', 'CloseTerminalZeroFill', '信号平仓')
+            system.exchange_api.close_position = Mock(return_value={
+                'confirmed': True, 'zero_fill_terminal': True,
+                'fully_closed': False, 'fully_filled': False,
+                'amount': 0.0, 'requested_amount': 1.0,
+                'remaining_amount': 1.0,
+                'clientOrderId': intent['client_order_id'],
+            })
+
+            result = system._submit_persisted_close(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '启动对账')
+
+            self.assertTrue(result['zero_fill_resolved'])
+            self.assertIsNone(system.trade_state.get_close_intent('BTCUSDT'))
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual(1.0, position['position_size'])
+            self.assertEqual('stop-old', position['stop_order_id'])
+            system.exchange_api.close_position.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', 1.0,
+                client_order_id=intent['client_order_id'],
+                require_existing=True)
 
     def test_historical_close_absent_keeps_blocker_but_maintains_exact_stop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -513,7 +713,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 'remaining_amount': 0.6, 'fully_closed': False,
             }
 
-            self.assertTrue(system._handle_partial_close(
+            self.assertFalse(system._handle_partial_close(
                 'BTCUSDT', order, system.trade_state.get_open_position('BTCUSDT'),
                 '测试平仓'))
 
@@ -542,11 +742,12 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             system.notifier = SimpleNamespace(
                 notify_error=Mock(), send_message=Mock())
             system._notify_trade_state_persistence_issue = Mock()
+
             system.exchange_api = SimpleNamespace(
                 create_stop_loss_order=Mock(return_value={'id': 'stop-new'}),
                 cancel_stop_order_only=Mock(return_value=True),
-                find_stop_order_state=Mock(
-                    side_effect=RuntimeError('完整算法单清单暂不可用')),
+                find_stop_order_state=Mock(side_effect=[
+                    'intact', RuntimeError('完整算法单清单暂不可用')]),
             )
 
             protected = system._ensure_stop_order_alive(
@@ -555,6 +756,96 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
             self.assertFalse(protected)
             self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertEqual(
+                2, system.exchange_api.find_stop_order_state.call_count)
+
+    def test_exact_pending_stop_settles_ledger_without_exchange_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(temp_dir)
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertTrue(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-old', position['stop_order_id'])
+            self.assertEqual(0.6, position['stop_order_size'])
+            self.assertFalse(position['stop_resize_pending'])
+            system.exchange_api.create_stop_loss_order.assert_not_called()
+            system.exchange_api.cancel_stop_order_only.assert_not_called()
+
+    def test_exact_adoptable_stop_is_adopted_and_settled_in_one_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(temp_dir)
+            system.exchange_api.find_stop_order_state.return_value = {
+                'state': 'adoptable', 'order_id': 'stop-adopted'}
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertTrue(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-adopted', position['stop_order_id'])
+            self.assertEqual(0.6, position['stop_order_size'])
+            self.assertFalse(position['stop_resize_pending'])
+            system.exchange_api.create_stop_loss_order.assert_not_called()
+            system.exchange_api.cancel_stop_order_only.assert_not_called()
+
+    def test_oversized_pending_stop_still_resizes_make_before_break(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(
+                temp_dir, stop_size=1.0)
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertTrue(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-new', position['stop_order_id'])
+            self.assertEqual(0.6, position['stop_order_size'])
+            self.assertFalse(position['stop_resize_pending'])
+            system.exchange_api.create_stop_loss_order.assert_called_once()
+            system.exchange_api.cancel_stop_order_only.assert_called_once_with(
+                'BTC/USDT:USDT', 'stop-old')
+
+    def test_exact_pending_but_missing_stop_still_replants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(temp_dir)
+            system.exchange_api.find_stop_order_state.return_value = 'missing'
+            system.exchange_api.find_stop_order_state.side_effect = [
+                'missing', 'intact']
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertTrue(protected)
+            self.assertEqual(
+                'stop-new',
+                system.trade_state.get_open_position(
+                    'BTCUSDT')['stop_order_id'])
+            system.exchange_api.create_stop_loss_order.assert_called_once()
+            self.assertEqual(
+                2, system.exchange_api.find_stop_order_state.call_count)
+
+    def test_fresh_residue_defers_exact_pending_ledger_settlement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(
+                temp_dir, residue=True)
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertTrue(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertTrue(position['stop_resize_pending'])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            system.exchange_api.create_stop_loss_order.assert_not_called()
+            system.exchange_api.cancel_stop_order_only.assert_not_called()
 
     def test_resize_retry_clears_old_ids_then_full_list_releases_residue(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -574,10 +865,15 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 notify_error=Mock(), send_message=Mock())
             system._notify_trade_state_persistence_issue = Mock()
             system.exchange_api = SimpleNamespace(
-                create_stop_loss_order=Mock(return_value={'id': 'stop-new'}),
+                create_stop_loss_order=Mock(
+                    side_effect=AssertionError('已有余仓主止损时不得再 POST')),
                 cancel_stop_order_only=Mock(return_value=True),
-                find_stop_order_state=Mock(return_value='intact'),
+                find_stop_order_state=Mock(),
             )
+            system.exchange_api.find_stop_order_state.side_effect = [
+                {'state': 'resize_cleanup', 'order_ids': ['stop-old']},
+                'intact',
+            ]
 
             protected = system._ensure_stop_order_alive(
                 'BTCUSDT', 'BTC/USDT:USDT',
@@ -588,6 +884,98 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertFalse(position['stop_resize_pending'])
             self.assertEqual([], position['extra_stop_order_ids'])
             self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+            system.exchange_api.create_stop_loss_order.assert_not_called()
+            system.exchange_api.cancel_stop_order_only.assert_called_once_with(
+                'BTC/USDT:USDT', 'stop-old')
+
+    def test_resize_cleanup_cancel_failure_keeps_exact_old_id_pending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = _GuardianSystem()
+            system.trade_state = TradeState(
+                str(Path(temp_dir) / 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 0.6, 90.0, 'stop-new',
+                strategy='ma_cross')
+            system.trade_state.update_stop_loss(
+                'BTCUSDT', 90.0, 'stop-new', stop_order_size=0.6,
+                extra_stop_order_ids=['stop-old'], stop_resize_pending=True)
+            system.trade_state.mark_stop_residue('BTCUSDT')
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            system._stop_anomalies = {}
+            system.notifier = SimpleNamespace(
+                notify_error=Mock(), send_message=Mock())
+            system._notify_trade_state_persistence_issue = Mock()
+            system.exchange_api = SimpleNamespace(
+                create_stop_loss_order=Mock(
+                    side_effect=AssertionError('不得重复 POST')),
+                cancel_stop_order_only=Mock(return_value=False),
+                find_stop_order_state=Mock(return_value={
+                    'state': 'resize_cleanup',
+                    'order_ids': ['stop-old'],
+                }),
+            )
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertFalse(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertTrue(position['stop_resize_pending'])
+            self.assertEqual(['stop-old'], position['extra_stop_order_ids'])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            system.exchange_api.create_stop_loss_order.assert_not_called()
+
+    def test_resize_cleanup_second_query_failure_keeps_residue_and_quarantine(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = _GuardianSystem()
+            system.trade_state = TradeState(
+                str(Path(temp_dir) / 'trade_state.json'))
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 0.6, 90.0, 'stop-new',
+                strategy='ma_cross')
+            system.trade_state.update_stop_loss(
+                'BTCUSDT', 90.0, 'stop-new', stop_order_size=0.6,
+                extra_stop_order_ids=['stop-old'], stop_resize_pending=True)
+            system.trade_state.mark_stop_residue('BTCUSDT')
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            system._stop_anomalies = {}
+            system.notifier = SimpleNamespace(
+                notify_error=Mock(), send_message=Mock())
+            system._notify_trade_state_persistence_issue = Mock()
+
+            def quarantine(symbol, reason, details=None,
+                           stop_residue_possible=False):
+                system.trade_state.mark_position_quarantine(
+                    symbol, reason, details)
+                if (stop_residue_possible and
+                        not system.trade_state.has_stop_residue(symbol)):
+                    system.trade_state.mark_stop_residue(symbol)
+
+            system._quarantine_position_mismatch = quarantine
+            system.exchange_api = SimpleNamespace(
+                create_stop_loss_order=Mock(
+                    side_effect=AssertionError('不得重复 POST')),
+                cancel_stop_order_only=Mock(return_value=True),
+                find_stop_order_state=Mock(side_effect=[
+                    {'state': 'resize_cleanup',
+                     'order_ids': ['stop-old']},
+                    RuntimeError('second snapshot unavailable'),
+                ]),
+            )
+
+            protected = system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA')
+
+            self.assertFalse(protected)
+            position = system.trade_state.get_open_position('BTCUSDT')
+            self.assertFalse(position['stop_resize_pending'])
+            self.assertEqual([], position['extra_stop_order_ids'])
+            self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertTrue(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
+            system.exchange_api.create_stop_loss_order.assert_not_called()
 
     def test_uncancelled_old_stop_is_tracked_as_extra_residue(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -597,7 +985,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 'remaining_amount': 0.6, 'fully_closed': False,
             }
 
-            self.assertTrue(system._handle_partial_close(
+            self.assertFalse(system._handle_partial_close(
                 'BTCUSDT', order, system.trade_state.get_open_position('BTCUSDT'),
                 '测试平仓'))
 
@@ -625,14 +1013,14 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             remaining = system.trade_state.get_open_position('BTCUSDT')['position_size']
             self.assertEqual(Decimal('1'), Decimal(str(remaining)) / Decimal('0.0001'))
 
-    def test_second_partial_close_preserves_all_older_stop_residue_ids(self):
+    def test_second_partial_close_known_oversized_stops_can_reconverge(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             system = self._system(temp_dir, old_cancel=False)
             first = {
                 'id': 'close-1', 'average': 105.0, 'amount': 0.2,
                 'remaining_amount': 0.8, 'fully_closed': False,
             }
-            self.assertTrue(system._handle_partial_close(
+            self.assertFalse(system._handle_partial_close(
                 'BTCUSDT', first, system.trade_state.get_open_position('BTCUSDT'),
                 '第一次部分平仓'))
 
@@ -642,7 +1030,7 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 'id': 'close-2', 'average': 106.0, 'amount': 0.2,
                 'remaining_amount': 0.6, 'fully_closed': False,
             }
-            self.assertTrue(system._handle_partial_close(
+            self.assertFalse(system._handle_partial_close(
                 'BTCUSDT', second, system.trade_state.get_open_position('BTCUSDT'),
                 '第二次部分平仓'))
 
@@ -652,6 +1040,142 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
             self.assertEqual(
                 1, system.exchange_api.create_stop_loss_order.call_count)
+
+            # 完整清单若严格证明只有账本已知的 oversized reduce-only 集合，
+            # guardian 越过可见窗后可重新挂精确余仓止损并只撤已知旧单。
+            guardian = _GuardianSystem()
+            guardian.trade_state = system.trade_state
+            guardian.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            guardian._stop_residue_runtime_not_before = {}
+            guardian._stop_anomalies = {}
+            guardian.label = '测试'
+            guardian.notifier = SimpleNamespace(
+                notify_error=Mock(), send_message=Mock())
+            guardian._notify_trade_state_persistence_issue = Mock()
+            guardian.exchange_api = SimpleNamespace(
+                find_stop_order_state=Mock(side_effect=[
+                    {'state': 'resize_needed'}, 'intact']),
+                create_stop_loss_order=Mock(return_value={'id': 'stop-final'}),
+                cancel_stop_order_only=Mock(return_value=True),
+            )
+
+            self.assertTrue(guardian._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                guardian.trade_state.get_open_position('BTCUSDT'), '双均线 EMA'))
+            converged = guardian.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-final', converged['stop_order_id'])
+            self.assertEqual(0.6, converged['stop_order_size'])
+            self.assertEqual([], converged['extra_stop_order_ids'])
+            self.assertFalse(converged['stop_resize_pending'])
+            self.assertFalse(guardian.trade_state.has_stop_residue('BTCUSDT'))
+
+    def test_late_exact_stop_is_recovered_by_deterministic_id_before_cleanup(self):
+        """确认超时的精确新止损只能只读找回，不能因旧单仍在而永久隔离。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(
+                temp_dir, stop_order_id='stop-old', stop_size=1.0,
+                residue=True)
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            system._stop_residue_runtime_not_before = {}
+            system.exchange_api.create_stop_loss_order = Mock(
+                return_value={'id': 'stop-late-exact'})
+            system.exchange_api.find_stop_order_state.side_effect = [
+                {'state': 'resize_cleanup', 'order_ids': ['stop-old']},
+                'intact',
+            ]
+
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA'))
+
+            system.exchange_api.create_stop_loss_order.assert_called_once_with(
+                'BTC/USDT:USDT', 'long', 0.6, 90.0,
+                require_existing=True)
+            converged = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-late-exact', converged['stop_order_id'])
+            self.assertEqual(0.6, converged['stop_order_size'])
+            self.assertEqual([], converged['extra_stop_order_ids'])
+            self.assertFalse(converged['stop_resize_pending'])
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+
+    def test_evidence_bearing_stop_states_reject_bare_strings(self):
+        for malformed in ('adoptable', 'resize_cleanup', 'resize_needed'):
+            with self.subTest(state=malformed), tempfile.TemporaryDirectory() as temp_dir:
+                system = self._guardian_with_pending_stop(
+                    temp_dir, stop_order_id='stop-main', stop_size=1.0)
+                system.trade_state.update_stop_loss(
+                    'BTCUSDT', 90.0, 'stop-main', stop_order_size=1.0,
+                    stop_resize_pending=True,
+                    extra_stop_order_ids=['stop-extra'],
+                )
+                system.exchange_api.find_stop_order_state.return_value = malformed
+
+                self.assertFalse(system._ensure_stop_order_alive(
+                    'BTCUSDT', 'BTC/USDT:USDT',
+                    system.trade_state.get_open_position('BTCUSDT'),
+                    '双均线 EMA',
+                ))
+                system.exchange_api.create_stop_loss_order.assert_not_called()
+
+    def test_new_system_close_is_blocked_while_stop_write_is_unresolved(self):
+        """不得用第二笔主动平仓改变未知止损所绑定的精确余仓内容。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._system(temp_dir)
+            system.trade_state.update_stop_loss(
+                'BTCUSDT', 90.0, 'stop-old', stop_order_size=1.0,
+                stop_resize_pending=True)
+            system.trade_state.mark_stop_residue('BTCUSDT')
+            system.exchange_api.close_position = Mock(
+                side_effect=AssertionError('不得发送第二笔主动平仓'))
+
+            result = system._submit_persisted_close(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'),
+                '未决止损期间测试')
+
+            self.assertIsNone(result)
+            self.assertIsNone(system.trade_state.get_close_intent('BTCUSDT'))
+            system.exchange_api.close_position.assert_not_called()
+
+    def test_resize_retry_unknown_post_is_recovered_with_existing_extras(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            system = self._guardian_with_pending_stop(
+                temp_dir, stop_order_id='stop-main', stop_size=0.8,
+                residue=True)
+            system.trade_state.update_stop_loss(
+                'BTCUSDT', 90.0, 'stop-main', stop_order_size=0.8,
+                extra_stop_order_ids=['stop-old'],
+                stop_resize_pending=True)
+            system.STOP_RESIDUE_VISIBILITY_GRACE_SECONDS = 0
+            system._stop_residue_runtime_not_before = {}
+
+            def create_stop(*_args, **kwargs):
+                if kwargs.get('require_existing') is True:
+                    return {'id': 'stop-late-exact'}
+                return None
+
+            system.exchange_api.create_stop_loss_order.side_effect = create_stop
+            system.exchange_api.find_stop_order_state.side_effect = [
+                {'state': 'resize_needed'},
+                {'state': 'resize_cleanup',
+                 'order_ids': ['stop-main', 'stop-old']},
+                'intact',
+            ]
+
+            self.assertFalse(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA'))
+            self.assertTrue(system._ensure_stop_order_alive(
+                'BTCUSDT', 'BTC/USDT:USDT',
+                system.trade_state.get_open_position('BTCUSDT'), '双均线 EMA'))
+
+            converged = system.trade_state.get_open_position('BTCUSDT')
+            self.assertEqual('stop-late-exact', converged['stop_order_id'])
+            self.assertEqual([], converged['extra_stop_order_ids'])
+            self.assertFalse(converged['stop_resize_pending'])
+            self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
+            self.assertEqual(
+                2, system.exchange_api.cancel_stop_order_only.call_count)
 
     def test_runtime_only_partial_reconciliation_is_not_reported_as_durable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -676,7 +1200,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             path = str(Path(temp_dir) / 'trade_state.json')
             system.trade_state = TradeState(path)
             system.trade_state.replace_stop_loss_dates({'BTCUSDT': '2026-07-10'})
-            system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
             system.exchange_api = SimpleNamespace(
                 get_last_price=Mock(return_value=102.0),
                 create_stop_loss_order=Mock(return_value={'id': 'stop-emergency'}),
@@ -713,7 +1236,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertEqual(['close-1'], position['partial_closes'][0]['exit_order_ids'])
             self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
             self.assertNotIn('BTCUSDT', system.trade_state.get_stop_loss_dates())
-            self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             reloaded = TradeState(path)
             self.assertEqual(
                 0.4, reloaded.get_open_position('BTCUSDT')['position_size'])
@@ -1092,6 +1614,9 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertEqual(
                 'RMISSINGROLLBACK1',
                 intent['unresolved_execution']['compensation_client_order_id'])
+            self.assertEqual(
+                1.0,
+                intent['unresolved_execution']['compensation_requested_size'])
             system.exchange_api.create_stop_loss_order.assert_called_once()
             system.exchange_api.open_position.assert_not_called()
             system.exchange_api.close_position.assert_not_called()
@@ -1144,7 +1669,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
             state.replace_stop_loss_dates({'BTCUSDT': '2026-07-10'})
             system.trade_state = state
-            system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
             rollback = {
                 'id': 'close-partial', 'average': 99.0,
                 'confirmed': True, 'fully_closed': False, 'amount': 0.6,
@@ -1191,7 +1715,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertEqual(0.02, position['partial_closes'][0]['exit_fee'])
             self.assertTrue(state.is_position_quarantined('BTCUSDT'))
             self.assertNotIn('BTCUSDT', state.get_stop_loss_dates())
-            self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             system.exchange_api.create_stop_loss_order.assert_not_called()
             system._cancel_stop_order_confirmed.assert_not_called()
             system._notify_trade_state_persistence_issue.assert_called_once()
@@ -1209,14 +1732,13 @@ class PartialCloseReconciliationTest(unittest.TestCase):
             self.assertNotIn(
                 'BTCUSDT', TradeState(state.state_file).get_stop_loss_dates())
 
-    def test_successful_open_syncs_in_memory_t1_mirror_without_second_save(self):
+    def test_successful_open_atomically_clears_authoritative_t1(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             system = _System()
             system.trade_state = TradeState(
                 str(Path(temp_dir) / 'trade_state.json'))
             system.trade_state.replace_stop_loss_dates(
                 {'BTCUSDT': '2026-07-10'})
-            system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
             system.notifier = SimpleNamespace(notify_error=Mock())
             system.exchange_api = SimpleNamespace()
             self._observe_exact_position(system, 1.0)
@@ -1226,7 +1748,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 90.0, 'stop-1', strategy='ma_cross',
                 open_order={'id': 'open-1', 'average': 100.0}))
 
-            self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             self.assertNotIn(
                 'BTCUSDT', system.trade_state.get_stop_loss_dates())
 
@@ -1242,7 +1763,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                  'stop_loss_price': 90.0},
                 planned_position_size=1.0)
             system.trade_state = state
-            system.stop_loss_dates = {'BTCUSDT': '2026-07-10'}
             system.exchange_api = SimpleNamespace(
                 get_position=Mock(return_value={
                     'side': 'long', 'contracts': 1.0}),
@@ -1274,7 +1794,6 @@ class PartialCloseReconciliationTest(unittest.TestCase):
                 'stop-1', state.get_open_position('BTCUSDT')['stop_order_id'])
             self.assertIsNone(state.get_open_intent('BTCUSDT'))
             self.assertNotIn('BTCUSDT', state.get_stop_loss_dates())
-            self.assertNotIn('BTCUSDT', system.stop_loss_dates)
             reloaded = TradeState(state.state_file)
             self.assertEqual(
                 'stop-1', reloaded.get_open_position('BTCUSDT')[
@@ -1291,7 +1810,9 @@ class PartialCloseReconciliationTest(unittest.TestCase):
 
 
 class SingleCompensationOrderFinalizationTest(unittest.TestCase):
-    def _provisional_state(self, temp_dir, position_size=1.0):
+    def _provisional_state(
+            self, temp_dir, position_size=1.0,
+            compensation_requested_size=None):
         state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
         state.prepare_open_intent(
             'BTCUSDT', 'ma_cross', 'long', 'ISINGLECLOSE123',
@@ -1300,7 +1821,8 @@ class SingleCompensationOrderFinalizationTest(unittest.TestCase):
             planned_position_size=position_size)
         state.mark_open_intent_unresolved_execution(
             'BTCUSDT', 'ISINGLECLOSE123', 'open_compensation', position_size,
-            compensation_client_order_id='RSINGLECLOSE123')
+            compensation_client_order_id='RSINGLECLOSE123',
+            compensation_requested_size=compensation_requested_size)
         state.add_untracked_open_position(
             symbol='BTCUSDT', side='long', entry_price=100.0,
             position_size=position_size, stop_loss_price=90.0,
@@ -1354,6 +1876,24 @@ class SingleCompensationOrderFinalizationTest(unittest.TestCase):
             self.assertEqual(['close-full'], closed['exit_order_ids'])
             self.assertNotIn('partial_closes', closed)
             TradeState.validate_state(TradeState(state.state_file).state)
+
+    def test_compensation_fill_cannot_exceed_persisted_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = self._provisional_state(
+                temp_dir, compensation_requested_size=0.5)
+
+            with self.assertRaisesRegex(
+                    TradeStatePersistenceError, '超过持久化请求量'):
+                state.finalize_unresolved_open_execution(
+                    'BTCUSDT', 'ISINGLECLOSE123', 100.0, 0.4,
+                    {'id': 'close-too-large', 'amount': 0.6,
+                     'price': 99.0, 'fee': 0.02},
+                    entry_order_id='open-1')
+
+            self.assertIsNotNone(state.get_open_intent('BTCUSDT'))
+            self.assertFalse(
+                state.get_open_position('BTCUSDT')[
+                    'execution_recovery_finalized'])
 
     def test_zero_fill_uses_none_and_consumes_lifecycle_without_financial_close(self):
         with tempfile.TemporaryDirectory() as temp_dir:

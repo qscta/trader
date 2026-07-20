@@ -8,7 +8,8 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / risk_manager / config /
-record_stop_loss / _cancel_stop_order_confirmed /
+health_snapshot /
+_cancel_stop_order_confirmed /
 _close_trade_state_with_runtime_fallback / _update_trade_state_stop_with_runtime_fallback /
 _buffer_trade_open_notification / _buffer_trade_close_notification /
 。
@@ -23,13 +24,20 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from config_validation import strict_float_finite
-from runtime_guard import maintenance_sentinel_active, maintenance_sentinel_path
+from runtime_guard import (
+    maintenance_sentinel_active,
+    maintenance_sentinel_path,
+    opening_supervision_ready,
+    t1_reentry_blocked,
+)
 from trade_state import (
     TradeStateCommitDurabilityError,
     TradeStatePersistenceError,
 )
 
 logger = logging.getLogger(__name__)
+
+MA_FLIP_CLOSE_CONTEXT = '双均线翻转平仓'
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,55 @@ class TradeExecutorMixin:
             'status': 'maintenance_blocked',
             'sentinel_path': path,
         } if maintenance_sentinel_active(path) else None
+
+    def _opening_runtime_block(self, symbol):
+        """统一的 fail-closed 开仓门；入口、慢 I/O 后与 POST 紧前复用。"""
+        maintenance_gate = self._maintenance_open_gate_status()
+        if maintenance_gate is not None:
+            logger.warning(
+                f'{symbol} 部署禁开仓哨兵存在、路径非法或状态不可确认 '
+                f"({maintenance_gate.get('sentinel_path')!r})，按 fail-closed 阻断任何新开仓")
+            return maintenance_gate
+
+        try:
+            runtime_health = self.health_snapshot()
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 无法读取开仓托管状态，中央边界禁开仓: {exc}')
+            return {'status': 'state_blocked'}
+        if not opening_supervision_ready(runtime_health):
+            logger.critical(
+                f'{symbol} scheduler/guardian 不可证明可托管新仓，中央边界禁开仓')
+            return {'status': 'state_blocked'}
+
+        try:
+            persistence = self.trade_state.get_runtime_persistence_status()
+            if (not isinstance(persistence, dict) or
+                    set(persistence) != {'degraded', 'context'} or
+                    not isinstance(persistence.get('degraded'), bool) or
+                    persistence.get('degraded')):
+                logger.critical(
+                    f'{symbol} 持久化健康状态降级或不可验证，中央边界禁开仓: '
+                    f'{persistence!r}')
+                return {'status': 'state_blocked'}
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 无法读取持久化健康状态，中央边界禁开仓: {exc}')
+            return {'status': 'state_blocked'}
+
+        try:
+            stopped_on = self.trade_state.get_stop_loss_date(symbol)
+            blocked = t1_reentry_blocked(
+                stopped_on, date.today().isoformat())
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 无法裁决 T+1 状态，中央边界禁开仓: {exc}')
+            return {'status': 'state_blocked'}
+        if blocked:
+            logger.warning(
+                f'{symbol} 止损日期尚未早于今天，中央边界执行 T+1 禁开仓')
+            return {'status': 't1_blocked'}
+        return None
 
     @staticmethod
     def _order_ids(order):
@@ -382,6 +439,32 @@ class TradeExecutorMixin:
         }
 
     @staticmethod
+    def _validate_absent_compensation_discovery(
+            progress, expected_client_order_id):
+        """严格验证不知请求量时的确定性 clOrdId absent 契约。"""
+        required = {
+            'terminal', 'absent', 'confirmed', 'filled', 'amount',
+            'requested_amount', 'remaining_amount', 'clientOrderId',
+            'ids', 'read_only_evidence', 'order', 'order_state',
+        }
+        if not isinstance(progress, dict) or set(progress) != required:
+            raise ValueError('补偿订单发现 absent 契约字段非法')
+        expected_top = {
+            'terminal': None, 'absent': True, 'confirmed': False,
+            'filled': 0.0, 'amount': 0.0,
+            'requested_amount': None, 'remaining_amount': None,
+            'clientOrderId': expected_client_order_id,
+            'ids': [], 'read_only_evidence': True, 'order': None,
+        }
+        if any(progress.get(key) != value for key, value in expected_top.items()):
+            raise ValueError('补偿订单发现 absent 契约自相矛盾')
+        if progress.get('order_state') != {
+                'client_order_id': expected_client_order_id,
+                'presence': 'absent', 'terminal': None, 'filled': None}:
+            raise ValueError('补偿订单发现 absent 存在性证据非法')
+        return True
+
+    @staticmethod
     def _extract_usdt_fee(order):
         """仅返回可直接计入 USDT 盈亏的交易所真实手续费。"""
         if not isinstance(order, dict) or order.get('execution_ambiguous'):
@@ -469,6 +552,47 @@ class TradeExecutorMixin:
             return 'partial' if remaining > 0 else 'unresolved'
         return 'unresolved'
 
+    def _full_compensation_request_amount(
+            self, compensation, expected_client_order_id):
+        """Return the proven request size without requiring financial fields."""
+        if (not isinstance(compensation, dict) or
+                compensation.get('confirmed') is not True or
+                compensation.get('fully_closed') is not True or
+                compensation.get('execution_ambiguous') is True):
+            return None
+        remaining = compensation.get('remaining_amount')
+        if isinstance(remaining, bool):
+            return None
+        try:
+            remaining = float(remaining)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(remaining) or remaining != 0.0:
+            return None
+        filled_amount = self._order_actual_amount(compensation, None)
+        requested_amount = self._order_actual_amount(
+            {'amount': compensation.get('requested_amount')},
+            filled_amount)
+        if filled_amount is None or requested_amount is None:
+            return None
+        tolerance = max(
+            1e-12,
+            math.ulp(max(filled_amount, requested_amount, 1.0)) * 8)
+        if abs(filled_amount - requested_amount) > tolerance:
+            return None
+        observed_client_id = compensation.get('clientOrderId')
+        observed_client_ids = compensation.get('clientOrderIds')
+        if (observed_client_id in (None, '') and
+                observed_client_ids is None):
+            return None
+        if (observed_client_id not in (None, '') and
+                observed_client_id != expected_client_order_id):
+            return None
+        if (observed_client_ids is not None and
+                observed_client_ids != [expected_client_order_id]):
+            return None
+        return requested_amount
+
     def _handle_unproven_close_execution(
             self, symbol, close_order, context):
         """保留仓位、止损和 close intent，并持久化隔离未证明的平仓回包。"""
@@ -494,6 +618,24 @@ class TradeExecutorMixin:
 
     def _submit_persisted_close(self, symbol, ccxt_symbol, position, context):
         """先落盘 close intent，再用固定 clOrdId 执行/恢复主动平仓。"""
+        try:
+            existing_intent = self.trade_state.get_close_intent(symbol)
+            current = self.trade_state.get_open_position(symbol) or position
+            unsettled_stop = (
+                not existing_intent and isinstance(current, dict) and
+                (current.get('stop_resize_pending') is True or
+                 bool(current.get('extra_stop_order_ids')) or
+                 self.trade_state.has_stop_residue(symbol)))
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} 新平仓前无法证明止损写入已收口，拒绝 POST: {exc}')
+            return None
+        if unsettled_stop:
+            logger.critical(
+                f'{symbol} 仍有未收口止损写入/缩量；拒绝发起新的主动平仓，'
+                '避免改变未知止损绑定的余仓内容。已有 close intent 的只读恢复不受影响')
+            return None
+
         candidate_id = f'C{uuid.uuid4().hex[:31]}'
         try:
             intent = self.trade_state.prepare_close_intent(
@@ -655,14 +797,6 @@ class TradeExecutorMixin:
                 return None
         return date.today().strftime('%Y-%m-%d')
 
-    def _sync_stop_trigger_date(self, symbol, stop_loss_date):
-        """主账本事务完成后，仅同步旧的进程内 T+1 镜像。"""
-        if stop_loss_date is None:
-            return
-        in_memory_dates = getattr(self, 'stop_loss_dates', None)
-        if isinstance(in_memory_dates, dict):
-            in_memory_dates[symbol] = stop_loss_date
-
     def _resume_persisted_close_intent(self, symbol, position, context):
         """在常规仓位对账前恢复主动平仓，返回 none/partial/closed/unresolved。"""
         intent = self.trade_state.get_close_intent(symbol)
@@ -714,7 +848,10 @@ class TradeExecutorMixin:
         exit_fee, exit_fee_currency = self._extract_usdt_fee(close_order)
         stop_loss_date = (
             self._stop_trigger_close_date(symbol)
-            if close_order.get('stop_triggered_before_post') is True else None)
+            if (close_order.get('stop_triggered_before_post') is True or
+                (intent_context == MA_FLIP_CLOSE_CONTEXT and
+                 not stop_cleared))
+            else None)
         closed, state_saved = self._close_trade_state_with_runtime_fallback(
             symbol, actual_exit, f'{context} close intent 恢复',
             exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
@@ -724,7 +861,6 @@ class TradeExecutorMixin:
             exit_price_source=close_order.get('exit_price_source'))
         if not closed or not state_saved:
             return 'unresolved'
-        self._sync_stop_trigger_date(symbol, stop_loss_date)
         logger.critical(
             f'{symbol} {context}已按单笔平仓订单恢复真实退出并原子消费 close intent')
         if not stop_cleared:
@@ -761,27 +897,21 @@ class TradeExecutorMixin:
                 f'{symbol} close intent 未决期间保护维护失败: {exc}')
             return False
 
-    def _compensation_close_client_id(self, open_order=None, fallback=None):
-        open_client_id = None
-        if isinstance(open_order, dict):
-            open_client_id = (
-                open_order.get('clientOrderId') or
-                open_order.get('client_order_id'))
-        open_client_id = open_client_id or fallback
-        if not open_client_id:
-            return None
-        return self.exchange_api.compensation_client_order_id(open_client_id)
-
     def _submit_compensation_close(
             self, ccxt_symbol, side, amount, open_order=None,
             open_client_order_id=None):
         """开仓回滚使用由持久化开仓 clOrdId 派生的固定平仓句柄。"""
-        close_id = self._compensation_close_client_id(
-            open_order, open_client_order_id)
-        if close_id is None:
+        open_client_id = open_client_order_id
+        if isinstance(open_order, dict):
+            open_client_id = (
+                open_order.get('clientOrderId') or
+                open_order.get('client_order_id') or open_client_id)
+        if not open_client_id:
             logger.critical(
                 f'{ccxt_symbol} 开仓结果缺少持久化 clOrdId，拒绝无句柄补偿 POST')
             return None
+        close_id = self.exchange_api.compensation_client_order_id(
+            open_client_id)
         return self.exchange_api.close_position(
             ccxt_symbol, side, amount, client_order_id=close_id)
 
@@ -794,7 +924,7 @@ class TradeExecutorMixin:
         """
         if not open_client_order_id:
             return None
-        result = self.exchange_api.find_compensation_close_evidence(
+        result = self.exchange_api.find_compensation_close_progress(
             ccxt_symbol, side, amount, open_client_order_id)
         if (not isinstance(result, dict) or
                 result.get('execution_ambiguous') or
@@ -940,19 +1070,27 @@ class TradeExecutorMixin:
         if not updated:
             self._reject_partial_close(symbol, close_order, context)
             return False
+        stop_write_complete = False
         if (state_saved and isinstance(new_stop, dict) and
                 not stop_resize_pending and not extra_stop_ids):
-            # 新 ID/余仓尺寸已耐久落账且全部旧单已验证撤销，方可消费写句柄。
-            self._complete_stop_write(symbol, f'{context}部分平仓止损缩量')
+            # 新 ID/余仓尺寸已耐久落账、旧单已验撤且完整清单仅剩主止损，
+            # 方可消费写句柄。
+            stop_write_complete = self._complete_stop_write(
+                symbol, ccxt_symbol, f'{context}部分平仓止损缩量')
 
+        if stop_resize_pending:
+            stop_status = '等待缩量重试'
+        elif stop_write_complete is True:
+            stop_status = '已通过完整清单复核'
+        else:
+            stop_status = '已落账但完整清单尚未证明唯一精确保护'
         msg = (f'{symbol} {context}仅部分成交：已平 {closed_size}币，余仓 {remaining}币；'
-               f'账本已按现实缩减，余仓止损'
-               f'{"等待缩量重试" if stop_resize_pending else "已重新挂妥"}')
+               f'账本已按现实缩减，余仓止损{stop_status}')
         logger.critical(msg)
         self.notifier.notify_error(msg)
         # 磁盘提交失败时，force_runtime_* 只保证本进程内不再误删/反手；重启后仍需
         # 对账，因此不能向 API 谎报 safely_reconciled=True。
-        return state_saved
+        return state_saved and stop_write_complete is True
 
     def _flip_position(self, symbol, signal, old_position, new_side, symbol_config):
         """双均线策略：翻转仓位（平旧开新）"""
@@ -960,7 +1098,7 @@ class TradeExecutorMixin:
         ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
 
         close_order = self._submit_persisted_close(
-            symbol, ccxt_symbol, old_position, '双均线翻转平仓')
+            symbol, ccxt_symbol, old_position, MA_FLIP_CLOSE_CONTEXT)
         if not close_order:
             logger.error(f"{symbol} [双均线] 翻转平仓失败")
             self.notifier.notify_error(f"{symbol} [双均线] 翻转平仓失败")
@@ -993,9 +1131,9 @@ class TradeExecutorMixin:
         stop_loss_date = (
             self._stop_trigger_close_date(
                 symbol, retired_from_pool=retired_from_pool)
-            if stop_triggered_before_post else None)
+            if stop_triggered_before_post or not stop_cleared else None)
         closed_position, state_saved = self._close_trade_state_with_runtime_fallback(
-            symbol, actual_exit, "双均线翻转平仓",
+            symbol, actual_exit, MA_FLIP_CLOSE_CONTEXT,
             exit_fee=exit_fee, exit_fee_currency=exit_fee_currency,
             exit_order_ids=self._order_ids(close_order),
             stop_loss_date=stop_loss_date,
@@ -1011,8 +1149,6 @@ class TradeExecutorMixin:
 
         if not state_saved:
             return
-        self._sync_stop_trigger_date(symbol, stop_loss_date)
-
         if stop_triggered_before_post:
             logger.warning(
                 f'{symbol} [双均线] 保护止损在主动平仓 POST 前已成交；'
@@ -1023,8 +1159,7 @@ class TradeExecutorMixin:
             # 记入 T+1：次日日检开头会自动重试清理残留，清理确认后由 T+1 重入按当时
             # EMA 方向重新入场，恢复「永远在市」；清理仍失败则维持开仓阻断（已有告警）。
             if not retired_from_pool:
-                self.record_stop_loss(symbol)
-                logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已记录 T+1，残留清理确认后次日按 EMA 方向重入")
+                logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已与记平原子记录 T+1，残留清理确认后次日按 EMA 方向重入")
             else:
                 logger.error(
                     f"{symbol} [双均线] 退池仓已平，但旧止损撤销不可确认；"
@@ -1055,23 +1190,32 @@ class TradeExecutorMixin:
                 '双均线翻转反手开仓未成功；保留本根交叉等待日内重试，请复核交易所与日志')
             logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，保留交叉等待日内重试")
 
-    def _mark_open_rollback_quarantine(self, symbol, reason, details):
-        """持久化隔离；磁盘故障时至少在本进程内保持 fail-closed。"""
+    def _persist_safety_marker(
+            self, symbol, label, durable_method, runtime_method,
+            *args, **kwargs):
+        """安全标记优先落盘；失败时仅保住当前进程的 fail-closed。"""
         try:
-            self.trade_state.mark_position_quarantine(symbol, reason, details)
+            getattr(self.trade_state, durable_method)(*args, **kwargs)
             return True
         except Exception as exc:
-            logger.critical(f'{symbol} 紧急回滚隔离落盘失败: {exc}')
+            logger.critical(f'{symbol} {label}落盘失败: {exc}')
         try:
-            self.trade_state.force_runtime_mark_position_quarantine(
-                symbol, reason, details)
+            getattr(self.trade_state, runtime_method)(*args, **kwargs)
         except Exception as exc:
-            logger.critical(f'{symbol} 紧急回滚连运行时隔离也失败: {exc}')
+            logger.critical(f'{symbol} {label}运行时建立也失败: {exc}')
         return False
+
+    def _mark_open_rollback_quarantine(self, symbol, reason, details):
+        """持久化隔离；磁盘故障时至少在本进程内保持 fail-closed。"""
+        return self._persist_safety_marker(
+            symbol, '紧急回滚隔离', 'mark_position_quarantine',
+            'force_runtime_mark_position_quarantine',
+            symbol, reason, details)
 
     def _mark_unresolved_open_execution(
             self, symbol, client_order_id, kind, expected_position_size,
             reason, details=None, compensation_client_order_id=None,
+            compensation_requested_size=None,
             protective_stop_order_id=None, protective_stop_order_size=None):
         """把未终态开仓/补偿句柄升级为有恢复责任人的一等生命周期 blocker。"""
         if compensation_client_order_id is None and kind == 'open_compensation':
@@ -1085,36 +1229,21 @@ class TradeExecutorMixin:
                 return False
         kwargs = dict(
             compensation_client_order_id=compensation_client_order_id,
+            compensation_requested_size=compensation_requested_size,
             protective_stop_order_id=protective_stop_order_id,
             protective_stop_order_size=protective_stop_order_size,
             reason=reason, details=details)
-        try:
-            self.trade_state.mark_open_intent_unresolved_execution(
-                symbol, client_order_id, kind, expected_position_size,
-                **kwargs)
-            return True
-        except Exception as exc:
-            logger.critical(f'{symbol} 未决执行 blocker 落盘失败: {exc}')
-        try:
-            self.trade_state.force_runtime_mark_open_intent_unresolved_execution(
-                symbol, client_order_id, kind, expected_position_size,
-                **kwargs)
-        except Exception as exc:
-            logger.critical(f'{symbol} 未决执行 blocker 运行时建立也失败: {exc}')
-        return False
+        return self._persist_safety_marker(
+            symbol, '未决执行 blocker',
+            'mark_open_intent_unresolved_execution',
+            'force_runtime_mark_open_intent_unresolved_execution',
+            symbol, client_order_id, kind, expected_position_size, **kwargs)
 
     def _mark_possible_unknown_stop_residue(self, symbol):
         """创建结果不确定时阻断未来开仓；磁盘失败也保留运行时标记。"""
-        try:
-            self.trade_state.mark_stop_residue(symbol)
-            return True
-        except Exception as exc:
-            logger.critical(f'{symbol} 未知止损残留标记落盘失败: {exc}')
-        try:
-            self.trade_state.force_runtime_mark_stop_residue(symbol)
-        except Exception as exc:
-            logger.critical(f'{symbol} 未知止损残留运行时标记也失败: {exc}')
-        return False
+        return self._persist_safety_marker(
+            symbol, '未知止损残留标记', 'mark_stop_residue',
+            'force_runtime_mark_stop_residue', symbol)
 
     def _begin_stop_write(self, symbol):
         """在任何止损 POST 前持久化唯一的 make-before-write 句柄。
@@ -1185,8 +1314,29 @@ class TradeExecutorMixin:
         deadlines[symbol] = max(
             float(deadlines.get(symbol, 0.0)), time.monotonic() + grace)
 
-    def _complete_stop_write(self, symbol, context):
-        """仅由调用方在止损 ID/尺寸已持久化且旧单已验撤后消费句柄。"""
+    def _complete_stop_write(self, symbol, ccxt_symbol, context):
+        """Only clear a write marker after the full list proves one exact stop."""
+        try:
+            position = self.trade_state.get_open_position(symbol)
+            if not isinstance(position, dict):
+                raise RuntimeError('本地持仓不存在')
+            if (position.get('stop_resize_pending') is True or
+                    position.get('extra_stop_order_ids')):
+                raise RuntimeError('止损缩量仍有待清理状态')
+            state = self.exchange_api.find_stop_order_state(
+                ccxt_symbol, position.get('side'),
+                position.get('position_size'),
+                position.get('stop_loss_price'),
+                position.get('stop_order_id'))
+        except Exception as exc:
+            logger.critical(
+                f'{symbol} {context}完整止损清单复核失败；保留写入句柄: {exc}')
+            return False
+        if state != 'intact':
+            logger.critical(
+                f'{symbol} {context}完整止损清单未证明仅剩精确主止损 '
+                f'(state={state!r})；保留写入句柄')
+            return False
         try:
             self.trade_state.clear_stop_residue(symbol)
             deadlines = getattr(
@@ -1244,20 +1394,6 @@ class TradeExecutorMixin:
                 f'{symbol} 开仓已回滚但本地往返账目未落盘，已保留恢复句柄: {exc}')
         return outcome
 
-    def _partial_rollback_exit_price(self, ccxt_symbol, rollback, entry_price):
-        value = None if rollback.get('execution_ambiguous') else rollback.get('average')
-        try:
-            value = float(value) if value is not None else None
-        except (TypeError, ValueError):
-            value = None
-        if value is not None and math.isfinite(value) and value > 0:
-            return value
-        try:
-            value = float(self.exchange_api.get_last_price(ccxt_symbol))
-        except Exception:
-            value = float(entry_price)
-        return value if math.isfinite(value) and value > 0 else float(entry_price)
-
     def _reconcile_partial_open_rollback(
             self, symbol, ccxt_symbol, side, entry_price, original_size,
             stop_loss_price, strategy, open_order, rollback, context,
@@ -1312,8 +1448,7 @@ class TradeExecutorMixin:
         exit_fee, exit_fee_currency = self._extract_usdt_fee(rollback)
         entry_ids = self._order_ids(open_order)
         exit_ids = self._order_ids(rollback)
-        exit_price = self._partial_rollback_exit_price(
-            ccxt_symbol, rollback, entry_price)
+        exit_price = self._safe_fill_price(rollback, entry_price)
         stop_resize_pending = (
             not protected or
             abs(stop_order_size - remaining) > max(1e-15, math.ulp(original_size) * 8))
@@ -1374,11 +1509,9 @@ class TradeExecutorMixin:
             return None, False, protected
 
         if state_saved and rebuilt_stop:
-            self._complete_stop_write(symbol, f'{context}部分回滚余仓保护')
+            self._complete_stop_write(
+                symbol, ccxt_symbol, f'{context}部分回滚余仓保护')
 
-        in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-        if isinstance(in_memory_t1, dict):
-            in_memory_t1.pop(symbol, None)
         msg = (
             f'{symbol} {context}仅部分成交：交易所余仓={remaining}币，'
             f'账本已按实际余仓建立；'
@@ -1475,10 +1608,8 @@ class TradeExecutorMixin:
             logger.critical(f'{symbol} 未决完整余仓账本建立失败: {exc}')
             return None, False, protected
         if state_saved and rebuilt_stop:
-            self._complete_stop_write(symbol, f'{context}完整余仓保护')
-        in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-        if isinstance(in_memory_t1, dict):
-            in_memory_t1.pop(symbol, None)
+            self._complete_stop_write(
+                symbol, ccxt_symbol, f'{context}完整余仓保护')
         msg = (
             f'{symbol} {context}未成交/不可确认：完整余仓 {remaining}币已建账；'
             f'{"reduce-only 止损仍在/已重建" if protected else "应急止损无法建立"}，'
@@ -1572,7 +1703,8 @@ class TradeExecutorMixin:
             allow_stop_rebuild=True, stop_residue_possible=False,
             open_intent_client_id=None, requested_position_size=None,
             preserve_open_intent=False,
-            unresolved_execution_kind='open_compensation'):
+            unresolved_execution_kind='open_compensation',
+            compensation_requested_size=None):
         """统一裁决开仓后的补偿平仓，truthy 从不等于“已全平”。"""
         try:
             actual_open_size = float(original_size)
@@ -1602,14 +1734,16 @@ class TradeExecutorMixin:
             preserve_open_intent = True
         unresolved_marked = False
         if preserve_open_intent and open_intent_client_id is not None:
+            marker_expected_size = original_size
             unresolved_marked = bool(self._mark_unresolved_open_execution(
                 symbol, open_intent_client_id,
-                unresolved_execution_kind, original_size,
+                unresolved_execution_kind, marker_expected_size,
                 f'{context}的确定性执行终态尚未证明',
                 {'open_client_order_id': open_intent_client_id,
                  'remaining_amount': (
                      rollback.get('remaining_amount')
-                     if isinstance(rollback, dict) else None)}))
+                     if isinstance(rollback, dict) else None)},
+                compensation_requested_size=compensation_requested_size))
         try:
             normalized_entry = float(entry_price)
         except (TypeError, ValueError):
@@ -1962,9 +2096,6 @@ class TradeExecutorMixin:
                 stop_order_id, strategy=strategy,
                 entry_fee=entry_fee, entry_fee_currency=entry_fee_currency,
                 entry_order_ids=self._order_ids(open_order), **add_kwargs)
-            in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-            if isinstance(in_memory_t1, dict):
-                in_memory_t1.pop(symbol, None)
             return True
         except TradeStateCommitDurabilityError as exc:
             # 主账本 rename 已发生，且事务结果已经包含这笔真实持仓并消费
@@ -1979,9 +2110,6 @@ class TradeExecutorMixin:
                 logger.critical(
                     f'{symbol} 开仓账本报告已提交但缺少事务结果；'
                     '保持永久禁开仓且绝不重放补偿订单')
-            in_memory_t1 = getattr(self, 'stop_loss_dates', None)
-            if isinstance(in_memory_t1, dict):
-                in_memory_t1.pop(symbol, None)
             self._notify_trade_state_persistence_issue(
                 symbol, '开仓持仓落账', exc)
             if not committed_matches:
@@ -2044,45 +2172,9 @@ class TradeExecutorMixin:
         本边界只处理本调用新建的 open intent。崩溃恢复由 main 的
         只读 lifecycle 裁决器处理，不得重入本方法回放旧信号。
         """
-        maintenance_gate = self._maintenance_open_gate_status()
-        if maintenance_gate is not None:
-            no_open_path = maintenance_gate.get('sentinel_path')
-            logger.warning(
-                f'{symbol} 部署禁开仓哨兵存在、路径非法或状态不可确认 '
-                f'({no_open_path!r})，按 fail-closed 阻断任何新开仓')
-            return {'status': 'maintenance_blocked'}
-
-        # 目录 fsync 失败后的主账本虽然当前可见，但掉电后可能回退；该门闩
-        # 运行中不可清除。所有开仓入口必须在任何交易所 I/O 前统一拒绝。
-        try:
-            persistence = self.trade_state.get_runtime_persistence_status()
-            if (not isinstance(persistence, dict) or
-                    set(persistence) != {'degraded', 'context'} or
-                    not isinstance(persistence.get('degraded'), bool) or
-                    persistence.get('degraded')):
-                logger.critical(
-                    f'{symbol} 持久化健康状态降级或不可验证，中央边界禁开仓: '
-                    f'{persistence!r}')
-                return {'status': 'state_blocked'}
-        except Exception as exc:
-            logger.critical(
-                f'{symbol} 无法读取持久化健康状态，中央边界禁开仓: {exc}')
-            return {'status': 'state_blocked'}
-
-        # T+1 是系统级风险约束，不属于某个信号入口。直接读命脉账本，防止
-        # 即时开仓或未来新入口绕过当天止损标记；没有隐式人工 override。
-        try:
-            stop_loss_dates = self.trade_state.get_stop_loss_dates()
-            if not isinstance(stop_loss_dates, dict):
-                raise TypeError('stop_loss_dates 不是对象')
-            stopped_on = stop_loss_dates.get(symbol)
-        except Exception as exc:
-            logger.critical(
-                f'{symbol} 无法读取 T+1 状态，中央边界禁开仓: {exc}')
-            return {'status': 'state_blocked'}
-        if stopped_on == date.today().isoformat():
-            logger.warning(f'{symbol} 当天已有止损记录，中央边界执行 T+1 禁开仓')
-            return {'status': 't1_blocked'}
+        runtime_block = self._opening_runtime_block(symbol)
+        if runtime_block is not None:
+            return runtime_block
 
         retired = bool(
             symbol_config.get('_retired_from_pool') or
@@ -2127,7 +2219,7 @@ class TradeExecutorMixin:
             msg = f"{symbol} 存在撤销未确认的止损单残留，阻断本次开仓；待自动清理确认或人工核对欧易委托后恢复"
             logger.error(msg)
             self.notifier.notify_error(msg)
-            return
+            return {'status': 'state_blocked'}
         # 新开仓在任何下单查询前即拒绝坏止损。
         signal_stop_invalid = (
             (side == 'long' and stop_loss_price >= entry_price) or
@@ -2202,6 +2294,11 @@ class TradeExecutorMixin:
             logger.error(f"{symbol} 头寸大小无效: {position_size}")
             return
 
+        # 行情、余额和精度读取都可能阻塞；落 open intent 前重新证明托管仍健康。
+        runtime_block = self._opening_runtime_block(symbol)
+        if runtime_block is not None:
+            return runtime_block
+
         # 所有开仓入口在任何 POST 前统一新建 open intent + clOrdId +
         # 固化数量。旧 intent 已在上方阻断，本方法不接受外部句柄。
         generated_client_id = f'I{uuid.uuid4().hex[:31]}'
@@ -2223,9 +2320,28 @@ class TradeExecutorMixin:
         open_intent_client_id = client_order_id
         requested_position_size = float(position_size)
 
+        submission_block = None
+
+        def pre_submit_guard():
+            nonlocal submission_block
+            submission_block = self._opening_runtime_block(symbol)
+            return submission_block is None
+
         open_order = self.exchange_api.open_position(
             ccxt_symbol, side, position_size,
-            client_order_id=client_order_id)
+            client_order_id=client_order_id,
+            pre_submit_guard=pre_submit_guard)
+        if submission_block is not None:
+            try:
+                self.trade_state.resolve_open_intent(
+                    symbol, open_intent_client_id)
+            except Exception as exc:
+                logger.critical(
+                    f'{symbol} POST 前门禁已阻断，但未发单 intent 收口失败: {exc}')
+                self.notifier.notify_error(
+                    f'{symbol} POST 前已安全阻断开仓，但 open intent 收口失败，请检查账本')
+                return {'status': 'state_blocked'}
+            return submission_block
         if not open_order:
             logger.error(f"{symbol} 开仓失败")
             self.notifier.notify_error(f"{symbol} 开仓失败")
@@ -2303,16 +2419,49 @@ class TradeExecutorMixin:
                     {'client_order_id': open_order.get('clientOrderId'),
                      'order_id': open_order.get('id')})
                 return
+            compensation = open_order.get('compensation')
+            unresolved_kind = 'open'
+            compensation_id = None
+            compensation_requested_size = None
+            if compensation is not None:
+                compensation_id = (
+                    self.exchange_api.compensation_client_order_id(
+                        client_order_id))
+                compensation_requested_size = (
+                    self._full_compensation_request_amount(
+                        compensation, compensation_id))
+                if compensation_requested_size is None:
+                    self._mark_open_rollback_quarantine(
+                        symbol,
+                        '存活开仓回包携带的补偿订单未严格证明全平',
+                        {'client_order_id': open_order.get('clientOrderId'),
+                         'order_id': open_order.get('id')})
+                    return
+                if (compensation_requested_size is None or
+                        compensation_requested_size > position_size + max(
+                            1e-12,
+                            math.ulp(max(abs(position_size), 1.0)) * 8)):
+                    self._mark_open_rollback_quarantine(
+                        symbol, '存活开仓回包的补偿请求量非法',
+                        {'client_order_id': open_order.get('clientOrderId'),
+                         'order_id': open_order.get('id')})
+                    return
+                unresolved_kind = 'open_compensation'
             details = {
                 'client_order_id': open_order.get('clientOrderId'),
                 'order_id': open_order.get('id'),
                 'side': side, 'planned_position_size': position_size,
             }
+            if compensation_requested_size is not None:
+                details['compensation_requested_size'] = (
+                    compensation_requested_size)
             if not self._mark_unresolved_open_execution(
-                    symbol, client_order_id, 'open', position_size,
-                    '开仓订单未证明终态，当前零仓仍可能迟到成交', details):
+                    symbol, client_order_id, unresolved_kind, position_size,
+                    '开仓订单未证明终态，当前净仓仍可能迟到变化', details,
+                    compensation_client_order_id=compensation_id,
+                    compensation_requested_size=compensation_requested_size):
                 self._mark_open_rollback_quarantine(
-                    symbol, '开仓订单未证明终态，当前零仓仍可能迟到成交',
+                    symbol, '开仓订单未证明终态，当前净仓仍可能迟到变化',
                     details)
             msg = (
                 f"{symbol} 开仓订单未证明终态，当前虽无仓仍可能迟到成交；"
@@ -2377,15 +2526,25 @@ class TradeExecutorMixin:
                 rollback_contract['fully_closed'] = False
                 rollback_contract['remaining_amount'] = remaining
             else:
-                rollback_contract = {
-                    'confirmed': True,
-                    'fully_closed': False,
-                    'remaining_amount': remaining,
-                    'execution_ambiguous': True,
-                }
+                # None 表示确定性补偿单的回包丢失，不表示没有真钱余仓。
+                # 交统一收口器 fresh 复读 side+amount 后建立 provisional；
+                # 不能合成 ambiguous truthy 回包而跳过风险托管。
+                rollback_contract = None
             original_size = self._order_actual_amount(open_order, position_size)
             if original_size is None:
                 original_size = position_size
+            compensation_requested_size = None
+            if isinstance(compensation, dict):
+                compensation_requested_size = self._order_actual_amount(
+                    {'amount': compensation.get('requested_amount')}, None)
+                if compensation_requested_size is None:
+                    compensation_requested_size = self._order_actual_amount(
+                        compensation, None)
+            else:
+                # 适配层只会按最后确认的真实净仓发这一张确定性
+                # reduce-only 补偿单；其 top-level amount 就是请求量。
+                compensation_requested_size = self._order_actual_amount(
+                    open_order, None)
             # 适配层已自行补偿；这里只裁决最终契约，严禁再次补偿 POST。
             outcome = self._finalize_open_rollback(
                 symbol, ccxt_symbol, side,
@@ -2397,7 +2556,8 @@ class TradeExecutorMixin:
                 open_intent_client_id=open_intent_client_id,
                 requested_position_size=requested_position_size,
                 preserve_open_intent=True,
-                unresolved_execution_kind='open_compensation')
+                unresolved_execution_kind='open_compensation',
+                compensation_requested_size=compensation_requested_size)
             return self._finalize_generic_rolled_back_outcome(
                 symbol, open_intent, outcome)
 
@@ -2577,7 +2737,7 @@ class TradeExecutorMixin:
             return self._finalize_generic_rolled_back_outcome(
                 symbol, open_intent, persist_result)
         # 已确认止损 ID/尺寸与真实仓位一并耐久落账后才可消费 POST 前句柄。
-        self._complete_stop_write(symbol, '开仓保护单')
+        self._complete_stop_write(symbol, ccxt_symbol, '开仓保护单')
         if buffer_notification:
             self._buffer_trade_open_notification(symbol, side, actual_price, position_size, stop_loss_price)
         return {

@@ -38,8 +38,9 @@
 ```
 
 - 凭据也可用环境变量：`OKX_API_KEY` / `OKX_API_SECRET` / `OKX_API_PASSPHRASE`、`DINGTALK_WEBHOOK`。
-- **向后兼容**：旧的 `{"exchanges": {"okx": {...}}}` 嵌套结构会被 `load_config()` 自动拍平为顶层 `okx`，无需手改即可运行。
+- **旧布局迁移**：生产 runner 只接受顶层 `okx`，会 fail-closed 拒绝旧的 `{"exchanges": {"okx": {...}}}` 嵌套布局。旧布局只能由受审的离线 `migrate_single_strategy.py` 显式收敛，禁止在生产启动时隐式改写。
 - **双均线默认参数**：`ma_short_period` 默认 **7**、`ma_long_period` 默认 **28**（仅改默认值；若你的 config.json 已显式写了短周期，则按你的配置走，不强制覆盖）。
+- **止损口径**：`ma_stop_period` 只控制信号日前 N 根已完成日线（不含信号日）的收盘价极值止损；它不参与入场或反转信号，参数键和计算公式保持不变。
 
 ## 三、前端（单所）
 
@@ -87,12 +88,12 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 - `FLASK_SECRET_KEY` 少于 32 字节会拒绝启动；不要使用文档占位符、密码或可猜字符串。
   若用 `TRADING_RUNNER_LOCK_FILE` 改锁路径，锁必须位于当前用户所有的专用 0700 目录，
   不能直接放在 `/tmp` 等共享目录。
-- **旧状态硬门禁**：MA-only runtime 不再自动导入 `data/okx/`。目录非空但缺少有效 `.okx_legacy_migration_complete.json` 时，部署预检与启动都会拒绝；必须在停机窗口人工核对并收口，防止部署预检之后又从永久旧快照复活未审查的持仓或在途状态。
+- **旧状态硬门禁**：MA-only runtime 不再自动导入 `data/okx/`。目录非空但缺少有效 `.okx_legacy_migration_complete.json` 时，部署预检与启动都会拒绝；必须在停机窗口人工核对并收口，防止部署预检之后又从永久旧快照复活未审查的持仓或在途状态。正式部署会先把停机源完整写入 root-only 回滚包；候选副本通过迁移复验后，再把这份旧快照及完成标记移出活动 runtime，仅作为 root-only 回滚证据保留。
 - **单策略部署预检**：停 runner 后执行 `python3 migrate_single_strategy.py --data-dir .`；确认报告后加 `--apply`，再干跑一次必须显示通过。未收口开仓意图、旧版 `signal_execution=pending`、无法证明终态的旧执行状态或不兼容在途持仓都会返回非零并阻断部署。
-- **部署零开仓门禁**：任何生产变更前，必须用 runner 同源调度解析器证明当前调度日已成功完成，并对在线源执行只读迁移/配置预检；未到日检窗口、仍在 2 分钟宽限期或当日未完成时保持旧生产运行并退出。随后关闭公网入口、优雅排空 runner，再在 runtime 目录维持 `.maintenance_no_open`。哨兵存在时正式/手动日检在任何副作用前返回且不标记完成，只运行健康与 guardian；不存在“跳过并标记完成”的环境旁路。部署期间冻结 OKX UI、人工及其它 API 消费者，运行期 managed SWAP 也只允许经系统 API 操作。完整顺序见 `DEPLOY_NOTES.md`。
+- **部署零开仓门禁**：任何生产变更前，必须用 runner 同源调度解析器证明当前调度日已成功完成，并对在线源执行只读迁移/配置预检；未到日检窗口、仍在 2 分钟宽限期或当日未完成时保持旧生产运行并退出。通过预检后，先持久化 write-once `arm-intent`，再由旧 runner 取得所有交易路径共用的锁、排空在途开仓，并在仍持锁时 fsync 它实际读取的 `.maintenance_no_open`；根证据复验成功后才安装持久启动阻断并优雅排空 runner。完整 v1 哨兵，或由同一 v1 临界区留下且与 root intent、当前 FLOCK worker、HTTP 门禁共同复验的不完整 0600 普通文件，都证明同锁排空已发生；单独的 503 或任意未知对象不能替代。哨兵存在时正式/手动日检在任何副作用前返回且不标记完成，只运行健康与 guardian；不存在“跳过并标记完成”的环境旁路。部署期间冻结 OKX UI、人工及其它 API 消费者，运行期 managed SWAP 也只允许经系统 API 操作。完整顺序见 `DEPLOY_NOTES.md`。
 - **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
-- **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。部分平仓后的止损缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
-- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
+- **止损自愈（防裸奔红线）**：常规巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。部分平仓后的止损缩量另有两个严格窄态：`resize_cleanup` 只清理已落账旧 ID，`resize_needed` 只对完整已知的 oversized 保护集合执行 make-before-break；绝不把未知订单纳入自动撤单。
+- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 从返回时刻起至少保留一个完整 guardian 周期（当前 5 分钟）的可见性等待窗。
 - **OKX 原生止损单**：直调 `POST /api/v5/trade/order-algo`，发送 `ordType=conditional`、`slTriggerPx`、`slOrdPx=-1`、`reduceOnly=true` 和确定性 `algoClOrdId`；每个意图最多一次 POST，ACK 或超时都只按同 ID 查询，绝不盲重发。
 - **状态归属护栏（防串仓红线）**：启动时校验 `trade_state.json` 顶层 `exchange` 标记——
   - 标记为 `okx`：放行；标记为其它交易所（如旧币安）：**拒绝启动**；

@@ -15,6 +15,7 @@ later ``arm`` can distinguish a committed cycle from an unproved one.
 import argparse
 import contextlib
 import copy
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -26,10 +27,11 @@ import secrets
 import stat
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import config_validation as cfgv
+from deployment_old_runner_gate import _flock_owner
 from runtime_guard import catchup_schedule_slot
 
 
@@ -161,7 +163,7 @@ def _same_identity(left, right):
 
 
 @contextlib.contextmanager
-def _open_data_directory(data_dir):
+def _open_data_directory(data_dir, *, recheck_on_exit=True):
     if not isinstance(data_dir, str) or not os.path.isabs(data_dir):
         raise GateError('--data-dir 必须是绝对路径')
     if (os.path.normpath(data_dir) != data_dir or
@@ -187,7 +189,8 @@ def _open_data_directory(data_dir):
         # detached release could receive a sentinel while the canonical path
         # points at a fresh unprotected tree.  A command may return success only
         # while its absolute path still resolves to the held inode.
-        _recheck_data_directory_path(data_dir, fd)
+        if recheck_on_exit:
+            _recheck_data_directory_path(data_dir, fd)
     finally:
         os.close(fd)
 
@@ -265,8 +268,11 @@ def _recheck_held_entry(dir_fd, name, fd, context):
         raise GateError(f'{context} 在门禁运行期间被替换')
 
 
-def _unlink_held_entry(dir_fd, name, fd, context):
+def _unlink_held_entry(
+        dir_fd, name, fd, context, *, validate_before_unlink=None):
     _recheck_held_entry(dir_fd, name, fd, context)
+    validated = (
+        validate_before_unlink() if validate_before_unlink is not None else None)
     try:
         os.unlink(name, dir_fd=dir_fd)
         # If unlink succeeded but fsync fails, durable completion plus the
@@ -274,6 +280,7 @@ def _unlink_held_entry(dir_fd, name, fd, context):
         os.fsync(dir_fd)
     except OSError as exc:
         raise GateError(f'无法安全删除{context}（{exc.__class__.__name__}）') from exc
+    return validated
 
 
 def _make_held_evidence_durable(dir_fd, name, fd, context):
@@ -342,18 +349,77 @@ def _write_all(fd, payload):
         offset += written
 
 
+def _link_named_noreplace(dir_fd, source, target):
+    """Non-Linux fallback: publish a complete temp without replacement."""
+    os.link(
+        source, target, src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+        follow_symlinks=False)
+    os.unlink(source, dir_fd=dir_fd)
+
+
+def _link_unnamed_noreplace(fd, dir_fd, target):
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = getattr(libc, 'linkat', None)
+    if linkat is None:
+        raise GateError('系统缺少 linkat')
+    linkat.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    source = os.fsencode(f'/proc/self/fd/{fd}')
+    if linkat(-100, source, dir_fd, os.fsencode(target), 0x400) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), target)
+    raise OSError(error, os.strerror(error), target)
+
+
 def _create_json_exclusive(dir_fd, name, payload, context):
-    """Write-once evidence; never replace or truncate an existing path."""
-    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL |
-             getattr(os, 'O_NOFOLLOW', 0))
+    """Publish complete write-once evidence from an unnamed durable inode."""
     fd = None
+    encoded = _dumps_strict(payload)
     try:
-        fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
-        os.fchmod(fd, 0o600)
-        _write_all(fd, _dumps_strict(payload))
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
+        try:
+            existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            _validate_regular(existing, context)
+            raise GateError(f'{context} 已存在；禁止覆盖权威证据')
+        if sys.platform.startswith('linux'):
+            if not getattr(os, 'O_TMPFILE', 0):
+                raise GateError('系统缺少 O_TMPFILE')
+            fd = os.open(
+                '.', os.O_WRONLY | os.O_TMPFILE, 0o600, dir_fd=dir_fd)
+            os.fchmod(fd, 0o600)
+            _write_all(fd, encoded)
+            os.fsync(fd)
+            _link_unnamed_noreplace(fd, dir_fd, name)
+            closing_fd = fd
+            fd = None
+            os.close(closing_fd)
+        else:
+            pending = f'.{name}.pending.{os.getpid()}.{secrets.token_hex(8)}'
+            try:
+                flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         getattr(os, 'O_NOFOLLOW', 0))
+                fd = os.open(pending, flags, 0o600, dir_fd=dir_fd)
+                try:
+                    os.fchmod(fd, 0o600)
+                    _write_all(fd, encoded)
+                    os.fsync(fd)
+                finally:
+                    closing_fd = fd
+                    fd = None
+                    os.close(closing_fd)
+                _link_named_noreplace(dir_fd, pending, name)
+            finally:
+                try:
+                    os.unlink(pending, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    pass
         os.fsync(dir_fd)
         verify_fd = _open_verified_entry(dir_fd, name, context)
         return verify_fd
@@ -461,6 +527,26 @@ def _require_runner_lock_held_elsewhere(lock_fd):
         raise GateError('commit 前正式 runner 未持有精确 runner 锁')
 
 
+def _require_expected_runner_lock_owner(lock_fd, expected_pid):
+    """Bind commit to the frozen worker generation reviewed by the driver."""
+    if (isinstance(expected_pid, bool) or
+            not isinstance(expected_pid, int) or expected_pid <= 0):
+        raise GateError('commit expected runner PID 非法')
+    try:
+        raw_pid = os.pread(lock_fd, 64, 0)
+    except OSError as exc:
+        raise GateError('无法读取正式 runner 锁 owner PID') from exc
+    if raw_pid != f'{expected_pid}\n'.encode('ascii'):
+        raise GateError('正式 runner 锁 owner PID 已换代')
+    _require_runner_lock_held_elsewhere(lock_fd)
+    try:
+        owner_pid = _flock_owner('/proc', os.fstat(lock_fd))
+    except Exception as exc:
+        raise GateError('无法证明正式 runner 锁的内核 FLOCK owner') from exc
+    if owner_pid != expected_pid:
+        raise GateError('正式 runner 锁的内核 FLOCK owner 已换代')
+
+
 def _require_exact_fields(value, expected, context):
     if not isinstance(value, dict):
         raise GateError(f'{context} 必须是对象')
@@ -478,7 +564,8 @@ def _validate_file_identity(value, context):
 def _validate_sentinel(payload):
     _require_exact_fields(
         payload, {'schema_version', 'nonce', 'release_sha'}, 'sentinel')
-    if payload['schema_version'] != SENTINEL_SCHEMA_VERSION:
+    if (type(payload['schema_version']) is not int or
+            payload['schema_version'] != SENTINEL_SCHEMA_VERSION):
         raise GateError('sentinel schema_version 不兼容')
     if not isinstance(payload['nonce'], str) or not NONCE_RE.fullmatch(payload['nonce']):
         raise GateError('sentinel nonce 非法')
@@ -551,19 +638,54 @@ def load_okx_config(config_path, environ=None):
     return copy.deepcopy(config['okx'])
 
 
-def require_completed_schedule_slot(config_path, data_dir, now=None):
-    """Return the current deployable slot only after the old runner completed it.
-
-    This is intentionally read-only and runs before the deployment installs a
-    start block or stops any production unit.  The scheduler's own slot
-    resolver remains the single source of date/buffer semantics.
-    """
+def _load_schedule_source(config_path, data_dir):
     _require_config_in_data_dir(config_path, data_dir)
     config = _read_private_json_path(config_path, 'config.json')
     state_path = os.path.join(data_dir, 'trade_state.json')
     state = _read_private_json_path(state_path, 'trade_state.json')
     if not isinstance(config, dict) or not isinstance(state, dict):
         raise GateError('部署前配置与账本必须是 JSON 对象')
+    return config, state
+
+
+def _recorded_slot_from_state(state, now=None):
+    value = state.get('last_daily_check_date')
+    if (not isinstance(value, str) or
+            re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', value) is None):
+        raise GateError('账本缺少规范的已完成调度日')
+    try:
+        parsed = datetime.strptime(value, '%Y-%m-%d').date()
+    except ValueError as exc:
+        raise GateError('账本已完成调度日非法') from exc
+    if parsed.isoformat() != value:
+        raise GateError('账本已完成调度日不是规范日期')
+    current = datetime.now() if now is None else now
+    if parsed > current.date():
+        raise GateError('账本已完成调度日不得位于未来')
+    return value
+
+
+def recorded_completed_schedule_slot(config_path, data_dir, now=None):
+    """Return the strict ledger slot without reinterpreting today's schedule."""
+    _config, state = _load_schedule_source(config_path, data_dir)
+    return _recorded_slot_from_state(state, now=now)
+
+
+def require_completed_schedule_slot(
+        config_path, data_dir, now=None, expected_slot=None):
+    """Return the current deployable slot only after the old runner completed it.
+
+    This is intentionally read-only and runs before the deployment installs a
+    start block or stops any production unit.  The scheduler's own slot
+    resolver remains the single source of date/buffer semantics.
+    """
+    config, state = _load_schedule_source(config_path, data_dir)
+    if expected_slot is not None:
+        recorded = _recorded_slot_from_state(state, now=now)
+        if recorded != expected_slot:
+            raise GateError(
+                f'冻结调度日 {expected_slot} 与账本已完成日 {recorded} 不一致')
+        return recorded
     try:
         slot = catchup_schedule_slot(
             config, datetime.now() if now is None else now)
@@ -576,6 +698,26 @@ def require_completed_schedule_slot(config_path, data_dir, now=None):
         raise GateError(
             f'当前调度日 {expected} 尚未成功完成；生产必须保持运行，拒绝停机部署')
     return expected
+
+
+def require_safe_resume_schedule_slot(
+        config_path, data_dir, expected_slot, now=None, horizon_seconds=600):
+    """Allow committed recovery only when catch-up cannot change its slot."""
+    config, state = _load_schedule_source(config_path, data_dir)
+    current = datetime.now() if now is None else now
+    recorded = _recorded_slot_from_state(state, now=current)
+    if recorded != expected_slot:
+        raise GateError(
+            f'恢复调度日 {expected_slot} 与账本已完成日 {recorded} 不一致')
+    for probe in (current, current + timedelta(seconds=horizon_seconds)):
+        try:
+            slot = catchup_schedule_slot(config, probe)
+        except Exception as exc:
+            raise GateError('无法按正式 scheduler 语义计算恢复调度槽') from exc
+        if slot is not None and slot.date().isoformat() != expected_slot:
+            raise GateError(
+                f'恢复窗口将进入未完成调度日 {slot.date().isoformat()}')
+    return recorded
 
 
 def _account_fingerprint(okx):
@@ -797,24 +939,6 @@ class ReadOnlyOkxGate:
         if result['pos_mode'] != 'net_mode':
             raise GateError('OKX account config.posMode 必须为 net_mode')
         return result
-
-    def api_permissions(self):
-        """读取当前请求 Key 的权限；只返回权限枚举，不返回任何凭据。"""
-        data = _response_data(
-            _call(self.exchange.privateGetAccountConfig, {}, 'OKX API permissions'),
-            'OKX API permissions')
-        if len(data) != 1 or not isinstance(data[0], dict):
-            raise GateError('OKX API permissions 数据数量异常')
-        raw = data[0].get('perm')
-        if not isinstance(raw, str) or not raw:
-            raise GateError('OKX account config.perm 缺失或非法')
-        values = raw.split(',')
-        allowed = {'read_only', 'trade', 'withdraw'}
-        if (any(not value or value != value.strip() for value in values) or
-                len(values) != len(set(values)) or
-                not set(values) <= allowed or 'read_only' not in values):
-            raise GateError('OKX account config.perm 含未知/重复权限')
-        return tuple(sorted(values))
 
     def positions(self):
         data = _response_data(
@@ -1053,7 +1177,8 @@ def _validate_baseline(payload):
         'api_fingerprint', 'account', 'sentinel', 'runner_lock',
         't0_ms', 'pre_t0_history', 'positions', 'pending',
     }, 'baseline')
-    if payload['schema_version'] != SCHEMA_VERSION:
+    if (type(payload['schema_version']) is not int or
+            payload['schema_version'] != SCHEMA_VERSION):
         raise GateError('baseline schema_version 不兼容')
     if payload['exchange'] != 'okx':
         raise GateError('baseline exchange 不是 okx')
@@ -1126,7 +1251,8 @@ def _validate_completion(payload):
         'baseline_sha256', 'baseline_file', 'sentinel', 'runner_lock',
         'account_domain', 'api_fingerprint', 'account', 't0_ms', 'summary',
     }, 'completion')
-    if payload['schema_version'] != COMPLETION_SCHEMA_VERSION:
+    if (type(payload['schema_version']) is not int or
+            payload['schema_version'] != COMPLETION_SCHEMA_VERSION):
         raise GateError('completion schema_version 不兼容')
     if payload['status'] != 'verified_no_open_through_history_end':
         raise GateError('completion status 非法')
@@ -1214,6 +1340,28 @@ def _require_payload_unchanged(expected, current, context):
         raise GateError(f'{context} 在门禁运行期间被原位修改')
 
 
+def _read_validated_completed_evidence(
+        sentinel_fd, baseline_fd, completion_fd, expected_sentinel,
+        expected_baseline, expected_completion, lock_info, okx, release_sha):
+    """Re-read and bind all held gate payloads at one final decision point."""
+    current_sentinel = _read_sentinel_fd(sentinel_fd)
+    current_baseline = _read_baseline_fd(baseline_fd)
+    current_completion = _read_completion_fd(completion_fd)
+    _require_payload_unchanged(
+        expected_sentinel, current_sentinel, '部署禁开仓哨兵')
+    _require_payload_unchanged(
+        expected_baseline, current_baseline, '部署只读基线')
+    _require_payload_unchanged(
+        expected_completion, current_completion, '部署完成证明')
+    _validate_baseline_bindings(
+        current_baseline, current_sentinel,
+        _identity(os.fstat(sentinel_fd)), lock_info, okx, release_sha)
+    _validate_completed_pair(
+        current_baseline, _identity(os.fstat(baseline_fd)),
+        current_completion, lock_info, expected_release=release_sha)
+    return current_sentinel, current_baseline, current_completion
+
+
 def _new_sentinel(release_sha):
     return {
         'schema_version': SENTINEL_SCHEMA_VERSION,
@@ -1281,6 +1429,28 @@ def arm(data_dir, release_sha, environ=None):
                 for fd in (sentinel_fd, baseline_fd, completion_fd):
                     if fd is not None:
                         os.close(fd)
+
+
+def arm_recovery_gate(data_dir, release_sha, environ=None):
+    """Create only a restart-blocking gate while the old runner lock is free.
+
+    A normally committed old runtime retains baseline/completion after its
+    sentinel is removed.  Recovery must preserve that evidence, so this narrow
+    operation deliberately neither reads nor mutates those cycle artifacts.
+    """
+    _require_release_sha(release_sha)
+    with _open_data_directory(data_dir) as dir_fd:
+        with _hold_runner_lock(
+                dir_fd, data_dir, environ=environ, exclusive=True):
+            sentinel_fd = _open_optional_entry(
+                dir_fd, SENTINEL_NAME, '旧 runtime 恢复禁开仓哨兵')
+            if sentinel_fd is not None:
+                os.close(sentinel_fd)
+                raise GateError('旧 runtime 恢复哨兵已存在；拒绝覆盖')
+            _recheck_data_directory_path(data_dir, dir_fd)
+            created_fd, _, _ = _create_sentinel(dir_fd, release_sha)
+            os.close(created_fd)
+            return True
 
 
 def _capture_snapshot(gate):
@@ -1596,37 +1766,13 @@ def run_quiescence(config_path, data_dir, release_sha, exchange=None,
                 return {'q0_ms': probe['t0_ms'], **summary}
 
 
-def probe_api_permission_mode(
-        config_path, required_mode, exchange=None,
-        ccxt_module=None, environ=None):
-    """首次引导门禁：机械证明当前 Key 是只读，或提交前已恢复交易权限。"""
-    if required_mode not in {'read_only', 'trade'}:
-        raise GateError('required_mode 只能是 read_only/trade')
-    okx = load_okx_config(config_path, environ=environ)
-    active_exchange = (
-        exchange if exchange is not None else
-        create_read_only_exchange(okx, ccxt_module=ccxt_module))
-    permissions = ReadOnlyOkxGate(active_exchange).api_permissions()
-    if required_mode == 'read_only' and permissions != ('read_only',):
-        raise GateError('首次引导要求当前 API Key 权限精确为 read_only')
-    if required_mode == 'trade' and permissions != ('read_only', 'trade'):
-        raise GateError(
-            '提交前当前 API Key 权限必须精确为 read_only,trade（禁止 withdraw）')
-    return {
-        'account_domain': _account_domain(okx),
-        'api_fingerprint': _account_fingerprint(okx),
-        'mode': required_mode,
-        'permissions': list(permissions),
-    }
-
-
 def seal(config_path, data_dir, release_sha, exchange=None,
          ccxt_module=None, environ=None):
     """Verify with the runner stopped and write completion, retaining sentinel."""
     _require_release_sha(release_sha)
     _require_config_in_data_dir(config_path, data_dir)
     okx = load_okx_config(config_path, environ=environ)
-    with _open_data_directory(data_dir) as dir_fd:
+    with _open_data_directory(data_dir, recheck_on_exit=False) as dir_fd:
         with _hold_runner_lock(
                 dir_fd, data_dir, environ=environ,
                 exclusive=True) as (_, lock_info):
@@ -1657,47 +1803,21 @@ def seal(config_path, data_dir, release_sha, exchange=None,
                 _recheck_data_directory_path(data_dir, dir_fd)
                 completion_fd = _create_json_exclusive(
                     dir_fd, COMPLETION_NAME, completion, '部署完成证明')
-                current_sentinel = _read_sentinel_fd(sentinel_fd)
-                current_baseline = _read_baseline_fd(baseline_fd)
-                current_completion = _read_completion_fd(completion_fd)
-                _require_payload_unchanged(
-                    sentinel, current_sentinel, '部署禁开仓哨兵')
-                _require_payload_unchanged(
-                    baseline, current_baseline, '部署只读基线')
-                _require_payload_unchanged(
-                    completion, current_completion, '部署完成证明')
-                _validate_baseline_bindings(
-                    current_baseline, current_sentinel,
-                    _identity(os.fstat(sentinel_fd)), lock_info,
-                    okx, release_sha)
-                _validate_completed_pair(
-                    current_baseline, _identity(os.fstat(baseline_fd)),
-                    current_completion, lock_info,
-                    expected_release=release_sha)
+                _read_validated_completed_evidence(
+                    sentinel_fd, baseline_fd, completion_fd,
+                    sentinel, baseline, completion, lock_info, okx,
+                    release_sha)
                 _make_held_evidence_durable(
                     dir_fd, SENTINEL_NAME, sentinel_fd, '部署禁开仓哨兵')
                 _make_held_evidence_durable(
                     dir_fd, BASELINE_NAME, baseline_fd, '部署只读基线')
                 _make_held_evidence_durable(
                     dir_fd, COMPLETION_NAME, completion_fd, '部署完成证明')
-                durable_sentinel = _read_sentinel_fd(sentinel_fd)
-                durable_baseline = _read_baseline_fd(baseline_fd)
-                durable_completion = _read_completion_fd(completion_fd)
-                _require_payload_unchanged(
-                    sentinel, durable_sentinel, '部署禁开仓哨兵')
-                _require_payload_unchanged(
-                    baseline, durable_baseline, '部署只读基线')
-                _require_payload_unchanged(
-                    completion, durable_completion, '部署完成证明')
-                _validate_baseline_bindings(
-                    durable_baseline, durable_sentinel,
-                    _identity(os.fstat(sentinel_fd)), lock_info,
-                    okx, release_sha)
-                _validate_completed_pair(
-                    durable_baseline, _identity(os.fstat(baseline_fd)),
-                    durable_completion, lock_info,
-                    expected_release=release_sha)
                 _recheck_data_directory_path(data_dir, dir_fd)
+                _read_validated_completed_evidence(
+                    sentinel_fd, baseline_fd, completion_fd,
+                    sentinel, baseline, completion, lock_info, okx,
+                    release_sha)
                 return summary
             finally:
                 for fd in (sentinel_fd, baseline_fd, completion_fd):
@@ -1705,16 +1825,19 @@ def seal(config_path, data_dir, release_sha, exchange=None,
                         os.close(fd)
 
 
-def commit_sealed(config_path, data_dir, release_sha, environ=None):
+def commit_sealed(
+        config_path, data_dir, release_sha, expected_runner_pid,
+        expected_slot, environ=None, now=None):
     """Atomically remove a sealed sentinel while the validated runner is live."""
     _require_release_sha(release_sha)
     _require_config_in_data_dir(config_path, data_dir)
     okx = load_okx_config(config_path, environ=environ)
-    with _open_data_directory(data_dir) as dir_fd:
+    with _open_data_directory(data_dir, recheck_on_exit=False) as dir_fd:
         with _hold_runner_lock(
                 dir_fd, data_dir, environ=environ,
                 exclusive=False) as (lock_fd, lock_info):
-            _require_runner_lock_held_elsewhere(lock_fd)
+            _require_expected_runner_lock_owner(
+                lock_fd, expected_runner_pid)
             sentinel_fd = _open_optional_entry(
                 dir_fd, SENTINEL_NAME, '部署禁开仓哨兵')
             baseline_fd = _open_optional_entry(
@@ -1738,10 +1861,78 @@ def commit_sealed(config_path, data_dir, release_sha, environ=None):
                         (BASELINE_NAME, baseline_fd, '部署只读基线'),
                         (COMPLETION_NAME, completion_fd, '部署完成证明')):
                     _make_held_evidence_durable(dir_fd, name, fd, context)
+                def validate_final_commit():
+                    current_slot = require_completed_schedule_slot(
+                        config_path, data_dir, now=now)
+                    if current_slot != expected_slot:
+                        raise GateError(
+                            f'最终调度槽已从 {expected_slot} 变为 '
+                            f'{current_slot}；拒绝解除禁开仓哨兵')
+                    _require_expected_runner_lock_owner(
+                        lock_fd, expected_runner_pid)
+                    _recheck_data_directory_path(data_dir, dir_fd)
+                    for name, fd, context in (
+                            (SENTINEL_NAME, sentinel_fd, '部署禁开仓哨兵'),
+                            (BASELINE_NAME, baseline_fd, '部署只读基线'),
+                            (COMPLETION_NAME, completion_fd, '部署完成证明')):
+                        _recheck_held_entry(dir_fd, name, fd, context)
+                    return _read_validated_completed_evidence(
+                        sentinel_fd, baseline_fd, completion_fd,
+                        sentinel, baseline, completion, lock_info, okx,
+                        release_sha)
+
+                _, _, durable_completion = _unlink_held_entry(
+                    dir_fd, SENTINEL_NAME, sentinel_fd, '部署禁开仓哨兵',
+                    validate_before_unlink=validate_final_commit)
+                return dict(durable_completion['summary'])
+            finally:
+                for fd in (sentinel_fd, baseline_fd, completion_fd):
+                    if fd is not None:
+                        os.close(fd)
+
+
+def verify_committed_cycle(data_dir, release_sha, runner_active=False,
+                           environ=None):
+    """Validate the durable state left by the unique sentinel-unlink commit."""
+    _require_release_sha(release_sha)
+    with _open_data_directory(data_dir, recheck_on_exit=False) as dir_fd:
+        with _hold_runner_lock(
+                dir_fd, data_dir, environ=environ,
+                exclusive=not runner_active) as (lock_fd, lock_info):
+            if runner_active:
+                _require_runner_lock_held_elsewhere(lock_fd)
+            sentinel_fd = _open_optional_entry(
+                dir_fd, SENTINEL_NAME, '部署禁开仓哨兵')
+            baseline_fd = _open_optional_entry(
+                dir_fd, BASELINE_NAME, '部署只读基线')
+            completion_fd = _open_optional_entry(
+                dir_fd, COMPLETION_NAME, '部署完成证明')
+            try:
+                if sentinel_fd is not None:
+                    raise GateError('已提交周期仍存在 sentinel')
+                if baseline_fd is None or completion_fd is None:
+                    raise GateError('已提交周期缺少 baseline/completion')
+                baseline = _read_baseline_fd(baseline_fd)
+                completion = _read_completion_fd(completion_fd)
+                _validate_completed_pair(
+                    baseline, _identity(os.fstat(baseline_fd)), completion,
+                    lock_info, expected_release=release_sha)
+                for name, fd, context in (
+                        (BASELINE_NAME, baseline_fd, '部署只读基线'),
+                        (COMPLETION_NAME, completion_fd, '部署完成证明')):
+                    _make_held_evidence_durable(dir_fd, name, fd, context)
                 _recheck_data_directory_path(data_dir, dir_fd)
-                _unlink_held_entry(
-                    dir_fd, SENTINEL_NAME, sentinel_fd, '部署禁开仓哨兵')
-                return dict(completion['summary'])
+                durable_baseline = _read_baseline_fd(baseline_fd)
+                durable_completion = _read_completion_fd(completion_fd)
+                _require_payload_unchanged(
+                    baseline, durable_baseline, '部署只读基线')
+                _require_payload_unchanged(
+                    completion, durable_completion, '部署完成证明')
+                _validate_completed_pair(
+                    durable_baseline, _identity(os.fstat(baseline_fd)),
+                    durable_completion, lock_info,
+                    expected_release=release_sha)
+                return dict(durable_completion['summary'])
             finally:
                 for fd in (sentinel_fd, baseline_fd, completion_fd):
                     if fd is not None:
@@ -1760,8 +1951,14 @@ def abandon_cycle(data_dir, release_sha, attempt_id, environ=None):
             held = {}
             locations = {}
             audit_fd = None
+            successor_sentinel_fd = None
             audit_name = f'deployment_abandon_{attempt_id}.json'
             try:
+                audit_fd = _open_optional_entry(
+                    dir_fd, audit_name, '部署 abandon 审计')
+                existing_audit = (
+                    _read_json_fd(audit_fd, '部署 abandon 审计')
+                    if audit_fd is not None else None)
                 for name, context in (
                         (SENTINEL_NAME, '部署禁开仓哨兵'),
                         (BASELINE_NAME, '部署只读基线'),
@@ -1771,6 +1968,16 @@ def abandon_cycle(data_dir, release_sha, attempt_id, environ=None):
                     archive_fd = _open_optional_entry(
                         dir_fd, archive, f'{context} abandon 归档')
                     if current_fd is not None and archive_fd is not None:
+                        # Once the write-once abandon audit exists, a fresh
+                        # sentinel may legitimately belong to the durably seeded
+                        # successor cycle. Preserve it while validating the old
+                        # archive. Baseline/completion overlap remains ambiguous
+                        # and is always rejected.
+                        if name == SENTINEL_NAME and existing_audit is not None:
+                            successor_sentinel_fd = current_fd
+                            held[name] = archive_fd
+                            locations[name] = 'archive'
+                            continue
                         os.close(current_fd)
                         os.close(archive_fd)
                         raise GateError('abandon 原件与归档同时存在')
@@ -1783,6 +1990,11 @@ def abandon_cycle(data_dir, release_sha, attempt_id, environ=None):
                 sentinel = _read_sentinel_fd(held[SENTINEL_NAME])
                 if sentinel['release_sha'] != release_sha:
                     raise GateError('abandon release SHA 不匹配')
+                if successor_sentinel_fd is not None:
+                    successor = _read_sentinel_fd(successor_sentinel_fd)
+                    if (successor['release_sha'] != release_sha or
+                            successor['nonce'] == sentinel['nonce']):
+                        raise GateError('abandon 后继 sentinel 绑定非法')
                 archived = {}
                 baseline = None
                 if held[BASELINE_NAME] is not None:
@@ -1811,12 +2023,10 @@ def abandon_cycle(data_dir, release_sha, attempt_id, environ=None):
                     'attempt_id': attempt_id,
                     'archived_sha256': archived,
                 }
-                audit_fd = _open_optional_entry(
-                    dir_fd, audit_name, '部署 abandon 审计')
                 if audit_fd is None:
                     audit_fd = _create_json_exclusive(
                         dir_fd, audit_name, audit, '部署 abandon 审计')
-                elif _read_json_fd(audit_fd, '部署 abandon 审计') != audit:
+                elif existing_audit != audit:
                     raise GateError('abandon 审计与当前证据不匹配')
                 # The write-once audit is durable before the first rename, so
                 # an interruption can only leave a deterministically resumable
@@ -1844,6 +2054,8 @@ def abandon_cycle(data_dir, release_sha, attempt_id, environ=None):
             finally:
                 if audit_fd is not None:
                     os.close(audit_fd)
+                if successor_sentinel_fd is not None:
+                    os.close(successor_sentinel_fd)
                 for fd in held.values():
                     if fd is not None:
                         os.close(fd)
@@ -1855,21 +2067,34 @@ def _build_parser():
     completed = subparsers.add_parser('completed-slot')
     completed.add_argument('--data-dir', required=True)
     completed.add_argument('--config', required=True)
-    permission = subparsers.add_parser('credential-mode')
-    permission.add_argument('--config', required=True)
-    permission.add_argument(
-        '--require-mode', required=True, choices=('read_only', 'trade'))
+    completed.add_argument('--expected-slot')
+    resume = subparsers.add_parser('resume-slot')
+    resume.add_argument('--data-dir', required=True)
+    resume.add_argument('--config', required=True)
+    resume.add_argument('--expected-slot', required=True)
+    recorded = subparsers.add_parser('recorded-slot')
+    recorded.add_argument('--data-dir', required=True)
+    recorded.add_argument('--config', required=True)
     exposure = subparsers.add_parser('credential-exposure')
     exposure.add_argument('--config', required=True)
-    for command in ('arm', 'baseline', 'verify', 'quiesce', 'seal', 'commit',
+    for command in ('arm', 'arm-recovery-gate', 'baseline', 'verify',
+                    'quiesce', 'seal', 'commit',
+                    'verify-committed-stopped', 'verify-committed-running',
                     'abandon'):
         child = subparsers.add_parser(command)
         child.add_argument('--data-dir', required=True)
         child.add_argument('--release-sha', required=True)
-        if command not in ('arm', 'abandon'):
+        if command not in (
+                'arm', 'arm-recovery-gate', 'abandon',
+                'verify-committed-stopped',
+                'verify-committed-running'):
             child.add_argument('--config', required=True)
         if command == 'baseline':
             child.add_argument('--history-start-ms', required=True, type=int)
+        if command == 'commit':
+            child.add_argument(
+                '--expected-runner-pid', required=True, type=int)
+            child.add_argument('--expected-slot', required=True)
         if command == 'abandon':
             child.add_argument('--attempt-id', required=True)
     return parser
@@ -1879,13 +2104,15 @@ def main(argv=None):
     args = _build_parser().parse_args(argv)
     try:
         if args.command == 'completed-slot':
-            print(require_completed_schedule_slot(args.config, args.data_dir))
-        elif args.command == 'credential-mode':
-            summary = probe_api_permission_mode(
-                args.config, args.require_mode)
-            print(json.dumps(
-                summary, ensure_ascii=False, sort_keys=True,
-                separators=(',', ':')))
+            print(require_completed_schedule_slot(
+                args.config, args.data_dir,
+                expected_slot=args.expected_slot))
+        elif args.command == 'resume-slot':
+            print(require_safe_resume_schedule_slot(
+                args.config, args.data_dir, args.expected_slot))
+        elif args.command == 'recorded-slot':
+            print(recorded_completed_schedule_slot(
+                args.config, args.data_dir))
         elif args.command == 'credential-exposure':
             summary = probe_public_history_exposure(args.config)
             print(json.dumps(
@@ -1895,6 +2122,9 @@ def main(argv=None):
             created = arm(args.data_dir, args.release_sha)
             print('[通过] 部署禁开仓哨兵已安全启用' if created else
                   '[通过] 既有部署禁开仓哨兵安全且已启用')
+        elif args.command == 'arm-recovery-gate':
+            arm_recovery_gate(args.data_dir, args.release_sha)
+            print('[通过] 旧 runtime 恢复禁开仓哨兵已安全启用')
         elif args.command == 'baseline':
             summary = run_baseline(
                 args.config, args.data_dir, args.release_sha,
@@ -1927,8 +2157,16 @@ def main(argv=None):
                 f"algo={summary['algo_orders_checked']}")
         elif args.command == 'commit':
             summary = commit_sealed(
-                args.config, args.data_dir, args.release_sha)
+                args.config, args.data_dir, args.release_sha,
+                args.expected_runner_pid, args.expected_slot)
             print('[通过] sealed sentinel 已原子提交解除：'
+                  f"history_end={summary['history_verified_through_ms']}")
+        elif args.command in {
+                'verify-committed-stopped', 'verify-committed-running'}:
+            summary = verify_committed_cycle(
+                args.data_dir, args.release_sha,
+                runner_active=args.command == 'verify-committed-running')
+            print('[通过] COMMIT_READY 对应的已提交门禁证据有效：'
                   f"history_end={summary['history_verified_through_ms']}")
         else:
             audit = abandon_cycle(
