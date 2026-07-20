@@ -358,6 +358,7 @@ verify_blocked_units() {
       cloudflared.service trading-mem-monitor.service trading.service; do
     state="$(systemctl show "$unit" -p ActiveState --value)" || return 1
     [[ "$state" = inactive ]] || return 1
+    [[ "$unit" = *.timer ]] && continue
     test "$(systemctl show "$unit" -p MainPID --value)" = 0 || return 1
     cgroup="$(systemctl show "$unit" -p ControlGroup --value)" || return 1
     cgroup_is_empty "$cgroup" || return 1

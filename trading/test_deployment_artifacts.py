@@ -2328,6 +2328,9 @@ printf 'fail:%s\n' "$fail" >>"$EVENTS"
             '"$signature" = \'a(sbbsi)\' && "$count" = 0',
             self.deploy)
 
+    def test_recovery_does_not_require_main_pid_from_timer_unit(self):
+        self.assertIn('[[ "$unit" = *.timer ]] && continue', self.recover)
+
     def test_backup_script_inode_is_synced_before_atomic_replace(self):
         install = self.deploy.index(
             '"$DEPLOY_STAGE/trading-state-backup.reviewed" '
