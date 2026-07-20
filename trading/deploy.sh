@@ -1,5 +1,5 @@
 #!/usr/bin/env -S -i PATH=/usr/sbin:/usr/bin:/sbin:/bin TRADING_STERILE_DRIVER=1 /bin/bash --noprofile --norc
-# Render __RELEASE_SHA__ once, review the rendered SHA-256, and install this
+# Render the release SHA placeholder once, review the rendered SHA-256, and install this
 # file plus emergency-stop.sh under /usr/local/lib/trading-deploy/<sha>/.
 # This driver is intentionally non-interactive.  Human decisions are supplied
 # as short-lived root-owned deployment_evidence.py files.

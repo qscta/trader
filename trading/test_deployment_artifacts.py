@@ -764,6 +764,9 @@ class DeploymentArtifactTests(unittest.TestCase):
         self.assertIn('"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"', self.prepare)
 
     def test_placeholder_is_single_and_consistent(self):
+        self.assertEqual(self.deploy.count(PLACEHOLDER), 1)
+        self.assertEqual(self.emergency.count(PLACEHOLDER), 1)
+        self.assertEqual(self.recover.count(PLACEHOLDER), 1)
         self.assertEqual(self.deploy.count("EXPECTED_SHA='__RELEASE_SHA__'"), 1)
         self.assertEqual(
             self.emergency.count("EXPECTED_SHA='__RELEASE_SHA__'"), 1)

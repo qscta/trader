@@ -1,5 +1,5 @@
 #!/usr/bin/env -S -i PATH=/usr/sbin:/usr/bin:/sbin:/bin TRADING_STERILE_DRIVER=1 /bin/bash --noprofile --norc
-# Render __RELEASE_SHA__ to the reviewed 40-hex commit, install this file as
+# Render the release SHA placeholder to the reviewed 40-hex commit, install this file as
 # /usr/local/lib/trading-deploy/<sha>/emergency-stop.sh root:root 0555, then
 # hash it before the normal deployment may stop any service.
 if [[ ${TRADING_STERILE_DRIVER:-} != 1 ]]; then
