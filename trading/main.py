@@ -1,0 +1,781 @@
+import json
+import sys
+import time
+import logging
+import logging.handlers
+import os
+import fcntl
+from datetime import datetime, date, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+from okx_api import OkxApi
+from equity_tracker import EquityTracker
+from ma_cross_strategy import MaCrossStrategy
+from risk_manager import RiskManager
+from dingtalk_notifier import DingTalkNotifier
+from trade_state import TradeState, TradeStatePersistenceError, atomic_write_json
+from stop_guardian import StopGuardianMixin
+from reporting import ReportingMixin
+from signal_handlers import SignalHandlersMixin
+from trade_executor import TradeExecutorMixin
+import config_validation as cfgv
+
+# 日志轮转（10MB自动切割，保留5个备份）。路径锚定项目目录，避免 systemd/cron 等不同 cwd 下日志写错位置。
+# delay=True 懒打开：首条日志时才创建文件——测试进程导入 main 时（根 logger 已被测试挂
+# NullHandler，basicConfig 空转）不再凭空建文件/占句柄；生产启动毫秒内即写日志，行为等价
+_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
+log_handler = logging.handlers.RotatingFileHandler(
+    _LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8', delay=True
+)
+log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[log_handler, console_handler]
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+RUNNER_LOCK_FILE = '/tmp/trading_system_runner.okx.lock'
+
+
+def acquire_runner_lock(lock_file=RUNNER_LOCK_FILE):
+    """全机单实例门禁；所有可执行入口必须在初始化交易系统前调用。"""
+    lock_fp = open(lock_file, 'w')
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception as e:
+        lock_fp.close()
+        raise RuntimeError('已有交易系统实例持锁，拒绝重复启动') from e
+    return lock_fp
+
+
+class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, TradeExecutorMixin):
+    """欧易单所交易系统的装配与调度核心。
+
+    物理分层（mixin，方法仍全部绑定在本类实例上，self 语义与调用链不变）：
+      - StopGuardianMixin（stop_guardian.py）：止损防线——验证式撤销确认、残留阻断、
+        止损自愈巡检、「交易所已平」统一收尾、账本落盘失败的运行时补偿；
+      - ReportingMixin（reporting.py）：通知缓冲/汇总、每日持仓汇总、周报、权益采样告警；
+      - SignalHandlersMixin（signal_handlers.py）：双均线 EMA 的信号分派——无仓开仓判定、
+        有仓时的止损确认/翻转分派、双均线 T+1 重入；
+      - TradeExecutorMixin（trade_executor.py）：下单执行——通用开仓（校验/回滚）、
+        双均线翻转、开仓落盘失败的交易所侧回滚；
+      - 本文件保留：装配与配置、状态归属护栏、启动同步、日检总指挥
+        check_and_execute_trades 与调度注册（真钱编排核心，刻意留在 main 便于审查）。
+    """
+
+    def __init__(self, config_file='config.json'):
+        """初始化欧易单交易所交易系统。状态文件落项目根目录（与原单所版一致）。"""
+        self.config_file = config_file
+        self.config = self.load_config(config_file)
+        self.exchange_id = 'okx'
+        self.label = self.config.get('okx', {}).get('label') or '欧易'
+        self.base_dir = os.path.dirname(os.path.abspath(config_file))
+        self.data_dir = self.base_dir
+        self._config_lock = threading.RLock()
+
+        # 交易所适配层：只换成欧易，策略层输入输出语义不变
+        self.exchange_api = OkxApi(self.config['okx'])
+
+        self.ma_cross_strategy = MaCrossStrategy(
+            self.config['strategy'].get('ma_short_period', 7),
+            self.config['strategy'].get('ma_long_period', 28),
+            self.config['strategy'].get('ma_stop_period', 28)
+        )
+
+        webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
+        self.notifier = DingTalkNotifier(webhook)
+        # 时区守卫：日检时点、T+1 记录、求索指数切日全用系统本地时间，部署要求
+        # Asia/Shanghai（UTC+8）。不符只在启动时告警一次、不阻断——不给调度器单独
+        # 钉时区（那会造出「调度上海时、业务本地时」的双时钟系统）。
+        _tz_offset = datetime.now().astimezone().utcoffset()
+        if _tz_offset != timedelta(hours=8):
+            _tz_msg = (f'[{self.label}] 服务器时区异常：当前 UTC 偏移 {_tz_offset}，部署要求 UTC+8'
+                       f'（Asia/Shanghai）。日检时点/T+1 记录/求索指数切日均依赖本地时间，'
+                       f'请尽快修正服务器时区！')
+            logger.critical(_tz_msg)
+            try:
+                self.notifier.notify_error(_tz_msg)
+            except Exception:
+                pass
+        try:
+            self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
+        except TradeStatePersistenceError as e:
+            # 账本损坏或不可确认（fail-closed）：广播后拒绝启动，绝不失忆运行——
+            # 失忆不仅漏管旧仓，日检还会把有真实仓位的品种当空仓重复开仓
+            logger.critical(f'交易状态账本不可确认，拒绝启动: {e}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 交易状态账本损坏或不可确认，系统已拒绝启动，'
+                    f'请立即人工修复 trade_state.json！\n{e}')
+            except Exception:
+                pass
+            raise
+        self._guard_state_owner()  # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入
+        self.scheduler = BackgroundScheduler()
+        self._last_check_date = None  # 防重复执行
+        self._last_summary_date = None  # 每日持仓汇总去重
+        self._pending_trade_open_notifications = []
+        self._pending_trade_close_notifications = []
+        self._trade_lock = threading.Lock()  # 防并发执行锁
+        self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
+        self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
+        self._known_orphans = set()  # 已告警的孤儿仓（新增才告警、消失即移除，与 _stop_anomalies 同一节流模式）
+        self._last_failure_notify_ts = 0
+        self._equity_tick_fail_streak = 0
+        self._equity_tick_alert_sent = False
+        # 部署/维护期的最小开仓总闸：只拦所有新开仓边界，不影响持仓巡检、
+        # 止损自愈和平仓。由 systemd 环境显式设置，默认关闭。
+        self.new_entries_disabled = os.environ.get('TRADING_DISABLE_NEW_OPENS') == '1'
+        if self.new_entries_disabled:
+            logger.warning(f'[{self.label}] TRADING_DISABLE_NEW_OPENS=1：新开仓总闸已关闭')
+
+        self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
+        self.stop_loss_dates = self._load_stop_loss_dates()
+
+        self.equity_tracker = EquityTracker(
+            self.data_dir, self,
+            notify_failure=self._notify_persistence_failure,
+            retention_days=self.config.get('equity_tick_retention_days'),
+        )
+
+        # 启动时必须成功获取权益，重试3次。get_balance 的网络异常（适配层重试耗尽后
+        # re-raise）与认证异常（立抛）都必须在此捕获——否则会绕过下方「钉钉告警+退出」
+        # 路径，进程裸 traceback 静默死亡，恰是本函数要消灭的最贵故障模式
+        account_equity = None
+        for _retry_i in range(3):
+            try:
+                balance = self.exchange_api.get_balance()
+            except Exception as e:
+                balance = None
+                logger.warning(f'[{self.label}] 启动时获取账户权益异常: {e}')
+            if balance and 'USDT' in balance.get('total', {}):
+                account_equity = balance['total']['USDT']
+                break
+            logger.warning(f'[{self.label}] 启动时获取账户权益失败，10秒后重试... (第{_retry_i+1}/3次)')
+            time.sleep(10)
+
+        if account_equity is None:
+            logger.critical('系统启动失败：3次尝试后仍无法获取初始账户权益！请检查API密钥和网络连接。')
+            # 退出前尽力补发钉钉：系统静默死掉是最贵的故障模式（与账本损坏路径同标准）
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
+                    f'进程即将退出，请检查API密钥和网络连接！')
+            except Exception:
+                pass
+            sys.exit(1)
+
+        self.risk_manager = RiskManager(account_equity, self.config['strategy']['default_risk_per_trade'])
+        logger.info(f"[{self.label}] 交易系统初始化完成，账户权益: {account_equity} USDT")
+
+        self.sync_positions_on_startup()
+
+    def load_config(self, config_file):
+        """加载欧易单所配置：{okx:{凭据...}, strategy, trading, scheduler, dingtalk}。
+        兼容旧多所格式（exchanges.okx）自动展平；环境变量可覆盖凭据。"""
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        # 兼容旧多所格式：从 exchanges.okx 展平到顶层
+        if 'okx' not in config and isinstance(config.get('exchanges'), dict):
+            okx_block = dict(config['exchanges'].get('okx') or {})
+            config['okx'] = okx_block
+            config.setdefault('strategy', okx_block.get('strategy', {}))
+            config.setdefault('trading', okx_block.get('trading', {'symbols': []}))
+        okx = config.setdefault('okx', {})
+        if os.environ.get('OKX_API_KEY'):
+            okx['apiKey'] = os.environ['OKX_API_KEY']
+        if os.environ.get('OKX_API_SECRET'):
+            okx['secret'] = os.environ['OKX_API_SECRET']
+        _pass = os.environ.get('OKX_API_PASSPHRASE') or os.environ.get('OKX_PASSWORD')
+        if _pass:
+            okx['password'] = _pass
+        if not okx.get('apiKey') or not okx.get('secret') or not okx.get('password'):
+            raise ValueError('未配置 OKX API 凭据（apiKey/secret/passphrase），请在 config.json 或环境变量中提供')
+        config.setdefault('strategy', {})
+        self._validate_strategy_config(config['strategy'])
+        config.setdefault('trading', {'symbols': []})
+        config['trading'].setdefault('symbols', [])
+        self._validate_symbol_configs(config['trading']['symbols'])
+        config.setdefault('scheduler', {})
+        self._validate_scheduler_config(config['scheduler'])
+        if config.get('equity_tick_retention_days') is not None:
+            # 与 strategy/scheduler 同标准 fail-loud：EquityTracker 虽有 try/except 防御，
+            # 但静默吞掉非法值会让「我配的保留天数」与实际生效值悄悄不一致
+            v = cfgv.strict_int(config['equity_tick_retention_days'], 'config.equity_tick_retention_days')
+            if not (7 <= v <= 3650):
+                raise ValueError(f"config.equity_tick_retention_days 超出允许范围 [7, 3650]: {v}")
+            config['equity_tick_retention_days'] = v
+        config.setdefault('dingtalk', {})
+        return config
+
+    def _validate_scheduler_config(self, scheduler):
+        """启动前校验并规范化调度参数（就地写回 config，消除类型漂移）。
+
+        这些整数直接流入 register_jobs 的算术与格式化（check_minute + 1、
+        {check_hour:02d}）和 APScheduler 的 hour/minute 字段。此前无校验：手写
+        config.json 把 check_minute 写成字符串 "0" 会让 `check_minute + 1` 抛
+        TypeError、把 check_hour 写成 25 会让 APScheduler 抛内部错——都是难懂的
+        启动崩溃。与 strategy/symbols 同源、同标准 fail-loud：给清晰 ValueError。
+        全部为可选键（缺省由 register_jobs 的 .get 默认值兜底），仅当显式提供时校验。
+        """
+        hour_keys = ('check_hour', 'summary_hour', 'weekly_hour')
+        minute_keys = ('check_minute', 'summary_minute', 'weekly_minute')
+        for key in hour_keys:
+            if scheduler.get(key) is None:
+                continue
+            v = cfgv.strict_int(scheduler[key], f'config.scheduler.{key}')
+            if not (0 <= v <= 23):
+                raise ValueError(f"config.scheduler.{key} 超出允许范围 [0, 23]: {v}")
+            scheduler[key] = v
+        for key in minute_keys:
+            if scheduler.get(key) is None:
+                continue
+            v = cfgv.strict_int(scheduler[key], f'config.scheduler.{key}')
+            if not (0 <= v <= 59):
+                raise ValueError(f"config.scheduler.{key} 超出允许范围 [0, 59]: {v}")
+            scheduler[key] = v
+        if scheduler.get('stop_loss_scan_interval_minutes') is not None:
+            v = cfgv.strict_int(scheduler['stop_loss_scan_interval_minutes'],
+                                'config.scheduler.stop_loss_scan_interval_minutes')
+            if not (1 <= v <= 1440):
+                raise ValueError(
+                    f"config.scheduler.stop_loss_scan_interval_minutes 超出允许范围 [1, 1440]: {v}")
+            scheduler['stop_loss_scan_interval_minutes'] = v
+
+    def _validate_strategy_config(self, strategy):
+        """启动前校验并**规范化**策略参数（就地写回 config，消除类型漂移）。
+
+        口径全部取自 config_validation（与前端/API 同一事实源）。default_risk_per_trade
+        在装配层是直接下标访问（非 .get 兜底），缺失或非法会在运行中抛裸异常或产出
+        危险仓位（风险度<0 算出负仓位）。校验后必须写回规范类型——否则 "0.01" 字符串
+        能通过校验却仍是字符串，构造 RiskManager 权益×"0.01"→TypeError。
+        与凭据缺失同标准 fail-loud，绝不静默塞默认值（真钱系统默认策略参数比拒启更危险）。
+        """
+        missing = [k for k in ('default_risk_per_trade',) if strategy.get(k) is None]
+        if missing:
+            raise ValueError(
+                f"config.strategy 缺少必需参数 {missing}，请对照 config.example.json 补全后再启动")
+
+        # 周期类 ma_* 三键有 .get 默认值，仅当显式提供时校验。规范化写回 int
+        for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
+            if strategy.get(key) is None:
+                continue
+            v = cfgv.strict_int(strategy[key], f'config.strategy.{key}')
+            if not (cfgv.PERIOD_MIN <= v <= cfgv.PERIOD_MAX):
+                raise ValueError(
+                    f"config.strategy.{key} 超出允许范围 [{cfgv.PERIOD_MIN}, {cfgv.PERIOD_MAX}]: {v}")
+            strategy[key] = v
+
+        strategy['default_risk_per_trade'] = cfgv.strict_risk_per_trade(
+            strategy['default_risk_per_trade'], 'config.strategy.default_risk_per_trade')
+
+        # EMA 短期必须小于长期（用生效值判定：缺省短 7 / 长 28，与构造处默认一致）
+        eff_short = strategy.get('ma_short_period', 7)
+        eff_long = strategy.get('ma_long_period', 28)
+        if eff_short >= eff_long:
+            raise ValueError(f"config.strategy EMA 短期({eff_short})必须小于长期({eff_long})")
+
+    def _validate_symbol_configs(self, symbols):
+        """启动前校验并规范化交易对池——与 api_server._validate_symbol_input 同口径（同源常量）。
+
+        手写 config.json 的品种 risk_per_trade / strategy / name 此前无启动校验：
+        risk_per_trade=1.0（100%）会直接进 _execute_open 的仓位计算放大到全仓风险；
+        非法策略名会绕过白名单（错误托管）。补齐三校验，
+        与增删品种的 API 入口一致，堵住"手写配置"这条绕过风控的入口。
+        """
+        seen = set()
+        for i, s in enumerate(symbols):
+            if not isinstance(s, dict):
+                raise ValueError(f"config.trading.symbols[{i}] 不是对象: {s!r}")
+            name = cfgv.normalize_symbol_name(s.get('name'), f"config.trading.symbols[{i}] 交易对名")
+            if name in seen:
+                raise ValueError(f"config.trading.symbols 存在重复交易对: {name}")
+            seen.add(name)
+            s['name'] = name  # 规范化写回（去空格/转大写）
+
+            if s.get('risk_per_trade') is not None:  # 缺省时由 default_risk_per_trade 兜底（既有行为）
+                s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")
+            if s.get('enabled') is not None:  # 缺省时 .get('enabled', True) 兜底（既有行为）
+                s['enabled'] = cfgv.strict_bool(s['enabled'], f"{name} enabled")  # 挡 "false" 被当真
+            if s.get('strategy') is not None and s['strategy'] not in cfgv.STRATEGY_WHITELIST:
+                raise ValueError(f"{name} 未知策略: {s['strategy']!r}（只支持 ma_cross）")
+
+    def _guard_state_owner(self):
+        """启动前校验本地状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入。
+
+        - 已标记为本所(okx)：放行。
+        - 标记为其它交易所：拒绝启动。
+        - 未标记且无持仓：视为全新状态，安全地打上本所标记。
+        - 未标记但已有持仓：来路不明(可能是旧币安状态)，拒绝启动并要求人工确认。
+        """
+        owner = self.trade_state.get_owner_exchange()
+        has_positions = bool(self.trade_state.get_all_open_positions())
+        if owner == self.exchange_id:
+            return
+        if owner and owner != self.exchange_id:
+            raise RuntimeError(
+                f"状态文件 trade_state.json 归属交易所为「{owner}」，与当前「{self.exchange_id}」不一致，"
+                "已拒绝启动以避免串仓。请改用独立目录部署，或人工确认后修正归属标记。"
+            )
+        # owner 为空：未标记
+        if not has_positions:
+            self.trade_state.claim_owner_exchange(self.exchange_id)
+            logger.info(f"[{self.label}] 全新本地状态，已标记归属交易所为 {self.exchange_id}")
+            return
+        raise RuntimeError(
+            "检测到根目录 trade_state.json 含持仓但无交易所归属标记，可能是旧币安单所版遗留状态。"
+            "为避免把币安持仓当作欧易仓位管理(错误止损/平仓)，已拒绝启动。请人工确认后二选一：\n"
+            "  1) 若该状态确属欧易：在 trade_state.json 顶层加 \"exchange\": \"okx\" 后重启；\n"
+            "  2) 若不确定或属币安：把欧易系统部署到独立目录(避免与旧状态混用)。"
+        )
+
+    def persist_config(self):
+        """把当前 config 原子写回磁盘（增删品种/改参数后调用）。"""
+        with self._config_lock:
+            return atomic_write_json(self.config_file, self.config)
+
+    def reload_strategies(self):
+        """重新加载策略参数"""
+        self.ma_cross_strategy = MaCrossStrategy(
+            self.config['strategy'].get('ma_short_period', 7),
+            self.config['strategy'].get('ma_long_period', 28),
+            self.config['strategy'].get('ma_stop_period', 28)
+        )
+        logger.info(f"策略参数已重新加载: EMA短期={self.config['strategy'].get('ma_short_period', 7)}, "
+                    f"EMA长期={self.config['strategy'].get('ma_long_period', 28)}, "
+                    f"EMA止损周期={self.config['strategy'].get('ma_stop_period', 28)}")
+
+    def sync_positions_on_startup(self):
+        """启动时与交易所同步持仓状态"""
+        logger.info("开始同步持仓状态...")
+        open_positions = self.trade_state.get_all_open_positions()
+
+        for symbol in list(open_positions.keys()):
+            ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+            position = self.exchange_api.get_position(ccxt_symbol)
+
+            if position is None or position.get('contracts', 0) == 0:
+                if not self._confirm_exchange_flat(symbol, ccxt_symbol):
+                    continue
+                logger.warning(f"{symbol} 在交易所中没有持仓，但本地记录有，更新状态...")
+                try:
+                    exit_price = self.exchange_api.get_last_price(ccxt_symbol) or open_positions[symbol]['entry_price']
+                except Exception:
+                    exit_price = open_positions[symbol]['entry_price']
+                pool_config = next(
+                    (s for s in self.config['trading']['symbols'] if s['name'] == symbol), None)
+                exit_only = pool_config is None or not pool_config.get('enabled', True)
+                self._persist_exchange_flat_policy(symbol, exit_only)
+                closed_position, _state_saved, _stop_cleared = self._handle_exchange_flat_close(
+                    symbol, ccxt_symbol, open_positions[symbol], exit_price, "启动同步平仓")
+                if not closed_position:
+                    logger.warning(f"{symbol} 启动同步时本地状态补偿失败，保留原状态等待人工处理")
+            else:
+                if self._managed_position_is_consistent(
+                        symbol, ccxt_symbol, open_positions[symbol], position):
+                    logger.info(f"{symbol} 持仓同步成功")
+                    # 重启后不等待下一个五分钟任务：持仓一致即立刻复用现有三态巡检，
+                    # 确认交易所止损仍在；停机期间被撤掉则立即补挂。
+                    held_strategy = open_positions[symbol].get('strategy') or 'ma_cross'
+                    self._ensure_stop_order_alive(
+                        symbol, ccxt_symbol, open_positions[symbol],
+                        self._get_strategy_display_name(held_strategy))
+
+        # 反向核对：交易所有仓但本地无记录（本地状态损坏丢失/人工开仓/开仓超时后迟到成交）——
+        # 该仓不会被系统托管（不推止损、不检查平仓），静默存在比报错更危险，必须告警。
+        # 同一核对在盘中巡检每轮执行（_check_orphan_positions），此处为启动首查
+        try:
+            self._check_orphan_positions('启动同步')
+        except Exception as e:
+            logger.warning(f"启动孤儿仓核对失败（不阻断启动）: {e}")
+
+        logger.info("持仓状态同步完成")
+
+    def get_strategy_for_symbol(self, symbol_config):
+        """根据交易对配置获取对应策略（当前仅双均线 EMA 一种）。"""
+        return self.ma_cross_strategy, 'ma_cross'
+
+    def _load_stop_loss_dates(self):
+        """加载 T+1 安全状态；文件存在但损坏时拒绝失忆运行。"""
+        if os.path.exists(self.stop_loss_file):
+            try:
+                with open(self.stop_loss_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError(f'顶层必须是对象，实际为 {type(data).__name__}')
+                today = date.today().strftime('%Y-%m-%d')
+                for symbol, day_text in data.items():
+                    if not isinstance(symbol, str) or not symbol:
+                        raise ValueError(f'交易对键非法: {symbol!r}')
+                    if not isinstance(day_text, str):
+                        raise ValueError(f'{symbol} 日期非字符串: {day_text!r}')
+                    datetime.strptime(day_text, '%Y-%m-%d')
+                    if day_text > today:
+                        raise ValueError(f'{symbol} 日期 {day_text} 晚于当前日期 {today}')
+                logger.info(f"已加载止损日期记录: {data}")
+                return data
+            except Exception as e:
+                msg = (f'T+1 止损日期文件损坏或无法读取: {self.stop_loss_file}: {e}。'
+                       f'拒绝以空状态启动，避免忘记当日止损后意外重新开仓。')
+                logger.critical(msg)
+                try:
+                    self.notifier.notify_error(msg)
+                except Exception:
+                    pass
+                raise TradeStatePersistenceError(msg) from e
+        return {}
+
+    def _save_stop_loss_dates(self):
+        """保存止损日期记录（原子写入）；失败必须向上抛出。"""
+        if not atomic_write_json(self.stop_loss_file, self.stop_loss_dates):
+            msg = (f'保存 T+1 止损日期失败: {self.stop_loss_file}。'
+                   f'当前进程仍保留内存阻断，但不得在修复磁盘前重启。')
+            logger.critical(msg)
+            try:
+                self.notifier.notify_error(msg)
+            except Exception:
+                pass
+            raise TradeStatePersistenceError(msg)
+        return True
+
+    def is_stop_loss_today(self, symbol):
+        """检查该交易对今天是否已经止损过（T+1限制）"""
+        if symbol in self.stop_loss_dates:
+            today_str = date.today().strftime('%Y-%m-%d')
+            # 未来日期只可能来自系统时钟回拨/外部篡改：按已止损处理（fail closed），
+            # 绝不因「不等于今天」就放行新开仓。启动加载也会拒绝这种状态。
+            if self.stop_loss_dates[symbol] >= today_str:
+                return True
+        return False
+
+    def record_stop_loss(self, symbol):
+        """记录止损日期（持久化到文件）"""
+        self.stop_loss_dates[symbol] = date.today().strftime('%Y-%m-%d')
+        self._save_stop_loss_dates()
+
+    def clear_stop_loss(self, symbol):
+        """清除 T+1 标记；落盘失败时恢复内存标记，保持 fail-closed。"""
+        previous = self.stop_loss_dates.pop(symbol, None)
+        if previous is None:
+            return False
+        try:
+            self._save_stop_loss_dates()
+        except Exception:
+            self.stop_loss_dates[symbol] = previous
+            raise
+        return True
+
+    def check_and_execute_trades(self, manual_run=False):
+        """检查并执行交易"""
+        # 三重防护：线程锁 + 日期检查 + APScheduler max_instances
+        if not self._trade_lock.acquire(blocking=False):
+            logger.warning("交易检查正在执行中(锁冲突)，跳过本次触发")
+            return
+        try:
+            self.equity_tracker.record_daily_equity_snapshot()  # 记录每日权益快照
+            today = date.today().isoformat()
+            if self._last_check_date == today and not manual_run:
+                logger.warning(f"今日({today})已执行过交易检查，跳过重复执行")
+                return
+            logger.info("开始检查交易信号...")
+            self._pending_trade_open_notifications = []
+            self._pending_trade_close_notifications = []
+
+            # 本轮监控集合 = 手动池启用品种 ∪ 有持仓品种。品种池取轮次开始时的
+            # 快照视图（与盘中巡检同一模式）：循环中途 API 增删品种不影响本轮的
+            # 一致性，也免去逐品种重扫池子
+            all_open_positions = self.trade_state.get_all_open_positions()
+            symbol_config_map = {s['name']: s for s in self.config['trading']['symbols']}
+            symbols_to_check = {name for name, s in symbol_config_map.items() if s.get('enabled', True)}
+            symbols_to_check.update(all_open_positions.keys())
+
+            logger.info(f"本轮检查交易对数: {len(symbols_to_check)}")
+
+            # 先重试清理止损残留（清理确认后解除对应品种的开仓阻断）
+            self._retry_clear_stop_residues()
+
+            # 账本瘦身：超出保留窗口的平仓历史搬进只追加的史书文件（失败不影响交易）
+            try:
+                self.trade_state.compact_closed_trades()
+            except Exception as e:
+                logger.warning(f"平仓历史归档失败（不影响交易，账本保留全部记录）: {e}")
+
+            # 逐个检查交易对（排序保证遍历与日志顺序确定，跨轮可对比）
+            failed_symbols = []
+            for symbol in sorted(symbols_to_check):
+                # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
+                try:
+                    symbol_config = symbol_config_map.get(symbol)
+                    if symbol_config is None:
+                        # 品种已从手动池删除但仍有持仓：优先用「持仓记录的策略」（当前仅 ma_cross）
+                        held = all_open_positions.get(symbol) or {}
+                        held_strategy = held.get('strategy') or 'ma_cross'
+                        symbol_config = {
+                            'name': symbol,
+                            'enabled': True,
+                            'risk_per_trade': self.config['strategy']['default_risk_per_trade'],
+                            'strategy': held_strategy,
+                            # 从品种池删除但仍有持仓：只管到当前仓结束，不反手、不重入。
+                            'exit_only': True
+                        }
+                    elif not symbol_config.get('enabled', True):
+                        # 禁用与删除保持同一安全语义：已有仓继续托管到结束，
+                        # 但反向信号只平旧仓，不得借“翻转”重新开仓。
+                        symbol_config = dict(symbol_config)
+                        symbol_config['exit_only'] = True
+
+                    strategy, strategy_type = self.get_strategy_for_symbol(symbol_config)
+                    logger.info(f"检查 {symbol} (策略: {strategy_type})...")
+
+                    ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
+                    required_closed_candles = cfgv.required_closed_candles_for_strategy(
+                        strategy_type, self.config.get('strategy', {}))
+                    fetch_limit = cfgv.ohlcv_fetch_limit_for_strategy(
+                        strategy_type, self.config.get('strategy', {}))
+
+                    ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
+                    if not ohlcv:
+                        logger.warning(f"{symbol} 获取K线数据失败")
+                        continue
+
+                    df = self.exchange_api.ohlcv_to_dataframe(ohlcv)
+                    df = self.exchange_api.filter_closed_candles(df, timeframe='1d')
+                    if len(df) == 0:
+                        logger.warning(f"{symbol} 无已收盘K线，跳过本轮检查")
+                        continue
+                    if len(df) < required_closed_candles:
+                        logger.warning(
+                            f"{symbol} K线数据不足：{strategy_type} 策略配置至少需要 "
+                            f"{required_closed_candles} 根已收盘K线，本轮仅取得 {len(df)} 根"
+                            f"（请求 {fetch_limit} 根），请检查周期配置或交易所历史K线供应")
+                        continue
+
+                    history_ok, history_error = strategy.validate_live_history(df)
+                    if not history_ok:
+                        logger.critical(
+                            f"{symbol} K线历史不适合真钱交易: {history_error}；"
+                            "本轮禁止开仓、平仓和反手")
+                        failed_symbols.append(symbol)
+                        continue
+
+                    signal = strategy.check_signal(df)
+
+                    if not signal:
+                        logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
+                        continue
+
+                    current_close = float(df['close'].iloc[-1])
+                    ema_s = signal.get('ema_short')
+                    ema_l = signal.get('ema_long')
+                    upper_stop = signal.get('upper_stop')
+                    lower_stop = signal.get('lower_stop')
+                    logger.info(f"{symbol} [双均线指标] 收盘价={current_close:.2f}, "
+                               f"EMA短={ema_s:.2f}, EMA长={ema_l:.2f}, "
+                               f"N日高={upper_stop:.2f}, N日低={lower_stop:.2f}, "
+                               f"信号={signal.get('action', '无')}")
+
+                    position = self.trade_state.get_open_position(symbol)
+
+                    if position:
+                        self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
+                    else:
+                        self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
+
+                except Exception as sym_e:
+                    logger.exception(f"{symbol} 本轮检查异常，跳过该品种继续: {sym_e}")
+                    failed_symbols.append(symbol)
+
+            # 信号检查完成后按汇总顺序推送，避免 08:00 单条消息过多触发限流
+            self._flush_pending_trade_notifications()
+            logger.info("信号检查完毕，刷新账户统计状态...")
+            self.equity_tracker.refresh_account_stats_state()
+            logger.info("信号检查完毕，推送每日持仓汇总...")
+            self.send_daily_position_summary_if_due(mark_sent=not manual_run)
+            if failed_symbols:
+                # 不标记当日完成：让 +1 分钟的重试调度整轮重跑（开仓/止损/平仓均有幂等防护）
+                logger.error(f"本轮 {len(failed_symbols)} 个品种检查异常: {', '.join(sorted(failed_symbols))}，"
+                             f"今日暂不标记完成，等待重试调度整轮重跑")
+                now_ts = int(time.time())
+                if now_ts - self._last_failure_notify_ts >= 600:
+                    self._last_failure_notify_ts = now_ts
+                    self.notifier.send_message(
+                        "交易检查部分品种失败",
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"失败品种: {', '.join(sorted(failed_symbols))}\n其余品种已正常检查")
+            elif not manual_run:
+                # 手动检查不标记当日完成：00:00–08:00 间手动触发跑的是昨日已收盘数据，
+                # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失
+                self._last_check_date = today
+        except Exception as e:
+            logger.exception(f"交易检查异常: {e}")
+            try:
+                now_ts = int(time.time())
+                if now_ts - self._last_failure_notify_ts >= 600:
+                    self._last_failure_notify_ts = now_ts
+                    self.notifier.send_message("交易检查失败",
+                        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n错误: {e}")
+            except Exception as ne:
+                logger.warning(f"发送失败告警失败: {ne}")
+        finally:
+            self._pending_trade_open_notifications = []
+            self._pending_trade_close_notifications = []
+            self._trade_lock.release()
+            logger.info("交易检查锁已释放")
+
+
+    def _run_startup_catchup_check(self, now=None):
+        """兜底补跑：已过今日检查时间而今日未执行过日检时，立即补跑一轮
+        （启动时调用一次 + 每 30 分钟周期兜底，守卫幂等，已跑则空转）。
+
+        场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
+        新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
+        重启后 _last_check_date 必然为空，午后重启也会补跑一轮——幂等防护
+        （持仓检查/同价跳过/T+1/张数上限）保证重复执行无副作用，且顺带自校验一遍状态。
+        缓冲 2 分钟：恰在调度窗口内启动时，让正常 cron（:05/:20/:40 与 +1 分钟重试）先走。
+        """
+        now = now or datetime.now()
+        sched = self.config.get('scheduler', {})
+        check_hour = sched.get('check_hour', 8)
+        check_minute = sched.get('check_minute', 0)
+        # 按当日绝对分钟数比较，避免 check_minute 接近 59 时 check_minute+2 溢出
+        # 让缓冲窗口错误地跨过整点（如 08:59 的缓冲应到 09:01，而非落在 (8,61) 的元组里）
+        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
+            return
+        if self._last_check_date == now.date().isoformat():
+            return
+        logger.warning(f"[{self.label}] 已过今日 {check_hour:02d}:{check_minute:02d} 检查时间且今日未执行，兜底补跑一轮日检")
+        self.check_and_execute_trades()
+
+    def _apply_deploy_restart_skip_catchup(self, now=None):
+        """部署重启专用护栏：显式要求时只跳过今天的启动兜底日检。
+
+        实盘晚间滚动代码时，重启会让内存级 _last_check_date 丢失；若已过 08:00，
+        启动兜底会立刻按上一根已收盘日线再跑一轮，可能管理当前实盘仓位。部署方可在
+        本次重启的进程环境里设 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1，把今日标记为已
+        日检，避免启动/30分钟兜底补跑；次日自然恢复正常 08:00 日检。
+
+        只在已过今日检查窗口（与 _run_startup_catchup_check 同一阈值）时生效：
+        未到检查时间本就没有兜底补跑可跳，若此时也标记，当天正点日检会被
+        _last_check_date 拦截，整日的新信号与止损推进丢失——标志按无效处理并告警。
+        """
+        if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
+            return False
+        now = now or datetime.now()
+        sched = self.config.get('scheduler', {})
+        check_hour = sched.get('check_hour', 8)
+        check_minute = sched.get('check_minute', 0)
+        if now.hour * 60 + now.minute < check_hour * 60 + check_minute + 2:
+            logger.warning(
+                f"[{self.label}] TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 已忽略：尚未到今日 "
+                f"{check_hour:02d}:{check_minute:02d} 日检时间，无兜底补跑可跳过；"
+                "若此时标记会吞掉今天的正点日检")
+            return False
+        today = now.date().isoformat()
+        self._last_check_date = today
+        logger.warning(
+            f"[{self.label}] 已按 TRADING_SKIP_STARTUP_CATCHUP_ONCE=1 标记今日({today})已日检，"
+            "本次部署重启跳过启动兜底补跑；次日正常恢复"
+        )
+        return True
+
+    def start(self):
+        """启动交易系统：注册定时任务、启动调度、阻塞主循环。"""
+        logger.info("启动交易系统...")
+        skip_startup_catchup = self._apply_deploy_restart_skip_catchup()
+        self.register_jobs(self.config.get('scheduler', {}))
+        self.scheduler.start()
+        logger.info(f"[{self.label}] 调度已启动，等待定时任务...")
+        if not self._scheduler_is_alive():
+            raise RuntimeError('APScheduler 启动后线程未存活')
+        if not skip_startup_catchup:
+            self._run_startup_catchup_check()
+        try:
+            while True:
+                time.sleep(60)
+                if not self._scheduler_is_alive():
+                    raise RuntimeError('APScheduler 调度线程已停止')
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，关闭交易系统...")
+            self.scheduler.shutdown()
+
+    def _scheduler_is_alive(self):
+        thread = getattr(self.scheduler, '_thread', None)
+        return bool(getattr(self.scheduler, 'running', False)
+                    and thread is not None and thread.is_alive())
+
+    def register_jobs(self, scheduler_config=None):
+        """把定时任务注册到本系统的调度器。"""
+        scheduler_config = scheduler_config or {}
+        ex = self.exchange_id
+        check_hour = scheduler_config.get('check_hour', 8)
+        check_minute = scheduler_config.get('check_minute', 0)
+        summary_hour = scheduler_config.get('summary_hour', 8)
+        summary_minute = scheduler_config.get('summary_minute', 0)
+        weekly_hour = scheduler_config.get('weekly_hour', 8)
+        weekly_minute = scheduler_config.get('weekly_minute', 1)
+
+        # 日内权益采样（间隔与 EquityTracker 分桶常量同源）用于前端求索指数
+        equity_tick_interval = EquityTracker.EQUITY_TICK_INTERVAL_MINUTES
+        self.scheduler.add_job(self._record_equity_tick_with_alert, 'cron',
+                              id=f'{ex}_equity_tick', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              minute=f'*/{equity_tick_interval}', second=15)
+
+        stop_loss_scan_interval = max(1, int(scheduler_config.get('stop_loss_scan_interval_minutes', 5)))
+        if stop_loss_scan_interval <= 59:
+            # cron 分钟步长仅支持 [1,59]：对齐到每 N 分钟的 :45 秒，错开权益采样(:15)与日检(:05/20/40)
+            self.scheduler.add_job(self.reconcile_intraday_stop_losses, 'cron',
+                                  id=f'{ex}_stoploss_scan', max_instances=1, coalesce=True, misfire_grace_time=120,
+                                  minute=f'*/{stop_loss_scan_interval}', second=45)
+        else:
+            # 间隔 ≥ 60 分钟：cron 的 minute='*/N' 会被 APScheduler 拒绝（步长 > 59，抛
+            # "step value higher than the total range"）——那会在守护线程里让整个调度注册崩溃，
+            # 交易线程静默死亡（Web 面板照常、日检/巡检/采样全部不跑）。改用 interval 触发器，
+            # 覆盖 _validate_scheduler_config 放行的 [60,1440] 全区间，与校验口径一致。
+            self.scheduler.add_job(self.reconcile_intraday_stop_losses, 'interval',
+                                  id=f'{ex}_stoploss_scan', max_instances=1, coalesce=True, misfire_grace_time=120,
+                                  minutes=stop_loss_scan_interval)
+
+        # 主执行 + 短窗口重试（成功一次后由 _last_check_date 拦截重复）
+        self.scheduler.add_job(self.check_and_execute_trades, 'cron',
+                              id=f'{ex}_daily_check', max_instances=1, coalesce=True, misfire_grace_time=60,
+                              hour=check_hour, minute=check_minute, second='5,20,40')
+        if check_minute < 59:
+            self.scheduler.add_job(self.check_and_execute_trades, 'cron',
+                                  id=f'{ex}_daily_check_retry', max_instances=1, coalesce=True, misfire_grace_time=60,
+                                  hour=check_hour, minute=check_minute + 1, second=0)
+        else:
+            logger.warning(f"[{self.label}] check_minute=59，跳过 +1 分钟重试任务")
+        # 日检兜底：主执行与 +1 分钟重试整窗失败（如恰逢网络故障）后当日再无触发点——
+        # 每 30 分钟由幂等守卫补跑（时间窗 + _last_check_date + 交易锁，已跑则空转）
+        self.scheduler.add_job(self._run_startup_catchup_check, 'cron',
+                              id=f'{ex}_daily_check_fallback', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              minute='*/30', second=0)
+        # 每日持仓汇总保持独立兜底调度，避免交易检查提前返回/异常时漏推
+        self.scheduler.add_job(self.send_daily_position_summary_if_due, 'cron',
+                              id=f'{ex}_daily_summary', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              hour=summary_hour, minute=summary_minute, second=50)
+        if summary_minute < 59:
+            self.scheduler.add_job(self.send_daily_position_summary_if_due, 'cron',
+                                  id=f'{ex}_daily_summary_retry', max_instances=1, coalesce=True, misfire_grace_time=120,
+                                  hour=summary_hour, minute=summary_minute + 1, second=20)
+        else:
+            logger.warning(f"[{self.label}] summary_minute=59，跳过 +1 分钟持仓汇总重试任务")
+        self.scheduler.add_job(self.send_weekly_report, 'cron',
+                              id=f'{ex}_weekly', day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
+
+        # 启动即采一次权益
+        self._record_equity_tick_with_alert()
+        logger.info(
+            f"[{self.label}] 定时任务已注册，每日检查 {check_hour:02d}:{check_minute:02d}，"
+            f"盘中止损巡检每 {stop_loss_scan_interval} 分钟"
+        )
+
+
+if __name__ == '__main__':
+    _runner_lock_fp = acquire_runner_lock()
+    TradingSystem().start()

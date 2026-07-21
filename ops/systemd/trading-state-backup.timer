@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Consistent Trading State Backup
+
+[Timer]
+OnCalendar=*-*-* 07:50:00
+AccuracySec=1min
+Persistent=false
+Unit=trading-state-backup.service
+
+[Install]
+WantedBy=timers.target

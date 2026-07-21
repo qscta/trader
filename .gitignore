@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+config.json
+
+# Runtime state and logs
+*.log
+*.log.*
+.runtime/
+trade_state.json
+trade_state.json.bak
+closed_trades_archive.json
+stop_loss_dates.json
+peak_equity.json
+equity_history.json
+daily_equity.json
+equity_ticks.json
+qiusuo_index.json
