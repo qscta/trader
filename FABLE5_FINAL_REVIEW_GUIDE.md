@@ -46,7 +46,7 @@
 
 ## 已知运维审查点
 
-截至快照生成时，`trading-state-backup.timer` 为 enabled 但 inactive，最后一次定时备份是 2026-07-20 07:50。备份脚本检查旧的 `.runtime/runner.lock`，而当前应用实际持有 `/tmp/trading_system_runner.okx.lock`。请独立判断影响、严重度和最小收缩方案；不要假设旧脚本可以直接重新启用。
+首轮审查确认了两个 P2：备份脚本的旧 `.runtime/runner.lock` 证明失真，以及资源监控缺 webhook 时以退出码 0 静默结束。当前分支包含候选修复：删除旧锁段（净减 11 行），并让生产监控路径退出码为 1、增加一项回归测试。请按 `FABLE5_FOLLOWUP_REVIEW.md` 独立复审；服务器尚未部署这些候选改动。
 
 ## 必须运行的验证
 

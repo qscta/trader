@@ -4,6 +4,7 @@
 
 - `systemd/trading.service` 与 drop-in：当前交易进程定义。
 - `systemd/trading-mem-monitor.service`：当前资源监控定义。
-- `systemd/trading-state-backup.service`、`.timer` 与 `sbin/trading-state-backup`：当前但已停用的自动备份链路。
+- `systemd/trading-state-backup.service`、`.timer`：当前但已停用的生产定义。
+- `sbin/trading-state-backup`：删除旧 runner lock 空证明后的候选修复，尚未部署。
 
-请勿把本目录直接当成部署包安装。尤其是备份链路存在 `RUNTIME_EVIDENCE.md` 所述的旧 runner lock 不匹配问题。
+请勿把本目录直接当成部署包安装。先按 `FABLE5_FOLLOWUP_REVIEW.md` 复审，批准后再部署并恢复 timer。

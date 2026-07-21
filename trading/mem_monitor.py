@@ -207,7 +207,7 @@ def main():
     webhook = load_webhook()
     if not webhook:
         logger.error("无法获取钉钉 webhook，退出")
-        return
+        sys.exit(1)
 
     last_alert_time = {
         'memory': 0,

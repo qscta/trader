@@ -24,7 +24,6 @@ cleanup() {
     status=$?
     trap - EXIT INT TERM
     /usr/bin/rm -f -- "$temporary"
-    exec 8>&- 2>/dev/null || true
     if ((restart_service)); then
         /usr/bin/systemctl start "$SERVICE" || status=1
     fi
@@ -40,16 +39,6 @@ if /usr/bin/systemctl is-active --quiet "$SERVICE"; then
 fi
 if /usr/bin/systemctl is-active --quiet "$SERVICE"; then
     echo 'trading service did not stop; refusing an inconsistent backup' >&2
-    exit 1
-fi
-if [[ ! -f "$SOURCE/.runtime/runner.lock" ||
-      -L "$SOURCE/.runtime/runner.lock" ]]; then
-    echo 'runner lock is missing or unsafe; refusing an unverified backup' >&2
-    exit 1
-fi
-exec 8<"$SOURCE/.runtime/runner.lock"
-if ! /usr/bin/flock -n 8; then
-    echo 'another trading runner still holds the project lock' >&2
     exit 1
 fi
 
