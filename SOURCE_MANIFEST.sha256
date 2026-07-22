@@ -6,7 +6,7 @@ a9df3a4ccdbf0efab224b9d1ad2fab65aba9015b830d043c9a2ad93f6e14e3c2  ./FABLE5_FINAL
 adc37d8fba8a012e8c1de163bcfb8e08232b18ac87fee1d637e2001ee30e7a04  ./RUNTIME_EVIDENCE.md
 b1964147510e366b4616cad1831b977d3830daff685cdd5a76399d6a639a5d5b  ./ops/README.md
 4be14995d45a18368f4f6bb1b0c036795445d64f6327a2c98593d87a6a8deec5  ./ops/logrotate/trading-mem-monitor
-f403e1deb87e3074d75b662ee6efdf18c0036b997e6c5f8bb13efd207905249f  ./ops/sbin/trading-state-backup
+7e832ef4d94c30d3dd67cebb58eff6a326b86f932797895663460c89b7477db7  ./ops/sbin/trading-state-backup
 080f53e9fc97f7b9604da0766048dfbe9a882e4ab8c66f9a1e8c545845e01c88  ./ops/systemd/trading-mem-monitor.service
 ed27e576dfb93caa554834f3fb42def47462b36f604a3cb99c15384dc1ff34a6  ./ops/systemd/trading-state-backup.service
 3fcb5a397d0512ddde2b7cebecf8af500e74aff132481bd486268d6d3a70f74a  ./ops/systemd/trading-state-backup.timer
