@@ -1,0 +1,9 @@
+/var/log/trading-mem-monitor/mem_monitor.log {
+    size 10M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

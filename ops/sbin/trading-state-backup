@@ -54,3 +54,13 @@ fi
 /usr/bin/mv "$temporary" "$archive"
 /usr/bin/sync -f "$archive"
 echo "consistent trading backup created: $archive"
+
+# Keep the newest 365 verified state archives; named deployment artifacts are untouched.
+printf '%s\n' "$DESTINATION"/state-*.tgz |
+    /usr/bin/sort -r |
+    /usr/bin/tail -n +366 |
+    while IFS= read -r expired; do
+        [[ -f "$expired" ]] || continue
+        /usr/bin/rm -- "$expired"
+        echo "expired trading backup removed: $expired"
+    done
