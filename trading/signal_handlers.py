@@ -8,8 +8,7 @@ T+1 止损重入。（海龟策略已下线移除。）
 宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
 stop_loss_dates / is_stop_loss_today / record_stop_loss / clear_stop_loss /
 _handle_exchange_flat_close / _get_strategy_display_name /
-_notify_missing_position_after_signal / _execute_open / _update_stop_order /
-_flip_position。
+_notify_missing_position_after_signal / _execute_open / _flip_position。
 """
 
 import logging

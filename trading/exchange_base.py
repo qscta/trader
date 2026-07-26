@@ -37,9 +37,12 @@ def retry_on_network_error(max_retries=3, backoff_seconds=(1, 2, 4)):
                 except (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeNotAvailable,
                         ccxt.DDoSProtection, ccxt.RateLimitExceeded) as e:
                     last_exception = e
-                    wait_time = backoff_seconds[attempt] if attempt < len(backoff_seconds) else backoff_seconds[-1]
-                    logger.warning(f"[重试 {attempt+1}/{max_retries}] {func.__name__} 网络异常: {e}, {wait_time}秒后重试...")
-                    time.sleep(wait_time)
+                    # 最后一次失败不再退避等待：多睡一个周期只会推迟调用方的
+                    # fail-safe（多品种巡检逐品种叠加），且「N秒后重试」也失实。
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_seconds[attempt] if attempt < len(backoff_seconds) else backoff_seconds[-1]
+                        logger.warning(f"[重试 {attempt+1}/{max_retries}] {func.__name__} 网络异常: {e}, {wait_time}秒后重试...")
+                        time.sleep(wait_time)
                 except (ccxt.InsufficientFunds, ccxt.InvalidOrder, ccxt.BadRequest,
                         ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.BadSymbol) as e:
                     logger.error(f"{func.__name__} 业务异常（不可重试）: {e}")
@@ -57,9 +60,9 @@ class ExchangeApi:
     """交易所适配层抽象基类。
 
     子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
-    close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
-    round_quantity、get_quantity_precision、find_stop_order_state、
-    list_position_symbols、find_existing_open_order、
+    close_position、create_stop_loss_order、cancel_order、cancel_stop_order_only、
+    cancel_all_orders、round_quantity、get_quantity_precision、
+    find_stop_order_state、list_position_symbols、find_existing_open_order、
     find_compensation_close_evidence。
 
     可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。

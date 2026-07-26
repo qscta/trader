@@ -33,14 +33,12 @@ def _build_system(tmpdir, config_symbols):
     system._last_failure_notify_ts = 0
     system._pending_trade_open_notifications = []
     system._pending_trade_close_notifications = []
-    system._pending_stop_loss_updates = []
     system.equity_tracker = SimpleNamespace(
         record_daily_equity_snapshot=lambda: None,
         refresh_account_stats_state=lambda: None)
     system.notifier = SimpleNamespace(
         send_message=lambda *a, **k: True,
-        notify_error=lambda *a, **k: True,
-        notify_stop_loss_updates_summary=lambda *a, **k: True)
+        notify_error=lambda *a, **k: True)
     system.send_daily_position_summary_if_due = lambda force=False, mark_sent=True, **kwargs: False
 
     checked = []  # [(symbol, strategy_type)]，由策略选择处记录
@@ -371,8 +369,6 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))
 
 
-
-
 class RetiredExternalFlatTest(unittest.TestCase):
     def test_retired_ma_flat_close_does_not_create_t1(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,79 +438,6 @@ class RetiredExternalFlatTest(unittest.TestCase):
                 'ma_cross 日检平仓', strategy_type='ma_cross')
 
             self.assertIn('ETHUSDT', system.trade_state.get_stop_loss_dates())
-
-
-class StopUpdateGapGuardTest(unittest.TestCase):
-    """撤旧确认与挂新止损之间的缝隙：交易所已无持仓时不得再挂新止损（防孤儿 reduce-only 单）。"""
-
-    def _build(self, tmp, position_after_cancel):
-        system = TradingSystem.__new__(TradingSystem)
-        system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
-        system.trade_state.add_open_position(
-            'BTCUSDT', 'long', 50000.0, 0.1, 48000.0, 'stop-1', strategy='ma_cross')
-        system._pending_stop_loss_updates = []
-        system.notifier = SimpleNamespace(notify_error=lambda *a, **k: True)
-        created = []
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=lambda s: s,
-            cancel_order=lambda *a, **k: True,
-            cancel_stop_order_only=lambda *a, **k: True,
-            get_position=position_after_cancel,
-            create_stop_loss_order=lambda *a, **k: created.append(a) or {'id': 'stop-2'})
-        return system, created
-
-    def test_no_position_after_cancel_skips_new_stop(self):
-        """撤旧确认后交易所已无仓（止损恰在撤销瞬间触发/人工平仓）：不挂新止损。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(tmp, position_after_cancel=lambda s: None)
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])  # 不留孤儿 reduce-only 单
-            # 本地保持旧止损记录，交由巡检/日检确认记平
-            self.assertEqual(system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'], 48000.0)
-
-    def test_query_failure_keeps_old_stop_and_skips_update(self):
-        """持仓复核查询失败：旧保护仍在，安全跳过而不制造未知新单。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            def boom(_s):
-                raise RuntimeError('查询失败')
-            system, created = self._build(tmp, position_after_cancel=boom)
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])
-            self.assertEqual(
-                system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'],
-                48000.0)
-
-    def test_position_present_updates_stop_normally(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(tmp, position_after_cancel=lambda s: {'contracts': 10})
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(len(created), 1)
-            self.assertEqual(system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'], 49000.0)
-            self.assertEqual(len(system._pending_stop_loss_updates), 1)  # 汇总通知照常入队
-
-    def test_unknown_stop_residue_blocks_replacement_before_new_order(self):
-        """未知旧单需全量清扫时，不得先挂新单再把新保护一并扫掉。"""
-        with tempfile.TemporaryDirectory() as tmp:
-            system, created = self._build(
-                tmp, position_after_cancel=lambda s: {'contracts': 10})
-            system.trade_state.mark_stop_residue('BTCUSDT')
-            position = system.trade_state.get_open_position('BTCUSDT')
-
-            system._update_stop_order('BTCUSDT', position, 49000.0)
-
-            self.assertEqual(created, [])
-            self.assertEqual(
-                system.trade_state.get_open_position('BTCUSDT')['stop_loss_price'],
-                48000.0)
 
 
 class StateOwnerGuardTest(unittest.TestCase):

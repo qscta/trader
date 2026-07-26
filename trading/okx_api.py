@@ -1620,10 +1620,20 @@ class OkxApi(ExchangeApi):
                         f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
                         "非零，孤儿仓核对拒绝跳过")
                 continue
+            if abs(contracts) <= 0:
+                continue
             # BTC/USD:BTC 若被 to_internal_symbol 会错映成 BTCUSDT，导致把
-            # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓。
-            if abs(contracts) > 0 and str(p.get('symbol') or '').endswith(':USDT'):
-                symbols.append(self.to_internal_symbol(p['symbol']))
+            # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓——两个判定都只认
+            # U 本位永续形态。
+            symbol_text = str(p.get('symbol') or '')
+            inst_id = str(info.get('instId') or '')
+            if symbol_text.endswith(':USDT'):
+                symbols.append(self.to_internal_symbol(symbol_text))
+            elif inst_id.endswith('-USDT-SWAP'):
+                # 市场表缺失/进程启动后新上线品种时，ccxt 可能给不出统一符号；
+                # instId 是同一信息的权威原生形态。静默跳过会让孤儿仓核对
+                # （账本尽毁/人工开仓场景的最后防线）漏检真钱仓位。
+                symbols.append(inst_id.split('-')[0] + 'USDT')
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
@@ -2071,9 +2081,12 @@ class OkxApi(ExchangeApi):
             return False
         return bool(self._cancel_algo_order(ccxt_symbol, order_id))
 
-    @retry_on_network_error(max_retries=3)
     def cancel_all_orders(self, symbol):
-        """安全清理某交易对挂单：连续空清单 + 普通单零成交撤销 + 空仓。"""
+        """安全清理某交易对挂单：连续空清单 + 普通单零成交撤销 + 空仓。
+
+        不挂网络重试装饰器：函数体把一切失败裁决为 False（fail-safe），
+        网络异常永远到不了装饰器；查询/撤销的重试由内部 _fetch_*_raw 各自承担。
+        """
         ccxt_symbol = self._resolve_symbol(symbol)
         try:
             # 先拍快照再发统一撤全，否则已成交消失的 ID 将无法做终态审计。

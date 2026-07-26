@@ -16,7 +16,6 @@ main = _test_stubs.import_main()
 TradingSystem = main.TradingSystem
 
 
-
 def _jload(path):
     with open(path) as f:
         return json.load(f)

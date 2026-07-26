@@ -33,7 +33,6 @@ def _make(equity, peak, peak_days_ago, longest):
     return tmp, eqt.EquityTracker(tmp, system)
 
 
-
 def _jload(path):
     with open(path) as f:
         return json.load(f)

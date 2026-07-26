@@ -8,7 +8,7 @@ import threading
 import time
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from trade_executor import safe_fill_price
 from trade_state import enrich_closed_trade_with_fees
 
@@ -72,6 +72,18 @@ def _validate_flask_secret_key(value):
     return str(value)
 
 
+def _validate_api_token(value):
+    """校验 API Token 强度。X-API-Token 与登录会话等权（可直达全部真钱写接口），
+    强度标准与 FLASK_SECRET_KEY 同口径：已配置但不足 32 字节即拒绝启动，
+    杜绝可被在线/离线猜中的短 token 带病上线。未配置（None）合法——仅用会话认证。
+    """
+    if value is None:
+        return None
+    if len(str(value).encode('utf-8')) < 32:
+        raise RuntimeError('TRADING_API_TOKEN 至少需要 32 字节的随机值，拒绝弱 token 启动')
+    return str(value)
+
+
 # 反代跳数由部署方声明（代码无法安全地自动探测——盲信 X-Forwarded-For 本身就是漏洞）：
 # 0 = 无反代直连（默认，完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（真实客户端 IP
 # 在链尾）；2 = CDN→nginx 双层。登录防爆破按还原后的 remote_addr 计数——跳数配错时
@@ -90,6 +102,10 @@ app.secret_key = _validate_flask_secret_key(os.environ.get('FLASK_SECRET_KEY'))
 # 设 TRADING_COOKIE_SECURE=1 开启，不无条件写死（内网纯 HTTP 部署会被弄坏）
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('TRADING_COOKIE_SECURE') == '1'
+# 会话签名 cookie 的最大可重放窗口：Flask 校验签名统一以 permanent_session_lifetime
+# 为 max_age（对非 permanent 会话同样生效）。登出只能清除本浏览器的 cookie、无法
+# 吊销已泄露的历史副本——默认 31 天重放窗口对真钱面板过长，收短到 24 小时。
+app.permanent_session_lifetime = timedelta(hours=24)
 
 LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
 
@@ -108,9 +124,12 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 LOGIN_FAILURE_CACHE_MAX = 4096
 _login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+# API Token 错误与登录失败同参数退避，但用独立计数池：token 与密码是两条
+# 认证通道，互不连坐（也避免测试/多客户端场景相互污染锁定状态）
+_token_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
 _login_guard = threading.Lock()
 
-API_TOKEN = os.environ.get('TRADING_API_TOKEN')
+API_TOKEN = _validate_api_token(os.environ.get('TRADING_API_TOKEN'))
 
 # 由 wsgi / __main__ 保存真实 runner 线程状态。不能仅凭 trading_system 非空就宣称
 # “运行中”：调度线程若在 register_jobs/start 中异常退出，Web 仍可能完全正常。
@@ -120,14 +139,18 @@ _runner_failure = None
 _runner_guard = threading.Lock()
 
 
-def _prune_login_failures(now):
+def _prune_failures(failures, now):
     """清除过期项并对攻击者可控的 IP 字典设置硬上限。必须在 _login_guard 内调用。"""
-    expired = [ip for ip, (_fails, locked_until) in _login_failures.items()
+    expired = [ip for ip, (_fails, locked_until) in failures.items()
                if locked_until and locked_until <= now]
     for ip in expired:
-        _login_failures.pop(ip, None)
-    while len(_login_failures) >= LOGIN_FAILURE_CACHE_MAX:
-        _login_failures.pop(next(iter(_login_failures)), None)
+        failures.pop(ip, None)
+    while len(failures) >= LOGIN_FAILURE_CACHE_MAX:
+        failures.pop(next(iter(failures)), None)
+
+
+def _prune_login_failures(now):
+    _prune_failures(_login_failures, now)
 
 
 def start_runner_thread(system):
@@ -291,17 +314,43 @@ def _explicit_null_error(data, fields):
 
 
 def require_auth(f):
-    """API认证装饰器：支持Session或Token认证。"""
+    """API认证装饰器：支持Session或Token认证。
+
+    Token 通道带与登录同参数的按 IP 退避：token 与会话等权（可直达全部真钱
+    写接口），不能留下无限速在线爆破面。仅在请求实际携带 X-API-Token 时计数，
+    普通未认证请求（无头）不落入退避池。
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if session.get('authenticated'):
             return f(*args, **kwargs)
         token = request.headers.get('X-API-Token')
-        # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
-        # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
-        # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
-        if API_TOKEN and token and secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
-            return f(*args, **kwargs)
+        if API_TOKEN and token:
+            ip = request.remote_addr or 'unknown'
+            now = time.time()
+            with _login_guard:
+                _fails, locked_until = _token_failures.get(ip, (0, 0.0))
+                if now < locked_until:
+                    return jsonify({'error': f'API Token 错误次数过多，'
+                                             f'请 {int(locked_until - now) + 1} 秒后再试'}), 429
+            # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
+            # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
+            # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
+            if secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
+                with _login_guard:
+                    _token_failures.pop(ip, None)
+                return f(*args, **kwargs)
+            with _login_guard:
+                if ip not in _token_failures:
+                    _prune_failures(_token_failures, now)
+                fails, _ = _token_failures.get(ip, (0, 0.0))
+                fails += 1
+                locked_until = (now + LOGIN_LOCKOUT_SECONDS
+                                if fails >= LOGIN_MAX_FAILURES else 0.0)
+                _token_failures[ip] = (fails, locked_until)
+                if locked_until:
+                    logger.warning(
+                        f"API Token 连续错误 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
         return jsonify({'error': '认证失败，请登录或提供有效的API Token'}), 401
     return decorated
 
@@ -710,6 +759,13 @@ def delete_symbol(symbol):
                             exchange_position.get('contracts') or 0) == 0
                     system.trade_state.remove_symbol_metadata(
                         symbol_u, clear_quarantine=clear_quarantine)
+                    # T+1 内存镜像随账本清理同步刷新，防止双源分叉：镜像残留会让
+                    # 删除→重加的品种次日无交叉自动重入，且 record/clear 的全量
+                    # 回写会把已清理条目复活回账本。
+                    dates_getter = getattr(system.trade_state, 'get_stop_loss_dates', None)
+                    if callable(dates_getter) and isinstance(
+                            getattr(system, 'stop_loss_dates', None), dict):
+                        system.stop_loss_dates = dates_getter()
                 except Exception as e:
                     # 查询失败时 fail-closed：不清 quarantine；配置删除本身已成功。
                     logger.warning(f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')

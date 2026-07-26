@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/production%20python-3.12-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-471%20stdlib%20%2B%20103%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-465%20stdlib%20%2B%20102%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -31,8 +31,8 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **574 个测试**——471 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 103 个依赖版集成用例。
-- **行情 fail-closed**——策略日检固定读取 OKX 最新单页 300 根，不为指标计算分页；最新已收盘日 K 陈旧、数据量不足或历史出现大跨度断层时，禁止该品种开仓、平仓、反手及策略止损推进。
+- **567 个测试**——465 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 102 个依赖版集成用例。
+- **行情 fail-closed**——策略日检固定读取 OKX 最新单页 300 根，不为指标计算分页；最新已收盘日 K 陈旧、数据量不足或历史出现大跨度断层时，禁止该品种开仓、平仓、反手等一切策略动作。
 
 ## 🏗️ 架构
 
@@ -41,8 +41,8 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
           │
           ├── StopGuardianMixin    (stop_guardian.py)    止损防线：验证式撤单 / 残留阻断 / 止损自愈 / 交易所已平收尾
           ├── ReportingMixin       (reporting.py)        通知报表：开平仓汇总 / 每日持仓汇总 / 周报 / 权益采样告警
-          ├── SignalHandlersMixin  (signal_handlers.py)  信号分派：无仓开仓判定 / 有仓平仓翻转 / 止损推进 / T+1 重入
-          ├── TradeExecutorMixin   (trade_executor.py)   下单执行：开仓校验回滚 / 止损更新 / 平仓 / 翻转
+          ├── SignalHandlersMixin  (signal_handlers.py)  信号分派：无仓开仓判定 / 有仓平仓翻转 / T+1 重入
+          ├── TradeExecutorMixin   (trade_executor.py)   下单执行：开仓校验回滚 / 平仓 / 翻转
           │
           ├── OkxApi          (okx_api.py)        欧易适配器：币数↔张数换算 / 算法止损单 / 杠杆 / 单向模式
           │     └── ExchangeApi (exchange_base.py) 适配层抽象基类：K线读取 / 收盘过滤 / 网络重试
@@ -95,6 +95,7 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 | 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC）；系统启动时校验 UTC+8，不符告警 |
 | `gunicorn -c gunicorn.conf.py` | 固定单 worker + gthread；120 秒请求超时、900 秒优雅退出窗口，避免在 OKX 长重试/交易收尾中误杀 runner |
 | 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；`FLASK_SECRET_KEY` 必须是至少 32 字节的随机值，缺失或过短均拒绝启动 |
+| 环境变量 `TRADING_API_TOKEN`（可选） | API Token 与会话等权；配置时必须 ≥32 字节随机值，过短拒绝启动；错误 token 与登录同参数按 IP 防爆破 |
 | 自定义 `TRADING_RUNNER_LOCK_FILE` 时使用专用 0700 目录 | 不得直接指向 `/tmp/runner.lock` 等共享目录；例如 `/run/user/$UID/trader/runner.lock` |
 | 反代部署显式设置 `TRADING_PROXYFIX_X_FOR=1` | 默认 0（不信任任何 XFF）；仅在确有一层可信反代时设 1，双层设 2 |
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
@@ -114,10 +115,10 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```bash
 cd trading
 
-# 471 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 465 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
-# 103 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
+# 102 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
 pip install -r requirements.lock
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
@@ -129,7 +130,9 @@ CI（`.github/workflows/tests.yml`）在 Python 3.10–3.13 上跑标准库套�
 
 - **任何形式的凭据都不要提交**：`config.json`、状态文件、日志、备份 tarball（备份里打包了 config.json）均已被 `.gitignore` 排除。
 - 若凭据曾出现在 git 历史中，视同泄露处理：到欧易删除并重建 API Key、更换钉钉机器人 webhook。
-- 管理台已加登录防爆破（按 IP 连续 5 次失败锁 60 秒）与会话 Cookie 加固（SameSite=Lax，Secure 可选）。
+- 管理台已加登录与 API Token 双通道防爆破（各按 IP 连续 5 次失败锁 60 秒）、会话 Cookie 加固
+  （SameSite=Lax，Secure 可选）与 24 小时会话寿命上限（登出无法吊销已泄露的历史 cookie，
+  由寿命上限压缩重放窗口）。
 
 ## 📚 更多文档
 

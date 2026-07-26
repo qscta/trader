@@ -65,7 +65,6 @@ class SignalExecutionStateTest(unittest.TestCase):
                 'ClosePartial123', position['last_close_client_order_id'])
 
 
-
 class OpenIntentStateTest(unittest.TestCase):
     def test_intent_and_planned_amount_survive_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,8 +87,8 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90},
+                planned_position_size=1.0)
 
             state.add_open_position(
                 'BTCUSDT', 'long', 100, 1, 90, 'stop-1',
@@ -105,8 +104,8 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90},
+                planned_position_size=1.0)
             with patch('trade_state.atomic_write_json', return_value=False):
                 with self.assertRaises(TradeStatePersistenceError):
                     state.add_open_position(
@@ -154,7 +153,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
         system.notifier = SimpleNamespace(
             notify_error=Mock(), send_message=Mock())
         system._pending_trade_open_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         return system, seen_client_ids
@@ -181,9 +179,8 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             system.trade_state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IRECOVER123',
                 {'side': 'long', 'entry_price': 100.0,
-                 'stop_loss_price': 90.0})
-            system.trade_state.set_open_intent_amount(
-                'BTCUSDT', 'IRECOVER123', 1.0)
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
             system.risk_manager.calculate_position_size = Mock(
                 side_effect=AssertionError('恢复 open intent 不得重算风险'))
 
@@ -341,8 +338,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
 
             self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
             self.assertEqual(1, len(system.trade_state.get_closed_trades()))
-
-
 
 
 class PositionReconciliationStateTest(unittest.TestCase):
@@ -683,7 +678,6 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system._last_failure_notify_ts = 0
         system._pending_trade_open_notifications = []
         system._pending_trade_close_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         system.equity_tracker = SimpleNamespace(
@@ -691,11 +685,10 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             refresh_account_stats_state=lambda: None)
         system.notifier = SimpleNamespace(
             notify_error=Mock(), notify_signal_missed=Mock(),
-            notify_stop_loss_updates_summary=Mock(), send_message=Mock())
+            send_message=Mock())
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = lambda **kwargs: True
-        system._closed_candle_id = lambda _df: 't5'
         system._daily_candle_is_fresh = (
             lambda _df, _scheduled_date: (True, date(2026, 7, 10), date(2026, 7, 9)))
         return system

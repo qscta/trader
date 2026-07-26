@@ -410,11 +410,14 @@ class EquityTracker:
         """新峰值确立时，把「旧峰值时间 → 现在」这段刚结束的未创新高周期结算进历史最长。"""
         if not old_peak_time:
             return
-        try:
-            closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
-        except Exception as exc:
-            logger.debug('结算未创新高周期时跳过坏峰值时间 %r: %s', old_peak_time, exc)
+        # 与 _validate_json_shape 的 iso_time 同源解析：校验器接受带时区的合法
+        # ISO（归一 UTC+8 naive），消费端必须同口径——否则 aware 串在 naive 相减
+        # 时 TypeError 被吞，回撤天数族指标静默归零且不可观测。
+        parsed_peak = _parse_equity_tick_timestamp(old_peak_time)
+        if parsed_peak is None:
+            logger.debug('结算未创新高周期时跳过坏峰值时间 %r', old_peak_time)
             return
+        closed_gap = max(0, (now - parsed_peak).days)
         if closed_gap <= 0:
             return
         with self._lock:
@@ -502,23 +505,22 @@ class EquityTracker:
                 eq_hist['max_drawdown'] = peak_drawdown
                 eq_hist['max_dd_time'] = now.isoformat()
 
-            # 未创新高天数：当前时间距最近一次权益新高
+            # 未创新高天数：当前时间距最近一次权益新高（解析与校验器同源，
+            # 带时区的合法 ISO 归一后正常计算而非静默归零）
             days_since_peak = 0
-            if peak_time:
-                try:
-                    days_since_peak = max(0, (now - datetime.fromisoformat(peak_time)).days)
-                except Exception:
-                    days_since_peak = 0
+            parsed_peak_time = _parse_equity_tick_timestamp(peak_time) if peak_time else None
+            if parsed_peak_time is not None:
+                days_since_peak = max(0, (now - parsed_peak_time).days)
 
             # 当前读数若临时创新高，只影响本次展示；真正的历史结算由每日收盘
             # reconcile 完成，不能让下午浮盈通过 persist=True 污染 durable 历史。
             provisional_closed_gap = 0
             if made_new_high and old_peak_time:
-                try:
-                    provisional_closed_gap = max(
-                        0, (now - datetime.fromisoformat(old_peak_time)).days)
-                except Exception as exc:
-                    logger.debug('展示用未创新高周期结算跳过: %s', exc)
+                parsed_old_peak = _parse_equity_tick_timestamp(old_peak_time)
+                if parsed_old_peak is not None:
+                    provisional_closed_gap = max(0, (now - parsed_old_peak).days)
+                else:
+                    logger.debug('展示用未创新高周期结算跳过坏峰值时间 %r', old_peak_time)
 
             if persist:
                 if not self.save_equity_history(eq_hist):

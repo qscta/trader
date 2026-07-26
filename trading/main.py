@@ -157,7 +157,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._last_summary_date = self.trade_state.get_last_daily_summary_date()
         self._pending_trade_open_notifications = []
         self._pending_trade_close_notifications = []
-        self._pending_stop_loss_updates = []
         self._trade_lock = threading.Lock()  # 防并发执行锁
         self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
         self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
@@ -757,11 +756,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             return True
         return False
 
-    def is_symbol_quarantined(self, symbol):
-        """API/executor 可调用的统一隔离查询入口。"""
-        check = getattr(self.trade_state, 'is_position_quarantined', None)
-        return bool(check(symbol)) if callable(check) else False
-
     def _verify_existing_position_or_quarantine(
             self, symbol, local_position, exchange_position, clear_on_match=True):
         """两边都有仓时必须方向+张数完整一致。"""
@@ -894,7 +888,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
     def get_strategy_for_symbol(self, symbol_config):
         """唯一在役策略 ma_cross（海龟已彻底移除；遗留 turtle 持仓同样由
-        双均线语义托管退出——EMA 反向平仓 + N 日高低点止损推进）。"""
+        双均线语义托管退出——EMA 反向交叉平仓/反手；入场时设定的 N 日高低点
+        止损由 stop_guardian 三防线维持存在性，不做每日推进）。"""
         return self.ma_cross_strategy, 'ma_cross'
 
     def _load_stop_loss_dates(self):
@@ -986,21 +981,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             decimals = 10
         return f'{number:.{decimals}f}'
 
-    @staticmethod
-    def _closed_candle_id(df):
-        """返回最新已收盘 K 线的稳定 ID（带时区无关的 ISO 字符串）。"""
-        value = df.iloc[-1].get('timestamp') if len(df) else None
-        if value is None:
-            raise ValueError('K 线缺少 timestamp，无法建立幂等信号 ID')
-        try:
-            return value.isoformat()
-        except AttributeError:
-            return str(value)
-
-
-
-
-
     def _recovery_symbol_config(self, symbol, strategy):
         """返回恢复事务使用的配置，并明确标记是否已经退池/禁用。
 
@@ -1059,9 +1039,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             filled = amount
         return terminal, filled
 
-
-
-
     @staticmethod
     def _pending_order_absence_is_conclusive(execution):
         """判断 OrderNotFound 是否仍足以证明 pending 从未发单。"""
@@ -1079,8 +1056,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         if age > _PENDING_ORDER_ABSENCE_PROOF_WINDOW:
             return False, f'pending 已超过交易所可证明未发单的 2 小时窗口（{age}）'
         return True, None
-
-
 
     def _finalize_open_intent_rollback(self, symbol, intent, outcome):
         close_order = (outcome or {}).get('close_order') or {}
@@ -1417,7 +1392,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             logger.info("开始检查交易信号...")
             self._pending_trade_open_notifications = []
             self._pending_trade_close_notifications = []
-            self._pending_stop_loss_updates = []
 
             unresolved_pending = self._reconcile_all_open_intents('日检')
 
@@ -1449,7 +1423,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             failed_symbols = sorted(unresolved_pending)
             data_unready_symbols = []
             for symbol in sorted(symbols_to_check):
-                # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
+                # 单品种异常只跳过该品种，不得中断其余品种的止损维护/平仓检查（真钱红线）
                 try:
                     symbol_config = symbol_config_map.get(symbol)
                     if symbol_config is None:
@@ -1574,7 +1548,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             f"{required_closed_candles} 根已收盘K线，本轮仅取得 {len(df)} 根"
                             f"（请求 {fetch_limit} 根），请检查周期配置或交易所历史K线供应")
                         if local_position:
-                            # 有钱仓位不得以“新币历史不足”降级：退出/止损推进未完成。
+                            # 有钱仓位不得以“新币历史不足”降级：退出/止损维护未完成。
                             failed_symbols.append(symbol)
                         else:
                             # 双边已确认空仓且历史确实不足，属结构性 data-unready。
@@ -1588,7 +1562,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         logger.critical(
                             f"{symbol} 最新已收盘日 K 陈旧：latest={latest_candle_date}，"
                             f"本次调度日={today}，最低允许={minimum_candle_date}；"
-                            "禁止本品种开仓、平仓、反手及策略止损推进")
+                            "禁止本品种开仓、平仓、反手等一切策略动作")
                         failed_symbols.append(symbol)
                         continue
 
@@ -1649,6 +1623,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 removed_metadata = (
                     pruner(symbol_config_map.keys()) if callable(pruner) else [])
                 if removed_metadata:
+                    # T+1 内存镜像必须随账本清理同步刷新：镜像残留会让重加品种
+                    # 次日按 EMA 方向无交叉自动重入，且 record/clear 全量回写
+                    # 会把已清理条目复活回账本（双源分叉）。
+                    dates_getter = getattr(self.trade_state, 'get_stop_loss_dates', None)
+                    if callable(dates_getter):
+                        self.stop_loss_dates = dates_getter()
                     logger.info(
                         f"已清理 {len(removed_metadata)} 个退池且无仓品种的信号元数据: "
                         f"{', '.join(removed_metadata)}")
@@ -1657,9 +1637,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
             # 信号检查完成后按汇总顺序推送，避免 08:00 单条消息过多触发限流
             self._flush_pending_trade_notifications()
-            if self._pending_stop_loss_updates:
-                logger.info(f"信号检查完毕，推送止损更新汇总({len(self._pending_stop_loss_updates)}条)...")
-                self.notifier.notify_stop_loss_updates_summary(self._pending_stop_loss_updates)
             logger.info("信号检查完毕，刷新账户统计状态...")
             self.equity_tracker.refresh_account_stats_state()
             logger.info("信号检查完毕，推送每日持仓汇总...")
@@ -1682,7 +1659,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         f"失败品种: {', '.join(sorted(failed_symbols))}\n其余品种已正常检查")
             elif not manual_run:
                 # 手动检查不标记当日完成：00:00–08:00 间手动触发跑的是昨日已收盘数据，
-                # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失
+                # 若标记会让当天 08:00 的正式日检被跳过，整日的新信号与反手/平仓检查丢失
                 self._mark_daily_check_complete(today)
         except Exception as e:
             logger.exception(f"交易检查异常: {e}")
@@ -1697,7 +1674,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         finally:
             self._pending_trade_open_notifications = []
             self._pending_trade_close_notifications = []
-            self._pending_stop_loss_updates = []
             self._trade_lock.release()
             logger.info("交易检查锁已释放")
 
@@ -1729,7 +1705,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         （启动时调用一次 + 每 30 分钟周期兜底，守卫幂等，已跑则空转）。
 
         场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
-        新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
+        新信号与反手/平仓检查整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
         _last_check_date 已持久化到主账本：成功调度日跨重启仍去重，
         未完成调度日才会补跑。持仓对账/信号 ID/T+1 继续作为业务幂等防护。
         缓冲 2 分钟：恰在调度窗口内启动时，让正常 cron（:05/:20/:40 与 +1 分钟重试）先走。
@@ -1772,7 +1748,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         只在已过今日检查窗口（与 _run_startup_catchup_check 同一阈值）时生效：
         未到检查时间本就没有兜底补跑可跳，若此时也标记，当天正点日检会被
-        _last_check_date 拦截，整日的新信号与止损推进丢失——标志按无效处理并告警。
+        _last_check_date 拦截，整日的新信号与反手/平仓检查丢失——标志按无效处理并告警。
         """
         if os.environ.get('TRADING_SKIP_STARTUP_CATCHUP_ONCE') != '1':
             return False

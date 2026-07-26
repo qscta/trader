@@ -555,8 +555,6 @@ class TradeState:
     def _snapshot_locked(self):
         return copy.deepcopy(self.state)
 
-
-
     def save_state(self):
         with self.lock:
             snapshot = self._snapshot_locked()
@@ -1245,10 +1243,12 @@ class TradeState:
                 self._archive_cache_records = []
                 return [], True
             try:
-                cache_key = tuple(
-                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
-                     private_file_stat(path).st_size)
-                    for path in paths)
+                key_parts = []
+                for path in paths:
+                    info = private_file_stat(path)  # 每路径一次安全打开，mtime/size 取自同一快照
+                    key_parts.append(
+                        (os.path.basename(path), info.st_mtime_ns, info.st_size))
+                cache_key = tuple(key_parts)
                 if (self._archive_cache_key == cache_key
                         and self._archive_cache_records is not None):
                     records = self._archive_cache_records
@@ -1315,11 +1315,16 @@ class TradeState:
         """供只读统计缓存使用；不解析史书内容即可识别归档/近期记录变化。"""
         with self.lock:
             try:
-                archive_key = tuple(
-                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
-                     private_file_stat(path).st_size)
-                    for path in self._archive_paths())
-            except (OSError, TradeStatePersistenceError):
+                key_parts = []
+                for path in self._archive_paths():
+                    info = private_file_stat(path)  # 每路径一次安全打开，mtime/size 取自同一快照
+                    key_parts.append(
+                        (os.path.basename(path), info.st_mtime_ns, info.st_size))
+                archive_key = tuple(key_parts)
+            except Exception:
+                # revision 只是缓存失效探针；史书层契约是「损坏只降级」——任何
+                # 探针失败（含符号链接/属主异常的 ValueError/RuntimeError）都按
+                # 「无法判定缓存有效性」处理，绝不让统计路由 500。
                 archive_key = None
             recent = self.state['closed_trades']
             last = recent[-1] if recent else {}
@@ -1420,8 +1425,6 @@ class TradeState:
                 # token，则退回前缀继续匹配。
                 continue
         return matched
-
-
 
     def remove_symbol_metadata(self, symbol, clear_quarantine=False):
         """清除已退池且无持仓/止损残留品种的辅助状态。
@@ -1561,30 +1564,6 @@ class TradeState:
         with self.lock:
             return copy.deepcopy(self.state.get('open_intents') or {})
 
-    def set_open_intent_amount(self, symbol, client_order_id, position_size):
-        if isinstance(position_size, bool):
-            raise ValueError('open intent 数量不能是 bool')
-        try:
-            amount = float(position_size)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('open intent 数量非法') from exc
-        if not math.isfinite(amount) or amount <= 0:
-            raise ValueError('open intent 数量必须是正有限数')
-        with self.lock:
-            intent = (self.state.get('open_intents') or {}).get(symbol) or {}
-            if (intent.get('status') != 'pending' or
-                    intent.get('client_order_id') != str(client_order_id)):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 不存在匹配 open intent')
-            existing = intent.get('planned_position_size')
-            if existing is not None:
-                return float(existing)
-            snapshot = self._snapshot_locked()
-            intent['planned_position_size'] = amount
-            intent['updated_at'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return amount
-
     def resolve_open_intent(self, symbol, client_order_id):
         with self.lock:
             intent = (self.state.get('open_intents') or {}).get(symbol) or {}
@@ -1657,13 +1636,6 @@ class TradeState:
             del self.state['open_intents'][symbol]
             self._save_or_rollback_locked(snapshot)
             return copy.deepcopy(existing)
-
-
-
-
-
-
-
 
     # ---- 双均线 T+1：与持仓/止损/信号共用同一账本事务 ----
 

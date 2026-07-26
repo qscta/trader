@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 import tempfile
 from datetime import date
 
@@ -17,7 +17,8 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 os.environ.setdefault("FLASK_SECRET_KEY", "test-secret-key-32-bytes-minimum!!")
-os.environ.setdefault("TRADING_API_TOKEN", "test-token")
+# API Token 有 ≥32 字节的启动强度校验（与 FLASK_SECRET_KEY 同口径）
+os.environ.setdefault("TRADING_API_TOKEN", "test-token-0123456789abcdef01234567")
 
 # 测试进程不落生产日志（与 _test_stubs.import_main 同一护栏）：下方 import main 会触发
 # logging.basicConfig(handlers=[RotatingFileHandler(trading.log), ...])，它仅在根 logger
@@ -964,94 +965,6 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system.exchange_api.get_balance.assert_not_called()
 
 
-class UpdateStopOrderTests(unittest.TestCase):
-    def make_system(self):
-        system = object.__new__(main.TradingSystem)
-        system._stop_anomalies = {}
-        system.exchange_api = SimpleNamespace(
-            to_ccxt_symbol=_fake_to_ccxt,
-            get_position=Mock(return_value={'contracts': 25, 'side': 'long'}),
-            cancel_order=Mock(return_value=True),
-            cancel_stop_order_only=Mock(return_value=True),
-            cancel_all_orders=Mock(),
-            create_stop_loss_order=Mock(return_value={"id": "new-stop"}),
-        )
-        system.trade_state = SimpleNamespace(
-            update_stop_loss=Mock(),
-            force_runtime_update_stop_loss=Mock(),
-            has_stop_residue=Mock(return_value=False),
-            clear_stop_residue=Mock(),
-            mark_stop_residue=Mock(),
-        )
-        system.notifier = SimpleNamespace(send_message=Mock(), notify_error=Mock())
-        system._pending_stop_loss_updates = []
-        return system
-
-    def test_updates_trade_state_when_new_stop_order_succeeds(self):
-        system = self.make_system()
-        position = {
-            "side": "long",
-            "position_size": 2.5,
-            "stop_loss_price": 80,
-            "stop_order_id": "old-stop",
-        }
-
-        system._update_stop_order("BTCUSDT", position, 90)
-
-        system.exchange_api.cancel_stop_order_only.assert_called_once_with(
-            "BTC/USDT", "old-stop")
-        system.exchange_api.cancel_order.assert_not_called()
-        self.assertEqual(2, system.trade_state.update_stop_loss.call_count)
-        system.trade_state.update_stop_loss.assert_any_call(
-            "BTCUSDT", 90, "new-stop", stop_order_size=2.5,
-            extra_stop_order_ids=['old-stop'], stop_resize_pending=True)
-        system.trade_state.update_stop_loss.assert_any_call(
-            "BTCUSDT", 90, "new-stop", stop_order_size=2.5,
-            extra_stop_order_ids=[])
-        self.assertEqual(len(system._pending_stop_loss_updates), 1)  # 现行为：缓冲，由轮末汇总推送
-        system.notifier.notify_error.assert_not_called()
-
-    def test_notifies_error_when_new_stop_order_creation_fails(self):
-        system = self.make_system()
-        system.exchange_api.create_stop_loss_order.return_value = None
-        position = {
-            "side": "long",
-            "position_size": 2.5,
-            "stop_loss_price": 80,
-            "stop_order_id": "old-stop",
-        }
-
-        system._update_stop_order("BTCUSDT", position, 90)
-
-        system.trade_state.update_stop_loss.assert_not_called()
-        system.exchange_api.cancel_order.assert_not_called()
-        system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
-        system.notifier.notify_error.assert_called_once()
-        self.assertEqual(system._pending_stop_loss_updates, [])
-
-    def test_keeps_new_and_old_ids_when_old_stop_cancel_unconfirmed(self):
-        """先挂新保护后撤旧失败：两张 ID 都保留，标记残留并阻断。"""
-        system = self.make_system()
-        system.exchange_api.cancel_stop_order_only.return_value = False
-        system.exchange_api.cancel_all_orders.return_value = True
-        position = {
-            "side": "long",
-            "position_size": 2.5,
-            "stop_loss_price": 80,
-            "stop_order_id": "old-stop",
-        }
-
-        system._update_stop_order("BTCUSDT", position, 90)
-
-        system.exchange_api.create_stop_loss_order.assert_called_once()
-        system.trade_state.update_stop_loss.assert_called_once_with(
-            "BTCUSDT", 90, "new-stop", stop_order_size=2.5,
-            extra_stop_order_ids=['old-stop'], stop_resize_pending=True)
-        system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
-        system.exchange_api.cancel_all_orders.assert_not_called()
-        system.notifier.notify_error.assert_called_once()
-
-
 class InstantOpenConfigRollbackTests(unittest.TestCase):
     def setUp(self):
         self.client = api_server.app.test_client()
@@ -1196,7 +1109,6 @@ class TradeStateIsolationTests(unittest.TestCase):
 
             fresh = ts.get_open_position("BTCUSDT")
             self.assertEqual(fresh["entry_price"], 100)
-
 
 
 class MaCrossFlipTests(unittest.TestCase):
@@ -1358,28 +1270,6 @@ class TradeStateCallsiteCompensationTests(unittest.TestCase):
         system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 2.5)
         system.notifier.notify_trade_opened.assert_not_called()
 
-    def test_update_stop_order_uses_runtime_fallback_when_persist_fails(self):
-        system = UpdateStopOrderTests().make_system()
-        system.trade_state.update_stop_loss.side_effect = trade_state.TradeStatePersistenceError("disk full")
-        position = {
-            "side": "long",
-            "position_size": 2.5,
-            "stop_loss_price": 80,
-            "stop_order_id": "old-stop",
-        }
-
-        system._update_stop_order("BTCUSDT", position, 90)
-
-        self.assertEqual(system.trade_state.force_runtime_update_stop_loss.call_args_list, [
-            call("BTCUSDT", 90, "new-stop", stop_order_size=2.5,
-                 extra_stop_order_ids=["old-stop"],
-                 stop_resize_pending=True),
-            call("BTCUSDT", 90, "new-stop", stop_order_size=2.5,
-                 extra_stop_order_ids=[]),
-        ])
-        system.notifier.notify_error.assert_called_once()
-        system.notifier.send_message.assert_not_called()
-
     def test_flip_position_stops_when_persist_fails(self):
         system = MaCrossFlipTests().make_system()
         system.trade_state.close_position.side_effect = trade_state.TradeStatePersistenceError("disk full")
@@ -1528,13 +1418,15 @@ class LoginBackoffTests(unittest.TestCase):
 
 
 class ApiTokenAuthTests(unittest.TestCase):
-    """API Token 认证：非 ASCII token 头不得触发 compare_digest 的 TypeError → 500。"""
+    """API Token 认证：非 ASCII 不 500、错误 401、连续错误按 IP 退避、强度校验。"""
 
     def setUp(self):
         self.client = api_server.app.test_client()
         patcher = patch.object(api_server, "API_TOKEN", "real-token-abc")
         patcher.start()
         self.addCleanup(patcher.stop)
+        api_server._token_failures.clear()
+        self.addCleanup(api_server._token_failures.clear)
 
     def test_non_ascii_token_returns_401_not_500(self):
         # 此前 compare_digest(str,str) 对非 ASCII 抛 TypeError（装饰器无捕获）→ 500；现应干净 401
@@ -1544,6 +1436,37 @@ class ApiTokenAuthTests(unittest.TestCase):
     def test_wrong_token_returns_401(self):
         resp = self.client.get("/api/status", headers={"X-API-Token": "wrong-token"})
         self.assertEqual(resp.status_code, 401)
+
+    def test_repeated_wrong_tokens_locked_out_and_correct_token_also_blocked(self):
+        # token 与会话等权，不能留无限速在线爆破面：连续 5 次错误后锁 IP，
+        # 锁定期内连正确 token 也 429（与登录防爆破同参数、独立计数池）
+        for _ in range(api_server.LOGIN_MAX_FAILURES):
+            resp = self.client.get(
+                "/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 401)
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 429)
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "real-token-abc"})
+        self.assertEqual(resp.status_code, 429)
+
+    def test_correct_token_clears_failure_streak(self):
+        for _ in range(api_server.LOGIN_MAX_FAILURES - 1):
+            self.client.get("/api/status", headers={"X-API-Token": "wrong-token"})
+        # 正确 token 认证成功（503=系统未注入 trading_system，已过认证层）并清零计数
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "real-token-abc"})
+        self.assertNotIn(resp.status_code, (401, 429))
+        self.assertEqual(api_server._token_failures, {})
+
+    def test_short_api_token_rejected_at_startup_validation(self):
+        # 与 FLASK_SECRET_KEY 同口径：已配置但 <32 字节拒绝启动；未配置合法
+        with self.assertRaises(RuntimeError):
+            api_server._validate_api_token("short-token")
+        self.assertIsNone(api_server._validate_api_token(None))
+        long_token = "x" * 32
+        self.assertEqual(long_token, api_server._validate_api_token(long_token))
 
 
 class DingtalkRedactionTests(unittest.TestCase):
