@@ -46,8 +46,6 @@ class MaCrossStrategy:
         返回信号字典，action 可能的值：
         - 'long': 做多（含从空翻多）
         - 'short': 做空（含从多翻空）
-        - 'close_long': 平多（EMA死叉）
-        - 'close_short': 平空（EMA金叉）
         - None: 无信号
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)

@@ -144,16 +144,11 @@ class DingTalkNotifier:
             f"原因: {reason}\n\n"
         )
         if signal:
+            # 双均线信号只携带 current_close/ema_*/upper_stop/lower_stop；
+            # 旧海龟通道键（upper_line/mid_line 等）已随策略下线移除。
             current_close = signal.get('current_close')
-            upper_line = signal.get('upper_line')
-            lower_line = signal.get('lower_line')
-            mid_line = signal.get('mid_line')
             if current_close is not None:
                 content += f"收盘价: {current_close}\n\n"
-            if upper_line is not None and lower_line is not None:
-                content += f"上轨/下轨: {upper_line} / {lower_line}\n\n"
-            if mid_line is not None:
-                content += f"中轨: {mid_line}\n\n"
         return self.send_message(f"[交易系统] 信号未成交 - {symbol}", content)
 
     def notify_position_summary(self, positions, symbols_config, total_equity):
