@@ -1124,6 +1124,13 @@ class OkxApi(ExchangeApi):
                 }
 
         tolerance = self._contracts_tolerance(ccxt_symbol)
+        # 请求量换算为 0 张而交易所仍有仓：绝不静默升级为全仓平仓——该形态只在
+        # 账本币数与面值漂移的失配态出现，全平可能吃掉人工仓，必须交上层隔离对账
+        if requested_contracts <= tolerance and pre_contracts > tolerance:
+            logger.critical(
+                f'{ccxt_symbol} 平仓请求量 {amount} 币换算为 0 张，而交易所仍有 '
+                f'{pre_contracts} 张；拒绝按全仓平仓，请先对账（可能含人工仓）')
+            return None
         if (supplied_client_id and not existing_legs and
                 pre_contracts > tolerance and requested_contracts > tolerance and
                 abs(pre_contracts - requested_contracts) > tolerance):
@@ -1155,7 +1162,7 @@ class OkxApi(ExchangeApi):
                             ccxt_symbol, observed_delta),
                         'requested_amount': self._contracts_to_coins(
                             ccxt_symbol, requested_contracts),
-                        'filled': observed_delta, 'confirmed': True,
+                        'confirmed': True,
                         'fully_filled': True, 'fully_closed': True,
                         'remaining_amount': 0.0,
                         'execution_ambiguous': True,
@@ -1270,7 +1277,9 @@ class OkxApi(ExchangeApi):
         aggregate['clientOrderIds'] = [leg.get('clientOrderId') for leg, _qty in legs]
         aggregate['amount'] = self._contracts_to_coins(ccxt_symbol, total_filled_contracts)
         aggregate['requested_amount'] = self._contracts_to_coins(ccxt_symbol, target_contracts)
-        aggregate['filled'] = total_filled_contracts
+        # 张数不外泄：末腿信封带来的 ccxt 原生 filled（张数）一并剔除，
+        # 上层统一消费币数字段 amount/requested_amount/remaining_amount
+        aggregate.pop('filled', None)
         aggregate['confirmed'] = True
         aggregate['fully_filled'] = (
             total_filled_contracts + tolerance >= target_contracts)

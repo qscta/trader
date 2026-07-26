@@ -128,6 +128,31 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
             self.assertNotIn('extra_stop_order_ids', position)
 
 
+class ForceRuntimeStopIdBoundaryTest(unittest.TestCase):
+    """force（仅内存）路径绕过 validate_state：stop_order_id 的字符串边界必须
+    在修改入口执行——非 str 住进内存账本后，全部品种的后续落盘都会持续失败。"""
+
+    def test_force_partial_close_rejects_non_str_stop_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='ma_cross')
+            with self.assertRaises(ValueError):
+                state.force_runtime_apply_partial_close(
+                    'BTCUSDT', 4.0, 100.0, new_stop_order_id=12345,
+                    remaining_size=6.0)
+            self.assertEqual(
+                10.0, state.get_open_position('BTCUSDT')['position_size'])
+
+    def test_force_untracked_rejects_non_str_stop_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.force_runtime_add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, 1.0, 90.0, stop_order_id=999)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+
 class ForceRuntimeUntrackedRollbackTest(unittest.TestCase):
     """force_runtime_add_untracked_open_position 必须与其余四个 force 通道
     同走事务原语：磁盘已失效时内存是唯一账本，改到一半异常（如隔离详情

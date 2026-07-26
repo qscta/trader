@@ -227,6 +227,14 @@ class EquityTracker:
         if filename == 'peak_equity.json':
             finite(data.get('peak_equity', 0), 'peak_equity', nonnegative=True)
             iso_time(data.get('peak_time'), 'peak_time')
+            observed_day = data.get('peak_observed_day')
+            if observed_day is not None:
+                # 日锁存承重字段：坏值会让 == 比较恒 False、锁存静默失开
+                # （同步基准被同日重跑覆盖），必须与 daily 的 date 同标准校验
+                if not isinstance(observed_day, str):
+                    raise ValueError(
+                        f'{filepath}:peak_observed_day 必须是 YYYY-MM-DD 或 null')
+                datetime.strptime(observed_day, '%Y-%m-%d')
         elif filename == 'equity_history.json':
             for field in ('max_drawdown', 'longest_drawdown_days'):
                 finite(data.get(field, 0), field, nonnegative=True)
@@ -448,8 +456,14 @@ class EquityTracker:
         if not balance:
             raise RuntimeError('获取账户余额失败')
 
-        current_equity = balance['total'].get('USDT', 0)
-        free_balance = balance['free'].get('USDT', 0)
+        # 与采样/快照/同步路径同一校验口径：瞬时坏响应（total 缺 USDT/垃圾值）
+        # 若按 0 消费，peak_drawdown=100% 会在 persist=True 时被永久 ratchet
+        # 进 max_drawdown。读不出正有限数一律 fail-loud（消费方均已捕获异常）。
+        current_equity = _coerce_positive_float(balance['total'].get('USDT'))
+        if current_equity is None:
+            raise RuntimeError('账户权益读取无效（total.USDT 非正有限数），拒绝计算统计')
+        free_balance = _coerce_positive_float(
+            (balance.get('free') or {}).get('USDT')) or 0.0
         open_positions = self.system.trade_state.get_all_open_positions()
         total_unrealized_pnl = 0
         total_stop_loss_amount = 0

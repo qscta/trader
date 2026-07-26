@@ -73,6 +73,35 @@ class EquitySyncPeakDayClaimTest(unittest.TestCase):
         self.assertEqual(500, peak['peak_equity'])   # 不得被同步前收盘 1000 覆盖
 
 
+class AccountStatsBadBalanceTest(unittest.TestCase):
+    """瞬时坏余额响应必须 fail-loud：按 0 消费会把 peak_drawdown=100%
+    永久 ratchet 进 max_drawdown（与采样/快照/同步路径同一校验口径）。"""
+
+    def test_missing_usdt_raises_instead_of_ratcheting(self):
+        tmp, t = _make(equity=100, peak=100, peak_days_ago=1, longest=0)
+        t.system.exchange_api.get_balance = lambda: {'total': {}, 'free': {}}
+        with self.assertRaises(RuntimeError):
+            t.build_account_stats(persist=True)
+        hist = _jload(os.path.join(tmp, 'equity_history.json'))
+        self.assertEqual(0, hist.get('max_drawdown', 0))
+
+    def test_peak_observed_day_shape_is_validated(self):
+        """日锁存承重字段：坏值让 == 恒 False 静默失开，形状校验必须拦截。"""
+        tmp, t = _make(equity=100, peak=100, peak_days_ago=1, longest=0)
+        path = os.path.join(tmp, 'peak_equity.json')
+        for bad in (123, '07/26/2026', 'not-a-date'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t._validate_json_shape(
+                    {'peak_equity': 100, 'peak_time': None,
+                     'peak_observed_day': bad}, dict, path)
+        # 合法形态与缺省/None 均放行（兼容旧文件）
+        t._validate_json_shape(
+            {'peak_equity': 100, 'peak_time': None,
+             'peak_observed_day': '2026-07-26'}, dict, path)
+        t._validate_json_shape(
+            {'peak_equity': 100, 'peak_time': None}, dict, path)
+
+
 class DrawdownStatsTest(unittest.TestCase):
     def test_not_new_high_includes_current_streak(self):
         """当前未创新高：历史最长 = max(历史已记录, 当前未创新高天数)。"""

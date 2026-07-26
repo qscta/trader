@@ -153,6 +153,30 @@ class StartupSmokeTest(unittest.TestCase):
                     with self.assertRaises(ValueError, msg=f"应拒绝非法配置: {bad}"):
                         TradingSystem(config_file=path)
 
+    def test_explicit_null_config_values_rejected(self):
+        """显式 null ≠ 键缺省：null 穿过 is not None 守卫会带病启动
+        （risk null→开仓 TypeError、check_minute null→调度注册在守护线程崩溃），
+        与 API 入口的 null 拒绝同口径 fail-loud。"""
+        cases = [
+            ('symbols.risk_per_trade',
+             lambda cfg: cfg['trading']['symbols'][0].update({'risk_per_trade': None})),
+            ('symbols.enabled',
+             lambda cfg: cfg['trading']['symbols'][0].update({'enabled': None})),
+            ('strategy.ma_short_period',
+             lambda cfg: cfg['strategy'].update({'ma_short_period': None})),
+            ('scheduler.check_minute',
+             lambda cfg: cfg.setdefault('scheduler', {}).update({'check_minute': None})),
+        ]
+        for label, mutate in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                mutate(cfg)
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝显式 null: {label}"):
+                        TradingSystem(config_file=path)
+
     def test_out_of_range_symbol_config_rejected(self):
         """手写 config.json 的品种池非法值：启动即拒（与增删品种的 API 入口同口径），
         堵住「手写配置绕过风控」——100% 风险度 / 非法策略名 / 脏交易对名都不得带病启动。"""

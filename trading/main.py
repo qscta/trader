@@ -258,6 +258,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._validate_symbol_configs(config['trading']['symbols'])
         config.setdefault('scheduler', {})
         self._validate_scheduler_config(config['scheduler'])
+        if ('equity_tick_retention_days' in config and
+                config['equity_tick_retention_days'] is None):
+            raise ValueError(
+                "config.equity_tick_retention_days 不允许为 null；请提供有效值或删除该键")
         if config.get('equity_tick_retention_days') is not None:
             # 与 strategy/scheduler 同标准 fail-loud：EquityTracker 虽有 try/except 防御，
             # 但静默吞掉非法值会让「我配的保留天数」与实际生效值悄悄不一致
@@ -280,6 +284,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         """
         hour_keys = ('check_hour', 'summary_hour', 'weekly_hour')
         minute_keys = ('check_minute', 'summary_minute', 'weekly_minute')
+        # 显式 null 拒绝：null 键让 register_jobs 的 .get(key, 默认) 返回 None
+        # 进入 `分钟 + 1` 算术——TypeError 发生在守护线程的调度注册里，
+        # 正是历史上「Web 正常、交易线程静默死亡」的事故形态。
+        for key in hour_keys + minute_keys + ('stop_loss_scan_interval_minutes',):
+            if key in scheduler and scheduler[key] is None:
+                raise ValueError(
+                    f"config.scheduler.{key} 不允许为 null；请提供有效值或删除该键")
         for key in hour_keys:
             if scheduler.get(key) is None:
                 continue
@@ -318,7 +329,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 "请对照 config.example.json 补全后再启动")
 
         # 周期类：ma_* 三键有 .get 默认值，仅当显式提供时校验类型/范围。
+        # 显式 null 拒绝：null 键会让 register/构造处的 .get(key, 默认) 返回 None
+        # 进入算术，与 API 入口 null 口径一致 fail-loud。
         for key in ('ma_short_period', 'ma_long_period', 'ma_stop_period'):
+            if key in strategy and strategy[key] is None:
+                raise ValueError(
+                    f"config.strategy.{key} 不允许为 null；请提供有效值或删除该键")
             if strategy.get(key) is None:
                 continue
             v = cfgv.strict_int(strategy[key], f'config.strategy.{key}')
@@ -354,6 +370,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 raise ValueError(f"config.trading.symbols 存在重复交易对: {name}")
             seen.add(name)
             s['name'] = name  # 规范化写回（去空格/转大写）
+
+            # 显式 null 与「键缺省」不同：缺省有明确兜底语义，null 会穿过下方
+            # is not None 守卫带病启动（risk null→开仓 TypeError、enabled null→
+            # 静默禁用）。与 API 入口的 _explicit_null_error 同口径 fail-loud。
+            for null_key in ('risk_per_trade', 'enabled', 'strategy'):
+                if null_key in s and s[null_key] is None:
+                    raise ValueError(
+                        f"{name} {null_key} 不允许为 null；请提供有效值或删除该键")
 
             if s.get('risk_per_trade') is not None:  # 缺省时由 default_risk_per_trade 兜底（既有行为）
                 s['risk_per_trade'] = cfgv.strict_risk_per_trade(s['risk_per_trade'], f"{name} risk_per_trade")

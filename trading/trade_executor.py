@@ -10,7 +10,8 @@
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / risk_manager / config /
 record_stop_loss / _cancel_stop_order_confirmed /
-_close_trade_state_with_runtime_fallback /
+_close_trade_state_with_runtime_fallback / _notify_trade_state_persistence_issue /
+_mark_ma_cross_reentry_pending / _finalize_open_intent_rollback /
 _buffer_trade_open_notification / _buffer_trade_close_notification。
 """
 

@@ -1610,6 +1610,21 @@ class PositionParsingStrictnessTest(unittest.TestCase):
             api.list_position_symbols()
 
 
+class ZeroContractCloseGuardTest(unittest.TestCase):
+    """请求量换算为 0 张而交易所仍有仓：拒绝静默升级为全仓平仓——该形态只在
+    账本币数与面值漂移的失配态出现，全平可能吃掉人工仓，必须交上层隔离对账。"""
+
+    def test_zero_contract_request_with_live_position_refuses_full_close(self):
+        api = _bare_api()
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        with patch.object(api, 'get_position', return_value={
+                'side': 'long', 'contracts': 10, 'info': {'pos': '10'}}):
+            result = api.close_position('BTC/USDT:USDT', 'long', 0.001)
+        self.assertIsNone(result)
+        api.exchange.create_order.assert_not_called()
+
+
 class OrderTriStateAdjudicationTest(unittest.TestCase):
     """终审缺陷反例：只有 OrderNotFound 才是「明确不存在」。
 

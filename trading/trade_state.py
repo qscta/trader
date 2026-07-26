@@ -810,6 +810,10 @@ class TradeState:
                                     close_intent_client_id=None):
         if symbol not in self.state['open_positions']:
             return None
+        # force_runtime（仅内存）路径不落盘、绕过 validate_state，字符串边界
+        # 必须在修改入口执行（与 _update_stop_loss_locked 同口径）
+        if new_stop_order_id is not None and not isinstance(new_stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         position = self.state['open_positions'][symbol]
         current_size = float(position['position_size'])
         closed_size = _require_positive_finite(closed_size, '部分平仓数量')
@@ -913,6 +917,8 @@ class TradeState:
                     f'{symbol} 部分回滚余仓与 pending open intent 不匹配')
         if side not in ('long', 'short'):
             raise ValueError('side 必须是 long/short')
+        if stop_order_id is not None and not isinstance(stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
             entry_price = float(entry_price)
             original_size = float(original_size)
@@ -1014,6 +1020,8 @@ class TradeState:
                     f'{symbol} 完整余仓与 pending open intent 不匹配')
         if side not in ('long', 'short'):
             raise ValueError('side 必须是 long/short')
+        if stop_order_id is not None and not isinstance(stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
             entry_price = float(entry_price)
             position_size = float(position_size)
@@ -1065,16 +1073,10 @@ class TradeState:
         return copy.deepcopy(position)
 
     def add_untracked_open_position(self, *args, **kwargs):
-        """原子建立未决完整余仓、隔离与未知止损残留标记。"""
+        """原子建立未决完整余仓、隔离与未知止损残留标记（与全部入口同走事务原语）。"""
         with self.lock:
-            snapshot = self._snapshot_locked()
-            try:
-                position = self._add_untracked_open_position_locked(*args, **kwargs)
-                self._save_or_rollback_locked(snapshot)
-                return position
-            except Exception:
-                self.state = snapshot
-                raise
+            return self._transact_locked(
+                lambda: self._add_untracked_open_position_locked(*args, **kwargs))
 
     def force_runtime_add_untracked_open_position(self, *args, **kwargs):
         """与其余四个 force_runtime 通道同走事务原语（save=False）：
