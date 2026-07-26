@@ -128,7 +128,7 @@ class PerSymbolIsolationTest(unittest.TestCase):
 
     def test_manual_run_does_not_mark_day_done(self):
         """手动检查不得标记当日完成：00:00–08:00 间手动触发跑的是昨日数据，
-        若标记会让当天 08:00 的正式日检被跳过，整日的新信号与止损推进丢失。"""
+        若标记会让当天 08:00 的正式日检被跳过，整日的新信号与反手/平仓检查丢失。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
                 tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
@@ -204,7 +204,7 @@ class StartupCatchupTest(unittest.TestCase):
 
     def test_deploy_restart_skip_ignored_before_check_time(self):
         """未到今日检查时间的重启：标志必须失效——此时本无兜底可跳，
-        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与止损推进丢失。"""
+        若也标记当日已检，当天 08:00 的正点日检会被拦截，整日信号与反手/平仓检查丢失。"""
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             system, calls = self._system(tmp)

@@ -281,7 +281,17 @@ class EquityTracker:
         return data
 
     def _load_json_state(self, filepath, expected_type, default):
-        """读取辅助状态；主文件损坏时仅从合法备份恢复，绝不静默清空。"""
+        """读取辅助状态；主文件损坏时仅从合法备份恢复，绝不静默清空。
+
+        整体持 _lock（RLock，写端调用方已持锁时零代价重入）：本方法在主文件
+        缺失/损坏分支会执行「恢复写」——若不持锁，只读路由（OHLC/历史等）触发的
+        迟到恢复写可与持锁写端刚提交的新世代竞态，把除数/峰值静默覆盖回旧世代，
+        且内容 schema 合法、下次加载零告警。读端恢复必须与写端同一串行化域。
+        """
+        with self._lock:
+            return self._load_json_state_locked(filepath, expected_type, default)
+
+    def _load_json_state_locked(self, filepath, expected_type, default):
         backup = filepath + '.bak'
         if not private_file_exists(filepath):
             if not private_file_exists(backup):

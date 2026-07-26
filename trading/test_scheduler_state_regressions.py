@@ -702,6 +702,44 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             'current_close': 11.0,
         }
 
+    def test_t1_blocked_cross_consumes_marker_without_all_day_retry(self):
+        """T+1 阻断日遇同根交叉：刻意不开仓即消费本根标记、不入失败重跑
+        （此前会确定性全天重跑+告警轰炸）；次日 T+1 重入按 EMA 方向恢复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.trade_state.replace_stop_loss_dates(
+                {'BTCUSDT': date.today().isoformat()})
+            system.stop_loss_dates = system.trade_state.get_stop_loss_dates()
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5', 1))
+            system._execute_open = Mock(
+                side_effect=AssertionError('T+1 当日不得开仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t5', metadata['last_processed_candle'])
+            self.assertIsNotNone(system._last_check_date)
+            system.notifier.notify_signal_missed.assert_not_called()
+            system._execute_open.assert_not_called()
+
+    def test_prune_refreshes_t1_memory_mirror(self):
+        """退池品种的 T+1 账本清理必须同步内存镜像：镜像残留会让重加品种
+        次日无交叉自动重入，且 record/clear 的全量回写会复活已清条目。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.trade_state.replace_stop_loss_dates(
+                {'ETHUSDT': '2026-01-01'})
+            system.stop_loss_dates = system.trade_state.get_stop_loss_dates()
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
+
+            system.check_and_execute_trades()
+
+            self.assertNotIn(
+                'ETHUSDT', system.trade_state.get_stop_loss_dates())
+            self.assertNotIn('ETHUSDT', system.stop_loss_dates)
+
     def test_failed_ma_open_does_not_advance_candle_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)

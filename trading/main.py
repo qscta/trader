@@ -88,7 +88,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
       - SignalHandlersMixin（signal_handlers.py）：双均线信号分派——无仓开仓判定、
         有仓时的止损确认/翻转分派、T+1 重入；
       - TradeExecutorMixin（trade_executor.py）：下单执行——通用开仓（校验/回滚）、
-        止损单更新、平仓执行、双均线翻转、开仓落盘失败的交易所侧回滚；
+        平仓意图提交与恢复、部分平仓收口、双均线翻转、开仓落盘失败的交易所侧回滚；
       - 本文件保留：装配与配置、状态迁移与归属护栏、启动同步、日检总指挥
         check_and_execute_trades 与调度注册（真钱编排核心，刻意留在 main 便于审查）。
     """
@@ -1259,10 +1259,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     symbol, f'{context} open intent 持仓查询不确定: {exc}')
                 unresolved.add(symbol)
                 continue
-            if exchange_position:
-                resolved = self._resume_open_intent_position(symbol, intent)
-            else:
-                resolved = self._adjudicate_flat_open_intent(symbol, intent)
+            try:
+                if exchange_position:
+                    resolved = self._resume_open_intent_position(symbol, intent)
+                else:
+                    resolved = self._adjudicate_flat_open_intent(symbol, intent)
+            except Exception as exc:
+                # 单意图异常只隔离该品种，不得中止整轮收口（与日检/巡检的
+                # 单品种隔离同标准）：中止会让启动路径整体拒启、日检整轮报废，
+                # 其余品种的止损维护与平仓检查被无辜连累
+                logger.exception(f'{symbol} {context} open intent 收口异常，隔离后继续: {exc}')
+                self._quarantine_position_mismatch(
+                    symbol, f'{context} open intent 收口异常: {exc}')
+                resolved = False
             if not resolved:
                 unresolved.add(symbol)
         return unresolved
@@ -1603,7 +1612,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             symbol_config.get('_retired_from_pool') and
                             position and position.get('side') != target_side and
                             not post_position)
+                        # T+1 阻断日的新开仓是「刻意不开」而非失败：本根交叉由
+                        # T+1 规则消费，次日重入按当时 EMA 方向恢复「永远在市」。
+                        # 不豁免会让当日必不可恢复的品种整天重跑+告警轰炸。
+                        # 仅适用于分派前就无仓的品种；翻转开新腿失败（分派前有仓）
+                        # 仍按失败重试，不受 T+1 影响。
+                        t1_blocked_new_open = bool(
+                            position is None and not post_position and
+                            self.is_stop_loss_today(symbol))
                         if (not retired_exit_complete and
+                                not t1_blocked_new_open and
                                 (not post_position or
                                  post_position.get('side') != target_side)):
                             logger.error(
@@ -1611,6 +1629,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 '不推进 K 线幂等标记，等待日内重试')
                             failed_symbols.append(symbol)
                             continue
+                        if t1_blocked_new_open:
+                            logger.info(
+                                f'{symbol} [双均线] 本根交叉因 T+1 限制刻意不开仓，'
+                                '消费信号标记；次日按 EMA 方向重入')
                     self.trade_state.mark_candle_processed(
                         symbol, 'ma_cross', candle_id)
 

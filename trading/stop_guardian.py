@@ -6,7 +6,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_display_name。
+_stop_anomalies / get_strategy_for_symbol / _get_strategy_display_name。
 """
 
 import logging

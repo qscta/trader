@@ -6,7 +6,7 @@ T+1 止损重入。（海龟策略已下线移除。）
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
-stop_loss_dates / is_stop_loss_today / record_stop_loss / clear_stop_loss /
+stop_loss_dates / is_stop_loss_today / clear_stop_loss /
 _handle_exchange_flat_close / _get_strategy_display_name /
 _notify_missing_position_after_signal / _execute_open / _flip_position。
 """

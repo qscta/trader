@@ -1413,6 +1413,11 @@ class TradeState:
             prefix[index] = matched
 
         matched = 0
+        # 扫描窗口 archive[-len(pattern):] 至多 len(pattern) 项，matched 每轮
+        # 净增至多 1，故整模式命中只可能发生在最后一轮——循环终态即为最大
+        # 后缀重叠，无需（也不得）做 full-match 回退：若未来把窗口放宽到
+        # 超过 len(pattern) 项，必须补 matched = prefix[matched-1] 的回退，
+        # 否则下一轮 pattern[matched] 会越界。
         for item in archive[-len(pattern):]:
             token = json.dumps(
                 item, sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -1420,10 +1425,6 @@ class TradeState:
                 matched = prefix[matched - 1]
             if token == pattern[matched]:
                 matched += 1
-            if matched == len(pattern):
-                # 完整模式若恰好落在 archive 尾部，就是最大重叠；若后面仍有
-                # token，则退回前缀继续匹配。
-                continue
         return matched
 
     def remove_symbol_metadata(self, symbol, clear_quarantine=False):

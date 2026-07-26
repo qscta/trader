@@ -329,6 +329,9 @@ def require_auth(f):
             ip = request.remote_addr or 'unknown'
             now = time.time()
             with _login_guard:
+                # 预检先清过期锁定（与 api_login 同构）：否则锁定到期后旧条目
+                # （fails=5）仍在池中，单次错误即再锁——「连续 5 次」承诺失效
+                _prune_failures(_token_failures, now)
                 _fails, locked_until = _token_failures.get(ip, (0, 0.0))
                 if now < locked_until:
                     return jsonify({'error': f'API Token 错误次数过多，'
@@ -769,8 +772,10 @@ def delete_symbol(symbol):
                 except Exception as e:
                     # 查询失败时 fail-closed：不清 quarantine；配置删除本身已成功。
                     logger.warning(f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')
-        send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
-        return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
+        # 审计消息与响应统一用规范化名（与 add/update 口径一致）：
+        # DELETE /api/symbols/btcusdt 实删的是 BTCUSDT，回显必须如实
+        send_dingtalk(f'[{system.label}] 删除交易对: {symbol_u}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已删除'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

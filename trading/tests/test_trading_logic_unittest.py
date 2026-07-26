@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1451,6 +1452,24 @@ class ApiTokenAuthTests(unittest.TestCase):
             "/api/status", headers={"X-API-Token": "real-token-abc"})
         self.assertEqual(resp.status_code, 429)
 
+    def test_lockout_expiry_restores_full_attempt_window(self):
+        # 锁定到期后预检必须清掉过期条目，恢复完整 5 次窗口——
+        # 否则旧条目（fails=5）滞留，单次错误即再锁 60 秒
+        for _ in range(api_server.LOGIN_MAX_FAILURES):
+            self.client.get("/api/status", headers={"X-API-Token": "wrong-token"})
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 429)
+        with api_server._login_guard:
+            ip, (fails, _until) = next(iter(api_server._token_failures.items()))
+            api_server._token_failures[ip] = (fails, time.time() - 1)  # 模拟锁定过期
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 401)  # 单次错误不得立即再锁
+        resp = self.client.get(
+            "/api/status", headers={"X-API-Token": "wrong-token"})
+        self.assertEqual(resp.status_code, 401)
+
     def test_correct_token_clears_failure_streak(self):
         for _ in range(api_server.LOGIN_MAX_FAILURES - 1):
             self.client.get("/api/status", headers={"X-API-Token": "wrong-token"})
@@ -1658,6 +1677,8 @@ class ApiProcessSafetyTests(unittest.TestCase):
                 _trade_lock=trade_lock,
                 _config_lock=threading.RLock(),
                 trade_state=state,
+                # T+1 内存镜像：删除路由清理账本后必须同步刷新（双源分叉回归锁定）
+                stop_loss_dates={"BTCUSDT": "2026-07-10"},
                 exchange_api=SimpleNamespace(
                     to_ccxt_symbol=lambda _s: "BTC/USDT:USDT",
                     get_position=lambda _s: None,
@@ -1675,6 +1696,7 @@ class ApiProcessSafetyTests(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(state.get_signal_metadata("BTCUSDT"), {})
             self.assertNotIn("BTCUSDT", state.get_stop_loss_dates())
+            self.assertNotIn("BTCUSDT", system.stop_loss_dates)
             self.assertFalse(state.is_position_quarantined("BTCUSDT"))
 
     def test_equity_sync_rejects_non_json_even_when_body_empty(self):

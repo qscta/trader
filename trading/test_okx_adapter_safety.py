@@ -1586,6 +1586,29 @@ class PositionParsingStrictnessTest(unittest.TestCase):
         ]
         self.assertEqual(['BTCUSDT'], api.list_position_symbols())
 
+    def test_list_position_symbols_includes_instid_only_usdt_swap(self):
+        """市场表缺失/新上线品种时 ccxt 给不出统一符号：instId 通道必须收录，
+        币本位 instId（-USD-SWAP）仍排除。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 2.0, 'info': {'pos': '2', 'instId': 'NEW-USDT-SWAP'}},
+            {'symbol': 'NEW2-USDT-SWAP', 'contracts': 1.0,
+             'info': {'pos': '1', 'instId': 'NEW2-USDT-SWAP'}},
+            {'contracts': 1.0, 'info': {'pos': '1', 'instId': 'BTC-USD-SWAP'}},
+        ]
+        self.assertEqual(
+            ['NEWUSDT', 'NEW2USDT'], api.list_position_symbols())
+
+    def test_list_position_symbols_rejects_zero_contracts_nonzero_pos(self):
+        """contracts=0 与原始 pos 非零矛盾：与 get_position 同款 fail-loud，
+        不得静默跳过（孤儿仓核对漏检）。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 0.0,
+             'info': {'pos': '3'}}]
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
+
 
 class OrderTriStateAdjudicationTest(unittest.TestCase):
     """终审缺陷反例：只有 OrderNotFound 才是「明确不存在」。

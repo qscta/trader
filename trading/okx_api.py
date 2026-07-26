@@ -1621,6 +1621,12 @@ class OkxApi(ExchangeApi):
                         "非零，孤儿仓核对拒绝跳过")
                 continue
             if abs(contracts) <= 0:
+                # 与 get_position 同款双向矛盾守卫：contracts=0 而原始 pos 非零
+                # 说明字段映射漂移，静默跳过等于孤儿仓核对漏检真钱仓位
+                if raw_pos is not None and raw_pos != 0:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} contracts=0 与原始 pos={info.get('pos')!r} "
+                        "矛盾，孤儿仓核对拒绝跳过")
                 continue
             # BTC/USD:BTC 若被 to_internal_symbol 会错映成 BTCUSDT，导致把
             # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓——两个判定都只认
@@ -2055,7 +2061,8 @@ class OkxApi(ExchangeApi):
             else:
                 normal_ok = self._normal_order_safely_cancelled(normal_detail)
 
-            algo_ok = self._cancel_algo_order(ccxt_symbol, order_id)
+            # 撤销指令的即时裁决不采信（列表可能滞后），下方以最终清单复验为准
+            self._cancel_algo_order(ccxt_symbol, order_id)
             normal_ok = normal_ok and self._normal_order_absent(
                 ccxt_symbol, order_id)
             algo_ok = self._algo_order_absent(ccxt_symbol, order_id)

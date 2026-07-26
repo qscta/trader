@@ -90,8 +90,8 @@ class ExchangeApi:
         """获取单个交易对的持仓（ccxt 统一结构，无持仓返回 None 或 contracts=0）。"""
         raise NotImplementedError
 
-    def open_position(self, symbol, side, amount):
-        """市价开仓。amount 单位为‘币数’。"""
+    def open_position(self, symbol, side, amount, client_order_id=None):
+        """市价开仓。amount 单位为‘币数’；client_order_id 为幂等 clOrdId（可选）。"""
         raise NotImplementedError
 
     def close_position(self, symbol, side, amount, client_order_id=None):

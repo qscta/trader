@@ -146,8 +146,9 @@ class DingTalkNotifier:
             entry = pos.get('entry_price', 0)
             stop = pos.get('stop_loss_price', 0)
             size = pos.get('position_size', 0)
-            # 有向亏损并钳到 ≥0（与前端持仓面板同口径）：止损已推进到盈利侧时
-            # 风险为 0（利润已锁定），按绝对值算会把锁定利润虚报成风险
+            # 有向亏损并钳到 ≥0（与前端持仓面板同口径）：止损位于盈利侧时
+            # 风险为 0（利润已锁定）——遗留海龟仓的历史推进止损或人工调挂
+            # 都可能造成该形态，按绝对值算会把锁定利润虚报成风险
             if pos.get('side') == 'long':
                 loss = max(0, (entry - stop) * size) if stop else 0
             else:
