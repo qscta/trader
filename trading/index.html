@@ -68,9 +68,7 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: #b9c1cf; background-clip: padding-box; }
 .container { max-width: 1320px; margin: 0 auto; padding: 24px 24px 56px; }
 .hidden { display: none !important; }
-.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .muted { color: var(--text-muted); }
-.section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-faint); margin: 28px 2px 12px; }
 
 /* ============================ 顶栏 ============================ */
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
@@ -183,7 +181,6 @@ body {
 .badge-short { background: var(--red-soft); color: var(--red-strong); }
 .badge-on { background: var(--green-soft); color: var(--green-strong); }
 .badge-off { background: var(--orange-soft); color: var(--orange); }
-.badge-ma { background: var(--purple-soft); color: var(--purple); }
 .badge-holding { background: var(--accent-soft); color: var(--accent); border-radius: var(--r-pill); margin-left: 8px; vertical-align: middle; padding: 2px 8px; font-size: 11px; }
 .table-wrap { overflow: auto; -webkit-overflow-scrolling: touch; }
 .portfolio-grid .card-body { flex: 1; min-height: 0; }
@@ -290,7 +287,7 @@ table.data tbody tr:last-child td { border-bottom: none; }
     </div>
 
     <!-- ============ 欧易管理视图 ============ -->
-    <div id="viewExchange">
+    <div>
         <!-- KPI 行1 -->
         <div class="stats-bar">
             <div class="stat-item"><div class="label">本年度收益率</div><div class="value" id="ytdReturn">-</div><div class="sub-value" id="totalReturnDetail"></div></div>
@@ -310,7 +307,7 @@ table.data tbody tr:last-child td { border-bottom: none; }
         <div class="grid-full">
             <div class="card">
                 <div class="card-header">
-                    <div><h2>求索指数</h2><div class="equity-kline-meta" id="equityKlineMeta">1853 点基准 · 08:00 切日</div></div>
+                    <div><h2>求索指数</h2><div class="equity-kline-meta">1853 点基准 · 08:00 切日</div></div>
                     <div class="equity-kline-toolbar" id="equityKlineToolbar">
                         <button class="equity-kline-range-btn" data-days="30">30根</button>
                         <button class="equity-kline-range-btn" data-days="60">60根</button>
@@ -410,6 +407,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
 </div>
 
 <script src="/static/lwc.js"></script>
-<script src="/static/app.js?v=20260712-1"></script>
+<script src="/static/app.js?v=20260726-4"></script>
 </body>
 </html>

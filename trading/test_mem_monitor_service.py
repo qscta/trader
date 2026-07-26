@@ -1,15 +1,22 @@
 """资源监控启动失败语义回归。"""
 
+import importlib.util
+import logging
 import sys
 import types
 import unittest
 from unittest.mock import patch
 
+# 单独运行本模块时不落生产日志：mem_monitor 导入时的 logging.basicConfig
+# 仅在根 logger 无 handler 时生效——先挂 NullHandler 让它空转（与
+# _test_stubs.import_main 同一护栏；discover 全跑时靠导入顺序碰巧安全不算保障）。
+if not logging.getLogger().handlers:
+    logging.getLogger().addHandler(logging.NullHandler())
+
 # stdlib-only CI job intentionally does not install requests.  These tests never
 # perform HTTP; provide only the import-time shape needed by mem_monitor.
-try:
-    import requests  # noqa: F401
-except ImportError:
+# find_spec 只探测可用性、不产生未使用导入（保持 pyflakes 验收门归零）。
+if importlib.util.find_spec('requests') is None:
     requests_stub = types.ModuleType('requests')
     requests_stub.post = None
     sys.modules['requests'] = requests_stub

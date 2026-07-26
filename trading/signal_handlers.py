@@ -6,10 +6,9 @@ T+1 止损重入。（海龟策略已下线移除。）
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / ma_cross_strategy /
-stop_loss_dates / is_stop_loss_today / record_stop_loss / clear_stop_loss /
+stop_loss_dates / is_stop_loss_today / clear_stop_loss /
 _handle_exchange_flat_close / _get_strategy_display_name /
-_notify_missing_position_after_signal / _execute_open / _update_stop_order /
-_flip_position。
+_notify_missing_position_after_signal / _execute_open / _flip_position。
 """
 
 import logging
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class SignalHandlersMixin:
 
-    def _mark_ma_cross_reentry_pending(self, symbol, side, signal, reason):
+    def _notify_ma_open_leg_failed(self, symbol, side, signal, reason):
         """双均线开仓腿失败后统一告警；K 线不推进，由日内调度幂等重试。
 
         T+1 只属于真实止损事件。把网络/下单失败伪装成“今天已止损”会阻断
@@ -46,7 +45,7 @@ class SignalHandlersMixin:
             stop_loss_price = signal['lower_stop']
             self._execute_open(symbol, 'long', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._mark_ma_cross_reentry_pending(
+                self._notify_ma_open_leg_failed(
                     symbol,
                     'long',
                     signal,
@@ -58,7 +57,7 @@ class SignalHandlersMixin:
             stop_loss_price = signal['upper_stop']
             self._execute_open(symbol, 'short', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._mark_ma_cross_reentry_pending(
+                self._notify_ma_open_leg_failed(
                     symbol,
                     'short',
                     signal,
@@ -119,14 +118,16 @@ class SignalHandlersMixin:
                     logger.warning(f"{symbol} [双均线] 止损确认已执行，但本地状态落盘失败，本轮不记录 T+1")
                     return
                 # 出场价传原始数值（与盘中巡检同口径），不做 .4f 假精度格式化
+                # T+1 记录与否由 _handle_exchange_flat_close 按在池状态如实
+                # 分叉记录（退池品种刻意不记），通知与日志不重复宣称
                 self.notifier.notify_stop_loss_triggered(
                     symbol,
                     self._get_strategy_display_name('ma_cross'),
                     position.get('side', ''),
                     exit_price,
-                    source='日检确认（T+1 已记录）'
+                    source='日检确认'
                 )
-                logger.info(f"{symbol} [双均线] 止损已记录，T+1将检查重入")
+                logger.info(f"{symbol} [双均线] 止损已确认并记平")
                 return
 
         # 检查反向交叉信号

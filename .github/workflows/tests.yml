@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# 供应链最小权限：三个 job 均为纯只读（checkout + 测试 + 语法检查），
+# 显式收口 GITHUB_TOKEN，杜绝任何 action 传递依赖被投毒时借默认写权限改仓库。
+permissions:
+  contents: read
+
 jobs:
   stdlib-tests:
     # 纯标准库测试：不装任何第三方依赖，验证核心逻辑在最小环境可跑
@@ -33,6 +38,9 @@ jobs:
           # 与生产服务器及 requirements.lock 的解析环境保持一致。
           python-version: "3.12"
           cache: pip
+          # 缓存键必须跟着实际安装事实源（锁文件）走：只重固化传递依赖时
+          # requirements.txt 不变，默认键会永远命中旧缓存。
+          cache-dependency-path: trading/requirements.lock
       - name: Install dependencies
         working-directory: trading
         run: |

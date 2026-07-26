@@ -33,7 +33,6 @@ def _make(equity, peak, peak_days_ago, longest):
     return tmp, eqt.EquityTracker(tmp, system)
 
 
-
 def _jload(path):
     with open(path) as f:
         return json.load(f)
@@ -51,6 +50,56 @@ class CoercePositiveFloatTest(unittest.TestCase):
 
     def test_accepts_positive_finite_values(self):
         self.assertEqual(eqt._coerce_positive_float("123.45"), 123.45)
+
+
+class EquitySyncPeakDayClaimTest(unittest.TestCase):
+    """资金同步整代重置峰值后，同交易日的日检快照重跑不得覆盖新基准。
+
+    日检重跑（+1 分钟重试/30 分钟兜底）属设计内行为；若同步不认领当日
+    （peak_observed_day），重跑会用同步前的 08:00 收盘快照绕过日锁存，把
+    刚重置的峰值覆盖回旧世代并 ratchet 出虚假 max_drawdown。"""
+
+    def test_same_day_snapshot_rerun_keeps_synced_peak(self):
+        tmp, t = _make(equity=1000, peak=1000, peak_days_ago=0, longest=0)
+        t.record_daily_equity_snapshot()          # 当日首写快照（close=1000）
+        t.system.exchange_api.get_balance = (     # 出金 500 后同步
+            lambda: {'total': {'USDT': 500}, 'free': {'USDT': 500}})
+        t.equity_sync(flow_amount=-500)
+        self.assertEqual(
+            500, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+
+        t.record_daily_equity_snapshot()          # 同交易日日检重跑
+        peak = _jload(os.path.join(tmp, 'peak_equity.json'))
+        self.assertEqual(500, peak['peak_equity'])   # 不得被同步前收盘 1000 覆盖
+
+
+class AccountStatsBadBalanceTest(unittest.TestCase):
+    """瞬时坏余额响应必须 fail-loud：按 0 消费会把 peak_drawdown=100%
+    永久 ratchet 进 max_drawdown（与采样/快照/同步路径同一校验口径）。"""
+
+    def test_missing_usdt_raises_instead_of_ratcheting(self):
+        tmp, t = _make(equity=100, peak=100, peak_days_ago=1, longest=0)
+        t.system.exchange_api.get_balance = lambda: {'total': {}, 'free': {}}
+        with self.assertRaises(RuntimeError):
+            t.build_account_stats(persist=True)
+        hist = _jload(os.path.join(tmp, 'equity_history.json'))
+        self.assertEqual(0, hist.get('max_drawdown', 0))
+
+    def test_peak_observed_day_shape_is_validated(self):
+        """日锁存承重字段：坏值让 == 恒 False 静默失开，形状校验必须拦截。"""
+        tmp, t = _make(equity=100, peak=100, peak_days_ago=1, longest=0)
+        path = os.path.join(tmp, 'peak_equity.json')
+        for bad in (123, '07/26/2026', 'not-a-date'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                t._validate_json_shape(
+                    {'peak_equity': 100, 'peak_time': None,
+                     'peak_observed_day': bad}, dict, path)
+        # 合法形态与缺省/None 均放行（兼容旧文件）
+        t._validate_json_shape(
+            {'peak_equity': 100, 'peak_time': None,
+             'peak_observed_day': '2026-07-26'}, dict, path)
+        t._validate_json_shape(
+            {'peak_equity': 100, 'peak_time': None}, dict, path)
 
 
 class DrawdownStatsTest(unittest.TestCase):
@@ -185,6 +234,37 @@ class DrawdownStatsTest(unittest.TestCase):
             )
 
         self.assertEqual(100, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+
+
+class AwarePeakTimeRegressionTest(unittest.TestCase):
+    """带时区 offset 的合法 ISO peak_time 必须归一（UTC+8→naive）后正常计算。
+
+    旧实现直接 `now - fromisoformat(peak_time)`：aware/naive 相减抛
+    TypeError 被吞 → days_since_peak 静默归零，未创新高统计全线失真。"""
+
+    def _make_aware(self, **kwargs):
+        tmp, t = _make(**kwargs)
+        path = os.path.join(tmp, 'peak_equity.json')
+        peak = _jload(path)
+        peak['peak_time'] += '+08:00'   # 同一北京时间点的 aware 表示
+        _jdump(peak, path)
+        return tmp, t
+
+    def test_aware_peak_time_still_counts_days_since_peak(self):
+        _, t = self._make_aware(equity=90, peak=100, peak_days_ago=5, longest=3)
+        d = t.build_account_stats(persist=False)
+        self.assertEqual(d['days_since_peak'], 5)
+        self.assertEqual(d['longest_drawdown_days'], 5)
+
+    def test_aware_peak_time_new_high_still_settles_streak(self):
+        tmp, t = self._make_aware(
+            equity=110, peak=100, peak_days_ago=5, longest=3)
+        t.record_daily_equity_snapshot()
+        d = t.build_account_stats(persist=True)
+        self.assertEqual(d['days_since_peak'], 0)
+        self.assertEqual(d['longest_drawdown_days'], 5)
+        hist = _jload(os.path.join(tmp, 'equity_history.json'))
+        self.assertEqual(hist['longest_drawdown_days'], 5)
 
 
 class TickCompactionConcurrencyTest(unittest.TestCase):

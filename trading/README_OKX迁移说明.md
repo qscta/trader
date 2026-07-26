@@ -1,7 +1,7 @@
 # 欧易（OKX）程序化交易系统 — 架构与上线说明
 
 本系统由币安版迁移而来，现已收敛为「**欧易单所版**」：只对接欧易，状态、配置、前端均按单所组织。
-两套策略的**信号语义**保持不变；但当前版本不是“只换适配层”：已同时加固下单幂等、订单终态归因、补偿回滚、原子账本、崩溃恢复、止损残留隔离与三入口配置校验。
+在役策略（双均线 ma_cross）的**信号语义**保持不变；但当前版本不是“只换适配层”：已同时加固下单幂等、订单终态归因、补偿回滚、原子账本、崩溃恢复、止损残留隔离与三入口配置校验。
 
 ## 一、整体架构
 
@@ -39,6 +39,8 @@
 
 - 凭据也可用环境变量：`OKX_API_KEY` / `OKX_API_SECRET` / `OKX_API_PASSPHRASE`、`DINGTALK_WEBHOOK`。
 - **向后兼容**：旧的 `{"exchanges": {"okx": {...}}}` 嵌套结构会被 `load_config()` 自动拍平为顶层 `okx`，无需手改即可运行。
+- **模拟盘只认 `sandbox` 键**：早期未文档化的别名键 `demo` 已移除——若你的
+  config.json 曾手写 `"demo": true`，升级后会按实盘运行，请改用 `"sandbox": true`。
 - **双均线默认参数**：`ma_short_period` 默认 **7**、`ma_long_period` 默认 **28**（仅改默认值；若你的 config.json 已显式写了短周期，则按你的配置走，不强制覆盖）。
 
 ## 三、前端（单所）
@@ -51,7 +53,7 @@
 
 ### 删除交易对的语义
 - 删除 ≠ 立即平仓、≠ 立即停止保护。正确语义：**从品种池移除，只托管当前仓位到下一次平仓**；`DELETE /api/symbols/<symbol>` 不动当前持仓、不撤保护止损，但退池后禁止反手、止损后重入或任何新腿；当前仓一旦结束即彻底停止监控和交易。
-- 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（唯一在役策略 ma_cross；遗留 turtle 持仓亦按双均线语义托管）继续跟踪、推进止损、处理平仓，直到仓位自然结束。
+- 如本地已有持仓，`check_and_execute_trades()` 会继续把 `trade_state` 里的持仓 symbol 加入检查集合，**按持仓记录的 `strategy` 字段**（唯一在役策略 ma_cross；遗留 turtle 持仓亦按双均线语义托管）继续跟踪、维持止损保护、处理平仓，直到仓位自然结束。
 - 老仓兜底：若删除时发现该持仓缺 `strategy` 字段，会先从当前配置补写进持仓再删；配置里也没有时**拒绝删除**，提示先明确策略。
 
 ### 未创新高统计口径
@@ -66,10 +68,12 @@
 
 `/api/login`、`/api/logout`、`/api/check_auth`、`/api/logs`、`/api/status`、`/api/positions`、
 `/api/symbols`、`/api/account_stats`、`/api/equity_ohlc`(=`/api/qiusuo_index_ohlc`)、`/api/instant_open`、
-`/api/close_position`、`/api/strategy_params`、`/api/equity_sync`、`/api/trades`、`/api/manual_check`。
+`/api/close_position`、`/api/strategy_params`、`/api/equity_sync`、`/api/trades`、`/api/trades_summary`、
+`/api/manual_check`。
 
 > 多所时代的 `/api/exchanges`、`/api/overview`、`/api/overview_ohlc` 已删除；前端通道图下线后残留的
-> `/api/channel_data` 孤儿路由也已删除。其余路由不再接受 `?exchange=` 或 body 里的 `exchange` 字段。
+> `/api/channel_data`，以及零消费者的 `/api/config`、`/api/equity_history` 孤儿路由也已删除。
+> 其余路由不再接受 `?exchange=` 或 body 里的 `exchange` 字段。
 
 ## 五、运行 / 部署
 
@@ -91,7 +95,7 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 - **一次性 legacy 迁移**：`data/okx/` 只在无 `.okx_legacy_migration_complete.json` 时参与裁决；迁移成功后原子写 marker，后续重启绝不再用永久旧快照复活主账本。根主账本/.bak 缺失冲突、两边存在不同生命周期数据、任一 schema/权限/符号链接异常均拒启；只在内容同源或安全空状态下迁移。
 - **目录归属护栏**：`.trading_data_owner.json` 在加载权益/信号等辅助文件前标记整个数据目录为 `okx`。它与 `trade_state.json.exchange` 冲突、无归属但存在生命周期数据时都拒启；只有全新空目录才自动认领。
 - **止损自愈（防裸奔红线）**：盘中巡检用四态裁决——`intact` 不动、`adoptable` 原子收养唯一完整新 ID、`mismatch` 隔离等人工、`missing` 补挂。止损更新/缩量采用 make-before-break：先建余仓新保护，再只撤已知旧 ID，绝不在持仓期间退化为撤全。
-- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手/止损推进。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
+- **止损残留护栏（防错杀红线）**：不可确认时持久化 marker 并阻断新开仓/反手。自动清理先同时确认**本地空仓 + 交易所空仓**，再撤净普通单与全部算法类型；两类完整分页清单连续为空、普通单终态证明零成交且交易所仍空仓才解除。未知 POST 还有 10 秒可见性等待窗。
 - **OKX 原生止损单**：直调 `POST /api/v5/trade/order-algo`，发送 `ordType=conditional`、`slTriggerPx`、`slOrdPx=-1`、`reduceOnly=true` 和确定性 `algoClOrdId`；每个意图最多一次 POST，ACK 或超时都只按同 ID 查询，绝不盲重发。
 - **状态归属护栏（防串仓红线）**：启动时校验 `trade_state.json` 顶层 `exchange` 标记——
   - 标记为 `okx`：放行；标记为其它交易所（如旧币安）：**拒绝启动**；
@@ -106,6 +110,7 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --stop-id-reuse
 ```
 
 `--fire` 超时未触发是“未获得证据”，不是通过；调整距离/超时后重跑。需确认：
@@ -114,13 +119,14 @@ OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
 2. **止损算法单**：确认原生 conditional 单确实挂上、是 reduce-only、触发后市价平仓且不反向开仓。
 3. **撤止损 / 撤全部**：确认 `cancel_all_orders` 能把算法止损单一并撤掉，无残留。
 4. **杠杆与单向模式**：账户须为**单向（净）持仓模式**；系统每品种首次开仓前 `set_leverage`，确认杠杆/保证金模式生效（风控以损定量，仓位价值常数倍于本金，杠杆必须够）。
+5. **止损幂等 ID 终态复用**：`--stop-id-reuse` 验证旧止损进入终态后同一 `algoClOrdId` 可再次 POST（崩溃重试幂等的根基）；常规 `--fire` 与基础验证测不到该场景，若交易所拒绝须提前记入运维预案。
 
 ## 七、测试
 
 当前聚合测试矩阵以仓库内两条 unittest 命令的实时结果为准。策略行情固定读取
 最新单页 300 根；配置若无法在过滤未收盘 K 线后满足最低窗口，启动/API 修改时即拒绝。
 日 K 陈旧时 fail-closed；历史出现大跨度断层时不回放旧交易，但仍只检查最新两根
-已收盘 K 线本身是否刚产生交叉/突破。
+已收盘 K 线本身是否刚产生 EMA 交叉。
 以聚合命令为准，避免模块新增后文档逐项计数漂移：
 
 ```bash
@@ -128,6 +134,6 @@ python3 -m unittest discover -s . -p 'test_*.py'
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。
+需要导入 `main` 的标准库测试统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。只测独立模块的文件直接导入被测对象，个别适配层/verify 测试按同一思路就地桩 `ccxt`/`pandas`。
 
 > 依赖版使用与生产同源的 requirements.lock（Python 3.12）。

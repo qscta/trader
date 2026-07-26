@@ -16,7 +16,6 @@ main = _test_stubs.import_main()
 TradingSystem = main.TradingSystem
 
 
-
 def _jload(path):
     with open(path) as f:
         return json.load(f)
@@ -152,6 +151,39 @@ class StartupSmokeTest(unittest.TestCase):
                 _jdump(cfg, path)
                 with patch.object(main, 'OkxApi', _FakeOkxApi):
                     with self.assertRaises(ValueError, msg=f"应拒绝非法配置: {bad}"):
+                        TradingSystem(config_file=path)
+
+    def test_explicit_null_config_values_rejected(self):
+        """显式 null ≠ 键缺省：null 穿过 is not None 守卫会带病启动
+        （risk null→开仓 TypeError、check_minute null→调度注册在守护线程崩溃），
+        与 API 入口的 null 拒绝同口径 fail-loud。"""
+        cases = [
+            ('symbols.risk_per_trade',
+             lambda cfg: cfg['trading']['symbols'][0].update({'risk_per_trade': None})),
+            ('symbols.enabled',
+             lambda cfg: cfg['trading']['symbols'][0].update({'enabled': None})),
+            ('strategy.ma_short_period',
+             lambda cfg: cfg['strategy'].update({'ma_short_period': None})),
+            ('scheduler.check_minute',
+             lambda cfg: cfg.setdefault('scheduler', {}).update({'check_minute': None})),
+            # 顶层键显式 null：setdefault 对已存在键是 no-op，未拦截会以裸
+            # TypeError/AttributeError 崩溃且无法定位配置问题
+            ('okx=null', lambda cfg: cfg.update({'okx': None})),
+            ('strategy=null', lambda cfg: cfg.update({'strategy': None})),
+            ('trading=null', lambda cfg: cfg.update({'trading': None})),
+            ('scheduler=null', lambda cfg: cfg.update({'scheduler': None})),
+            ('trading.symbols=null',
+             lambda cfg: cfg['trading'].update({'symbols': None})),
+            ('dingtalk=null', lambda cfg: cfg.update({'dingtalk': None})),
+        ]
+        for label, mutate in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = _write_config(tmp)
+                cfg = _jload(path)
+                mutate(cfg)
+                _jdump(cfg, path)
+                with patch.object(main, 'OkxApi', _FakeOkxApi):
+                    with self.assertRaises(ValueError, msg=f"应拒绝显式 null: {label}"):
                         TradingSystem(config_file=path)
 
     def test_out_of_range_symbol_config_rejected(self):

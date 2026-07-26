@@ -5,8 +5,10 @@
 
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
-宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / record_stop_loss / get_strategy_for_symbol / _get_strategy_display_name。
+宿主须提供：exchange_api / trade_state / notifier / config / label / _trade_lock /
+_stop_anomalies / get_strategy_for_symbol / _get_strategy_display_name /
+_quarantine_position_mismatch / _clear_position_quarantine_after_reconcile /
+_resume_persisted_close_intent / _cancel_active_stop_ids_only。
 """
 
 import logging
@@ -79,13 +81,22 @@ class StopGuardianMixin:
             return
 
         for symbol in sorted(exchange_symbols - local_symbols):
-            intent_getter = getattr(self.trade_state, 'get_open_intent', None)
-            intent = intent_getter(symbol) if callable(intent_getter) else None
-            resume_intent = getattr(self, '_resume_open_intent_position', None)
-            if intent and callable(resume_intent) and resume_intent(symbol, intent):
-                continue
-            self._quarantine_position_mismatch(
-                symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
+            # 单孤儿异常只隔离该品种，不得中断其余孤儿的隔离与告警
+            # （与日检/意图收口的单品种隔离同标准）：intent 恢复会真实下单，
+            # 网络/适配层异常可抛，一个品种炸掉整段核对会让排序在后的
+            # 孤儿持续无隔离无告警。
+            try:
+                intent_getter = getattr(self.trade_state, 'get_open_intent', None)
+                intent = intent_getter(symbol) if callable(intent_getter) else None
+                resume_intent = getattr(self, '_resume_open_intent_position', None)
+                if intent and callable(resume_intent) and resume_intent(symbol, intent):
+                    continue
+                self._quarantine_position_mismatch(
+                    symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
+            except Exception as exc:
+                logger.exception(f'{symbol} 盘中孤儿仓处理异常，隔离后继续: {exc}')
+                self._quarantine_position_mismatch(
+                    symbol, f'盘中孤儿仓处理异常: {exc}')
 
         get_quarantines = getattr(self.trade_state, 'get_position_quarantines', None)
         quarantines = list(get_quarantines()) if callable(get_quarantines) else []
@@ -123,7 +134,7 @@ class StopGuardianMixin:
         if exchange_position is not None and exchange_position.get('contracts', 0) > 0:
             verifier = getattr(self, '_verify_existing_position_or_quarantine', None)
             if callable(verifier) and not verifier(
-                    symbol, position, exchange_position, clear_on_match=False):
+                    symbol, position, exchange_position):
                 return
             protected = self._ensure_stop_order_alive(
                 symbol, ccxt_symbol, position, strategy_name)
@@ -153,7 +164,8 @@ class StopGuardianMixin:
             logger.warning(f"{symbol} [{strategy_name}] 盘中止损巡检已发通知，但本地状态落盘失败，跳过后续状态修正")
             return
 
-        logger.info(f"{symbol} [双均线] 盘中止损巡检已与平仓同事务记录 T+1 限制")
+        # T+1 记录与否由 _handle_exchange_flat_close 按在池状态如实分叉记录
+        logger.info(f"{symbol} [双均线] 盘中止损巡检记平已同事务落盘")
 
     def _ensure_stop_order_alive(self, symbol, ccxt_symbol, position, strategy_name):
         """止损自愈：本地与交易所都有仓时，确认止损单仍挂在交易所；丢失则按本地止损价补挂。
@@ -502,6 +514,9 @@ class StopGuardianMixin:
             in_memory_dates = getattr(self, 'stop_loss_dates', None)
             if isinstance(in_memory_dates, dict):
                 in_memory_dates[symbol] = stop_loss_date
+            logger.info(f'{symbol} T+1 限制已与平仓同事务记录，次日按 EMA 方向检查重入')
+        elif effective_strategy == 'ma_cross':
+            logger.info(f'{symbol} 退池/禁用品种按「只平不开」收口，刻意不记 T+1')
         stop_cleared = self._cancel_stop_order_confirmed(
             symbol, ccxt_symbol, position.get('stop_order_id'),
             position.get('extra_stop_order_ids'),

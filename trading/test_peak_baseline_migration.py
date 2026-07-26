@@ -140,6 +140,33 @@ class RunTest(unittest.TestCase):
                 len([name for name in os.listdir(tmp) if '.premigrate.' in name]),
             )
 
+    def test_residual_equity_sync_journal_refuses_run(self):
+        """残留 journal = 上次资金同步中断：三份状态可能是半事务世代，且下次
+        tracker 构造会按 journal 整代前滚、静默覆写迁移刚写入的纠正——
+        干跑与 --apply 都必须拒绝，peak 文件不得被改动。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            journal = os.path.join(tmp, '.equity_sync_journal.json')
+            with open(journal, 'w', encoding='utf-8') as handle:
+                json.dump({'version': 1}, handle)
+            self.assertEqual(1, migration.run(tmp, apply=False))
+            self.assertEqual(1, migration.run(tmp, apply=True))
+            with open(os.path.join(tmp, 'peak_equity.json')) as handle:
+                self.assertEqual(json.load(handle), POLLUTED_PEAK)
+            self.assertEqual(
+                [], [name for name in os.listdir(tmp) if '.premigrate.' in name])
+
+    def test_nonfinite_state_fails_loud_instead_of_misdiagnosis(self):
+        """Infinity/NaN 状态与全库读取口径同样 fail-loud：静默放行会把损坏
+        文件经 _pos_float 过滤误诊为「数据不足」跳过。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            with open(os.path.join(tmp, 'peak_equity.json'), 'w',
+                      encoding='utf-8') as handle:
+                handle.write('{"peak_equity": Infinity, "peak_time": null}')
+            with self.assertRaises(ValueError):
+                migration.run(tmp, apply=False)
+
     def test_never_raises_a_legitimate_peak(self):
         with tempfile.TemporaryDirectory() as tmp:
             clean = {

@@ -128,6 +128,83 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
             self.assertNotIn('extra_stop_order_ids', position)
 
 
+class ForceRuntimeStopIdBoundaryTest(unittest.TestCase):
+    """force（仅内存）路径绕过 validate_state：stop_order_id 的字符串边界必须
+    在修改入口执行——非 str 住进内存账本后，全部品种的后续落盘都会持续失败。"""
+
+    def test_force_partial_close_rejects_non_str_stop_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            state.add_open_position(
+                'BTCUSDT', 'long', 100.0, 10.0, 90.0, 'stop-1', strategy='ma_cross')
+            with self.assertRaises(ValueError):
+                state.force_runtime_apply_partial_close(
+                    'BTCUSDT', 4.0, 100.0, new_stop_order_id=12345,
+                    remaining_size=6.0)
+            self.assertEqual(
+                10.0, state.get_open_position('BTCUSDT')['position_size'])
+
+    def test_force_untracked_rejects_non_str_stop_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.force_runtime_add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, 1.0, 90.0, stop_order_id=999)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+
+class ForceRuntimeUntrackedRollbackTest(unittest.TestCase):
+    """force_runtime_add_untracked_open_position 必须与其余四个 force 通道
+    同走事务原语：磁盘已失效时内存是唯一账本，改到一半异常（如隔离详情
+    不可 deepcopy）必须整体回滚，不能留下「持仓已建、隔离标记缺失」的半截账本。"""
+
+    class _Boom:
+        def __deepcopy__(self, memo):
+            raise RuntimeError('quarantine details 不可拷贝')
+
+    def test_mid_mutation_failure_rolls_back_position(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(RuntimeError):
+                state.force_runtime_add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, 1.0, 90.0,
+                    stop_order_id='stop-1', strategy='ma_cross',
+                    quarantine_details={'raw': self._Boom()})
+            # 回滚后不得残留半截持仓/隔离/残留标记
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+            self.assertFalse(state.is_position_quarantined('BTCUSDT'))
+            self.assertFalse(state.has_stop_residue('BTCUSDT'))
+
+
+class RecoveryEntryNumericBoundaryTest(unittest.TestCase):
+    """三个恢复建账入口与 _require_positive_finite 同口径：bool 不得被
+    float() 静默换算成 1.0 入账（与正常开仓/止损更新/部分平仓一致）。"""
+
+    def test_partial_rollback_recovery_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.add_open_after_partial_rollback(
+                    'BTCUSDT', 'long', True, 10.0, 6.0, 90.0, 100.0)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+    def test_untracked_recovery_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, True, 90.0)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+    def test_round_trip_finalize_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.finalize_open_intent_round_trip(
+                    'BTCUSDT', 'client-1', True, 101.0, 1.0)
+            self.assertEqual([], state.get_closed_trades())
+
+
 class AddOpenPositionGuardTest(unittest.TestCase):
     def test_rejects_silent_overwrite_of_same_symbol(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -205,12 +205,12 @@ class EquityTracker:
                    allow_none=False):
             if value is None and allow_none:
                 return
-            if isinstance(value, bool):
-                raise ValueError(f'{filepath}:{field} 不能是 bool')
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f'{filepath}:{field} 必须是有限数') from exc
+            # 与主账本校验器同口径要求 JSON number：数字字符串（"1000"）能过
+            # float() 但下游裸消费（比较/max）会抛 TypeError，且因校验放行，
+            # .bak 恢复分支永不触发——比 fail-closed 更难定位
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f'{filepath}:{field} 必须是数值')
+            parsed = float(value)
             if not math.isfinite(parsed):
                 raise ValueError(f'{filepath}:{field} 必须是有限数')
             if positive and parsed <= 0:
@@ -227,6 +227,14 @@ class EquityTracker:
         if filename == 'peak_equity.json':
             finite(data.get('peak_equity', 0), 'peak_equity', nonnegative=True)
             iso_time(data.get('peak_time'), 'peak_time')
+            observed_day = data.get('peak_observed_day')
+            if observed_day is not None:
+                # 日锁存承重字段：坏值会让 == 比较恒 False、锁存静默失开
+                # （同步基准被同日重跑覆盖），必须与 daily 的 date 同标准校验
+                if not isinstance(observed_day, str):
+                    raise ValueError(
+                        f'{filepath}:peak_observed_day 必须是 YYYY-MM-DD 或 null')
+                datetime.strptime(observed_day, '%Y-%m-%d')
         elif filename == 'equity_history.json':
             for field in ('max_drawdown', 'longest_drawdown_days'):
                 finite(data.get(field, 0), field, nonnegative=True)
@@ -281,7 +289,17 @@ class EquityTracker:
         return data
 
     def _load_json_state(self, filepath, expected_type, default):
-        """读取辅助状态；主文件损坏时仅从合法备份恢复，绝不静默清空。"""
+        """读取辅助状态；主文件损坏时仅从合法备份恢复，绝不静默清空。
+
+        整体持 _lock（RLock，写端调用方已持锁时零代价重入）：本方法在主文件
+        缺失/损坏分支会执行「恢复写」——若不持锁，只读路由（OHLC/历史等）触发的
+        迟到恢复写可与持锁写端刚提交的新世代竞态，把除数/峰值静默覆盖回旧世代，
+        且内容 schema 合法、下次加载零告警。读端恢复必须与写端同一串行化域。
+        """
+        with self._lock:
+            return self._load_json_state_locked(filepath, expected_type, default)
+
+    def _load_json_state_locked(self, filepath, expected_type, default):
         backup = filepath + '.bak'
         if not private_file_exists(filepath):
             if not private_file_exists(backup):
@@ -324,6 +342,15 @@ class EquityTracker:
     def _save_json_state(self, filepath, data, expected_type, label):
         """保存辅助状态并保留最后一个已验证版本；现有文件损坏时拒绝覆盖。"""
         try:
+            # 残留 journal = 上次资金同步提交与回滚双双失败：peak/history/qiusuo
+            # 可能处于半事务世代，且下次启动会按 journal 整代前滚——此间任何
+            # 覆写都会被前滚静默丢弃还 ratchet 出假统计。journal 范围内文件
+            # 一律拒写（fail-loud），等重试资金同步重建整代或重启收口。
+            journal_scoped = {
+                path for path, _t in self._equity_sync_targets().values()}
+            if (filepath in journal_scoped and
+                    private_file_exists(self.EQUITY_SYNC_JOURNAL_FILE)):
+                raise OSError('权益同步 journal 未收口，拒绝覆写半事务世代状态')
             self._validate_json_shape(data, expected_type, filepath)
             if private_file_exists(filepath):
                 with open_private_text_file(filepath) as f:
@@ -410,11 +437,14 @@ class EquityTracker:
         """新峰值确立时，把「旧峰值时间 → 现在」这段刚结束的未创新高周期结算进历史最长。"""
         if not old_peak_time:
             return
-        try:
-            closed_gap = max(0, (now - datetime.fromisoformat(old_peak_time)).days)
-        except Exception as exc:
-            logger.debug('结算未创新高周期时跳过坏峰值时间 %r: %s', old_peak_time, exc)
+        # 与 _validate_json_shape 的 iso_time 同源解析：校验器接受带时区的合法
+        # ISO（归一 UTC+8 naive），消费端必须同口径——否则 aware 串在 naive 相减
+        # 时 TypeError 被吞，回撤天数族指标静默归零且不可观测。
+        parsed_peak = _parse_equity_tick_timestamp(old_peak_time)
+        if parsed_peak is None:
+            logger.debug('结算未创新高周期时跳过坏峰值时间 %r', old_peak_time)
             return
+        closed_gap = max(0, (now - parsed_peak).days)
         if closed_gap <= 0:
             return
         with self._lock:
@@ -435,8 +465,12 @@ class EquityTracker:
         if not balance:
             raise RuntimeError('获取账户余额失败')
 
-        current_equity = balance['total'].get('USDT', 0)
-        free_balance = balance['free'].get('USDT', 0)
+        # 与采样/快照/同步路径同一校验口径：瞬时坏响应（total 缺 USDT/垃圾值）
+        # 若按 0 消费，peak_drawdown=100% 会在 persist=True 时被永久 ratchet
+        # 进 max_drawdown。读不出正有限数一律 fail-loud（消费方均已捕获异常）。
+        current_equity = _coerce_positive_float(balance['total'].get('USDT'))
+        if current_equity is None:
+            raise RuntimeError('账户权益读取无效（total.USDT 非正有限数），拒绝计算统计')
         open_positions = self.system.trade_state.get_all_open_positions()
         total_unrealized_pnl = 0
         total_stop_loss_amount = 0
@@ -502,23 +536,22 @@ class EquityTracker:
                 eq_hist['max_drawdown'] = peak_drawdown
                 eq_hist['max_dd_time'] = now.isoformat()
 
-            # 未创新高天数：当前时间距最近一次权益新高
+            # 未创新高天数：当前时间距最近一次权益新高（解析与校验器同源，
+            # 带时区的合法 ISO 归一后正常计算而非静默归零）
             days_since_peak = 0
-            if peak_time:
-                try:
-                    days_since_peak = max(0, (now - datetime.fromisoformat(peak_time)).days)
-                except Exception:
-                    days_since_peak = 0
+            parsed_peak_time = _parse_equity_tick_timestamp(peak_time) if peak_time else None
+            if parsed_peak_time is not None:
+                days_since_peak = max(0, (now - parsed_peak_time).days)
 
             # 当前读数若临时创新高，只影响本次展示；真正的历史结算由每日收盘
             # reconcile 完成，不能让下午浮盈通过 persist=True 污染 durable 历史。
             provisional_closed_gap = 0
             if made_new_high and old_peak_time:
-                try:
-                    provisional_closed_gap = max(
-                        0, (now - datetime.fromisoformat(old_peak_time)).days)
-                except Exception as exc:
-                    logger.debug('展示用未创新高周期结算跳过: %s', exc)
+                parsed_old_peak = _parse_equity_tick_timestamp(old_peak_time)
+                if parsed_old_peak is not None:
+                    provisional_closed_gap = max(0, (now - parsed_old_peak).days)
+                else:
+                    logger.debug('展示用未创新高周期结算跳过坏峰值时间 %r', old_peak_time)
 
             if persist:
                 if not self.save_equity_history(eq_hist):
@@ -538,7 +571,6 @@ class EquityTracker:
 
         stats = {
             'current_equity': current_equity,
-            'free_balance': free_balance,
             'unrealized_pnl': total_unrealized_pnl,
             'peak_equity': peak_equity,
             'peak_time': peak_time,
@@ -1054,6 +1086,12 @@ class EquityTracker:
 
         now = datetime.now()
         with self._lock:
+            # 残留 journal（上次同步提交与回滚双双失败）：必须先整代前滚收口
+            # 再取「旧世代」——否则半事务混合态会被钦定为 old generation，且
+            # 新一轮提交部分失败后的「回滚成功」会把混合态写满六份文件并删除
+            # journal，把可重启修复的状态变成不可恢复的静默统计污染。
+            # 前滚失败则 fail-closed 上抛（与构造路径同口径）。
+            self._recover_equity_sync_journal()
             old_peak = self.load_peak_equity()
             old_history = self.load_equity_history()
             old_qiusuo = self.load_qiusuo_index_state()
@@ -1076,7 +1114,13 @@ class EquityTracker:
                 qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
             new_divisor = current_equity / qiusuo_anchor
 
-            peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
+            # 同步即整代重置基准：必须同时认领当日（peak_observed_day）——
+            # 否则同交易日的日检重跑（+1 分钟/30 分钟兜底均属设计内行为）会用
+            # 同步前的 08:00 收盘快照绕过日锁存，把刚重置的峰值/回撤基准
+            # 静默覆盖回旧世代，并被随后的统计刷新 ratchet 进 max_drawdown。
+            peak_data = {'peak_equity': current_equity,
+                         'peak_time': now.isoformat(),
+                         'peak_observed_day': self._qiusuo_trading_day(now)}
 
             eq_hist = copy.deepcopy(old_history)
             # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），

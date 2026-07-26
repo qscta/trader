@@ -7,6 +7,7 @@ import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from exchange_base import ExchangeApi, retry_on_network_error
+from trade_state import finite_nonnegative_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,10 @@ class OkxApi(ExchangeApi):
                 'defaultType': 'swap',
             },
         })
-        if config.get('sandbox') or config.get('demo'):
+        # 只认文档化的 sandbox 键（verify_okx/迁移说明同口径）；类型已在
+        # __init__ 强校验为真布尔，未文档化别名键会让 verify 的实盘/模拟盘
+        # 判定与主程序分叉，已移除
+        if config.get('sandbox'):
             ex.set_sandbox_mode(True)   # OKX 模拟盘（demo trading）
             logger.info("OKX 已切换到模拟盘模式")
         return ex
@@ -74,6 +78,13 @@ class OkxApi(ExchangeApi):
             raise ValueError(
                 f"okx.margin_mode 非法: {config.get('margin_mode')!r}"
                 "（只支持 cross / isolated）")
+        # 实盘/模拟盘开关只接受真布尔（与 enabled 的 strict_bool 同威胁模型）：
+        # 字符串 "false" 裸 truthiness 会被当真切入模拟盘——实盘持仓/止损
+        # 无人托管，且 verify 的实盘确认提示被跳过。
+        raw_sandbox = config.get('sandbox')
+        if raw_sandbox is not None and not isinstance(raw_sandbox, bool):
+            raise ValueError(
+                f"okx.sandbox 非法: {raw_sandbox!r}（只支持布尔 true/false）")
         super().__init__(config)
         self.margin_mode = raw_margin_mode.strip().lower()
         # 杠杆：默认值 + 可按内部符号覆盖，如 {"BTCUSDT": 10}
@@ -123,9 +134,20 @@ class OkxApi(ExchangeApi):
                 if (market.get('type') == 'swap'
                         and market.get('quote') == 'USDT'
                         and market.get('settle') == 'USDT'):
+                    # 与 _get_contract_size 同一 fail-closed 口径：畸形面值
+                    # （NaN/inf/非正/bool）绝不入缓存——预填是生产主路径，
+                    # 这里放进去的坏值会绕过惰性路径的守卫污染全部换算。
+                    # 校验不过则跳过该品种，真正使用时由惰性路径 fail-loud。
                     contract_size = market.get('contractSize')
-                    if contract_size:
-                        self._contract_size_cache[sym] = float(contract_size)
+                    try:
+                        contract_size = (
+                            None if isinstance(contract_size, bool)
+                            else float(contract_size))
+                    except (TypeError, ValueError):
+                        contract_size = None
+                    if (contract_size is not None and
+                            math.isfinite(contract_size) and contract_size > 0):
+                        self._contract_size_cache[sym] = contract_size
                     amount_step = (market.get('precision') or {}).get('amount')
                     if amount_step is not None:
                         self._amount_precision_cache[sym] = self._normalize_precision(amount_step)
@@ -140,7 +162,10 @@ class OkxApi(ExchangeApi):
             return self._contract_size_cache[ccxt_symbol]
         try:
             market = self.exchange.market(ccxt_symbol)
-            contract_size = float(market.get('contractSize') or 0)
+            raw_size = market.get('contractSize')
+            if isinstance(raw_size, bool):
+                raise ValueError(f'contractSize 非法: {raw_size!r}')
+            contract_size = float(raw_size or 0)
         except Exception as e:
             raise ContractSizeUnavailable(f"{ccxt_symbol} 合约面值获取失败: {e}，拒绝换算/交易") from e
         if not math.isfinite(contract_size) or contract_size <= 0:
@@ -395,13 +420,10 @@ class OkxApi(ExchangeApi):
         # 仅容忍浮点表示噪声，绝不把“少半个步长”当作完整成交。
         return max(1e-12, (10 ** (-precision)) * 1e-9)
 
-    @staticmethod
-    def _finite_nonnegative(value):
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed if math.isfinite(parsed) and parsed >= 0 else None
+    # 共享原语（trade_state.finite_nonnegative_or_none）：拒 bool——
+    # filled=True 会被 float 换算成 1.0 假成交量，在 1 张委托下恰好
+    # 通过归因一致性检查。副本各自漂移历史上已实际出过该缺口。
+    _finite_nonnegative = staticmethod(finite_nonnegative_or_none)
 
     @staticmethod
     def _order_reduce_only(order):
@@ -641,6 +663,9 @@ class OkxApi(ExchangeApi):
                                 actual_contracts, *, fully_closed=None, source='order+position'):
         """构造上层契约：amount/requested_amount 均为币数，张数不外泄。"""
         result = dict(order or {})
+        # ccxt 原生 filled/remaining/amount 均为张数，剔除后上层只见币数字段
+        result.pop('filled', None)
+        result.pop('remaining', None)
         result['amount'] = self._contracts_to_coins(ccxt_symbol, actual_contracts)
         result['requested_amount'] = self._contracts_to_coins(ccxt_symbol, requested_contracts)
         result['confirmed'] = True
@@ -947,6 +972,10 @@ class OkxApi(ExchangeApi):
         delta。终态部分成交会按实际币数返回，由上层按实际量挂止损/记账。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向市价单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝开仓：非法方向 {side!r}")
+            return None
         order_side = 'buy' if side == 'long' else 'sell'
 
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
@@ -1070,6 +1099,10 @@ class OkxApi(ExchangeApi):
         交易所净持仓已归零时为 True。上层不得用部分成交结果删除完整账本。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向市价单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝平仓：非法方向 {side!r}")
+            return None
         close_side = 'sell' if side == 'long' else 'buy'
 
         try:
@@ -1124,6 +1157,13 @@ class OkxApi(ExchangeApi):
                 }
 
         tolerance = self._contracts_tolerance(ccxt_symbol)
+        # 请求量换算为 0 张而交易所仍有仓：绝不静默升级为全仓平仓——该形态只在
+        # 账本币数与面值漂移的失配态出现，全平可能吃掉人工仓，必须交上层隔离对账
+        if requested_contracts <= tolerance and pre_contracts > tolerance:
+            logger.critical(
+                f'{ccxt_symbol} 平仓请求量 {amount} 币换算为 0 张，而交易所仍有 '
+                f'{pre_contracts} 张；拒绝按全仓平仓，请先对账（可能含人工仓）')
+            return None
         if (supplied_client_id and not existing_legs and
                 pre_contracts > tolerance and requested_contracts > tolerance and
                 abs(pre_contracts - requested_contracts) > tolerance):
@@ -1155,7 +1195,7 @@ class OkxApi(ExchangeApi):
                             ccxt_symbol, observed_delta),
                         'requested_amount': self._contracts_to_coins(
                             ccxt_symbol, requested_contracts),
-                        'filled': observed_delta, 'confirmed': True,
+                        'confirmed': True,
                         'fully_filled': True, 'fully_closed': True,
                         'remaining_amount': 0.0,
                         'execution_ambiguous': True,
@@ -1174,9 +1214,9 @@ class OkxApi(ExchangeApi):
                 f'{ccxt_symbol} 命中 {len(existing_legs)} 条幂等平仓腿，'
                 '已汇总真实终态且未重复下单')
         else:
-            target_contracts = (
-                min(requested_contracts, pre_contracts)
-                if requested_contracts > 0 else pre_contracts)
+            # 走到这里必然 requested_contracts > tolerance（0 张请求已在上方
+            # fail-loud 拒绝），只需夹住不超平。
+            target_contracts = min(requested_contracts, pre_contracts)
             total_filled_contracts = 0.0
             last_contracts = pre_contracts
             legs = []
@@ -1270,7 +1310,10 @@ class OkxApi(ExchangeApi):
         aggregate['clientOrderIds'] = [leg.get('clientOrderId') for leg, _qty in legs]
         aggregate['amount'] = self._contracts_to_coins(ccxt_symbol, total_filled_contracts)
         aggregate['requested_amount'] = self._contracts_to_coins(ccxt_symbol, target_contracts)
-        aggregate['filled'] = total_filled_contracts
+        # 张数不外泄：末腿信封带来的 ccxt 原生 filled/remaining（张数）一并
+        # 剔除，上层统一消费币数字段 amount/requested_amount/remaining_amount
+        aggregate.pop('filled', None)
+        aggregate.pop('remaining', None)
         aggregate['confirmed'] = True
         aggregate['fully_filled'] = (
             total_filled_contracts + tolerance >= target_contracts)
@@ -1488,18 +1531,22 @@ class OkxApi(ExchangeApi):
         amount 单位为币数。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向保护单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝创建止损：非法方向 {side!r}")
+            return None
         stop_side = 'sell' if side == 'long' else 'buy'
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
 
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
         if contracts <= 0:
-            # 用实际持仓张数兜底，避免因换算误差漏挂止损
-            try:
-                contracts = self._position_contracts(ccxt_symbol)
-            except Exception:
-                contracts = 0.0
-        if contracts <= 0:
-            logger.error(f"{ccxt_symbol} 止损单张数为0，放弃创建止损单")
+            # 请求币数换算为 0 张只在「账本币数与面值漂移」的失配态出现
+            # （合法账本量恒整张对齐）。绝不静默升级为整仓兜底：那会按交易所
+            # 全仓（可能含人工仓）挂单且记账尺寸失真——巡检按请求量换算 0 张
+            # 与整仓单必然 mismatch 死循环。交上层隔离对账（与平仓侧同口径）。
+            logger.critical(
+                f"{ccxt_symbol} 止损请求量 {amount} 币换算为 0 张，"
+                f"拒绝按整仓兜底挂单，请先对账（可能含人工仓）")
             return None
 
         try:
@@ -1620,10 +1667,26 @@ class OkxApi(ExchangeApi):
                         f"{ccxt_symbol} contracts 缺失但原始 pos={info.get('pos')!r} "
                         "非零，孤儿仓核对拒绝跳过")
                 continue
+            if abs(contracts) <= 0:
+                # 与 get_position 同款双向矛盾守卫：contracts=0 而原始 pos 非零
+                # 说明字段映射漂移，静默跳过等于孤儿仓核对漏检真钱仓位
+                if raw_pos is not None and raw_pos != 0:
+                    raise PositionModeError(
+                        f"{ccxt_symbol} contracts=0 与原始 pos={info.get('pos')!r} "
+                        "矛盾，孤儿仓核对拒绝跳过")
+                continue
             # BTC/USD:BTC 若被 to_internal_symbol 会错映成 BTCUSDT，导致把
-            # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓。
-            if abs(contracts) > 0 and str(p.get('symbol') or '').endswith(':USDT'):
-                symbols.append(self.to_internal_symbol(p['symbol']))
+            # 人工币本位仓误报/漏报为本系统的 U 本位孤儿仓——两个判定都只认
+            # U 本位永续形态。
+            symbol_text = str(p.get('symbol') or '')
+            inst_id = str(info.get('instId') or '')
+            if symbol_text.endswith(':USDT'):
+                symbols.append(self.to_internal_symbol(symbol_text))
+            elif inst_id.endswith('-USDT-SWAP'):
+                # 市场表缺失/进程启动后新上线品种时，ccxt 可能给不出统一符号；
+                # instId 是同一信息的权威原生形态。静默跳过会让孤儿仓核对
+                # （账本尽毁/人工开仓场景的最后防线）漏检真钱仓位。
+                symbols.append(inst_id.split('-')[0] + 'USDT')
         return symbols
 
     def find_stop_order_state(self, symbol, side, amount, stop_price, stop_order_id=None):
@@ -2045,7 +2108,8 @@ class OkxApi(ExchangeApi):
             else:
                 normal_ok = self._normal_order_safely_cancelled(normal_detail)
 
-            algo_ok = self._cancel_algo_order(ccxt_symbol, order_id)
+            # 撤销指令的即时裁决不采信（列表可能滞后），下方以最终清单复验为准
+            self._cancel_algo_order(ccxt_symbol, order_id)
             normal_ok = normal_ok and self._normal_order_absent(
                 ccxt_symbol, order_id)
             algo_ok = self._algo_order_absent(ccxt_symbol, order_id)
@@ -2071,9 +2135,12 @@ class OkxApi(ExchangeApi):
             return False
         return bool(self._cancel_algo_order(ccxt_symbol, order_id))
 
-    @retry_on_network_error(max_retries=3)
     def cancel_all_orders(self, symbol):
-        """安全清理某交易对挂单：连续空清单 + 普通单零成交撤销 + 空仓。"""
+        """安全清理某交易对挂单：连续空清单 + 普通单零成交撤销 + 空仓。
+
+        不挂网络重试装饰器：函数体把一切失败裁决为 False（fail-safe），
+        网络异常永远到不了装饰器；查询/撤销的重试由内部 _fetch_*_raw 各自承担。
+        """
         ccxt_symbol = self._resolve_symbol(symbol)
         try:
             # 先拍快照再发统一撤全，否则已成交消失的 ID 将无法做终态审计。

@@ -113,6 +113,15 @@ class MarginModeValidationTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 OkxApi(self._config(bad))
 
+    def test_non_bool_sandbox_is_rejected_before_trading(self):
+        """实盘/模拟盘开关只接受真布尔：字符串 "false" 裸 truthiness 会被
+        当真切入模拟盘，实盘持仓/止损无人托管。"""
+        for bad in ('false', 'true', 1, 0, 'no'):
+            config = self._config(None)
+            config['sandbox'] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                OkxApi(config)
+
     def test_valid_and_default_margin_modes_are_normalized(self):
         with patch.object(OkxApi, '_load_market_cache'), patch.object(
                 OkxApi, '_ensure_one_way_mode'):
@@ -161,6 +170,35 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         self.assertEqual(api._get_contract_size('BTC/USDT:USDT'), 0.01)
         self.assertEqual(api._contract_size_cache['BTC/USDT:USDT'], 0.01)
 
+    def test_bool_contract_size_raises(self):
+        """bool 会被 float 换算成 1.0 假面值，必须与畸形值同等 fail-closed。"""
+        api = _bare_api()
+        api.exchange.market.return_value = {'contractSize': True}
+        with self.assertRaises(ContractSizeUnavailable):
+            api._get_contract_size('BTC/USDT:USDT')
+        self.assertNotIn('BTC/USDT:USDT', api._contract_size_cache)
+
+    def test_prefill_market_cache_rejects_malformed_contract_size(self):
+        """预填是生产主路径：畸形面值绝不入缓存（绕过惰性守卫即污染全部换算），
+        校验不过跳过该品种，真正使用时由惰性路径 fail-loud。"""
+        def _market(contract_size):
+            return {
+                'type': 'swap', 'quote': 'USDT', 'settle': 'USDT',
+                'contractSize': contract_size, 'precision': {'amount': 1},
+            }
+
+        api = _bare_api()
+        api.exchange.load_markets.return_value = {
+            'BTC/USDT:USDT': _market(0.01),
+            'ETH/USDT:USDT': _market('1e999'),
+            'SOL/USDT:USDT': _market(float('nan')),
+            'DOGE/USDT:USDT': _market(-0.01),
+            'XRP/USDT:USDT': _market(True),
+            'ADA/USDT:USDT': _market(None),
+        }
+        api._load_market_cache()
+        self.assertEqual({'BTC/USDT:USDT': 0.01}, api._contract_size_cache)
+
     def test_coin_contract_round_trip_never_loses_exact_contract(self):
         """回归：49*0.0001 再除回面值不得被 ccxt TRUNCATE 成 48 张。"""
         api = _bare_api()
@@ -188,6 +226,47 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         ]
         self.assertEqual(
             ['BTCUSDT', 'DOGEUSDT'], sorted(api.list_position_symbols()))
+
+
+class SideWhitelistTest(unittest.TestCase):
+    """真钱下单最后边界：side 漂移值绝不允许被 else 兜底翻成反方向真实市价单，
+    必须在任何交易所调用之前拒绝。"""
+
+    def test_open_close_stop_refuse_malformed_side(self):
+        for bad in ('buy', 'sell', 'LONG', '', None, 1):
+            for method, args in (
+                    ('open_position', ('BTCUSDT', bad, 0.01)),
+                    ('close_position', ('BTCUSDT', bad, 0.01)),
+                    ('create_stop_loss_order', ('BTCUSDT', bad, 0.01, 50000))):
+                api = _bare_api()
+                api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+                with self.subTest(method=method, bad=bad):
+                    self.assertIsNone(getattr(api, method)(*args))
+                    self.assertEqual([], api.exchange.mock_calls)
+
+    def test_finite_nonnegative_rejects_bool_and_none(self):
+        for bad in (True, False, None, float('nan'), -1, 'x'):
+            self.assertIsNone(OkxApi._finite_nonnegative(bad), repr(bad))
+        self.assertEqual(3.0, OkxApi._finite_nonnegative('3'))
+        self.assertEqual(0.0, OkxApi._finite_nonnegative(0))
+
+
+class LastPriceValidationTest(unittest.TestCase):
+    """市价读取唯一入口 fail-loud：None/bool/NaN/inf/0/负价一律拒绝，
+    不得以假价流入止损距离与市值计算。"""
+
+    def test_malformed_last_price_fails_loud(self):
+        api = _bare_api()
+        for bad in (None, True, False, float('nan'), float('inf'), 0, -1, '0'):
+            api.exchange.fetch_ticker.return_value = {'last': bad}
+            with self.subTest(bad=bad), \
+                    self.assertRaises((TypeError, ValueError)):
+                api.get_last_price('BTC/USDT:USDT')
+
+    def test_valid_last_price_returned(self):
+        api = _bare_api()
+        api.exchange.fetch_ticker.return_value = {'last': '65000.5'}
+        self.assertEqual(65000.5, api.get_last_price('BTC/USDT:USDT'))
 
 
 class PositionModeFailClosedTest(unittest.TestCase):
@@ -1585,6 +1664,59 @@ class PositionParsingStrictnessTest(unittest.TestCase):
             {'symbol': 'LTC/USD:LTC', 'contracts': 1.0, 'info': {'pos': '1'}},
         ]
         self.assertEqual(['BTCUSDT'], api.list_position_symbols())
+
+    def test_list_position_symbols_includes_instid_only_usdt_swap(self):
+        """市场表缺失/新上线品种时 ccxt 给不出统一符号：instId 通道必须收录，
+        币本位 instId（-USD-SWAP）仍排除。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'contracts': 2.0, 'info': {'pos': '2', 'instId': 'NEW-USDT-SWAP'}},
+            {'symbol': 'NEW2-USDT-SWAP', 'contracts': 1.0,
+             'info': {'pos': '1', 'instId': 'NEW2-USDT-SWAP'}},
+            {'contracts': 1.0, 'info': {'pos': '1', 'instId': 'BTC-USD-SWAP'}},
+        ]
+        self.assertEqual(
+            ['NEWUSDT', 'NEW2USDT'], api.list_position_symbols())
+
+    def test_list_position_symbols_rejects_zero_contracts_nonzero_pos(self):
+        """contracts=0 与原始 pos 非零矛盾：与 get_position 同款 fail-loud，
+        不得静默跳过（孤儿仓核对漏检）。"""
+        api = _bare_api()
+        api.exchange.fetch_positions.return_value = [
+            {'symbol': 'BTC/USDT:USDT', 'contracts': 0.0,
+             'info': {'pos': '3'}}]
+        with self.assertRaises(PositionModeError):
+            api.list_position_symbols()
+
+
+class ZeroContractCloseGuardTest(unittest.TestCase):
+    """请求量换算为 0 张而交易所仍有仓：拒绝静默升级为全仓平仓——该形态只在
+    账本币数与面值漂移的失配态出现，全平可能吃掉人工仓，必须交上层隔离对账。"""
+
+    def test_zero_contract_request_with_live_position_refuses_full_close(self):
+        api = _bare_api()
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        with patch.object(api, 'get_position', return_value={
+                'side': 'long', 'contracts': 10, 'info': {'pos': '10'}}):
+            result = api.close_position('BTC/USDT:USDT', 'long', 0.001)
+        self.assertIsNone(result)
+        api.exchange.create_order.assert_not_called()
+
+    def test_zero_contract_stop_request_refuses_full_position_fallback(self):
+        """止损侧同口径：0 张请求绝不静默升级为整仓兜底挂单——那会按交易所
+        全仓（可能含人工仓）挂单且记账尺寸失真，巡检必然 mismatch 死循环。"""
+        api = _bare_api()
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _symbol, value: str(int(float(value))))
+        with patch.object(api, '_position_contracts', return_value=10.0):
+            result = api.create_stop_loss_order(
+                'BTC/USDT:USDT', 'long', 0.001, 50000)
+        self.assertIsNone(result)
+        api.exchange.create_order.assert_not_called()
+        api.exchange.privatePostTradeOrderAlgo.assert_not_called()
 
 
 class OrderTriStateAdjudicationTest(unittest.TestCase):

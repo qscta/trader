@@ -117,7 +117,10 @@ def atomic_write_json(filepath, data):
         return False
 
 
-def _normalise_optional_fee(value):
+def finite_nonnegative_or_none(value):
+    """「有限非负数或 None」共享原语：None/bool/不可转换/非有限/负数一律
+    归 None。费用规范化、成交量/均价归因（okx_api）、订单终态解析（main）
+    三处消费同一实现——历史上副本各自漂移（漏拒 bool）已实际出过缺口。"""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -125,6 +128,10 @@ def _normalise_optional_fee(value):
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) and value >= 0 else None
+
+
+def _normalise_optional_fee(value):
+    return finite_nonnegative_or_none(value)
 
 
 def _require_positive_finite(value, field):
@@ -555,8 +562,6 @@ class TradeState:
     def _snapshot_locked(self):
         return copy.deepcopy(self.state)
 
-
-
     def save_state(self):
         with self.lock:
             snapshot = self._snapshot_locked()
@@ -812,6 +817,10 @@ class TradeState:
                                     close_intent_client_id=None):
         if symbol not in self.state['open_positions']:
             return None
+        # force_runtime（仅内存）路径不落盘、绕过 validate_state，字符串边界
+        # 必须在修改入口执行（与 _update_stop_loss_locked 同口径）
+        if new_stop_order_id is not None and not isinstance(new_stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         position = self.state['open_positions'][symbol]
         current_size = float(position['position_size'])
         closed_size = _require_positive_finite(closed_size, '部分平仓数量')
@@ -823,9 +832,8 @@ class TradeState:
         if remaining_size is None:
             remaining = current_size - closed_size
         else:
-            remaining = float(remaining_size)
-            if (not math.isfinite(remaining) or remaining <= 0 or
-                    remaining >= current_size):
+            remaining = _require_positive_finite(remaining_size, '交易所余仓数量')
+            if remaining >= current_size:
                 raise ValueError('交易所余仓数量必须介于 0 与当前仓位之间')
             if not math.isclose(
                     closed_size + remaining, current_size,
@@ -915,20 +923,21 @@ class TradeState:
                     f'{symbol} 部分回滚余仓与 pending open intent 不匹配')
         if side not in ('long', 'short'):
             raise ValueError('side 必须是 long/short')
+        if stop_order_id is not None and not isinstance(stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
-            entry_price = float(entry_price)
-            original_size = float(original_size)
-            remaining_size = float(remaining_size)
-            stop_loss_price = float(stop_loss_price)
-            partial_exit_price = float(partial_exit_price)
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            original_size = _require_positive_finite(original_size, 'original_size')
+            remaining_size = _require_positive_finite(remaining_size, 'remaining_size')
+            stop_loss_price = _require_positive_finite(stop_loss_price, 'stop_loss_price')
+            partial_exit_price = _require_positive_finite(
+                partial_exit_price, 'partial_exit_price')
             closed_size = float(
                 Decimal(str(original_size)) - Decimal(str(remaining_size)))
-        except (TypeError, ValueError, InvalidOperation) as exc:
+        except (ValueError, InvalidOperation) as exc:
             raise ValueError('部分回滚恢复的价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, original_size, remaining_size,
-                stop_loss_price, partial_exit_price, closed_size)):
-            raise ValueError('部分回滚恢复的价格/数量必须是正有限数')
+        # 五值已是正有限数；Decimal 减法保号、float() 舍入单调不越界，故
+        # remaining < original ⟺ closed_size 为正有限数——语义检查即完整边界
         if remaining_size >= original_size:
             raise ValueError('部分回滚余仓必须小于原始仓位')
 
@@ -942,7 +951,8 @@ class TradeState:
             'stop_loss_price': stop_loss_price,
             'stop_order_id': stop_order_id,
             'stop_order_size': (
-                remaining_size if stop_order_size is None else float(stop_order_size)),
+                remaining_size if stop_order_size is None
+                else _require_positive_finite(stop_order_size, 'stop_order_size')),
             'strategy': strategy,
             'open_time': now,
             'recovered_partial_rollback': True,
@@ -1016,17 +1026,17 @@ class TradeState:
                     f'{symbol} 完整余仓与 pending open intent 不匹配')
         if side not in ('long', 'short'):
             raise ValueError('side 必须是 long/short')
+        if stop_order_id is not None and not isinstance(stop_order_id, str):
+            raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
-            entry_price = float(entry_price)
-            position_size = float(position_size)
-            stop_loss_price = float(stop_loss_price)
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            position_size = _require_positive_finite(position_size, 'position_size')
+            stop_loss_price = _require_positive_finite(stop_loss_price, 'stop_loss_price')
             stop_order_size = (
-                position_size if stop_order_size is None else float(stop_order_size))
-        except (TypeError, ValueError) as exc:
+                position_size if stop_order_size is None
+                else _require_positive_finite(stop_order_size, 'stop_order_size'))
+        except ValueError as exc:
             raise ValueError('未决开仓的价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, position_size, stop_loss_price, stop_order_size)):
-            raise ValueError('未决开仓的价格/数量必须是正有限数')
         now = datetime.now().isoformat()
         position = {
             'symbol': symbol, 'side': side, 'entry_price': entry_price,
@@ -1067,20 +1077,19 @@ class TradeState:
         return copy.deepcopy(position)
 
     def add_untracked_open_position(self, *args, **kwargs):
-        """原子建立未决完整余仓、隔离与未知止损残留标记。"""
+        """原子建立未决完整余仓、隔离与未知止损残留标记（与全部入口同走事务原语）。"""
         with self.lock:
-            snapshot = self._snapshot_locked()
-            try:
-                position = self._add_untracked_open_position_locked(*args, **kwargs)
-                self._save_or_rollback_locked(snapshot)
-                return position
-            except Exception:
-                self.state = snapshot
-                raise
+            return self._transact_locked(
+                lambda: self._add_untracked_open_position_locked(*args, **kwargs))
 
     def force_runtime_add_untracked_open_position(self, *args, **kwargs):
+        """与其余四个 force_runtime 通道同走事务原语（save=False）：
+        磁盘已失效时内存是唯一账本，修改中途异常必须整体回滚，
+        不能留下「持仓已建、隔离/残留标记缺失、intent 未消费」的半截账本。"""
         with self.lock:
-            return self._add_untracked_open_position_locked(*args, **kwargs)
+            return self._transact_locked(
+                lambda: self._add_untracked_open_position_locked(*args, **kwargs),
+                save=False)
 
     def _close_position_locked(
             self, symbol, exit_price, exit_fee=None,
@@ -1245,10 +1254,12 @@ class TradeState:
                 self._archive_cache_records = []
                 return [], True
             try:
-                cache_key = tuple(
-                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
-                     private_file_stat(path).st_size)
-                    for path in paths)
+                key_parts = []
+                for path in paths:
+                    info = private_file_stat(path)  # 每路径一次安全打开，mtime/size 取自同一快照
+                    key_parts.append(
+                        (os.path.basename(path), info.st_mtime_ns, info.st_size))
+                cache_key = tuple(key_parts)
                 if (self._archive_cache_key == cache_key
                         and self._archive_cache_records is not None):
                     records = self._archive_cache_records
@@ -1315,11 +1326,16 @@ class TradeState:
         """供只读统计缓存使用；不解析史书内容即可识别归档/近期记录变化。"""
         with self.lock:
             try:
-                archive_key = tuple(
-                    (os.path.basename(path), private_file_stat(path).st_mtime_ns,
-                     private_file_stat(path).st_size)
-                    for path in self._archive_paths())
-            except (OSError, TradeStatePersistenceError):
+                key_parts = []
+                for path in self._archive_paths():
+                    info = private_file_stat(path)  # 每路径一次安全打开，mtime/size 取自同一快照
+                    key_parts.append(
+                        (os.path.basename(path), info.st_mtime_ns, info.st_size))
+                archive_key = tuple(key_parts)
+            except Exception:
+                # revision 只是缓存失效探针；史书层契约是「损坏只降级」——任何
+                # 探针失败（含符号链接/属主异常的 ValueError/RuntimeError）都按
+                # 「无法判定缓存有效性」处理，绝不让统计路由 500。
                 archive_key = None
             recent = self.state['closed_trades']
             last = recent[-1] if recent else {}
@@ -1340,17 +1356,12 @@ class TradeState:
             overflow_count = len(closed) - self.keep_recent_closed
             if overflow_count <= 0:
                 return 0
-            archive, ok = self._read_archive()
+            _archive, ok = self._read_archive(copy_records=False)
             if not ok:
                 return 0  # 史书损坏：保留账本全部记录等人工修复，_read_archive 已记日志
             overflow = closed[:overflow_count]
-            # 上轮可能崩溃在“史书已追加、账本尚未收缩”。只能跳过
-            # archive 后缀与 overflow 前缀的最大有序重叠；集合式 `t not in tail`
-            # 会把两笔内容恰好相同的真实成交误删掉。
-            overlap = self._ordered_archive_overlap(archive, overflow)
-            to_append = overflow[overlap:]
             grouped = {}
-            for record in to_append:
+            for record in overflow:
                 grouped.setdefault(self._archive_year(record), []).append(record)
             for year, records in sorted(grouped.items()):
                 path = os.path.join(
@@ -1364,7 +1375,16 @@ class TradeState:
                         f'读取年度平仓史书失败，本轮跳过（账本保留全部记录）: '
                         f'{path}: {exc}')
                     return 0
-                if not atomic_write_json(path, existing + records):
+                # 上轮可能崩溃在“史书已追加、账本尚未收缩”。追加永远发生在
+                # 具体分卷末尾且组内顺序保持，因此在每个目标分卷内做后缀/前缀
+                # 最大有序重叠去重——全局合并序会把 undated 分卷排到最前，
+                # 全局后缀匹配对它失效；集合式 `t not in tail` 则会把两笔
+                # 内容恰好相同的真实成交误删掉。
+                overlap = self._ordered_archive_overlap(existing, records)
+                to_append = records[overlap:]
+                if not to_append:
+                    continue  # 该分卷上轮已完整写入，重试无需重写
+                if not atomic_write_json(path, existing + to_append):
                     logger.error(
                         f'年度平仓史书写入失败，本轮跳过（账本保留全部记录）: {path}')
                     return 0
@@ -1408,6 +1428,11 @@ class TradeState:
             prefix[index] = matched
 
         matched = 0
+        # 扫描窗口 archive[-len(pattern):] 至多 len(pattern) 项，matched 每轮
+        # 净增至多 1，故整模式命中只可能发生在最后一轮——循环终态即为最大
+        # 后缀重叠，无需（也不得）做 full-match 回退：若未来把窗口放宽到
+        # 超过 len(pattern) 项，必须补 matched = prefix[matched-1] 的回退，
+        # 否则下一轮 pattern[matched] 会越界。
         for item in archive[-len(pattern):]:
             token = json.dumps(
                 item, sort_keys=True, ensure_ascii=False, allow_nan=False)
@@ -1415,13 +1440,7 @@ class TradeState:
                 matched = prefix[matched - 1]
             if token == pattern[matched]:
                 matched += 1
-            if matched == len(pattern):
-                # 完整模式若恰好落在 archive 尾部，就是最大重叠；若后面仍有
-                # token，则退回前缀继续匹配。
-                continue
         return matched
-
-
 
     def remove_symbol_metadata(self, symbol, clear_quarantine=False):
         """清除已退池且无持仓/止损残留品种的辅助状态。
@@ -1561,30 +1580,6 @@ class TradeState:
         with self.lock:
             return copy.deepcopy(self.state.get('open_intents') or {})
 
-    def set_open_intent_amount(self, symbol, client_order_id, position_size):
-        if isinstance(position_size, bool):
-            raise ValueError('open intent 数量不能是 bool')
-        try:
-            amount = float(position_size)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('open intent 数量非法') from exc
-        if not math.isfinite(amount) or amount <= 0:
-            raise ValueError('open intent 数量必须是正有限数')
-        with self.lock:
-            intent = (self.state.get('open_intents') or {}).get(symbol) or {}
-            if (intent.get('status') != 'pending' or
-                    intent.get('client_order_id') != str(client_order_id)):
-                raise TradeStatePersistenceError(
-                    f'{symbol} 不存在匹配 open intent')
-            existing = intent.get('planned_position_size')
-            if existing is not None:
-                return float(existing)
-            snapshot = self._snapshot_locked()
-            intent['planned_position_size'] = amount
-            intent['updated_at'] = datetime.now().isoformat()
-            self._save_or_rollback_locked(snapshot)
-            return amount
-
     def resolve_open_intent(self, symbol, client_order_id):
         with self.lock:
             intent = (self.state.get('open_intents') or {}).get(symbol) or {}
@@ -1601,14 +1596,11 @@ class TradeState:
             position_size, entry_order_ids=None, exit_order_ids=None,
             entry_fee=None, exit_fee=None, reason='open intent 恢复补记'):
         try:
-            entry_price = float(entry_price)
-            exit_price = float(exit_price)
-            position_size = float(position_size)
-        except (TypeError, ValueError) as exc:
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            exit_price = _require_positive_finite(exit_price, 'exit_price')
+            position_size = _require_positive_finite(position_size, 'position_size')
+        except ValueError as exc:
             raise ValueError('open intent 往返价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, exit_price, position_size)):
-            raise ValueError('open intent 往返价格/数量必须是正有限数')
         with self.lock:
             intent = (self.state.get('open_intents') or {}).get(symbol) or {}
             if intent.get('client_order_id') != str(client_order_id):
@@ -1657,13 +1649,6 @@ class TradeState:
             del self.state['open_intents'][symbol]
             self._save_or_rollback_locked(snapshot)
             return copy.deepcopy(existing)
-
-
-
-
-
-
-
 
     # ---- 双均线 T+1：与持仓/止损/信号共用同一账本事务 ----
 

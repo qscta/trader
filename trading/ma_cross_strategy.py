@@ -46,8 +46,6 @@ class MaCrossStrategy:
         返回信号字典，action 可能的值：
         - 'long': 做多（含从空翻多）
         - 'short': 做空（含从多翻空）
-        - 'close_long': 平多（EMA死叉）
-        - 'close_short': 平空（EMA金叉）
         - None: 无信号
         """
         min_required = max(self.long_period * 2, self.stop_loss_period + 1)
@@ -63,7 +61,6 @@ class MaCrossStrategy:
         previous_ema_long = df['ema_long'].iloc[-2]
 
         current_close = df['close'].iloc[-1]
-        previous_close = df['close'].iloc[-2]
 
         # 计算止损高低点
         upper_stop, lower_stop = self.calculate_stop_levels(df)
@@ -76,7 +73,6 @@ class MaCrossStrategy:
             'upper_stop': upper_stop,    # N天最高收盘价（空单止损）
             'lower_stop': lower_stop,    # N天最低收盘价（多单止损）
             'current_close': current_close,
-            'previous_close': previous_close,
             'action': None
         }
 
@@ -94,9 +90,6 @@ class MaCrossStrategy:
         elif death_cross:
             # 死叉：做空信号（如果有多仓会先平多再开空）
             signal['action'] = 'short'
-
-        # 当前EMA相对位置（用于止损后重入判断）
-        signal['ema_bullish'] = current_ema_short > current_ema_long
 
         return signal
 
@@ -139,7 +132,6 @@ class MaCrossStrategy:
             'upper_stop': upper_stop,
             'lower_stop': lower_stop,
             'current_close': current_close,
-            'ema_bullish': current_ema_short > current_ema_long
         }
 
     def check_reentry_condition(self, df):
@@ -170,7 +162,6 @@ class MaCrossStrategy:
             'upper_stop': upper_stop,
             'lower_stop': lower_stop,
             'current_close': current_close,
-            'ema_bullish': current_ema_short > current_ema_long
         }
 
         if current_ema_short > current_ema_long:

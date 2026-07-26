@@ -37,9 +37,12 @@ def retry_on_network_error(max_retries=3, backoff_seconds=(1, 2, 4)):
                 except (ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeNotAvailable,
                         ccxt.DDoSProtection, ccxt.RateLimitExceeded) as e:
                     last_exception = e
-                    wait_time = backoff_seconds[attempt] if attempt < len(backoff_seconds) else backoff_seconds[-1]
-                    logger.warning(f"[重试 {attempt+1}/{max_retries}] {func.__name__} 网络异常: {e}, {wait_time}秒后重试...")
-                    time.sleep(wait_time)
+                    # 最后一次失败不再退避等待：多睡一个周期只会推迟调用方的
+                    # fail-safe（多品种巡检逐品种叠加），且「N秒后重试」也失实。
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_seconds[attempt] if attempt < len(backoff_seconds) else backoff_seconds[-1]
+                        logger.warning(f"[重试 {attempt+1}/{max_retries}] {func.__name__} 网络异常: {e}, {wait_time}秒后重试...")
+                        time.sleep(wait_time)
                 except (ccxt.InsufficientFunds, ccxt.InvalidOrder, ccxt.BadRequest,
                         ccxt.AuthenticationError, ccxt.PermissionDenied, ccxt.BadSymbol) as e:
                     logger.error(f"{func.__name__} 业务异常（不可重试）: {e}")
@@ -57,9 +60,9 @@ class ExchangeApi:
     """交易所适配层抽象基类。
 
     子类必须实现：_create_exchange、to_ccxt_symbol、get_position、open_position、
-    close_position、create_stop_loss_order、cancel_order、cancel_all_orders、
-    round_quantity、get_quantity_precision、find_stop_order_state、
-    list_position_symbols、find_existing_open_order、
+    close_position、create_stop_loss_order、cancel_order、cancel_stop_order_only、
+    cancel_all_orders、round_quantity、get_quantity_precision、
+    find_stop_order_state、list_position_symbols、find_existing_open_order、
     find_compensation_close_evidence。
 
     可选重写：setup_symbol（开仓前设置杠杆/保证金模式等）。
@@ -87,16 +90,18 @@ class ExchangeApi:
         """获取单个交易对的持仓（ccxt 统一结构，无持仓返回 None 或 contracts=0）。"""
         raise NotImplementedError
 
-    def open_position(self, symbol, side, amount):
-        """市价开仓。amount 单位为‘币数’。"""
+    def open_position(self, symbol, side, amount, client_order_id=None):
+        """市价开仓。amount 单位为‘币数’；client_order_id 为幂等 clOrdId（可选）。"""
         raise NotImplementedError
 
     def close_position(self, symbol, side, amount, client_order_id=None):
         """市价平仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
-    def create_stop_loss_order(self, symbol, side, amount, stop_price):
-        """创建止损单（触发后市价平仓）。amount 单位为‘币数’。"""
+    def create_stop_loss_order(self, symbol, side, amount, stop_price,
+                               client_order_id=None):
+        """创建止损单（触发后市价平仓）。amount 单位为‘币数’；
+        client_order_id 为幂等 algoClOrdId（可选）。"""
         raise NotImplementedError
 
     def cancel_order(self, symbol, order_id):
@@ -177,7 +182,7 @@ class ExchangeApi:
         服务所有行情入口（日检、即时开仓、API 展示）：时间戳必须严格递增
         不得重复；开高低收必须是有限正数（拒绝 bool/NaN/无穷）；蜡烛内部
         关系必须成立（low<=open/close<=high）；成交量必须是有限非负数。
-        坏数据进入 EMA/突破计算仍可能算出「有效」信号并进入开仓链路，
+        坏数据进入 EMA 计算仍可能算出「有效」信号并进入开仓链路，
         因此只能拒绝，不能静默丢弃或修补。
         """
         if ohlcv is None:
@@ -270,7 +275,7 @@ class ExchangeApi:
                 f'K 线请求 {requested} 根超过 OKX 单页上限 300；'
                 '策略配置必须在最新单页内完成计算')
         # 所有行情入口共用同一边界校验：坏蜡烛（NaN/重复/乱序/区间矛盾）
-        # 一律在适配层拒绝，绝不让 EMA/突破在污染数据上算出“有效”信号。
+        # 一律在适配层拒绝，绝不让 EMA 在污染数据上算出“有效”信号。
         return self.validate_ohlcv(
             self.exchange.fetch_ohlcv(symbol, timeframe, limit=requested),
             symbol)
@@ -288,4 +293,12 @@ class ExchangeApi:
         """
         ccxt_symbol = symbol if '/' in symbol else self.to_ccxt_symbol(symbol)
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
-        return float(ticker['last'])
+        raw_last = ticker['last']
+        # last=None → float 抛 TypeError；bool 会被 float 换算成 0.0/1.0 假价，
+        # 与 NaN/inf/0/负价一并 fail-loud，防止坏行情静默流入止损距离与市值计算
+        if isinstance(raw_last, bool):
+            raise ValueError(f"{ccxt_symbol} 最新成交价非法: {raw_last!r}")
+        price = float(raw_last)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"{ccxt_symbol} 最新成交价非法: {raw_last!r}")
+        return price

@@ -13,7 +13,8 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import atomic_write_json, open_private_text_file
+from trade_state import (
+    _reject_nonfinite_json, atomic_write_json, open_private_text_file)
 
 
 ROLLOVER_HOUR = 8
@@ -107,14 +108,13 @@ def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
         candidates.append((eq, close_time, f'daily:{day_str}'))
         observed_days.append(_trading_day(close_time))
 
-    if not candidates:
-        return None
-
+    # candidates 恒非空：baseline 缺失已在上方早退，且必然被 append
     best_eq, best_time, best_source = max(candidates, key=lambda item: item[0])
+    # baseline_time 在上方缺失即返回 None，此处必然非空
     observed_day = (
         max(observed_days)
         if observed_days
-        else _trading_day(baseline_time or best_time)
+        else _trading_day(baseline_time)
     )
     return {
         'stored_peak_equity': stored_eq,
@@ -131,13 +131,28 @@ def _load_json(path):
     if not os.path.lexists(path):
         return None
     with open_private_text_file(path) as handle:
-        return json.load(handle)
+        # 与全库命脉状态读取同口径拒绝 NaN/Infinity：静默放行会把损坏文件
+        # 误诊为「数据不足」跳过，甚至让 inf 候选被过滤后错误向下写峰值
+        return json.load(handle, parse_constant=_reject_nonfinite_json)
 
 
 def run(data_dir, apply):
     peak_path = os.path.join(data_dir, 'peak_equity.json')
     hist_path = os.path.join(data_dir, 'equity_history.json')
     daily_path = os.path.join(data_dir, 'daily_equity.json')
+
+    # 残留的权益同步 journal 说明上次 equity_sync 中断：三份状态可能是半事务
+    # 世代，且 tracker 下次构造会无条件按 journal 整代前滚、静默覆写本工具
+    # 刚写入的纠正。必须先由 tracker 收口（正常启动一次即可），再跑迁移。
+    journal_path = os.path.join(data_dir, '.equity_sync_journal.json')
+    if os.path.lexists(journal_path):
+        print(
+            f'[拒绝] 检测到未收口的权益同步 journal: {journal_path}\n'
+            '  上次资金同步中断，状态文件可能处于半事务世代；此时迁移分析不可信，'
+            '写入也会在下次启动被 journal 前滚覆盖。\n'
+            '  请先正常启动一次交易系统（tracker 构造时会整代前滚并删除 journal），'
+            '再重新执行本工具。')
+        return 1
 
     peak_data = _load_json(peak_path)
     if not isinstance(peak_data, dict):

@@ -16,6 +16,82 @@ TradingSystem = main.TradingSystem
 from trade_state import TradeState, TradeStatePersistenceError
 
 
+class PrivateLogHandlerTest(unittest.TestCase):
+    """trading.log 含持仓/权益明细，与状态/锁文件同口径 0600：
+    创建、既有宽权限收紧、轮转新文件必须全覆盖（手工 chmod 会随轮转失效）。"""
+
+    def test_log_created_and_rotated_with_0600(self):
+        import logging
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=200, backupCount=2, encoding='utf-8', delay=True)
+            log = logging.Logger('t-0600')
+            log.addHandler(handler)
+            log.error('x' * 150)
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            log.error('y' * 150)   # 超过 maxBytes 触发轮转
+            handler.close()
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            self.assertTrue(os.path.exists(path + '.1'))
+            self.assertEqual(0o600, os.stat(path + '.1').st_mode & 0o777)
+
+    def test_existing_permissive_log_tightened_on_open(self):
+        import logging
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write('legacy')
+            os.chmod(path, 0o644)
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=10**6, backupCount=1, encoding='utf-8', delay=True)
+            log = logging.Logger('t-tighten')
+            log.addHandler(handler)
+            log.error('new line')
+            handler.close()
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+
+    def test_existing_permissive_backups_tightened_at_construction(self):
+        """升级路径：0600 时代之前的轮转备份经 rename 保留旧 mode、自然淘汰
+        需整整 backupCount 次轮转——构造时必须一次清扫收权。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            for suffix in ('.1', '.2'):
+                with open(path + suffix, 'w', encoding='utf-8') as fh:
+                    fh.write('legacy backup')
+                os.chmod(path + suffix, 0o644)
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=10**6, backupCount=3, encoding='utf-8',
+                delay=True)
+            handler.close()
+            for suffix in ('.1', '.2'):
+                self.assertEqual(
+                    0o600, os.stat(path + suffix).st_mode & 0o777, suffix)
+
+
+class SchedulerJobRegistrationTest(unittest.TestCase):
+    """全部定时任务必须显式带 misfire 保护：apscheduler 默认宽限仅 1 秒，
+    周报默认 08:01 与日检重试同刻，错过即下一触发点在 7 天后。"""
+
+    def test_all_jobs_carry_misfire_protection(self):
+        system = TradingSystem.__new__(TradingSystem)
+        system.exchange_id = 'okx'
+        system.label = '欧易'
+        system.scheduler = Mock()
+        system._record_equity_tick_with_alert = lambda: None
+        system.register_jobs({})
+
+        calls = system.scheduler.add_job.call_args_list
+        ids = {call.kwargs.get('id') for call in calls}
+        self.assertIn('okx_weekly', ids)
+        for call in calls:
+            job_id = call.kwargs.get('id')
+            self.assertEqual(1, call.kwargs.get('max_instances'), job_id)
+            self.assertTrue(call.kwargs.get('coalesce'), job_id)
+            self.assertGreaterEqual(
+                call.kwargs.get('misfire_grace_time') or 0, 60, job_id)
+
+
 class SignalExecutionStateTest(unittest.TestCase):
     def test_close_intent_survives_restart_and_is_consumed_with_full_close(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,7 +141,6 @@ class SignalExecutionStateTest(unittest.TestCase):
                 'ClosePartial123', position['last_close_client_order_id'])
 
 
-
 class OpenIntentStateTest(unittest.TestCase):
     def test_intent_and_planned_amount_survive_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,8 +163,8 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90},
+                planned_position_size=1.0)
 
             state.add_open_position(
                 'BTCUSDT', 'long', 100, 1, 90, 'stop-1',
@@ -105,8 +180,8 @@ class OpenIntentStateTest(unittest.TestCase):
             state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IABC123',
                 {'side': 'long', 'entry_price': 100,
-                 'stop_loss_price': 90})
-            state.set_open_intent_amount('BTCUSDT', 'IABC123', 1.0)
+                 'stop_loss_price': 90},
+                planned_position_size=1.0)
             with patch('trade_state.atomic_write_json', return_value=False):
                 with self.assertRaises(TradeStatePersistenceError):
                     state.add_open_position(
@@ -154,7 +229,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
         system.notifier = SimpleNamespace(
             notify_error=Mock(), send_message=Mock())
         system._pending_trade_open_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         return system, seen_client_ids
@@ -181,9 +255,8 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             system.trade_state.prepare_open_intent(
                 'BTCUSDT', 'ma_cross', 'long', 'IRECOVER123',
                 {'side': 'long', 'entry_price': 100.0,
-                 'stop_loss_price': 90.0})
-            system.trade_state.set_open_intent_amount(
-                'BTCUSDT', 'IRECOVER123', 1.0)
+                 'stop_loss_price': 90.0},
+                planned_position_size=1.0)
             system.risk_manager.calculate_position_size = Mock(
                 side_effect=AssertionError('恢复 open intent 不得重算风险'))
 
@@ -343,8 +416,6 @@ class GenericOpenIntentIntegrationTest(unittest.TestCase):
             self.assertEqual(1, len(system.trade_state.get_closed_trades()))
 
 
-
-
 class PositionReconciliationStateTest(unittest.TestCase):
     def _system(self, tmp):
         system = TradingSystem.__new__(TradingSystem)
@@ -368,9 +439,11 @@ class PositionReconciliationStateTest(unittest.TestCase):
             self.assertTrue(TradeState(
                 os.path.join(tmp, 'trade_state.json')).is_position_quarantined('BTCUSDT'))
 
+            # 一致只裁决、绝不解除隔离：解除必须由调用方在交易所侧止损
+            # 严格确认与 intent 收口之后显式执行（生产三个调用点均如此）
             self.assertTrue(system._verify_existing_position_or_quarantine(
                 'BTCUSDT', local, {'side': 'long', 'contracts': 10}))
-            self.assertFalse(system.trade_state.is_position_quarantined('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_quarantine_disk_failure_still_blocks_in_current_process(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -683,7 +756,6 @@ class MaMarkerIntegrationTest(unittest.TestCase):
         system._last_failure_notify_ts = 0
         system._pending_trade_open_notifications = []
         system._pending_trade_close_notifications = []
-        system._pending_stop_loss_updates = []
         system._stop_anomalies = {}
         system.stop_loss_dates = {}
         system.equity_tracker = SimpleNamespace(
@@ -691,11 +763,10 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             refresh_account_stats_state=lambda: None)
         system.notifier = SimpleNamespace(
             notify_error=Mock(), notify_signal_missed=Mock(),
-            notify_stop_loss_updates_summary=Mock(), send_message=Mock())
+            send_message=Mock())
         system._retry_clear_stop_residues = lambda: None
         system._flush_pending_trade_notifications = lambda: None
         system.send_daily_position_summary_if_due = lambda **kwargs: True
-        system._closed_candle_id = lambda _df: 't5'
         system._daily_candle_is_fresh = (
             lambda _df, _scheduled_date: (True, date(2026, 7, 10), date(2026, 7, 9)))
         return system
@@ -708,6 +779,70 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             'upper_stop': 12.0, 'lower_stop': 8.0,
             'current_close': 11.0,
         }
+
+    def test_t1_blocked_cross_consumes_marker_without_all_day_retry(self):
+        """T+1 阻断日遇同根交叉：刻意不开仓即消费本根标记、不入失败重跑
+        （此前会确定性全天重跑+告警轰炸）；次日 T+1 重入按 EMA 方向恢复。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.trade_state.replace_stop_loss_dates(
+                {'BTCUSDT': date.today().isoformat()})
+            system.stop_loss_dates = system.trade_state.get_stop_loss_dates()
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5', 1))
+            system._execute_open = Mock(
+                side_effect=AssertionError('T+1 当日不得开仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t5', metadata['last_processed_candle'])
+            self.assertIsNotNone(system._last_check_date)
+            system.notifier.notify_signal_missed.assert_not_called()
+            system._execute_open.assert_not_called()
+
+    def test_prune_refreshes_t1_memory_mirror(self):
+        """退池品种的 T+1 账本清理必须同步内存镜像：镜像残留会让重加品种
+        次日无交叉自动重入，且 record/clear 的全量回写会复活已清条目。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp)
+            system.trade_state.replace_stop_loss_dates(
+                {'ETHUSDT': '2026-01-01'})
+            system.stop_loss_dates = system.trade_state.get_stop_loss_dates()
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
+
+            system.check_and_execute_trades()
+
+            self.assertNotIn(
+                'ETHUSDT', system.trade_state.get_stop_loss_dates())
+            self.assertNotIn('ETHUSDT', system.stop_loss_dates)
+
+    def test_retired_flat_close_same_candle_cross_consumes_marker(self):
+        """退池品种在日检对账中记平（交易所已被外部平仓）后，同根 K 线又
+        出现新交叉：退池禁止新开属「刻意不开」而非失败，必须消费本根标记
+        并标记当日完成（此前 position 已被记平置空导致豁免不成立→该品种
+        确定性全天重跑+告警轰炸，且永远无法自愈）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, held_side='short')
+            system.config['trading']['symbols'][0]['enabled'] = False
+            system.exchange_api.get_position = Mock(return_value=None)
+            system.exchange_api.cancel_order = lambda *args, **kwargs: True
+            system.exchange_api.cancel_all_orders = lambda *args, **kwargs: True
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5', 1))
+            system._execute_open = Mock(
+                side_effect=AssertionError('退池品种不得开新仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t5', metadata['last_processed_candle'])
+            self.assertIsNotNone(system._last_check_date)
+            # 退池平仓不得记 T+1，否则品种重新入池后次日会无交叉自动重入
+            self.assertNotIn(
+                'BTCUSDT', system.trade_state.get_stop_loss_dates())
+            system._execute_open.assert_not_called()
 
     def test_failed_ma_open_does_not_advance_candle_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -722,6 +857,26 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             self.assertEqual('t3', metadata['last_processed_candle'])
             self.assertIsNone(system._last_check_date)
             system.notifier.notify_signal_missed.assert_called_once()
+
+    def test_same_side_intent_resolved_then_quarantine_cleared_same_round(self):
+        """既有隔离 + 崩溃遗留的同向 open intent + 对账一致：本轮日检必须先
+        收口 intent 再清隔离。顺序反了（先清后收）守卫会判「意图未定形」让
+        解除空转，交易阻断多拖一轮盘中巡检。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, held_side='long')
+            system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'OpenIntent42',
+                {'entry_price': 10.0}, planned_position_size=1.0)
+            system.trade_state.mark_position_quarantine('BTCUSDT', '测试既有隔离')
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
+            system.handle_open_position_ma_cross = lambda *args, **kwargs: None
+
+            system.check_and_execute_trades()
+
+            self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
+            self.assertFalse(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_opposite_held_position_does_not_flip_without_latest_cross(self):
         with tempfile.TemporaryDirectory() as tmp:

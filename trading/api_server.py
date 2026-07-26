@@ -8,7 +8,7 @@ import threading
 import time
 import os
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from trade_executor import safe_fill_price
 from trade_state import enrich_closed_trade_with_fees
 
@@ -72,6 +72,31 @@ def _validate_flask_secret_key(value):
     return str(value)
 
 
+def _validate_api_token(value):
+    """校验 API Token 强度。X-API-Token 与登录会话等权（可直达全部真钱写接口），
+    强度标准与 FLASK_SECRET_KEY 同口径：已配置但不足 32 字节即拒绝启动，
+    杜绝可被在线/离线猜中的短 token 带病上线。未配置（None）合法——仅用会话认证。
+    """
+    if value is None:
+        return None
+    if len(str(value).encode('utf-8')) < 32:
+        raise RuntimeError('TRADING_API_TOKEN 至少需要 32 字节的随机值，拒绝弱 token 启动')
+    return str(value)
+
+
+def _validate_login_password(value):
+    """校验登录密码强度。登录会话与 API Token 等权（可直达全部真钱写接口），
+    弱密码在防爆破退避下仍可被慢速在线猜中。人工输入通道下限取 12 字节
+    （随机 token 的 32 字节标准对人不可记忆）；未配置（None）合法——仅用
+    Token 认证，/api/login 返回 503。升级前须检查存量密码长度。
+    """
+    if value is None:
+        return None
+    if len(str(value).encode('utf-8')) < 12:
+        raise RuntimeError('TRADING_LOGIN_PASSWORD 至少需要 12 字节，拒绝弱密码启动')
+    return str(value)
+
+
 # 反代跳数由部署方声明（代码无法安全地自动探测——盲信 X-Forwarded-For 本身就是漏洞）：
 # 0 = 无反代直连（默认，完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（真实客户端 IP
 # 在链尾）；2 = CDN→nginx 双层。登录防爆破按还原后的 remote_addr 计数——跳数配错时
@@ -90,8 +115,23 @@ app.secret_key = _validate_flask_secret_key(os.environ.get('FLASK_SECRET_KEY'))
 # 设 TRADING_COOKIE_SECURE=1 开启，不无条件写死（内网纯 HTTP 部署会被弄坏）
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 app.config['SESSION_COOKIE_SECURE'] = os.environ.get('TRADING_COOKIE_SECURE') == '1'
+# 会话签名 cookie 的最大可重放窗口：Flask 校验签名统一以 permanent_session_lifetime
+# 为 max_age（对非 permanent 会话同样生效）。登出只能清除本浏览器的 cookie、无法
+# 吊销已泄露的历史副本——默认 31 天重放窗口对真钱面板过长，收短到 24 小时。
+app.permanent_session_lifetime = timedelta(hours=24)
 
-LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
+LOGIN_PASSWORD = _validate_login_password(os.environ.get('TRADING_LOGIN_PASSWORD'))
+
+
+@app.after_request
+def _security_headers(response):
+    # 真钱面板最小加固头（纵深防御，零破坏面：无 iframe 嵌套需求、静态资源
+    # MIME 均正确、无外链 Referer 需求）。完整 CSP 需先重构 index.html 的
+    # 内联脚本与 onclick，另行裁决，不在此一行式清单内。
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    return response
 
 # 全局单交易所系统（由 wsgi / __main__ 注入）
 trading_system = None
@@ -108,9 +148,26 @@ LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
 LOGIN_FAILURE_CACHE_MAX = 4096
 _login_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
+# API Token 错误与登录失败同参数退避，但用独立计数池：token 与密码是两条
+# 认证通道，互不连坐（也避免测试/多客户端场景相互污染锁定状态）
+_token_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
 _login_guard = threading.Lock()
 
-API_TOKEN = os.environ.get('TRADING_API_TOKEN')
+API_TOKEN = _validate_api_token(os.environ.get('TRADING_API_TOKEN'))
+
+
+def _require_auth_channel(password, token):
+    """管理面仅有密码会话与 API Token 两条认证通道：双双未配置=零认证
+    可用面——真钱 runner 照常交易而应急控制面（手动平仓/隔离核查）永久
+    401/503，属带病上线。与「弱密码/弱 token 拒启」同一 fail-loud 口径。
+    """
+    if password is None and token is None:
+        raise RuntimeError(
+            '未配置任何管理面认证通道：TRADING_LOGIN_PASSWORD 与 '
+            'TRADING_API_TOKEN 至少须配置其一，拒绝启动')
+
+
+_require_auth_channel(LOGIN_PASSWORD, API_TOKEN)
 
 # 由 wsgi / __main__ 保存真实 runner 线程状态。不能仅凭 trading_system 非空就宣称
 # “运行中”：调度线程若在 register_jobs/start 中异常退出，Web 仍可能完全正常。
@@ -120,14 +177,18 @@ _runner_failure = None
 _runner_guard = threading.Lock()
 
 
-def _prune_login_failures(now):
+def _prune_failures(failures, now):
     """清除过期项并对攻击者可控的 IP 字典设置硬上限。必须在 _login_guard 内调用。"""
-    expired = [ip for ip, (_fails, locked_until) in _login_failures.items()
+    expired = [ip for ip, (_fails, locked_until) in failures.items()
                if locked_until and locked_until <= now]
     for ip in expired:
-        _login_failures.pop(ip, None)
-    while len(_login_failures) >= LOGIN_FAILURE_CACHE_MAX:
-        _login_failures.pop(next(iter(_login_failures)), None)
+        failures.pop(ip, None)
+    while len(failures) >= LOGIN_FAILURE_CACHE_MAX:
+        failures.pop(next(iter(failures)), None)
+
+
+def _prune_login_failures(now):
+    _prune_failures(_login_failures, now)
 
 
 def start_runner_thread(system):
@@ -291,17 +352,48 @@ def _explicit_null_error(data, fields):
 
 
 def require_auth(f):
-    """API认证装饰器：支持Session或Token认证。"""
+    """API认证装饰器：支持Session或Token认证。
+
+    Token 通道带与登录同参数的按 IP 退避：token 与会话等权（可直达全部真钱
+    写接口），不能留下无限速在线爆破面。仅在请求实际携带 X-API-Token 时计数，
+    普通未认证请求（无头）不落入退避池。
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if session.get('authenticated'):
             return f(*args, **kwargs)
         token = request.headers.get('X-API-Token')
-        # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
-        # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
-        # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
-        if API_TOKEN and token and secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
-            return f(*args, **kwargs)
+        if token:
+            # token 未配置的部署也走同一退避簿记与 429：否则 429/401 差异会
+            # 泄露「token 是否启用」（与已消除的 500/401 探测同一威胁模型）
+            ip = request.remote_addr or 'unknown'
+            now = time.time()
+            with _login_guard:
+                # 预检先清过期锁定（与 api_login 同构）：否则锁定到期后旧条目
+                # （fails=5）仍在池中，单次错误即再锁——「连续 5 次」承诺失效
+                _prune_failures(_token_failures, now)
+                _fails, locked_until = _token_failures.get(ip, (0, 0.0))
+                if now < locked_until:
+                    return jsonify({'error': f'API Token 错误次数过多，'
+                                             f'请 {int(locked_until - now) + 1} 秒后再试'}), 429
+            # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
+            # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
+            # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
+            if API_TOKEN and secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
+                with _login_guard:
+                    _token_failures.pop(ip, None)
+                return f(*args, **kwargs)
+            with _login_guard:
+                if ip not in _token_failures:
+                    _prune_failures(_token_failures, now)
+                fails, _ = _token_failures.get(ip, (0, 0.0))
+                fails += 1
+                locked_until = (now + LOGIN_LOCKOUT_SECONDS
+                                if fails >= LOGIN_MAX_FAILURES else 0.0)
+                _token_failures[ip] = (fails, locked_until)
+                if locked_until:
+                    logger.warning(
+                        f"API Token 连续错误 {fails} 次，已锁定 {ip} {LOGIN_LOCKOUT_SECONDS} 秒")
         return jsonify({'error': '认证失败，请登录或提供有效的API Token'}), 401
     return decorated
 
@@ -710,11 +802,20 @@ def delete_symbol(symbol):
                             exchange_position.get('contracts') or 0) == 0
                     system.trade_state.remove_symbol_metadata(
                         symbol_u, clear_quarantine=clear_quarantine)
+                    # T+1 内存镜像随账本清理同步刷新，防止双源分叉：镜像残留会让
+                    # 删除→重加的品种次日无交叉自动重入，且 record/clear 的全量
+                    # 回写会把已清理条目复活回账本。
+                    dates_getter = getattr(system.trade_state, 'get_stop_loss_dates', None)
+                    if callable(dates_getter) and isinstance(
+                            getattr(system, 'stop_loss_dates', None), dict):
+                        system.stop_loss_dates = dates_getter()
                 except Exception as e:
                     # 查询失败时 fail-closed：不清 quarantine；配置删除本身已成功。
                     logger.warning(f'删除 {symbol_u} 后清理辅助状态失败（隔离记录保留）: {e}')
-        send_dingtalk(f'[{system.label}] 删除交易对: {symbol}')
-        return jsonify({'status': 'success', 'message': f'交易对 {symbol} 已删除'})
+        # 审计消息与响应统一用规范化名（与 add/update 口径一致）：
+        # DELETE /api/symbols/btcusdt 实删的是 BTCUSDT，回显必须如实
+        send_dingtalk(f'[{system.label}] 删除交易对: {symbol_u}')
+        return jsonify({'status': 'success', 'message': f'交易对 {symbol_u} 已删除'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -853,22 +954,6 @@ def get_trades_summary():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/config', methods=['GET'])
-@require_auth
-def get_config():
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        return jsonify({
-            'strategy': system.config.get('strategy', {}),
-            'trading': system.config.get('trading', {}),
-            'scheduler': system.config.get('scheduler', {})
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/account_stats', methods=['GET'])
 @require_auth
 def get_account_stats():
@@ -923,20 +1008,6 @@ def equity_sync():
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"权益同步异常: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/equity_history', methods=['GET'])
-@require_auth
-def get_equity_history():
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        snapshots = system.equity_tracker.load_daily_equity()
-        eq_hist = system.equity_tracker.load_equity_history()
-        return jsonify({'daily_snapshots': snapshots, 'initial_equity': eq_hist.get('initial_equity', 0)})
-    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
@@ -1280,8 +1351,10 @@ def close_position():
             actual_price = None if close_order.get('execution_ambiguous') \
                 else safe_fill_price(close_order, None)
             if not actual_price:
+                # get_last_price 契约恒返回正有限价（坏行情 fail-loud），
+                # 一切失败路径均落入 except 兜底到入场价。
                 try:
-                    actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
+                    actual_price = system.exchange_api.get_last_price(ccxt_symbol)
                 except Exception:
                     actual_price = position['entry_price']
             if close_order.get('fee') is not None or close_order.get('fees'):

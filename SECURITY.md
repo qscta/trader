@@ -11,7 +11,16 @@ redact the in-memory environment overrides before writing configuration to disk,
 and credential/state files must be owner-readable only (`0600`).
 `FLASK_SECRET_KEY` must be a random value of at least 32 bytes; generate one with
 `python3 -c 'import secrets; print(secrets.token_hex(32))'` and keep it only in
-the deployment secret store or environment.
+the deployment secret store or environment. `TRADING_API_TOKEN` (optional) is
+held to the same standard: if configured it must be at least 32 random bytes,
+or startup is refused — check existing deployments before upgrading.
+`TRADING_LOGIN_PASSWORD` (optional) is a human-entered credential with the same
+privileges as the token; if configured it must be at least 12 bytes, or startup
+is refused — check existing deployments before upgrading. At least one of
+`TRADING_LOGIN_PASSWORD` / `TRADING_API_TOKEN` must be configured: with both
+absent there is no usable auth channel at all (the money-handling runner would
+trade while the emergency control panel is permanently unreachable), so
+startup is refused.
 
 ## If a secret enters Git history
 

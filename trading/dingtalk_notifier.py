@@ -113,25 +113,6 @@ class DingTalkNotifier:
         )
         return self.send_message(f"[交易系统] 止损触发 - {symbol}", content)
 
-    def notify_stop_loss_updates_summary(self, updates):
-        """发送本轮止损更新汇总。"""
-        if not updates:
-            return False
-
-        lines = []
-        for item in updates:
-            lines.append(
-                f"- {item['symbol']}: {item['old_stop_loss_price']} -> {item['new_stop_loss_price']}"
-            )
-
-        content = (
-            f"### 交易系统止损更新汇总\n\n"
-            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"更新数量: {len(updates)}\n\n"
-            f"{chr(10).join(lines)}"
-        )
-        return self.send_message("[交易系统] 止损更新汇总", content)
-
     def notify_signal_missed(self, symbol, strategy_name, side, reason, signal=None):
         """标准信号已出现但最终未形成持仓时提醒人工复核。"""
         side_cn = "做多" if side == 'long' else "做空"
@@ -144,16 +125,11 @@ class DingTalkNotifier:
             f"原因: {reason}\n\n"
         )
         if signal:
+            # 双均线信号只携带 current_close/ema_*/upper_stop/lower_stop；
+            # 旧海龟通道键（upper_line/mid_line 等）已随策略下线移除。
             current_close = signal.get('current_close')
-            upper_line = signal.get('upper_line')
-            lower_line = signal.get('lower_line')
-            mid_line = signal.get('mid_line')
             if current_close is not None:
                 content += f"收盘价: {current_close}\n\n"
-            if upper_line is not None and lower_line is not None:
-                content += f"上轨/下轨: {upper_line} / {lower_line}\n\n"
-            if mid_line is not None:
-                content += f"中轨: {mid_line}\n\n"
         return self.send_message(f"[交易系统] 信号未成交 - {symbol}", content)
 
     def notify_position_summary(self, positions, symbols_config, total_equity):
@@ -170,8 +146,9 @@ class DingTalkNotifier:
             entry = pos.get('entry_price', 0)
             stop = pos.get('stop_loss_price', 0)
             size = pos.get('position_size', 0)
-            # 有向亏损并钳到 ≥0（与前端持仓面板同口径）：止损已推进到盈利侧时
-            # 风险为 0（利润已锁定），按绝对值算会把锁定利润虚报成风险
+            # 有向亏损并钳到 ≥0（与前端持仓面板同口径）：止损位于盈利侧时
+            # 风险为 0（利润已锁定）——遗留海龟仓的历史推进止损或人工调挂
+            # 都可能造成该形态，按绝对值算会把锁定利润虚报成风险
             if pos.get('side') == 'long':
                 loss = max(0, (entry - stop) * size) if stop else 0
             else:

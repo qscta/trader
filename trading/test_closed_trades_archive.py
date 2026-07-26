@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 import _test_stubs
 
-TradingSystem = _test_stubs.import_main().TradingSystem  # noqa: F841  保证桩机制先行
+# 只为副作用调用（挂 NullHandler 防测试进程写生产日志）；本文件不消费 main
+_test_stubs.import_main()
 import trade_state as trade_state_module
 from trade_state import TradeState, TradeStatePersistenceError
 
@@ -167,8 +168,45 @@ class ArchiveFailSafeTest(unittest.TestCase):
             self.assertEqual(_symbols(ts.get_closed_trades()),
                              [f'C{i}USDT' for i in range(8)])
 
+    def test_undated_crash_retry_does_not_duplicate_in_archive(self):
+        """undated 分卷在全局合并序中恒排最前（排序键为空串），全局后缀去重
+        对它失效——去重必须按目标分卷做：崩溃重试不得把无 close_time 的
+        遗留记录在史书里写两遍。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = _make_state(tmp, keep=2)
+            ts.state['closed_trades'] = [
+                {'symbol': 'L0USDT', 'pnl': 1},
+                {'symbol': 'L1USDT', 'pnl': 2},
+                {'symbol': 'L2USDT', 'pnl': 3},
+                {'symbol': 'K0USDT', 'close_time': '2026-01-01T00:00:00'},
+                {'symbol': 'K1USDT', 'close_time': '2026-02-01T00:00:00'},
+            ]
+            ts.save_state()
+            # 史书另有带时记录：合并序会把 undated 排到它前面，使全局后缀窗口
+            # 永远看不到 undated 尾部（本用例的判别核心）
+            with open(_year_archive(ts, '2025'), 'w', encoding='utf-8') as handle:
+                json.dump(
+                    [{'symbol': 'OLDUSDT', 'close_time': '2025-06-01T00:00:00'}],
+                    handle)
+
+            with patch.object(TradeState, 'save_state',
+                              side_effect=TradeStatePersistenceError('模拟落盘失败')):
+                with self.assertRaises(TradeStatePersistenceError):
+                    ts.compact_closed_trades()
+            self.assertEqual(5, len(ts.state['closed_trades']))
+
+            self.assertEqual(3, ts.compact_closed_trades())
+            merged = ts.get_closed_trades()
+            self.assertEqual(6, len(merged))   # 账本 5 + 旧史书 1，零重复
+            self.assertEqual(
+                ['L0USDT', 'L1USDT', 'L2USDT'],
+                [t['symbol'] for t in merged if 'close_time' not in t])
+
     def test_ordered_overlap_preserves_two_identical_real_trades(self):
-        """史书已有第一笔、账本前两笔内容相同：只跳过有序重叠的一笔。"""
+        """史书已有第一笔、账本前两笔内容相同：只跳过有序重叠的一笔。
+
+        fixture 把既有记录放在其正确分卷（'legacy' 不可解析 → undated）：
+        生产中 compact 恒按 _archive_year 路由，记录不可能落错分卷。"""
         with tempfile.TemporaryDirectory() as tmp:
             ts = _make_state(tmp, keep=1)
             duplicate = {'symbol': 'SAMEUSDT', 'pnl': 1, 'close_time': 'legacy'}
@@ -176,14 +214,16 @@ class ArchiveFailSafeTest(unittest.TestCase):
             ts.state['closed_trades'] = [
                 copy.deepcopy(duplicate), copy.deepcopy(duplicate), recent]
             ts.save_state()
-            with open(_year_archive(ts), 'w', encoding='utf-8') as handle:
+            with open(_year_archive(ts, 'undated'), 'w', encoding='utf-8') as handle:
                 json.dump([duplicate], handle)
 
             self.assertEqual(2, ts.compact_closed_trades())
 
             archive, ok = ts._read_archive()
             self.assertTrue(ok)
-            self.assertEqual([duplicate, duplicate], archive)
+            self.assertEqual(
+                [duplicate, duplicate],
+                [t for t in archive if t['symbol'] == 'SAMEUSDT'])
 
     def test_partial_multi_year_write_retries_without_duplicates(self):
         with tempfile.TemporaryDirectory() as tmp:
