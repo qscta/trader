@@ -34,6 +34,7 @@ trading/backups/
 .DS_Store
 *.bak
 *.bak.*
+*.premigrate.*
 *.tmp
 *~
 

@@ -156,6 +156,17 @@ class RunTest(unittest.TestCase):
             self.assertEqual(
                 [], [name for name in os.listdir(tmp) if '.premigrate.' in name])
 
+    def test_nonfinite_state_fails_loud_instead_of_misdiagnosis(self):
+        """Infinity/NaN 状态与全库读取口径同样 fail-loud：静默放行会把损坏
+        文件经 _pos_float 过滤误诊为「数据不足」跳过。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp)
+            with open(os.path.join(tmp, 'peak_equity.json'), 'w',
+                      encoding='utf-8') as handle:
+                handle.write('{"peak_equity": Infinity, "peak_time": null}')
+            with self.assertRaises(ValueError):
+                migration.run(tmp, apply=False)
+
     def test_never_raises_a_legitimate_peak(self):
         with tempfile.TemporaryDirectory() as tmp:
             clean = {

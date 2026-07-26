@@ -1134,8 +1134,11 @@ class TradeExecutorMixin:
         else:
             try:
                 balance = self.exchange_api.get_balance()
-                account_equity = float(
-                    (balance.get('total') or {}).get('USDT'))
+                raw_equity = (balance.get('total') or {}).get('USDT')
+                # 与启动权益解析同一校验口径：bool 会被 float 换算成 1.0 假权益
+                if isinstance(raw_equity, bool):
+                    raise ValueError(f'非法 USDT 权益 {raw_equity!r}')
+                account_equity = float(raw_equity)
                 if not math.isfinite(account_equity) or account_equity <= 0:
                     raise ValueError(f'非法 USDT 权益 {account_equity!r}')
             except Exception as e:

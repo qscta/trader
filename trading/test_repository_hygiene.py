@@ -39,6 +39,9 @@ def _is_forbidden_tracked_path(path):
     # 运行日志可能包含订单号、余额等敏感信息，且属运行产物，禁止入库。
     if name.endswith('.log') or '.log.' in name:
         return True
+    # 峰值迁移工具的 .premigrate.* 备份与主文件同含真实权益数据。
+    if '.premigrate.' in name:
+        return True
     return name.endswith(('.save', '.tgz', '.tar', '.tar.gz', '.zip'))
 
 
@@ -103,7 +106,8 @@ class RepositoryHygieneTest(unittest.TestCase):
                 'trading/.okx_legacy_migration_complete.json',
                 'trading/.equity_sync_journal.json',
                 'trading/trading.log',
-                'trading/trading.log.2026-07-01'):
+                'trading/trading.log.2026-07-01',
+                'trading/peak_equity.json.premigrate.20260726_183000'):
             self.assertTrue(_is_forbidden_tracked_path(path), path)
         self.assertFalse(_is_forbidden_tracked_path('trading/config.example.json'))
         self.assertFalse(_is_forbidden_tracked_path('.env.example'))

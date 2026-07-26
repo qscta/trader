@@ -13,7 +13,8 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trade_state import atomic_write_json, open_private_text_file
+from trade_state import (
+    _reject_nonfinite_json, atomic_write_json, open_private_text_file)
 
 
 ROLLOVER_HOUR = 8
@@ -132,7 +133,9 @@ def _load_json(path):
     if not os.path.lexists(path):
         return None
     with open_private_text_file(path) as handle:
-        return json.load(handle)
+        # 与全库命脉状态读取同口径拒绝 NaN/Infinity：静默放行会把损坏文件
+        # 误诊为「数据不足」跳过，甚至让 inf 候选被过滤后错误向下写峰值
+        return json.load(handle, parse_constant=_reject_nonfinite_json)
 
 
 def run(data_dir, apply):

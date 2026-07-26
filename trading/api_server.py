@@ -927,22 +927,6 @@ def get_trades_summary():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/config', methods=['GET'])
-@require_auth
-def get_config():
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        return jsonify({
-            'strategy': system.config.get('strategy', {}),
-            'trading': system.config.get('trading', {}),
-            'scheduler': system.config.get('scheduler', {})
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/account_stats', methods=['GET'])
 @require_auth
 def get_account_stats():
@@ -997,20 +981,6 @@ def equity_sync():
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"权益同步异常: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/equity_history', methods=['GET'])
-@require_auth
-def get_equity_history():
-    system, err = _require_system()
-    if err:
-        return err
-    try:
-        snapshots = system.equity_tracker.load_daily_equity()
-        eq_hist = system.equity_tracker.load_equity_history()
-        return jsonify({'daily_snapshots': snapshots, 'initial_equity': eq_hist.get('initial_equity', 0)})
-    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 

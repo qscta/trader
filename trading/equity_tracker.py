@@ -342,6 +342,15 @@ class EquityTracker:
     def _save_json_state(self, filepath, data, expected_type, label):
         """保存辅助状态并保留最后一个已验证版本；现有文件损坏时拒绝覆盖。"""
         try:
+            # 残留 journal = 上次资金同步提交与回滚双双失败：peak/history/qiusuo
+            # 可能处于半事务世代，且下次启动会按 journal 整代前滚——此间任何
+            # 覆写都会被前滚静默丢弃还 ratchet 出假统计。journal 范围内文件
+            # 一律拒写（fail-loud），等重试资金同步重建整代或重启收口。
+            journal_scoped = {
+                path for path, _t in self._equity_sync_targets().values()}
+            if (filepath in journal_scoped and
+                    private_file_exists(self.EQUITY_SYNC_JOURNAL_FILE)):
+                raise OSError('权益同步 journal 未收口，拒绝覆写半事务世代状态')
             self._validate_json_shape(data, expected_type, filepath)
             if private_file_exists(filepath):
                 with open_private_text_file(filepath) as f:

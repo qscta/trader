@@ -12,7 +12,7 @@ label / _pending_* 缓冲 / _summary_lock / _last_summary_date / _equity_tick_* 
 import logging
 from datetime import datetime, date
 
-from equity_tracker import EquityTracker
+from equity_tracker import EquityTracker, _coerce_positive_float
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +81,11 @@ class ReportingMixin:
             positions = self.trade_state.get_all_open_positions()
             symbols_config = self.config['trading']['symbols']
             try:
+                # 与采样/统计路径同一校验口径：bool/NaN/垃圾值解析为 None，
+                # 落入通知端既有「未知（读取失败）」分支而非渲染假权益
                 balance = self.exchange_api.get_balance()
-                total_equity = float(balance['total']['USDT']) if balance else None
+                total_equity = _coerce_positive_float(
+                    (balance.get('total') or {}).get('USDT')) if balance else None
             except Exception as e:
                 logger.warning(f"获取权益失败: {e}")
                 total_equity = None

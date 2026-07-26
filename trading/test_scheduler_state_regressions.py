@@ -51,6 +51,23 @@ class PrivateLogHandlerTest(unittest.TestCase):
             handler.close()
             self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
 
+    def test_existing_permissive_backups_tightened_at_construction(self):
+        """升级路径：0600 时代之前的轮转备份经 rename 保留旧 mode、自然淘汰
+        需整整 backupCount 次轮转——构造时必须一次清扫收权。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            for suffix in ('.1', '.2'):
+                with open(path + suffix, 'w', encoding='utf-8') as fh:
+                    fh.write('legacy backup')
+                os.chmod(path + suffix, 0o644)
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=10**6, backupCount=3, encoding='utf-8',
+                delay=True)
+            handler.close()
+            for suffix in ('.1', '.2'):
+                self.assertEqual(
+                    0o600, os.stat(path + suffix).st_mode & 0o777, suffix)
+
 
 class SchedulerJobRegistrationTest(unittest.TestCase):
     """全部定时任务必须显式带 misfire 保护：apscheduler 默认宽限仅 1 秒，

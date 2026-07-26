@@ -67,7 +67,10 @@ def validate_strategy_ohlcv_capacity(strategy_config=None):
 
 
 def strict_float_finite(value, field):
-    """有限浮点：拒绝 nan / inf / -inf（否则会污染求索指数除数等下游状态）。抛 ValueError。"""
+    """有限浮点：拒绝 bool / nan / inf / -inf（否则 true 会被静默换算成 1.0
+    混进 check_hour/flow_amount 等下游，非有限数会污染求索指数除数）。抛 ValueError。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 不是有效数字: {value!r}")
     try:
         f = float(value)
     except (TypeError, ValueError):

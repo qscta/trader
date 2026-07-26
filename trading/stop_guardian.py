@@ -81,13 +81,22 @@ class StopGuardianMixin:
             return
 
         for symbol in sorted(exchange_symbols - local_symbols):
-            intent_getter = getattr(self.trade_state, 'get_open_intent', None)
-            intent = intent_getter(symbol) if callable(intent_getter) else None
-            resume_intent = getattr(self, '_resume_open_intent_position', None)
-            if intent and callable(resume_intent) and resume_intent(symbol, intent):
-                continue
-            self._quarantine_position_mismatch(
-                symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
+            # 单孤儿异常只隔离该品种，不得中断其余孤儿的隔离与告警
+            # （与日检/意图收口的单品种隔离同标准）：intent 恢复会真实下单，
+            # 网络/适配层异常可抛，一个品种炸掉整段核对会让排序在后的
+            # 孤儿持续无隔离无告警。
+            try:
+                intent_getter = getattr(self.trade_state, 'get_open_intent', None)
+                intent = intent_getter(symbol) if callable(intent_getter) else None
+                resume_intent = getattr(self, '_resume_open_intent_position', None)
+                if intent and callable(resume_intent) and resume_intent(symbol, intent):
+                    continue
+                self._quarantine_position_mismatch(
+                    symbol, '盘中发现交易所有仓但本地无记录（孤儿仓）')
+            except Exception as exc:
+                logger.exception(f'{symbol} 盘中孤儿仓处理异常，隔离后继续: {exc}')
+                self._quarantine_position_mismatch(
+                    symbol, f'盘中孤儿仓处理异常: {exc}')
 
         get_quarantines = getattr(self.trade_state, 'get_position_quarantines', None)
         quarantines = list(get_quarantines()) if callable(get_quarantines) else []

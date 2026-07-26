@@ -41,6 +41,39 @@ class EquityStatePersistenceTest(unittest.TestCase):
             self.assertEqual(1, len(trimmed))
             self.assertNotIn('+', trimmed[0]['timestamp'])
 
+    def test_residual_sync_journal_blocks_scoped_saves(self):
+        """journal 双失败残留时 peak/history/qiusuo 拒写：运行期覆写会在下次
+        启动被前滚静默丢弃并 ratchet 假统计；非 journal 范围文件不受影响，
+        journal 收口（重试同步/重启）后恢复可写。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            notifications = []
+            tracker = self._tracker(temp_dir, notifications)
+            valid_peak = {'peak_equity': 1000.0, 'peak_time': None}
+            self.assertTrue(tracker.save_peak_equity(valid_peak))
+
+            with open(tracker.EQUITY_SYNC_JOURNAL_FILE, 'w',
+                      encoding='utf-8') as f:
+                json.dump({'version': 1}, f)
+            os.chmod(tracker.EQUITY_SYNC_JOURNAL_FILE, 0o600)
+
+            self.assertFalse(
+                tracker.save_peak_equity({'peak_equity': 2000.0, 'peak_time': None}))
+            self.assertFalse(tracker.save_equity_history(
+                {'max_drawdown': 0, 'max_dd_time': None,
+                 'initial_equity': None, 'initial_time': None,
+                 'year_start_equity': None, 'year_start_time': None,
+                 'longest_drawdown_days': 0}))
+            self.assertTrue(notifications)
+            # 半事务世代未被覆写
+            self.assertEqual(1000.0, tracker.load_peak_equity()['peak_equity'])
+            # 非 journal 范围不受影响
+            self.assertTrue(tracker.save_daily_equity(
+                [{'date': '2026-07-26', 'equity': 1000.0}]))
+
+            os.unlink(tracker.EQUITY_SYNC_JOURNAL_FILE)
+            self.assertTrue(tracker.save_peak_equity(
+                {'peak_equity': 2000.0, 'peak_time': None}))
+
     def test_valid_backup_recovers_corrupt_main(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = self._tracker(temp_dir)

@@ -17,6 +17,13 @@ class StrictIntTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(v)):
                 cv.strict_int(v, 'x')
 
+    def test_rejects_bool(self):
+        # JSON true 经 request.get_json 变 Python True，float(True)==1.0 会让
+        # check_hour:true 静默变成 01:00 日检——与账本入口同口径拒 bool
+        for v in (True, False):
+            with self.assertRaises(ValueError, msg=repr(v)):
+                cv.strict_int(v, 'x')
+
 
 class StrictFloatFiniteTest(unittest.TestCase):
     def test_accepts_finite(self):
@@ -25,6 +32,11 @@ class StrictFloatFiniteTest(unittest.TestCase):
 
     def test_rejects_nonfinite(self):
         for v in ("inf", "-inf", "nan", float('inf'), float('nan'), "abc", None):
+            with self.assertRaises(ValueError, msg=repr(v)):
+                cv.strict_float_finite(v, 'x')
+
+    def test_rejects_bool(self):
+        for v in (True, False):
             with self.assertRaises(ValueError, msg=repr(v)):
                 cv.strict_float_finite(v, 'x')
 

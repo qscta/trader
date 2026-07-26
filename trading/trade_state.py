@@ -930,8 +930,8 @@ class TradeState:
                 Decimal(str(original_size)) - Decimal(str(remaining_size)))
         except (ValueError, InvalidOperation) as exc:
             raise ValueError('部分回滚恢复的价格/数量非法') from exc
-        if not math.isfinite(closed_size) or closed_size <= 0:
-            raise ValueError('部分回滚恢复的价格/数量必须是正有限数')
+        # 五值已是正有限数；Decimal 减法保号、float() 舍入单调不越界，故
+        # remaining < original ⟺ closed_size 为正有限数——语义检查即完整边界
         if remaining_size >= original_size:
             raise ValueError('部分回滚余仓必须小于原始仓位')
 

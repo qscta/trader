@@ -38,6 +38,26 @@ class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
     经 ubuntu 组读走。轮转每次经 _open 建新文件，子类覆盖即全覆盖；
     fchmod 顺带收紧历史遗留的宽权限旧文件。"""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 升级路径一次清扫：0600 时代之前产生的轮转备份经 doRollover 的
+        # rename 保留旧 mode，自然淘汰需整整 backupCount 次轮转，期间持续
+        # 可被同组读走——构造时统一收权（缺文件跳过，失败仅告警不阻启动）。
+        for index in range(1, (self.backupCount or 0) + 1):
+            backup = f'{self.baseFilename}.{index}'
+            try:
+                fd = os.open(
+                    backup, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            except OSError:
+                continue
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                logging.getLogger(__name__).warning(
+                    '收紧旧日志备份权限失败: %s: %s', backup, exc)
+            finally:
+                os.close(fd)
+
     def _open(self):
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, 'O_NOFOLLOW'):
@@ -142,8 +162,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.debug('迁移失败告警发送失败: %s', notify_exc)
             raise
 
-        # 交易所适配层：只换成欧易，策略层输入输出语义不变
-        self.exchange_api = OkxApi(self.config['okx'])
+        # 交易所适配层：只换成欧易，策略层输入输出语义不变。
+        # 构造可因 margin_mode 配置非法等 fail-closed 拒启，须先告警。
+        try:
+            self.exchange_api = OkxApi(self.config['okx'])
+        except Exception as exc:
+            logger.critical(f'[{self.label}] 交易所适配层构造失败，拒绝启动: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 交易所适配层构造失败，进程拒绝启动，'
+                    f'请立即人工检查配置: {exc}')
+            except Exception as notify_exc:
+                logger.debug('适配层构造失败告警发送失败: %s', notify_exc)
+            raise
 
         self.ma_cross_strategy = MaCrossStrategy(
             self.config['strategy'].get('ma_short_period', 7),
@@ -211,11 +242,22 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._heartbeat_lock = threading.Lock()
         self._runner_heartbeat_ts = None
 
-        self.equity_tracker = EquityTracker(
-            self.data_dir, self,
-            notify_failure=self._notify_persistence_failure,
-            retention_days=self.config.get('equity_tick_retention_days'),
-        )
+        # 构造可因 equity_sync journal 无法恢复等 fail-closed 拒启，须先告警。
+        try:
+            self.equity_tracker = EquityTracker(
+                self.data_dir, self,
+                notify_failure=self._notify_persistence_failure,
+                retention_days=self.config.get('equity_tick_retention_days'),
+            )
+        except Exception as exc:
+            logger.critical(f'[{self.label}] 权益跟踪器构造失败，拒绝启动: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 权益跟踪器构造失败（权益状态/同步 journal '
+                    f'无法恢复），进程拒绝启动，请立即人工检查: {exc}')
+            except Exception as notify_exc:
+                logger.debug('权益跟踪器构造失败告警发送失败: %s', notify_exc)
+            raise
 
         # 启动时必须成功获取权益，重试3次。get_balance 的网络异常（适配层重试耗尽后
         # re-raise）与认证异常（立抛）都必须在此捕获——否则会绕过下方「钉钉告警+退出」
@@ -1895,6 +1937,18 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 self._update_runner_heartbeat()
         except KeyboardInterrupt:
             logger.info("收到中断信号，关闭交易系统...")
+        except Exception as exc:
+            # 与启动链同标准：runner 线程死亡（注册/调度启动/心跳循环任一段
+            # 异常）意味着日检/巡检/采样全停而 Web 面板照常——必须大声告警
+            # 后再上抛，保持 api_server 侧 _runner_failure 语义不变。
+            logger.critical(f'[{self.label}] runner 异常退出，后台调度已停止: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] runner 线程异常退出，日检/止损巡检/权益采样'
+                    f'已全部停止，请立即人工检查并重启: {exc}')
+            except Exception as notify_exc:
+                logger.debug('runner 异常退出告警发送失败: %s', notify_exc)
+            raise
         finally:
             try:
                 if getattr(self.scheduler, 'running', False):
