@@ -350,7 +350,6 @@ function setEquityKlineRange(days) {
     });
     loadEquityKline();
 }
-window.setEquityKlineRange = setEquityKlineRange;
 
 /* ---------------- 持仓 ---------------- */
 async function loadPositions() {

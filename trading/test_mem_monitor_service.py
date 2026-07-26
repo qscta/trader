@@ -1,5 +1,6 @@
 """资源监控启动失败语义回归。"""
 
+import importlib.util
 import logging
 import sys
 import types
@@ -14,9 +15,8 @@ if not logging.getLogger().handlers:
 
 # stdlib-only CI job intentionally does not install requests.  These tests never
 # perform HTTP; provide only the import-time shape needed by mem_monitor.
-try:
-    import requests  # noqa: F401
-except ImportError:
+# find_spec 只探测可用性、不产生未使用导入（保持 pyflakes 验收门归零）。
+if importlib.util.find_spec('requests') is None:
     requests_stub = types.ModuleType('requests')
     requests_stub.post = None
     sys.modules['requests'] = requests_stub

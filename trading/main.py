@@ -134,10 +134,35 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         check_and_execute_trades 与调度注册（真钱编排核心，刻意留在 main 便于审查）。
     """
 
+    def _alert_critical(self, log_message, notify_message):
+        """fail-closed 拒启/退出/致命故障的统一大声告警：critical + 尽力钉钉。
+
+        告警发送失败只留痕（debug），不掩盖主错误，也不阻挠调用方
+        raise/sys.exit——裸 traceback 静默死亡是最贵的故障模式。
+        """
+        logger.critical(log_message)
+        try:
+            self.notifier.notify_error(notify_message)
+        except Exception as notify_exc:
+            logger.debug('致命告警发送失败: %s', notify_exc)
+
     def __init__(self, config_file='config.json'):
         """初始化欧易单交易所交易系统。状态文件落项目根目录（与原单所版一致）。"""
         self.config_file = config_file
-        self.config = self.load_config(config_file)
+        try:
+            self.config = self.load_config(config_file)
+        except Exception as exc:
+            # 配置失败发生在常规 notifier 构造之前：用 env webhook（若有）
+            # 建一次性通知器尽力告警——配置校验拒启同样不得裸 traceback 静默死亡
+            logger.critical(f'配置加载/校验失败，拒绝启动: {exc}')
+            try:
+                DingTalkNotifier(
+                    os.environ.get('DINGTALK_WEBHOOK')).notify_error(
+                    f'[欧易] 配置加载/校验失败，进程拒绝启动，'
+                    f'请立即人工检查 {config_file}: {exc}')
+            except Exception as notify_exc:
+                logger.debug('配置失败告警发送失败: %s', notify_exc)
+            raise
         self.exchange_id = 'okx'
         self.label = self.config.get('okx', {}).get('label') or '欧易'
         self.base_dir = os.path.dirname(os.path.abspath(config_file))
@@ -153,13 +178,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         try:
             self._migrate_okx_legacy_state()
         except Exception as exc:
-            logger.critical(f'[{self.label}] 旧版状态迁移失败，拒绝启动: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 旧版状态迁移失败，进程拒绝启动，'
-                    f'请立即人工检查: {exc}')
-            except Exception as notify_exc:
-                logger.debug('迁移失败告警发送失败: %s', notify_exc)
+            self._alert_critical(
+                f'[{self.label}] 旧版状态迁移失败，拒绝启动: {exc}',
+                f'[{self.label}] 旧版状态迁移失败，进程拒绝启动，'
+                f'请立即人工检查: {exc}')
             raise
 
         # 交易所适配层：只换成欧易，策略层输入输出语义不变。
@@ -167,13 +189,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         try:
             self.exchange_api = OkxApi(self.config['okx'])
         except Exception as exc:
-            logger.critical(f'[{self.label}] 交易所适配层构造失败，拒绝启动: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 交易所适配层构造失败，进程拒绝启动，'
-                    f'请立即人工检查配置: {exc}')
-            except Exception as notify_exc:
-                logger.debug('适配层构造失败告警发送失败: %s', notify_exc)
+            self._alert_critical(
+                f'[{self.label}] 交易所适配层构造失败，拒绝启动: {exc}',
+                f'[{self.label}] 交易所适配层构造失败，进程拒绝启动，'
+                f'请立即人工检查配置: {exc}')
             raise
 
         self.ma_cross_strategy = MaCrossStrategy(
@@ -189,25 +208,16 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             _tz_msg = (f'[{self.label}] 服务器时区异常：当前 UTC 偏移 {_tz_offset}，部署要求 UTC+8'
                        f'（Asia/Shanghai）。日检时点/T+1 记录/求索指数切日均依赖本地时间，'
                        f'请尽快修正服务器时区！')
-            logger.critical(_tz_msg)
-            try:
-                self.notifier.notify_error(_tz_msg)
-            except Exception as exc:
-                # 时区问题已 critical 记录；告警发送再失败不能掩盖主问题。
-                logger.debug('发送时区异常告警失败（不影响启动）: %s', exc)
+            self._alert_critical(_tz_msg, _tz_msg)  # 只告警一次、不阻断启动
         try:
             self.trade_state = TradeState(os.path.join(self.data_dir, 'trade_state.json'))
         except TradeStatePersistenceError as e:
             # 账本损坏且备份不可恢复（fail-closed）：广播后拒绝启动，绝不失忆运行——
             # 失忆不仅漏管旧仓，日检还会把有真实仓位的品种当空仓重复开仓
-            logger.critical(f'交易状态账本不可恢复，拒绝启动: {e}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 交易状态账本损坏且备份不可恢复，系统已拒绝启动，'
-                    f'请立即人工修复 trade_state.json！\n{e}')
-            except Exception as exc:
-                # 账本损坏是主错误（下方 raise 拒绝启动）；二次告警失败仅留痕。
-                logger.debug('账本损坏告警发送失败: %s', exc)
+            self._alert_critical(
+                f'交易状态账本不可恢复，拒绝启动: {e}',
+                f'[{self.label}] 交易状态账本损坏且备份不可恢复，系统已拒绝启动，'
+                f'请立即人工修复 trade_state.json！\n{e}')
             raise
         try:
             # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入；
@@ -217,14 +227,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
             self.stop_loss_dates = self._load_stop_loss_dates()
         except Exception as exc:
-            # 与账本损坏/启动对账失败同标准：fail-closed 拒启前必须大声告警。
-            logger.critical(f'[{self.label}] 启动状态校验/加载失败，拒绝启动: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 启动状态归属校验或 T+1 状态加载失败，'
-                    f'进程拒绝启动，请立即人工检查: {exc}')
-            except Exception as notify_exc:
-                logger.debug('启动状态失败告警发送失败: %s', notify_exc)
+            self._alert_critical(
+                f'[{self.label}] 启动状态校验/加载失败，拒绝启动: {exc}',
+                f'[{self.label}] 启动状态归属校验或 T+1 状态加载失败，'
+                f'进程拒绝启动，请立即人工检查: {exc}')
             raise
 
         self.scheduler = BackgroundScheduler()
@@ -250,13 +256,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 retention_days=self.config.get('equity_tick_retention_days'),
             )
         except Exception as exc:
-            logger.critical(f'[{self.label}] 权益跟踪器构造失败，拒绝启动: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 权益跟踪器构造失败（权益状态/同步 journal '
-                    f'无法恢复），进程拒绝启动，请立即人工检查: {exc}')
-            except Exception as notify_exc:
-                logger.debug('权益跟踪器构造失败告警发送失败: %s', notify_exc)
+            self._alert_critical(
+                f'[{self.label}] 权益跟踪器构造失败，拒绝启动: {exc}',
+                f'[{self.label}] 权益跟踪器构造失败（权益状态/同步 journal '
+                f'无法恢复），进程拒绝启动，请立即人工检查: {exc}')
             raise
 
         # 启动时必须成功获取权益，重试3次。get_balance 的网络异常（适配层重试耗尽后
@@ -277,15 +280,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             time.sleep(10)
 
         if account_equity is None:
-            logger.critical('系统启动失败：3次尝试后仍无法获取初始账户权益！请检查API密钥和网络连接。')
-            # 退出前尽力补发钉钉：系统静默死掉是最贵的故障模式（与账本损坏路径同标准）
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
-                    f'进程即将退出，请检查API密钥和网络连接！')
-            except Exception as exc:
-                # 启动失败是主错误（下方 sys.exit）；二次告警失败不能阻挠退出。
-                logger.debug('启动失败告警发送失败: %s', exc)
+            self._alert_critical(
+                '系统启动失败：3次尝试后仍无法获取初始账户权益！请检查API密钥和网络连接。',
+                f'[{self.label}] 系统启动失败：3次尝试后仍无法获取初始账户权益，'
+                f'进程即将退出，请检查API密钥和网络连接！')
             sys.exit(1)
 
         self.risk_manager = RiskManager(account_equity, self.config['strategy']['default_risk_per_trade'])
@@ -294,15 +292,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         try:
             self.sync_positions_on_startup()
         except Exception as exc:
-            # 与启动权益失败同标准：进程拒绝带着未对账的账本运行，但退出前
-            # 必须大声告警——裸 traceback 静默死亡是最贵的故障模式。
-            logger.critical(f'[{self.label}] 启动持仓对账失败，拒绝启动: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] 启动持仓对账失败，进程拒绝启动，'
-                    f'请立即人工检查: {exc}')
-            except Exception as notify_exc:
-                logger.debug('启动对账失败告警发送失败: %s', notify_exc)
+            # 进程拒绝带着未对账的账本运行
+            self._alert_critical(
+                f'[{self.label}] 启动持仓对账失败，拒绝启动: {exc}',
+                f'[{self.label}] 启动持仓对账失败，进程拒绝启动，'
+                f'请立即人工检查: {exc}')
             raise
 
     def load_config(self, config_file):
@@ -355,6 +349,12 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             if not (7 <= v <= 3650):
                 raise ValueError(f"config.equity_tick_retention_days 超出允许范围 [7, 3650]: {v}")
             config['equity_tick_retention_days'] = v
+        # 与其余键的显式 null 拒绝族同口径：显式 "dingtalk": null 不做猜测
+        # （缺省=禁用钉钉是明确语义，null 则直接 fail-loud 指路）
+        if 'dingtalk' in config and not isinstance(config['dingtalk'], dict):
+            raise ValueError(
+                '配置项 dingtalk 必须是对象：如需禁用钉钉通知，'
+                '请删除该键或设为 {}')
         config.setdefault('dingtalk', {})
         return config
 
@@ -848,6 +848,19 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.exception(f"{symbol} 发送仓位隔离告警失败")
         return persist_error is None
 
+    def _resolve_matching_intent_then_clear_quarantine(self, symbol, local_position):
+        """对账一致后的统一收尾：先收口同向 intent 再清隔离。
+
+        解除守卫要求意图已定形，顺序反了会让解除空转推迟到下一轮盘中巡检；
+        启动对账与日检共用本方法，防止两处副本失同步。
+        """
+        intent_getter = getattr(self.trade_state, 'get_open_intent', None)
+        intent = intent_getter(symbol) if callable(intent_getter) else None
+        if intent and intent.get('side') == local_position.get('side'):
+            self.trade_state.resolve_open_intent(
+                symbol, intent.get('client_order_id'))
+        self._clear_position_quarantine_after_reconcile(symbol)
+
     def _clear_position_quarantine_after_reconcile(self, symbol):
         # 方向/数量一致还不等于“可解除隔离”：应急余仓可能仍无止损，
         # 或有未知算法单残留。等 guardian 验证/补挂保护后再清。
@@ -950,16 +963,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             self._quarantine_position_mismatch(
                                 symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
                             continue
-                        # 先收口同向 intent 再清隔离：解除守卫要求意图已定形，
-                        # 顺序反了会让解除空转推迟到下一轮盘中巡检。
-                        intent_getter = getattr(
-                            self.trade_state, 'get_open_intent', None)
-                        intent = (
-                            intent_getter(symbol) if callable(intent_getter) else None)
-                        if intent and intent.get('side') == local_position.get('side'):
-                            self.trade_state.resolve_open_intent(
-                                symbol, intent.get('client_order_id'))
-                        self._clear_position_quarantine_after_reconcile(symbol)
+                        self._resolve_matching_intent_then_clear_quarantine(
+                            symbol, local_position)
                         logger.info(f"{symbol} 持仓方向与张数同步成功")
             except Exception as exc:
                 # 单品种启动对账异常绝不连累其余品种，也绝不让构造
@@ -1611,17 +1616,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 symbol, '日检仓位一致但止损保护未能严格确认')
                             failed_symbols.append(symbol)
                             continue
-                        # 先收口同向 intent 再清隔离：解除守卫要求意图已定形，
-                        # 顺序反了会让解除空转推迟到下一轮盘中巡检。
-                        intent_getter = getattr(
-                            self.trade_state, 'get_open_intent', None)
-                        intent = (
-                            intent_getter(symbol)
-                            if callable(intent_getter) else None)
-                        if intent and intent.get('side') == local_position.get('side'):
-                            self.trade_state.resolve_open_intent(
-                                symbol, intent.get('client_order_id'))
-                        self._clear_position_quarantine_after_reconcile(symbol)
+                        self._resolve_matching_intent_then_clear_quarantine(
+                            symbol, local_position)
                     elif local_position and not exchange_position:
                         exit_price = (
                             local_position.get('stop_loss_price') or
@@ -1938,16 +1934,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         except KeyboardInterrupt:
             logger.info("收到中断信号，关闭交易系统...")
         except Exception as exc:
-            # 与启动链同标准：runner 线程死亡（注册/调度启动/心跳循环任一段
-            # 异常）意味着日检/巡检/采样全停而 Web 面板照常——必须大声告警
-            # 后再上抛，保持 api_server 侧 _runner_failure 语义不变。
-            logger.critical(f'[{self.label}] runner 异常退出，后台调度已停止: {exc}')
-            try:
-                self.notifier.notify_error(
-                    f'[{self.label}] runner 线程异常退出，日检/止损巡检/权益采样'
-                    f'已全部停止，请立即人工检查并重启: {exc}')
-            except Exception as notify_exc:
-                logger.debug('runner 异常退出告警发送失败: %s', notify_exc)
+            # runner 线程死亡（注册/调度启动/心跳循环任一段异常）意味着
+            # 日检/巡检/采样全停而 Web 面板照常——大声告警后原样上抛，
+            # 保持 api_server 侧 _runner_failure 语义不变。
+            self._alert_critical(
+                f'[{self.label}] runner 异常退出，后台调度已停止: {exc}',
+                f'[{self.label}] runner 线程异常退出，日检/止损巡检/权益采样'
+                f'已全部停止，请立即人工检查并重启: {exc}')
             raise
         finally:
             try:

@@ -825,9 +825,8 @@ class TradeState:
         if remaining_size is None:
             remaining = current_size - closed_size
         else:
-            remaining = float(remaining_size)
-            if (not math.isfinite(remaining) or remaining <= 0 or
-                    remaining >= current_size):
+            remaining = _require_positive_finite(remaining_size, '交易所余仓数量')
+            if remaining >= current_size:
                 raise ValueError('交易所余仓数量必须介于 0 与当前仓位之间')
             if not math.isclose(
                     closed_size + remaining, current_size,

@@ -205,12 +205,12 @@ class EquityTracker:
                    allow_none=False):
             if value is None and allow_none:
                 return
-            if isinstance(value, bool):
-                raise ValueError(f'{filepath}:{field} 不能是 bool')
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f'{filepath}:{field} 必须是有限数') from exc
+            # 与主账本校验器同口径要求 JSON number：数字字符串（"1000"）能过
+            # float() 但下游裸消费（比较/max）会抛 TypeError，且因校验放行，
+            # .bak 恢复分支永不触发——比 fail-closed 更难定位
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f'{filepath}:{field} 必须是数值')
+            parsed = float(value)
             if not math.isfinite(parsed):
                 raise ValueError(f'{filepath}:{field} 必须是有限数')
             if positive and parsed <= 0:
@@ -1086,6 +1086,12 @@ class EquityTracker:
 
         now = datetime.now()
         with self._lock:
+            # 残留 journal（上次同步提交与回滚双双失败）：必须先整代前滚收口
+            # 再取「旧世代」——否则半事务混合态会被钦定为 old generation，且
+            # 新一轮提交部分失败后的「回滚成功」会把混合态写满六份文件并删除
+            # journal，把可重启修复的状态变成不可恢复的静默统计污染。
+            # 前滚失败则 fail-closed 上抛（与构造路径同口径）。
+            self._recover_equity_sync_journal()
             old_peak = self.load_peak_equity()
             old_history = self.load_equity_history()
             old_qiusuo = self.load_qiusuo_index_state()

@@ -411,6 +411,10 @@ class OkxApi(ExchangeApi):
 
     @staticmethod
     def _finite_nonnegative(value):
+        # 拒 bool：filled=True 会被 float 换算成 1.0 假成交量，在 1 张委托下
+        # 恰好通过归因一致性检查（与 main._finite_nonnegative 同口径）
+        if value is None or isinstance(value, bool):
+            return None
         try:
             parsed = float(value)
         except (TypeError, ValueError):
@@ -964,6 +968,10 @@ class OkxApi(ExchangeApi):
         delta。终态部分成交会按实际币数返回，由上层按实际量挂止损/记账。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向市价单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝开仓：非法方向 {side!r}")
+            return None
         order_side = 'buy' if side == 'long' else 'sell'
 
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
@@ -1087,6 +1095,10 @@ class OkxApi(ExchangeApi):
         交易所净持仓已归零时为 True。上层不得用部分成交结果删除完整账本。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向市价单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝平仓：非法方向 {side!r}")
+            return None
         close_side = 'sell' if side == 'long' else 'buy'
 
         try:
@@ -1515,6 +1527,10 @@ class OkxApi(ExchangeApi):
         amount 单位为币数。
         """
         ccxt_symbol = self._resolve_symbol(symbol)
+        # 真钱下单最后边界白名单：else 兜底会把任何漂移值翻成反方向保护单
+        if side not in ('long', 'short'):
+            logger.critical(f"{ccxt_symbol} 拒绝创建止损：非法方向 {side!r}")
+            return None
         stop_side = 'sell' if side == 'long' else 'buy'
         stop_price = self._align_stop_price(ccxt_symbol, stop_price)
 

@@ -1,6 +1,6 @@
 import api_server as srv
 from api_server import app, logger, _bootstrap, start_runner_thread
-from runtime_guard import acquire_runner_lock
+from runtime_guard import RunnerAlreadyActiveError, acquire_runner_lock
 
 _lock_path = None
 
@@ -11,11 +11,16 @@ def _try_start_runner_once():
     # 重复连接交易所并执行 sync_positions（真钱风险）。本系统必须以 -w 1 单 worker 运行。
     try:
         _lock_path = acquire_runner_lock()
-    except Exception:
+    except RunnerAlreadyActiveError:
         logger.critical('WSGI: 已有实例持锁，本 worker 启动失败并退出。'
                         '本系统必须使用 gunicorn.conf.py 的单 worker 配置！')
         # 不留「半可用」worker（manager 未初始化会 503）：直接让本 worker 启动失败
         raise RuntimeError('检测到重复 runner：请使用 gunicorn -c gunicorn.conf.py')
+    except Exception as exc:
+        # 锁目录属主/权限等部署故障不得误诊为「重复实例」：如实记录后原样
+        # 上抛，保持 fail-loud 且不误导处置方向
+        logger.critical(f'WSGI: runner 锁获取失败（部署环境问题，非重复实例）: {exc}')
+        raise
 
     _bootstrap()
     start_runner_thread(srv.trading_system)

@@ -21,8 +21,11 @@ class _FakeNotifier:
         self.trade_close_summary_calls = 0
         self.trade_close_summary_payload = None
 
+    last_total_equity = 'unset'
+
     def notify_position_summary(self, positions, symbols_config, total_equity):
         self.calls += 1
+        self.last_total_equity = total_equity
         return self.result
 
     def send_message(self, title, content):
@@ -76,6 +79,19 @@ class DailySummaryDeliveryTest(unittest.TestCase):
                 restarted.trade_state.get_last_daily_summary_date())
             self.assertFalse(restarted.send_daily_position_summary_if_due())
             self.assertEqual(0, restarted.notifier.calls)
+
+    def test_summary_equity_parse_rejects_bool_nan_and_garbage(self):
+        """汇总权益与采样/统计同一校验口径：bool/NaN/垃圾/0 解析为 None
+        落入通知端「未知」分支，绝不渲染 1.00U/nanU 假权益。"""
+        for bad in (True, float('nan'), 'garbage', None, 0):
+            system = self._build_system(notify_result=True)
+            system.exchange_api = SimpleNamespace(
+                get_balance=lambda bad=bad: {'total': {'USDT': bad}})
+            self.assertTrue(system.send_daily_position_summary_if_due())
+            self.assertIsNone(system.notifier.last_total_equity, repr(bad))
+        system = self._build_system(notify_result=True)
+        self.assertTrue(system.send_daily_position_summary_if_due())
+        self.assertEqual(1000.0, system.notifier.last_total_equity)
 
     def test_daily_summary_failure_does_not_mark_day_as_sent(self):
         system = self._build_system(notify_result=False)

@@ -74,6 +74,54 @@ class EquityStatePersistenceTest(unittest.TestCase):
             self.assertTrue(tracker.save_peak_equity(
                 {'peak_equity': 2000.0, 'peak_time': None}))
 
+    def test_retry_sync_with_unrecoverable_journal_fails_closed(self):
+        """残留 journal 无法恢复时重试 equity_sync 必须 fail-closed：直接
+        叠加新 journal 会把半事务混合态钦定为「旧一代」并覆写恢复凭据。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = self._tracker(temp_dir)
+            tracker.system.exchange_api = SimpleNamespace(
+                get_balance=lambda: {'total': {'USDT': 500.0}})
+            tracker.system.trade_state = SimpleNamespace(
+                get_all_open_positions=lambda: {})
+            with open(tracker.EQUITY_SYNC_JOURNAL_FILE, 'w',
+                      encoding='utf-8') as f:
+                json.dump({'version': 1}, f)
+            os.chmod(tracker.EQUITY_SYNC_JOURNAL_FILE, 0o600)
+            with self.assertRaises(EquityStatePersistenceError):
+                tracker.equity_sync()
+            # 残留 journal 未被覆写（恢复凭据保留给重启前滚）
+            with open(tracker.EQUITY_SYNC_JOURNAL_FILE) as f:
+                self.assertEqual({'version': 1}, json.load(f))
+
+    def test_retry_sync_rolls_forward_valid_residual_journal_first(self):
+        """残留 journal 可恢复时，重试 equity_sync 先整代前滚收口再取
+        「旧世代」——用前滚后的 initial_equity 证明顺序。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = self._tracker(temp_dir)
+            tracker.system.exchange_api = SimpleNamespace(
+                get_balance=lambda: {'total': {'USDT': 800.0}})
+            tracker.system.trade_state = SimpleNamespace(
+                get_all_open_positions=lambda: {})
+            tracker.equity_sync()   # 建立一代干净基准（initial=800，无残留）
+
+            old_gen = {
+                'peak': tracker.load_peak_equity(),
+                'history': tracker.load_equity_history(),
+                'qiusuo': tracker.load_qiusuo_index_state(),
+            }
+            new_gen = json.loads(json.dumps(old_gen))
+            new_gen['history']['initial_equity'] = 700.0
+            with open(tracker.EQUITY_SYNC_JOURNAL_FILE, 'w',
+                      encoding='utf-8') as f:
+                json.dump({'version': 1, 'old': old_gen, 'new': new_gen}, f)
+            os.chmod(tracker.EQUITY_SYNC_JOURNAL_FILE, 0o600)
+
+            result = tracker.equity_sync()
+            # old_initial=700 证明先前滚（new 世代）再加载，而非混合态直读
+            self.assertEqual(700.0, result['old_initial'])
+            self.assertFalse(
+                os.path.exists(tracker.EQUITY_SYNC_JOURNAL_FILE))
+
     def test_valid_backup_recovers_corrupt_main(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = self._tracker(temp_dir)

@@ -796,6 +796,20 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system.exchange_api.open_position.assert_not_called()
         self.assertEqual(10000, system.risk_manager.account_equity)
 
+    def test_bool_or_nan_usdt_equity_refuses_open(self):
+        """开仓前权益重取与启动解析同口径：True 会被 float 换算成 1.0
+        假权益、NaN 会静默穿过风险计算，均须拒绝开仓且不覆盖风险基准。"""
+        for bad in (True, float('nan'), 'garbage'):
+            system = self.make_system()
+            system.exchange_api.get_balance.return_value = {'total': {'USDT': bad}}
+
+            system._execute_open(
+                'BTCUSDT', 'long', 100, 80,
+                {'name': 'BTCUSDT', 'risk_per_trade': 0.01})
+
+            system.exchange_api.open_position.assert_not_called()
+            self.assertEqual(10000, system.risk_manager.account_equity, repr(bad))
+
     def test_rolls_back_when_fill_price_crosses_stop(self):
         system = self.make_system()
         system.exchange_api.exchange.fetch_ticker.return_value = {"last": 82}
