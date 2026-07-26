@@ -641,6 +641,9 @@ class OkxApi(ExchangeApi):
                                 actual_contracts, *, fully_closed=None, source='order+position'):
         """构造上层契约：amount/requested_amount 均为币数，张数不外泄。"""
         result = dict(order or {})
+        # ccxt 原生 filled/remaining/amount 均为张数，剔除后上层只见币数字段
+        result.pop('filled', None)
+        result.pop('remaining', None)
         result['amount'] = self._contracts_to_coins(ccxt_symbol, actual_contracts)
         result['requested_amount'] = self._contracts_to_coins(ccxt_symbol, requested_contracts)
         result['confirmed'] = True
@@ -1181,9 +1184,9 @@ class OkxApi(ExchangeApi):
                 f'{ccxt_symbol} 命中 {len(existing_legs)} 条幂等平仓腿，'
                 '已汇总真实终态且未重复下单')
         else:
-            target_contracts = (
-                min(requested_contracts, pre_contracts)
-                if requested_contracts > 0 else pre_contracts)
+            # 走到这里必然 requested_contracts > tolerance（0 张请求已在上方
+            # fail-loud 拒绝），只需夹住不超平。
+            target_contracts = min(requested_contracts, pre_contracts)
             total_filled_contracts = 0.0
             last_contracts = pre_contracts
             legs = []
@@ -1277,9 +1280,10 @@ class OkxApi(ExchangeApi):
         aggregate['clientOrderIds'] = [leg.get('clientOrderId') for leg, _qty in legs]
         aggregate['amount'] = self._contracts_to_coins(ccxt_symbol, total_filled_contracts)
         aggregate['requested_amount'] = self._contracts_to_coins(ccxt_symbol, target_contracts)
-        # 张数不外泄：末腿信封带来的 ccxt 原生 filled（张数）一并剔除，
-        # 上层统一消费币数字段 amount/requested_amount/remaining_amount
+        # 张数不外泄：末腿信封带来的 ccxt 原生 filled/remaining（张数）一并
+        # 剔除，上层统一消费币数字段 amount/requested_amount/remaining_amount
         aggregate.pop('filled', None)
+        aggregate.pop('remaining', None)
         aggregate['confirmed'] = True
         aggregate['fully_filled'] = (
             total_filled_contracts + tolerance >= target_contracts)

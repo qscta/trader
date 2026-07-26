@@ -765,6 +765,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
     def _clear_position_quarantine_after_reconcile(self, symbol):
         # 方向/数量一致还不等于“可解除隔离”：应急余仓可能仍无止损，
         # 或有未知算法单残留。等 guardian 验证/补挂保护后再清。
+        # pending open intent 未收口时账本尚未定形，同样不得解除隔离。
+        get_intent = getattr(self.trade_state, 'get_open_intent', None)
+        if callable(get_intent) and get_intent(symbol) is not None:
+            return False
         get_position = getattr(self.trade_state, 'get_open_position', None)
         position = get_position(symbol) if callable(get_position) else None
         if position and (
@@ -1632,9 +1636,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     target_side = signal.get('action')
                     if target_side in ('long', 'short'):
                         post_position = self.trade_state.get_open_position(symbol)
+                        # 退池品种的生命周期已完成态：本根交叉平掉了反向旧仓，
+                        # 或分派前就已无仓（退池禁止新开，属刻意不开而非失败）。
+                        # 两种形态都必须消费 marker，否则整天重跑+告警轰炸。
                         retired_exit_complete = bool(
                             symbol_config.get('_retired_from_pool') and
-                            position and position.get('side') != target_side and
+                            (position is None or
+                             position.get('side') != target_side) and
                             not post_position)
                         # T+1 阻断日的新开仓是「刻意不开」而非失败：本根交叉由
                         # T+1 规则消费，次日重入按当时 EMA 方向恢复「永远在市」。

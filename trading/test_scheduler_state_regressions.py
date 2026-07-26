@@ -740,6 +740,32 @@ class MaMarkerIntegrationTest(unittest.TestCase):
                 'ETHUSDT', system.trade_state.get_stop_loss_dates())
             self.assertNotIn('ETHUSDT', system.stop_loss_dates)
 
+    def test_retired_flat_close_same_candle_cross_consumes_marker(self):
+        """退池品种在日检对账中记平（交易所已被外部平仓）后，同根 K 线又
+        出现新交叉：退池禁止新开属「刻意不开」而非失败，必须消费本根标记
+        并标记当日完成（此前 position 已被记平置空导致豁免不成立→该品种
+        确定性全天重跑+告警轰炸，且永远无法自愈）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, held_side='short')
+            system.config['trading']['symbols'][0]['enabled'] = False
+            system.exchange_api.get_position = Mock(return_value=None)
+            system.exchange_api.cancel_order = lambda *args, **kwargs: True
+            system.exchange_api.cancel_all_orders = lambda *args, **kwargs: True
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(), 't5', 1))
+            system._execute_open = Mock(
+                side_effect=AssertionError('退池品种不得开新仓'))
+
+            system.check_and_execute_trades()
+
+            metadata = system.trade_state.get_signal_metadata('BTCUSDT')
+            self.assertEqual('t5', metadata['last_processed_candle'])
+            self.assertIsNotNone(system._last_check_date)
+            # 退池平仓不得记 T+1，否则品种重新入池后次日会无交叉自动重入
+            self.assertNotIn(
+                'BTCUSDT', system.trade_state.get_stop_loss_dates())
+            system._execute_open.assert_not_called()
+
     def test_failed_ma_open_does_not_advance_candle_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             system = self._system(tmp)

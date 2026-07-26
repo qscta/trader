@@ -11,7 +11,7 @@
 宿主须提供：exchange_api / trade_state / notifier / risk_manager / config /
 record_stop_loss / _cancel_stop_order_confirmed /
 _close_trade_state_with_runtime_fallback / _notify_trade_state_persistence_issue /
-_mark_ma_cross_reentry_pending / _finalize_open_intent_rollback /
+_notify_ma_open_leg_failed / _finalize_open_intent_rollback /
 _buffer_trade_open_notification / _buffer_trade_close_notification。
 """
 
@@ -485,7 +485,7 @@ class TradeExecutorMixin:
             # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：
             # 不把执行故障伪装成止损 T+1；保留本根 candle marker，交给当日
             # 08:01/30 分钟兜底按同一个最新交叉重试。跨日后不追补旧信号。
-            self._mark_ma_cross_reentry_pending(
+            self._notify_ma_open_leg_failed(
                 symbol, new_side, signal,
                 '双均线翻转反手开仓未成功；保留本根交叉等待日内重试，请复核交易所与日志')
             logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，保留交叉等待日内重试")

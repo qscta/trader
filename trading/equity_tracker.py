@@ -462,8 +462,6 @@ class EquityTracker:
         current_equity = _coerce_positive_float(balance['total'].get('USDT'))
         if current_equity is None:
             raise RuntimeError('账户权益读取无效（total.USDT 非正有限数），拒绝计算统计')
-        free_balance = _coerce_positive_float(
-            (balance.get('free') or {}).get('USDT')) or 0.0
         open_positions = self.system.trade_state.get_all_open_positions()
         total_unrealized_pnl = 0
         total_stop_loss_amount = 0
@@ -564,7 +562,6 @@ class EquityTracker:
 
         stats = {
             'current_equity': current_equity,
-            'free_balance': free_balance,
             'unrealized_pnl': total_unrealized_pnl,
             'peak_equity': peak_equity,
             'peak_time': peak_time,

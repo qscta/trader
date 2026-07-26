@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class SignalHandlersMixin:
 
-    def _mark_ma_cross_reentry_pending(self, symbol, side, signal, reason):
+    def _notify_ma_open_leg_failed(self, symbol, side, signal, reason):
         """双均线开仓腿失败后统一告警；K 线不推进，由日内调度幂等重试。
 
         T+1 只属于真实止损事件。把网络/下单失败伪装成“今天已止损”会阻断
@@ -45,7 +45,7 @@ class SignalHandlersMixin:
             stop_loss_price = signal['lower_stop']
             self._execute_open(symbol, 'long', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._mark_ma_cross_reentry_pending(
+                self._notify_ma_open_leg_failed(
                     symbol,
                     'long',
                     signal,
@@ -57,7 +57,7 @@ class SignalHandlersMixin:
             stop_loss_price = signal['upper_stop']
             self._execute_open(symbol, 'short', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
-                self._mark_ma_cross_reentry_pending(
+                self._notify_ma_open_leg_failed(
                     symbol,
                     'short',
                     signal,

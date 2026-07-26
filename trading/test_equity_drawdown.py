@@ -236,6 +236,37 @@ class DrawdownStatsTest(unittest.TestCase):
         self.assertEqual(100, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
 
 
+class AwarePeakTimeRegressionTest(unittest.TestCase):
+    """带时区 offset 的合法 ISO peak_time 必须归一（UTC+8→naive）后正常计算。
+
+    旧实现直接 `now - fromisoformat(peak_time)`：aware/naive 相减抛
+    TypeError 被吞 → days_since_peak 静默归零，未创新高统计全线失真。"""
+
+    def _make_aware(self, **kwargs):
+        tmp, t = _make(**kwargs)
+        path = os.path.join(tmp, 'peak_equity.json')
+        peak = _jload(path)
+        peak['peak_time'] += '+08:00'   # 同一北京时间点的 aware 表示
+        _jdump(peak, path)
+        return tmp, t
+
+    def test_aware_peak_time_still_counts_days_since_peak(self):
+        _, t = self._make_aware(equity=90, peak=100, peak_days_ago=5, longest=3)
+        d = t.build_account_stats(persist=False)
+        self.assertEqual(d['days_since_peak'], 5)
+        self.assertEqual(d['longest_drawdown_days'], 5)
+
+    def test_aware_peak_time_new_high_still_settles_streak(self):
+        tmp, t = self._make_aware(
+            equity=110, peak=100, peak_days_ago=5, longest=3)
+        t.record_daily_equity_snapshot()
+        d = t.build_account_stats(persist=True)
+        self.assertEqual(d['days_since_peak'], 0)
+        self.assertEqual(d['longest_drawdown_days'], 5)
+        hist = _jload(os.path.join(tmp, 'equity_history.json'))
+        self.assertEqual(hist['longest_drawdown_days'], 5)
+
+
 class TickCompactionConcurrencyTest(unittest.TestCase):
     def test_compaction_cannot_overwrite_a_concurrent_new_tick(self):
         with tempfile.TemporaryDirectory() as tmp:
