@@ -134,7 +134,7 @@ class StopGuardianMixin:
         if exchange_position is not None and exchange_position.get('contracts', 0) > 0:
             verifier = getattr(self, '_verify_existing_position_or_quarantine', None)
             if callable(verifier) and not verifier(
-                    symbol, position, exchange_position, clear_on_match=False):
+                    symbol, position, exchange_position):
                 return
             protected = self._ensure_stop_order_alive(
                 symbol, ccxt_symbol, position, strategy_name)

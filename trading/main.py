@@ -17,7 +17,7 @@ from risk_manager import RiskManager
 from dingtalk_notifier import DingTalkNotifier
 from trade_state import (
     TradeState, TradeStatePersistenceError, atomic_write_json,
-    open_private_text_file, private_file_exists,
+    finite_nonnegative_or_none, open_private_text_file, private_file_exists,
 )
 from stop_guardian import StopGuardianMixin
 from reporting import ReportingMixin
@@ -312,6 +312,20 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             config['okx'] = okx_block
             config.setdefault('strategy', okx_block.get('strategy', {}))
             config.setdefault('trading', okx_block.get('trading', {'symbols': []}))
+        # 显式 null/类型漂移拒绝族（置于旧格式展平之后）：五个顶层键任一为
+        # null 或非预期类型时给出可定位的 ValueError，而不是裸 TypeError/
+        # AttributeError（setdefault 对已存在的 null 键是 no-op）。
+        for key in ('okx', 'strategy', 'trading', 'scheduler'):
+            if key in config and not isinstance(config[key], dict):
+                raise ValueError(
+                    f'配置项 {key} 必须是对象，不允许显式 null；'
+                    f'如需默认值请删除该键')
+        if (isinstance(config.get('trading'), dict) and
+                'symbols' in config['trading'] and
+                not isinstance(config['trading']['symbols'], list)):
+            raise ValueError(
+                '配置项 trading.symbols 必须是数组，不允许显式 null；'
+                '如需空池请设为 []')
         okx = config.setdefault('okx', {})
         # 记住磁盘上原始凭据。环境变量只是运行时覆盖，之后 API 持久化
         # 策略配置时必须恢复这些原值，不能把 env-only 密钥扩散到文件/备份。
@@ -884,8 +898,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return False
 
     def _verify_existing_position_or_quarantine(
-            self, symbol, local_position, exchange_position, clear_on_match=True):
-        """两边都有仓时必须方向+张数完整一致。"""
+            self, symbol, local_position, exchange_position):
+        """两边都有仓时必须方向+张数完整一致。
+
+        本方法只裁决一致性，绝不解除隔离：解除必须由调用方在交易所侧止损
+        严格确认（_ensure_stop_order_alive）与 intent 收口之后显式执行——
+        方向/张数一致还不等于「可解除隔离」。
+        """
         try:
             details = self._position_reconciliation_details(
                 symbol, local_position, exchange_position)
@@ -899,8 +918,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 f"交易所 {details['exchange_side']} {details['exchange_contracts']} 张")
             self._quarantine_position_mismatch(symbol, reason, details)
             return False
-        if clear_on_match:
-            self._clear_position_quarantine_after_reconcile(symbol)
         return True
 
     def sync_positions_on_startup(self):
@@ -955,7 +972,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 else:
                     local_position = open_positions[symbol]
                     if self._verify_existing_position_or_quarantine(
-                            symbol, local_position, position, clear_on_match=False):
+                            symbol, local_position, position):
                         strategy_type = local_position.get('strategy') or 'ma_cross'
                         strategy_name = self._get_strategy_display_name(strategy_type)
                         if not self._ensure_stop_order_alive(
@@ -1127,15 +1144,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return symbol_config, retired
 
 
-    @staticmethod
-    def _finite_nonnegative(value):
-        if value is None or isinstance(value, bool):
-            return None
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) and value >= 0 else None
+    # 共享原语（trade_state.finite_nonnegative_or_none）：三处副本历史上
+    # 各自漂移（漏拒 bool）已实际出过缺口，收敛为单一实现。
+    _finite_nonnegative = staticmethod(finite_nonnegative_or_none)
 
     def _pending_order_resolution(self, order):
         """将只读查到的旧订单归一为 (terminal, filled_contracts)。"""
@@ -1605,8 +1616,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         continue
                     if local_position and exchange_position:
                         if not self._verify_existing_position_or_quarantine(
-                                symbol, local_position, exchange_position,
-                                clear_on_match=False):
+                                symbol, local_position, exchange_position):
                             failed_symbols.append(symbol)
                             continue
                         if not self._ensure_stop_order_alive(

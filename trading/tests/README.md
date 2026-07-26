@@ -7,7 +7,8 @@
 - 双均线 T+1 重入
 - `instant_open` / `delete_symbol` / 输入校验 / 策略参数校验等 API 路由行为
 - 开仓与主动平仓两阶段意图、确定性多腿幂等恢复、归因隔离、部分回滚余仓建账
-- make-before-break 止损更新、持久化失败补偿、调度/进程生命周期
+- 持久化失败补偿、调度/进程生命周期（make-before-break 止损缩量在根目录
+  标准库套件 `test_partial_close_reconciliation.py` 覆盖）
 
 ## 运行
 

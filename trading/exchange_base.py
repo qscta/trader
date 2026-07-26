@@ -98,8 +98,10 @@ class ExchangeApi:
         """市价平仓。amount 单位为‘币数’。"""
         raise NotImplementedError
 
-    def create_stop_loss_order(self, symbol, side, amount, stop_price):
-        """创建止损单（触发后市价平仓）。amount 单位为‘币数’。"""
+    def create_stop_loss_order(self, symbol, side, amount, stop_price,
+                               client_order_id=None):
+        """创建止损单（触发后市价平仓）。amount 单位为‘币数’；
+        client_order_id 为幂等 algoClOrdId（可选）。"""
         raise NotImplementedError
 
     def cancel_order(self, symbol, order_id):

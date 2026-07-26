@@ -439,9 +439,11 @@ class PositionReconciliationStateTest(unittest.TestCase):
             self.assertTrue(TradeState(
                 os.path.join(tmp, 'trade_state.json')).is_position_quarantined('BTCUSDT'))
 
+            # 一致只裁决、绝不解除隔离：解除必须由调用方在交易所侧止损
+            # 严格确认与 intent 收口之后显式执行（生产三个调用点均如此）
             self.assertTrue(system._verify_existing_position_or_quarantine(
                 'BTCUSDT', local, {'side': 'long', 'contracts': 10}))
-            self.assertFalse(system.trade_state.is_position_quarantined('BTCUSDT'))
+            self.assertTrue(system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_quarantine_disk_failure_still_blocks_in_current_process(self):
         with tempfile.TemporaryDirectory() as tmp:

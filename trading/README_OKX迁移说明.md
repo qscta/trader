@@ -39,6 +39,8 @@
 
 - 凭据也可用环境变量：`OKX_API_KEY` / `OKX_API_SECRET` / `OKX_API_PASSPHRASE`、`DINGTALK_WEBHOOK`。
 - **向后兼容**：旧的 `{"exchanges": {"okx": {...}}}` 嵌套结构会被 `load_config()` 自动拍平为顶层 `okx`，无需手改即可运行。
+- **模拟盘只认 `sandbox` 键**：早期未文档化的别名键 `demo` 已移除——若你的
+  config.json 曾手写 `"demo": true`，升级后会按实盘运行，请改用 `"sandbox": true`。
 - **双均线默认参数**：`ma_short_period` 默认 **7**、`ma_long_period` 默认 **28**（仅改默认值；若你的 config.json 已显式写了短周期，则按你的配置走，不强制覆盖）。
 
 ## 三、前端（单所）

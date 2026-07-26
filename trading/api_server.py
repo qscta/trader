@@ -338,7 +338,9 @@ def require_auth(f):
         if session.get('authenticated'):
             return f(*args, **kwargs)
         token = request.headers.get('X-API-Token')
-        if API_TOKEN and token:
+        if token:
+            # token 未配置的部署也走同一退避簿记与 429：否则 429/401 差异会
+            # 泄露「token 是否启用」（与已消除的 500/401 探测同一威胁模型）
             ip = request.remote_addr or 'unknown'
             now = time.time()
             with _login_guard:
@@ -352,7 +354,7 @@ def require_auth(f):
             # 编码成 bytes 再比：compare_digest 对 str 仅支持 ASCII，攻击者发一个非 ASCII 的
             # X-API-Token 头会抛 TypeError（装饰器内无捕获）→ 500 而非干净 401，还能借此探测
             # token 是否启用。bytes 无此限制。（与 api_login 密码比较同一口径）
-            if secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
+            if API_TOKEN and secrets.compare_digest(token.encode('utf-8'), API_TOKEN.encode('utf-8')):
                 with _login_guard:
                     _token_failures.pop(ip, None)
                 return f(*args, **kwargs)

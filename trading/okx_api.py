@@ -7,6 +7,7 @@ import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 from exchange_base import ExchangeApi, retry_on_network_error
+from trade_state import finite_nonnegative_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,9 @@ class OkxApi(ExchangeApi):
                 'defaultType': 'swap',
             },
         })
-        if config.get('sandbox') or config.get('demo'):
+        # 只认文档化的 sandbox 键（verify_okx/迁移说明同口径）：未文档化的
+        # 别名键会绕过三入口校验且让 verify 的实盘/模拟盘判定与主程序分叉
+        if config.get('sandbox'):
             ex.set_sandbox_mode(True)   # OKX 模拟盘（demo trading）
             logger.info("OKX 已切换到模拟盘模式")
         return ex
@@ -409,17 +412,10 @@ class OkxApi(ExchangeApi):
         # 仅容忍浮点表示噪声，绝不把“少半个步长”当作完整成交。
         return max(1e-12, (10 ** (-precision)) * 1e-9)
 
-    @staticmethod
-    def _finite_nonnegative(value):
-        # 拒 bool：filled=True 会被 float 换算成 1.0 假成交量，在 1 张委托下
-        # 恰好通过归因一致性检查（与 main._finite_nonnegative 同口径）
-        if value is None or isinstance(value, bool):
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed if math.isfinite(parsed) and parsed >= 0 else None
+    # 共享原语（trade_state.finite_nonnegative_or_none）：拒 bool——
+    # filled=True 会被 float 换算成 1.0 假成交量，在 1 张委托下恰好
+    # 通过归因一致性检查。副本各自漂移历史上已实际出过该缺口。
+    _finite_nonnegative = staticmethod(finite_nonnegative_or_none)
 
     @staticmethod
     def _order_reduce_only(order):

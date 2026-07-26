@@ -219,6 +219,29 @@ class ContractSizeFailClosedTest(unittest.TestCase):
             ['BTCUSDT', 'DOGEUSDT'], sorted(api.list_position_symbols()))
 
 
+class SideWhitelistTest(unittest.TestCase):
+    """真钱下单最后边界：side 漂移值绝不允许被 else 兜底翻成反方向真实市价单，
+    必须在任何交易所调用之前拒绝。"""
+
+    def test_open_close_stop_refuse_malformed_side(self):
+        for bad in ('buy', 'sell', 'LONG', '', None, 1):
+            for method, args in (
+                    ('open_position', ('BTCUSDT', bad, 0.01)),
+                    ('close_position', ('BTCUSDT', bad, 0.01)),
+                    ('create_stop_loss_order', ('BTCUSDT', bad, 0.01, 50000))):
+                api = _bare_api()
+                api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+                with self.subTest(method=method, bad=bad):
+                    self.assertIsNone(getattr(api, method)(*args))
+                    self.assertEqual([], api.exchange.mock_calls)
+
+    def test_finite_nonnegative_rejects_bool_and_none(self):
+        for bad in (True, False, None, float('nan'), -1, 'x'):
+            self.assertIsNone(OkxApi._finite_nonnegative(bad), repr(bad))
+        self.assertEqual(3.0, OkxApi._finite_nonnegative('3'))
+        self.assertEqual(0.0, OkxApi._finite_nonnegative(0))
+
+
 class LastPriceValidationTest(unittest.TestCase):
     """市价读取唯一入口 fail-loud：None/bool/NaN/inf/0/负价一律拒绝，
     不得以假价流入止损距离与市值计算。"""

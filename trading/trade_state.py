@@ -117,7 +117,10 @@ def atomic_write_json(filepath, data):
         return False
 
 
-def _normalise_optional_fee(value):
+def finite_nonnegative_or_none(value):
+    """「有限非负数或 None」共享原语：None/bool/不可转换/非有限/负数一律
+    归 None。费用规范化、成交量/均价归因（okx_api）、订单终态解析（main）
+    三处消费同一实现——历史上副本各自漂移（漏拒 bool）已实际出过缺口。"""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -125,6 +128,10 @@ def _normalise_optional_fee(value):
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) and value >= 0 else None
+
+
+def _normalise_optional_fee(value):
+    return finite_nonnegative_or_none(value)
 
 
 def _require_positive_finite(value, field):
@@ -1349,17 +1356,12 @@ class TradeState:
             overflow_count = len(closed) - self.keep_recent_closed
             if overflow_count <= 0:
                 return 0
-            archive, ok = self._read_archive()
+            _archive, ok = self._read_archive(copy_records=False)
             if not ok:
                 return 0  # 史书损坏：保留账本全部记录等人工修复，_read_archive 已记日志
             overflow = closed[:overflow_count]
-            # 上轮可能崩溃在“史书已追加、账本尚未收缩”。只能跳过
-            # archive 后缀与 overflow 前缀的最大有序重叠；集合式 `t not in tail`
-            # 会把两笔内容恰好相同的真实成交误删掉。
-            overlap = self._ordered_archive_overlap(archive, overflow)
-            to_append = overflow[overlap:]
             grouped = {}
-            for record in to_append:
+            for record in overflow:
                 grouped.setdefault(self._archive_year(record), []).append(record)
             for year, records in sorted(grouped.items()):
                 path = os.path.join(
@@ -1373,7 +1375,16 @@ class TradeState:
                         f'读取年度平仓史书失败，本轮跳过（账本保留全部记录）: '
                         f'{path}: {exc}')
                     return 0
-                if not atomic_write_json(path, existing + records):
+                # 上轮可能崩溃在“史书已追加、账本尚未收缩”。追加永远发生在
+                # 具体分卷末尾且组内顺序保持，因此在每个目标分卷内做后缀/前缀
+                # 最大有序重叠去重——全局合并序会把 undated 分卷排到最前，
+                # 全局后缀匹配对它失效；集合式 `t not in tail` 则会把两笔
+                # 内容恰好相同的真实成交误删掉。
+                overlap = self._ordered_archive_overlap(existing, records)
+                to_append = records[overlap:]
+                if not to_append:
+                    continue  # 该分卷上轮已完整写入，重试无需重写
+                if not atomic_write_json(path, existing + to_append):
                     logger.error(
                         f'年度平仓史书写入失败，本轮跳过（账本保留全部记录）: {path}')
                     return 0

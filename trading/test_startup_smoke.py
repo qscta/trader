@@ -166,6 +166,15 @@ class StartupSmokeTest(unittest.TestCase):
              lambda cfg: cfg['strategy'].update({'ma_short_period': None})),
             ('scheduler.check_minute',
              lambda cfg: cfg.setdefault('scheduler', {}).update({'check_minute': None})),
+            # 顶层键显式 null：setdefault 对已存在键是 no-op，未拦截会以裸
+            # TypeError/AttributeError 崩溃且无法定位配置问题
+            ('okx=null', lambda cfg: cfg.update({'okx': None})),
+            ('strategy=null', lambda cfg: cfg.update({'strategy': None})),
+            ('trading=null', lambda cfg: cfg.update({'trading': None})),
+            ('scheduler=null', lambda cfg: cfg.update({'scheduler': None})),
+            ('trading.symbols=null',
+             lambda cfg: cfg['trading'].update({'symbols': None})),
+            ('dingtalk=null', lambda cfg: cfg.update({'dingtalk': None})),
         ]
         for label, mutate in cases:
             with tempfile.TemporaryDirectory() as tmp:
