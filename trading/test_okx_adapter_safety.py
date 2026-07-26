@@ -161,6 +161,35 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         self.assertEqual(api._get_contract_size('BTC/USDT:USDT'), 0.01)
         self.assertEqual(api._contract_size_cache['BTC/USDT:USDT'], 0.01)
 
+    def test_bool_contract_size_raises(self):
+        """bool 会被 float 换算成 1.0 假面值，必须与畸形值同等 fail-closed。"""
+        api = _bare_api()
+        api.exchange.market.return_value = {'contractSize': True}
+        with self.assertRaises(ContractSizeUnavailable):
+            api._get_contract_size('BTC/USDT:USDT')
+        self.assertNotIn('BTC/USDT:USDT', api._contract_size_cache)
+
+    def test_prefill_market_cache_rejects_malformed_contract_size(self):
+        """预填是生产主路径：畸形面值绝不入缓存（绕过惰性守卫即污染全部换算），
+        校验不过跳过该品种，真正使用时由惰性路径 fail-loud。"""
+        def _market(contract_size):
+            return {
+                'type': 'swap', 'quote': 'USDT', 'settle': 'USDT',
+                'contractSize': contract_size, 'precision': {'amount': 1},
+            }
+
+        api = _bare_api()
+        api.exchange.load_markets.return_value = {
+            'BTC/USDT:USDT': _market(0.01),
+            'ETH/USDT:USDT': _market('1e999'),
+            'SOL/USDT:USDT': _market(float('nan')),
+            'DOGE/USDT:USDT': _market(-0.01),
+            'XRP/USDT:USDT': _market(True),
+            'ADA/USDT:USDT': _market(None),
+        }
+        api._load_market_cache()
+        self.assertEqual({'BTC/USDT:USDT': 0.01}, api._contract_size_cache)
+
     def test_coin_contract_round_trip_never_loses_exact_contract(self):
         """回归：49*0.0001 再除回面值不得被 ccxt TRUNCATE 成 48 张。"""
         api = _bare_api()
@@ -188,6 +217,24 @@ class ContractSizeFailClosedTest(unittest.TestCase):
         ]
         self.assertEqual(
             ['BTCUSDT', 'DOGEUSDT'], sorted(api.list_position_symbols()))
+
+
+class LastPriceValidationTest(unittest.TestCase):
+    """市价读取唯一入口 fail-loud：None/bool/NaN/inf/0/负价一律拒绝，
+    不得以假价流入止损距离与市值计算。"""
+
+    def test_malformed_last_price_fails_loud(self):
+        api = _bare_api()
+        for bad in (None, True, False, float('nan'), float('inf'), 0, -1, '0'):
+            api.exchange.fetch_ticker.return_value = {'last': bad}
+            with self.subTest(bad=bad), \
+                    self.assertRaises((TypeError, ValueError)):
+                api.get_last_price('BTC/USDT:USDT')
+
+    def test_valid_last_price_returned(self):
+        api = _bare_api()
+        api.exchange.fetch_ticker.return_value = {'last': '65000.5'}
+        self.assertEqual(65000.5, api.get_last_price('BTC/USDT:USDT'))
 
 
 class PositionModeFailClosedTest(unittest.TestCase):

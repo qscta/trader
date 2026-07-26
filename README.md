@@ -7,7 +7,7 @@
 [![tests](https://github.com/qscta/trader/actions/workflows/tests.yml/badge.svg)](https://github.com/qscta/trader/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/production%20python-3.12-blue.svg)](https://www.python.org/)
-[![tests count](https://img.shields.io/badge/tests-480%20stdlib%20%2B%20103%20deps-brightgreen.svg)](trading/tests)
+[![tests count](https://img.shields.io/badge/tests-492%20stdlib%20%2B%20104%20deps-brightgreen.svg)](trading/tests)
 
 </div>
 
@@ -31,7 +31,7 @@ Flask 管理台（亮/暗双主题）+ 钉钉通知。
 - **三条防线将不确定性收缩为 fail-closed / 隔离状态**——账本损坏/误删拒启，撤单以完整分页清单+订单终态复验，止损每 5 分钟做四态裁决（intact / adoptable / mismatch / missing）。网络或交易所无法证明时会停止自动动作并隔离，不作“永远”承诺。
 - **单一事实源配置校验**——前端表单 / HTTP API / 手写 config.json 三入口由同一套 `config_validation` 原语把关，杜绝字符串混入下单路径、非法参数带病启动。
 - **物理分层的清晰架构**——装配核心 + 四个 mixin（止损防线 / 通知报表 / 信号分派 / 下单执行），真钱编排集中一处便于审查。
-- **583 个测试**——480 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 103 个依赖版集成用例。
+- **596 个测试**——492 个纯标准库用例（零依赖即可跑，含并发混沌 / 灾难恢复 / 变异测试）+ 104 个依赖版集成用例。
 - **行情 fail-closed**——策略日检固定读取 OKX 最新单页 300 根，不为指标计算分页；最新已收盘日 K 陈旧、数据量不足或历史出现大跨度断层时，禁止该品种开仓、平仓、反手等一切策略动作。
 
 ## 🏗️ 架构
@@ -82,6 +82,7 @@ cp config.example.json config.json        # 填入 OKX 凭据与钉钉 webhook�
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --stop-id-reuse
 gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```
 
@@ -94,13 +95,13 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 |---|---|
 | 服务器时区 `Asia/Shanghai` | 日检 08:00 对齐 OKX 日线收盘（00:00 UTC）；系统启动时校验 UTC+8，不符告警 |
 | `gunicorn -c gunicorn.conf.py` | 固定单 worker + gthread；120 秒请求超时、900 秒优雅退出窗口，避免在 OKX 长重试/交易收尾中误杀 runner |
-| 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；`FLASK_SECRET_KEY` 必须是至少 32 字节的随机值，缺失或过短均拒绝启动 |
+| 环境变量 `FLASK_SECRET_KEY`、`TRADING_LOGIN_PASSWORD` | 管理台会话与登录；`FLASK_SECRET_KEY` 必须是至少 32 字节的随机值，缺失或过短均拒绝启动；`TRADING_LOGIN_PASSWORD` 配置时必须 ≥12 字节，过短拒绝启动（升级前检查存量密码长度） |
 | 环境变量 `TRADING_API_TOKEN`（可选） | API Token 与会话等权；配置时必须 ≥32 字节随机值，过短拒绝启动；错误 token 与登录同参数按 IP 防爆破 |
 | 自定义 `TRADING_RUNNER_LOCK_FILE` 时使用专用 0700 目录 | 不得直接指向 `/tmp/runner.lock` 等共享目录；例如 `/run/user/$UID/trader/runner.lock` |
 | 反代部署显式设置 `TRADING_PROXYFIX_X_FOR=1` | 默认 0（不信任任何 XFF）；仅在确有一层可信反代时设 1，双层设 2 |
 | 环境变量 `TRADING_COOKIE_SECURE=1`（HTTPS 部署时） | 会话 cookie 加 Secure 标志；内网纯 HTTP 部署不要设置，否则登录态无法保持 |
 | 公网访问须经 HTTPS 反向代理 | 登录密码与会话 cookie 不得明文传输 |
-| 当前提交在模拟盘跑通上述普通全链路 + long/short 两个 `--fire` | 张数换算 / 止损触发 / 撤单 / 单向模式只能真连交易所自证；超时未触发属“不确定”，必须调参重试 |
+| 当前提交在模拟盘跑通上述普通全链路 + long/short 两个 `--fire` + `--stop-id-reuse` | 张数换算 / 止损触发 / 撤单 / 单向模式 / 止损幂等 ID 终态复用只能真连交易所自证；超时未触发属“不确定”，必须调参重试 |
 
 `FLASK_SECRET_KEY` 可用 `python3 -c 'import secrets; print(secrets.token_hex(32))'`
 生成；生成后仅放在部署环境的 secret manager / 环境变量中。
@@ -115,10 +116,10 @@ gunicorn -c gunicorn.conf.py wsgi:application  # 默认仅监听 127.0.0.1:5000
 ```bash
 cd trading
 
-# 480 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
+# 492 用例，纯标准库，无需安装任何依赖（含并发混沌 / 灾难恢复 / 变异测试）
 python3 -m unittest discover -s . -p "test_*.py"
 
-# 103 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
+# 104 用例，需 flask/pandas/ccxt 环境（交易逻辑 / 路由集成）
 pip install -r requirements.lock
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```

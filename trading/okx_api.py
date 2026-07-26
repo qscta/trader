@@ -123,9 +123,20 @@ class OkxApi(ExchangeApi):
                 if (market.get('type') == 'swap'
                         and market.get('quote') == 'USDT'
                         and market.get('settle') == 'USDT'):
+                    # 与 _get_contract_size 同一 fail-closed 口径：畸形面值
+                    # （NaN/inf/非正/bool）绝不入缓存——预填是生产主路径，
+                    # 这里放进去的坏值会绕过惰性路径的守卫污染全部换算。
+                    # 校验不过则跳过该品种，真正使用时由惰性路径 fail-loud。
                     contract_size = market.get('contractSize')
-                    if contract_size:
-                        self._contract_size_cache[sym] = float(contract_size)
+                    try:
+                        contract_size = (
+                            None if isinstance(contract_size, bool)
+                            else float(contract_size))
+                    except (TypeError, ValueError):
+                        contract_size = None
+                    if (contract_size is not None and
+                            math.isfinite(contract_size) and contract_size > 0):
+                        self._contract_size_cache[sym] = contract_size
                     amount_step = (market.get('precision') or {}).get('amount')
                     if amount_step is not None:
                         self._amount_precision_cache[sym] = self._normalize_precision(amount_step)
@@ -140,7 +151,10 @@ class OkxApi(ExchangeApi):
             return self._contract_size_cache[ccxt_symbol]
         try:
             market = self.exchange.market(ccxt_symbol)
-            contract_size = float(market.get('contractSize') or 0)
+            raw_size = market.get('contractSize')
+            if isinstance(raw_size, bool):
+                raise ValueError(f'contractSize 非法: {raw_size!r}')
+            contract_size = float(raw_size or 0)
         except Exception as e:
             raise ContractSizeUnavailable(f"{ccxt_symbol} 合约面值获取失败: {e}，拒绝换算/交易") from e
         if not math.isfinite(contract_size) or contract_size <= 0:

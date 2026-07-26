@@ -16,6 +16,65 @@ TradingSystem = main.TradingSystem
 from trade_state import TradeState, TradeStatePersistenceError
 
 
+class PrivateLogHandlerTest(unittest.TestCase):
+    """trading.log 含持仓/权益明细，与状态/锁文件同口径 0600：
+    创建、既有宽权限收紧、轮转新文件必须全覆盖（手工 chmod 会随轮转失效）。"""
+
+    def test_log_created_and_rotated_with_0600(self):
+        import logging
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=200, backupCount=2, encoding='utf-8', delay=True)
+            log = logging.Logger('t-0600')
+            log.addHandler(handler)
+            log.error('x' * 150)
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            log.error('y' * 150)   # 超过 maxBytes 触发轮转
+            handler.close()
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            self.assertTrue(os.path.exists(path + '.1'))
+            self.assertEqual(0o600, os.stat(path + '.1').st_mode & 0o777)
+
+    def test_existing_permissive_log_tightened_on_open(self):
+        import logging
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'trading.log')
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write('legacy')
+            os.chmod(path, 0o644)
+            handler = main.PrivateRotatingFileHandler(
+                path, maxBytes=10**6, backupCount=1, encoding='utf-8', delay=True)
+            log = logging.Logger('t-tighten')
+            log.addHandler(handler)
+            log.error('new line')
+            handler.close()
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+
+
+class SchedulerJobRegistrationTest(unittest.TestCase):
+    """全部定时任务必须显式带 misfire 保护：apscheduler 默认宽限仅 1 秒，
+    周报默认 08:01 与日检重试同刻，错过即下一触发点在 7 天后。"""
+
+    def test_all_jobs_carry_misfire_protection(self):
+        system = TradingSystem.__new__(TradingSystem)
+        system.exchange_id = 'okx'
+        system.label = '欧易'
+        system.scheduler = Mock()
+        system._record_equity_tick_with_alert = lambda: None
+        system.register_jobs({})
+
+        calls = system.scheduler.add_job.call_args_list
+        ids = {call.kwargs.get('id') for call in calls}
+        self.assertIn('okx_weekly', ids)
+        for call in calls:
+            job_id = call.kwargs.get('id')
+            self.assertEqual(1, call.kwargs.get('max_instances'), job_id)
+            self.assertTrue(call.kwargs.get('coalesce'), job_id)
+            self.assertGreaterEqual(
+                call.kwargs.get('misfire_grace_time') or 0, 60, job_id)
+
+
 class SignalExecutionStateTest(unittest.TestCase):
     def test_close_intent_survives_restart_and_is_consumed_with_full_close(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -779,6 +838,26 @@ class MaMarkerIntegrationTest(unittest.TestCase):
             self.assertEqual('t3', metadata['last_processed_candle'])
             self.assertIsNone(system._last_check_date)
             system.notifier.notify_signal_missed.assert_called_once()
+
+    def test_same_side_intent_resolved_then_quarantine_cleared_same_round(self):
+        """既有隔离 + 崩溃遗留的同向 open intent + 对账一致：本轮日检必须先
+        收口 intent 再清隔离。顺序反了（先清后收）守卫会判「意图未定形」让
+        解除空转，交易阻断多拖一轮盘中巡检。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            system = self._system(tmp, held_side='long')
+            system.trade_state.prepare_open_intent(
+                'BTCUSDT', 'ma_cross', 'long', 'OpenIntent42',
+                {'entry_price': 10.0}, planned_position_size=1.0)
+            system.trade_state.mark_position_quarantine('BTCUSDT', '测试既有隔离')
+            system._ma_signal_with_catchup = (
+                lambda *args, **kwargs: (self._signal(action=None), 't5', 0))
+            system.handle_open_position_ma_cross = lambda *args, **kwargs: None
+
+            system.check_and_execute_trades()
+
+            self.assertIsNone(system.trade_state.get_open_intent('BTCUSDT'))
+            self.assertFalse(
+                system.trade_state.is_position_quarantined('BTCUSDT'))
 
     def test_opposite_held_position_does_not_flip_without_latest_cross(self):
         with tempfile.TemporaryDirectory() as tmp:

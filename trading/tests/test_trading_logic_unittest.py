@@ -1487,6 +1487,15 @@ class ApiTokenAuthTests(unittest.TestCase):
         long_token = "x" * 32
         self.assertEqual(long_token, api_server._validate_api_token(long_token))
 
+    def test_short_login_password_rejected_at_startup_validation(self):
+        # 登录会话与 Token 等权；人工输入通道下限 12 字节，未配置合法
+        for bad in ("", "hunter2", "short-pw"):
+            with self.assertRaises(RuntimeError, msg=repr(bad)):
+                api_server._validate_login_password(bad)
+        self.assertIsNone(api_server._validate_login_password(None))
+        strong = "correct-horse-battery"
+        self.assertEqual(strong, api_server._validate_login_password(strong))
+
 
 class DingtalkRedactionTests(unittest.TestCase):
     """钉钉 webhook access_token 不得随 requests 连接异常泄露到日志。"""

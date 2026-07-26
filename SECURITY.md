@@ -14,6 +14,9 @@ and credential/state files must be owner-readable only (`0600`).
 the deployment secret store or environment. `TRADING_API_TOKEN` (optional) is
 held to the same standard: if configured it must be at least 32 random bytes,
 or startup is refused — check existing deployments before upgrading.
+`TRADING_LOGIN_PASSWORD` (optional) is a human-entered credential with the same
+privileges as the token; if configured it must be at least 12 bytes, or startup
+is refused — check existing deployments before upgrading.
 
 ## If a secret enters Git history
 

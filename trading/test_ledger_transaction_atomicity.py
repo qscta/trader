@@ -176,6 +176,35 @@ class ForceRuntimeUntrackedRollbackTest(unittest.TestCase):
             self.assertFalse(state.has_stop_residue('BTCUSDT'))
 
 
+class RecoveryEntryNumericBoundaryTest(unittest.TestCase):
+    """三个恢复建账入口与 _require_positive_finite 同口径：bool 不得被
+    float() 静默换算成 1.0 入账（与正常开仓/止损更新/部分平仓一致）。"""
+
+    def test_partial_rollback_recovery_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.add_open_after_partial_rollback(
+                    'BTCUSDT', 'long', True, 10.0, 6.0, 90.0, 100.0)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+    def test_untracked_recovery_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, True, 90.0)
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+
+    def test_round_trip_finalize_rejects_bool(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(ValueError):
+                state.finalize_open_intent_round_trip(
+                    'BTCUSDT', 'client-1', True, 101.0, 1.0)
+            self.assertEqual([], state.get_closed_trades())
+
+
 class AddOpenPositionGuardTest(unittest.TestCase):
     def test_rejects_silent_overwrite_of_same_symbol(self):
         with tempfile.TemporaryDirectory() as temp_dir:

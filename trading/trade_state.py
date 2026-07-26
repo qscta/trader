@@ -920,18 +920,17 @@ class TradeState:
         if stop_order_id is not None and not isinstance(stop_order_id, str):
             raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
-            entry_price = float(entry_price)
-            original_size = float(original_size)
-            remaining_size = float(remaining_size)
-            stop_loss_price = float(stop_loss_price)
-            partial_exit_price = float(partial_exit_price)
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            original_size = _require_positive_finite(original_size, 'original_size')
+            remaining_size = _require_positive_finite(remaining_size, 'remaining_size')
+            stop_loss_price = _require_positive_finite(stop_loss_price, 'stop_loss_price')
+            partial_exit_price = _require_positive_finite(
+                partial_exit_price, 'partial_exit_price')
             closed_size = float(
                 Decimal(str(original_size)) - Decimal(str(remaining_size)))
-        except (TypeError, ValueError, InvalidOperation) as exc:
+        except (ValueError, InvalidOperation) as exc:
             raise ValueError('部分回滚恢复的价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, original_size, remaining_size,
-                stop_loss_price, partial_exit_price, closed_size)):
+        if not math.isfinite(closed_size) or closed_size <= 0:
             raise ValueError('部分回滚恢复的价格/数量必须是正有限数')
         if remaining_size >= original_size:
             raise ValueError('部分回滚余仓必须小于原始仓位')
@@ -946,7 +945,8 @@ class TradeState:
             'stop_loss_price': stop_loss_price,
             'stop_order_id': stop_order_id,
             'stop_order_size': (
-                remaining_size if stop_order_size is None else float(stop_order_size)),
+                remaining_size if stop_order_size is None
+                else _require_positive_finite(stop_order_size, 'stop_order_size')),
             'strategy': strategy,
             'open_time': now,
             'recovered_partial_rollback': True,
@@ -1023,16 +1023,14 @@ class TradeState:
         if stop_order_id is not None and not isinstance(stop_order_id, str):
             raise ValueError(f'{symbol}.stop_order_id 必须是字符串或 None')
         try:
-            entry_price = float(entry_price)
-            position_size = float(position_size)
-            stop_loss_price = float(stop_loss_price)
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            position_size = _require_positive_finite(position_size, 'position_size')
+            stop_loss_price = _require_positive_finite(stop_loss_price, 'stop_loss_price')
             stop_order_size = (
-                position_size if stop_order_size is None else float(stop_order_size))
-        except (TypeError, ValueError) as exc:
+                position_size if stop_order_size is None
+                else _require_positive_finite(stop_order_size, 'stop_order_size'))
+        except ValueError as exc:
             raise ValueError('未决开仓的价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, position_size, stop_loss_price, stop_order_size)):
-            raise ValueError('未决开仓的价格/数量必须是正有限数')
         now = datetime.now().isoformat()
         position = {
             'symbol': symbol, 'side': side, 'entry_price': entry_price,
@@ -1588,14 +1586,11 @@ class TradeState:
             position_size, entry_order_ids=None, exit_order_ids=None,
             entry_fee=None, exit_fee=None, reason='open intent 恢复补记'):
         try:
-            entry_price = float(entry_price)
-            exit_price = float(exit_price)
-            position_size = float(position_size)
-        except (TypeError, ValueError) as exc:
+            entry_price = _require_positive_finite(entry_price, 'entry_price')
+            exit_price = _require_positive_finite(exit_price, 'exit_price')
+            position_size = _require_positive_finite(position_size, 'position_size')
+        except ValueError as exc:
             raise ValueError('open intent 往返价格/数量非法') from exc
-        if any(not math.isfinite(value) or value <= 0 for value in (
-                entry_price, exit_price, position_size)):
-            raise ValueError('open intent 往返价格/数量必须是正有限数')
         with self.lock:
             intent = (self.state.get('open_intents') or {}).get(symbol) or {}
             if intent.get('client_order_id') != str(client_order_id):

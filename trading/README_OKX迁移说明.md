@@ -106,6 +106,7 @@ TRADING_LOGIN_PASSWORD=xxx gunicorn -c gunicorn.conf.py wsgi:application
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --fire
 OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
+OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side long --stop-id-reuse
 ```
 
 `--fire` 超时未触发是“未获得证据”，不是通过；调整距离/超时后重跑。需确认：
@@ -114,6 +115,7 @@ OKX_DEMO=1 python verify_okx.py BTCUSDT 0.01 --side short --fire
 2. **止损算法单**：确认原生 conditional 单确实挂上、是 reduce-only、触发后市价平仓且不反向开仓。
 3. **撤止损 / 撤全部**：确认 `cancel_all_orders` 能把算法止损单一并撤掉，无残留。
 4. **杠杆与单向模式**：账户须为**单向（净）持仓模式**；系统每品种首次开仓前 `set_leverage`，确认杠杆/保证金模式生效（风控以损定量，仓位价值常数倍于本金，杠杆必须够）。
+5. **止损幂等 ID 终态复用**：`--stop-id-reuse` 验证旧止损进入终态后同一 `algoClOrdId` 可再次 POST（崩溃重试幂等的根基）；常规 `--fire` 与基础验证测不到该场景，若交易所拒绝须提前记入运维预案。
 
 ## 七、测试
 
@@ -128,6 +130,6 @@ python3 -m unittest discover -s . -p 'test_*.py'
 python3 -m unittest tests.test_trading_logic_unittest -v
 ```
 
-测试桩统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。
+需要导入 `main` 的标准库测试统一走 `_test_stubs.import_main()`：桩模块只在导入 main 的瞬间存在于 `sys.modules`，导入完成立即恢复原状，因此多个测试模块同进程任意顺序运行互不污染。只测独立模块的文件直接导入被测对象，个别适配层/verify 测试按同一思路就地桩 `ccxt`/`pandas`。
 
 > 依赖版使用与生产同源的 requirements.lock（Python 3.12）。

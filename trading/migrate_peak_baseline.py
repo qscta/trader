@@ -140,6 +140,19 @@ def run(data_dir, apply):
     hist_path = os.path.join(data_dir, 'equity_history.json')
     daily_path = os.path.join(data_dir, 'daily_equity.json')
 
+    # 残留的权益同步 journal 说明上次 equity_sync 中断：三份状态可能是半事务
+    # 世代，且 tracker 下次构造会无条件按 journal 整代前滚、静默覆写本工具
+    # 刚写入的纠正。必须先由 tracker 收口（正常启动一次即可），再跑迁移。
+    journal_path = os.path.join(data_dir, '.equity_sync_journal.json')
+    if os.path.lexists(journal_path):
+        print(
+            f'[拒绝] 检测到未收口的权益同步 journal: {journal_path}\n'
+            '  上次资金同步中断，状态文件可能处于半事务世代；此时迁移分析不可信，'
+            '写入也会在下次启动被 journal 前滚覆盖。\n'
+            '  请先正常启动一次交易系统（tracker 构造时会整代前滚并删除 journal），'
+            '再重新执行本工具。')
+        return 1
+
     peak_data = _load_json(peak_path)
     if not isinstance(peak_data, dict):
         print(f'[跳过] 未找到有效 peak_equity.json: {peak_path}')

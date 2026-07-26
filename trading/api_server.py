@@ -84,6 +84,19 @@ def _validate_api_token(value):
     return str(value)
 
 
+def _validate_login_password(value):
+    """校验登录密码强度。登录会话与 API Token 等权（可直达全部真钱写接口），
+    弱密码在防爆破退避下仍可被慢速在线猜中。人工输入通道下限取 12 字节
+    （随机 token 的 32 字节标准对人不可记忆）；未配置（None）合法——仅用
+    Token 认证，/api/login 返回 503。升级前须检查存量密码长度。
+    """
+    if value is None:
+        return None
+    if len(str(value).encode('utf-8')) < 12:
+        raise RuntimeError('TRADING_LOGIN_PASSWORD 至少需要 12 字节，拒绝弱密码启动')
+    return str(value)
+
+
 # 反代跳数由部署方声明（代码无法安全地自动探测——盲信 X-Forwarded-For 本身就是漏洞）：
 # 0 = 无反代直连（默认，完全不信 XFF）；1 = 单反代 / Cloudflare Tunnel（真实客户端 IP
 # 在链尾）；2 = CDN→nginx 双层。登录防爆破按还原后的 remote_addr 计数——跳数配错时
@@ -107,7 +120,7 @@ app.config['SESSION_COOKIE_SECURE'] = os.environ.get('TRADING_COOKIE_SECURE') ==
 # 吊销已泄露的历史副本——默认 31 天重放窗口对真钱面板过长，收短到 24 小时。
 app.permanent_session_lifetime = timedelta(hours=24)
 
-LOGIN_PASSWORD = os.environ.get('TRADING_LOGIN_PASSWORD')
+LOGIN_PASSWORD = _validate_login_password(os.environ.get('TRADING_LOGIN_PASSWORD'))
 
 # 全局单交易所系统（由 wsgi / __main__ 注入）
 trading_system = None
@@ -1341,8 +1354,10 @@ def close_position():
             actual_price = None if close_order.get('execution_ambiguous') \
                 else safe_fill_price(close_order, None)
             if not actual_price:
+                # get_last_price 契约恒返回正有限价（坏行情 fail-loud），
+                # 一切失败路径均落入 except 兜底到入场价。
                 try:
-                    actual_price = system.exchange_api.get_last_price(ccxt_symbol) or position['entry_price']
+                    actual_price = system.exchange_api.get_last_price(ccxt_symbol)
                 except Exception:
                     actual_price = position['entry_price']
             if close_order.get('fee') is not None or close_order.get('fees'):

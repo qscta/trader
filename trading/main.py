@@ -30,7 +30,28 @@ import config_validation as cfgv
 # delay=True 懒打开：首条日志时才创建文件——测试进程导入 main 时（根 logger 已被测试挂
 # NullHandler，basicConfig 空转）不再凭空建文件/占句柄；生产启动毫秒内即写日志，行为等价
 _LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading.log')
-log_handler = logging.handlers.RotatingFileHandler(
+
+
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """日志含持仓/权益/盈亏明细与历史告警（/api/logs 也按特权数据保护），
+    与状态/锁文件同口径强制 0600：默认 umask 下 0644 会让 mem-monitor 沙箱
+    经 ubuntu 组读走。轮转每次经 _open 建新文件，子类覆盖即全覆盖；
+    fchmod 顺带收紧历史遗留的宽权限旧文件。"""
+
+    def _open(self):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self.baseFilename, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            os.close(fd)
+            raise
+        return open(fd, self.mode, encoding=self.encoding)
+
+
+log_handler = PrivateRotatingFileHandler(
     _LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8', delay=True
 )
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -103,8 +124,23 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.data_dir = self.base_dir
         self._config_lock = threading.RLock()
 
+        # 通知器最先构造（纯内存操作，无顺序依赖）：启动链后续任何 fail-closed
+        # 拒启路径都必须能大声告警——裸 traceback 静默死亡是最贵的故障模式。
+        webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
+        self.notifier = DingTalkNotifier(webhook)
+
         # 旧多所版若把欧易状态存在 data/okx/，收敛单所时迁回根目录（仅当根目录尚无状态）
-        self._migrate_okx_legacy_state()
+        try:
+            self._migrate_okx_legacy_state()
+        except Exception as exc:
+            logger.critical(f'[{self.label}] 旧版状态迁移失败，拒绝启动: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 旧版状态迁移失败，进程拒绝启动，'
+                    f'请立即人工检查: {exc}')
+            except Exception as notify_exc:
+                logger.debug('迁移失败告警发送失败: %s', notify_exc)
+            raise
 
         # 交易所适配层：只换成欧易，策略层输入输出语义不变
         self.exchange_api = OkxApi(self.config['okx'])
@@ -114,9 +150,6 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             self.config['strategy'].get('ma_long_period', 28),
             self.config['strategy'].get('ma_stop_period', 28)
         )
-
-        webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
-        self.notifier = DingTalkNotifier(webhook)
         # 时区守卫：日检时点、T+1 记录、求索指数切日全用系统本地时间，部署要求
         # Asia/Shanghai（UTC+8）。不符只在启动时告警一次、不阻断——不给调度器单独
         # 钉时区（那会造出「调度上海时、业务本地时」的双时钟系统）。
@@ -145,12 +178,23 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 # 账本损坏是主错误（下方 raise 拒绝启动）；二次告警失败仅留痕。
                 logger.debug('账本损坏告警发送失败: %s', exc)
             raise
-        self._guard_state_owner()  # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入
-
-        # 双均线 T+1 是交易状态而非展示数据，必须在启动仓位同步之前就可用，
-        # 并且与主账本共享事务性落盘。旧的独立 JSON 只用于一次性迁移。
-        self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
-        self.stop_loss_dates = self._load_stop_loss_dates()
+        try:
+            # 校验状态归属，防止把其它交易所(如旧币安)的持仓当成欧易状态读入；
+            # T+1 是交易状态而非展示数据，必须在启动仓位同步之前就可用，
+            # 并且与主账本共享事务性落盘（旧的独立 JSON 只用于一次性迁移）。
+            self._guard_state_owner()
+            self.stop_loss_file = os.path.join(self.data_dir, 'stop_loss_dates.json')
+            self.stop_loss_dates = self._load_stop_loss_dates()
+        except Exception as exc:
+            # 与账本损坏/启动对账失败同标准：fail-closed 拒启前必须大声告警。
+            logger.critical(f'[{self.label}] 启动状态校验/加载失败，拒绝启动: {exc}')
+            try:
+                self.notifier.notify_error(
+                    f'[{self.label}] 启动状态归属校验或 T+1 状态加载失败，'
+                    f'进程拒绝启动，请立即人工检查: {exc}')
+            except Exception as notify_exc:
+                logger.debug('启动状态失败告警发送失败: %s', notify_exc)
+            raise
 
         self.scheduler = BackgroundScheduler()
         self._last_check_date = self.trade_state.get_last_daily_check_date()  # 跨重启防重复执行
@@ -864,7 +908,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             self._quarantine_position_mismatch(
                                 symbol, '启动时仓位一致，但交易所止损保护未能严格确认')
                             continue
-                        self._clear_position_quarantine_after_reconcile(symbol)
+                        # 先收口同向 intent 再清隔离：解除守卫要求意图已定形，
+                        # 顺序反了会让解除空转推迟到下一轮盘中巡检。
                         intent_getter = getattr(
                             self.trade_state, 'get_open_intent', None)
                         intent = (
@@ -872,6 +917,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
+                        self._clear_position_quarantine_after_reconcile(symbol)
                         logger.info(f"{symbol} 持仓方向与张数同步成功")
             except Exception as exc:
                 # 单品种启动对账异常绝不连累其余品种，也绝不让构造
@@ -1523,7 +1569,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                                 symbol, '日检仓位一致但止损保护未能严格确认')
                             failed_symbols.append(symbol)
                             continue
-                        self._clear_position_quarantine_after_reconcile(symbol)
+                        # 先收口同向 intent 再清隔离：解除守卫要求意图已定形，
+                        # 顺序反了会让解除空转推迟到下一轮盘中巡检。
                         intent_getter = getattr(
                             self.trade_state, 'get_open_intent', None)
                         intent = (
@@ -1532,6 +1579,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         if intent and intent.get('side') == local_position.get('side'):
                             self.trade_state.resolve_open_intent(
                                 symbol, intent.get('client_order_id'))
+                        self._clear_position_quarantine_after_reconcile(symbol)
                     elif local_position and not exchange_position:
                         exit_price = (
                             local_position.get('stop_loss_price') or
@@ -1942,8 +1990,11 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self.scheduler.add_job(self._run_daily_summary_retry, 'cron',
                               id=f'{ex}_daily_summary_retry', max_instances=1, coalesce=True, misfire_grace_time=120,
                               hour=summary_retry_hour, minute=summary_retry_minute, second=20)
+        # 周报默认 08:01 与日检 +1 分钟重试同刻：不放宽宽限窗（apscheduler 默认
+        # 仅 1 秒），线程池忙碌即错过且下一触发点在 7 天后——与兄弟任务同参数
         self.scheduler.add_job(self.send_weekly_report, 'cron',
-                              id=f'{ex}_weekly', day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
+                              id=f'{ex}_weekly', max_instances=1, coalesce=True, misfire_grace_time=120,
+                              day_of_week='mon', hour=weekly_hour, minute=weekly_minute, second=0)
 
         # 启动即采一次权益
         self._record_equity_tick_with_alert()

@@ -291,9 +291,12 @@ class ExchangeApi:
         """
         ccxt_symbol = symbol if '/' in symbol else self.to_ccxt_symbol(symbol)
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
-        price = float(ticker['last'])
-        # last=None → float 已抛 TypeError；此处再挡 NaN/inf/0/负价，
-        # 防止坏行情静默流入止损距离与市值计算
+        raw_last = ticker['last']
+        # last=None → float 抛 TypeError；bool 会被 float 换算成 0.0/1.0 假价，
+        # 与 NaN/inf/0/负价一并 fail-loud，防止坏行情静默流入止损距离与市值计算
+        if isinstance(raw_last, bool):
+            raise ValueError(f"{ccxt_symbol} 最新成交价非法: {raw_last!r}")
+        price = float(raw_last)
         if not math.isfinite(price) or price <= 0:
-            raise ValueError(f"{ccxt_symbol} 最新成交价非法: {ticker['last']!r}")
+            raise ValueError(f"{ccxt_symbol} 最新成交价非法: {raw_last!r}")
         return price
