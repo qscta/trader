@@ -113,6 +113,15 @@ class MarginModeValidationTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 OkxApi(self._config(bad))
 
+    def test_non_bool_sandbox_is_rejected_before_trading(self):
+        """实盘/模拟盘开关只接受真布尔：字符串 "false" 裸 truthiness 会被
+        当真切入模拟盘，实盘持仓/止损无人托管。"""
+        for bad in ('false', 'true', 1, 0, 'no'):
+            config = self._config(None)
+            config['sandbox'] = bad
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                OkxApi(config)
+
     def test_valid_and_default_margin_modes_are_normalized(self):
         with patch.object(OkxApi, '_load_market_cache'), patch.object(
                 OkxApi, '_ensure_one_way_mode'):
@@ -1693,6 +1702,21 @@ class ZeroContractCloseGuardTest(unittest.TestCase):
             result = api.close_position('BTC/USDT:USDT', 'long', 0.001)
         self.assertIsNone(result)
         api.exchange.create_order.assert_not_called()
+
+    def test_zero_contract_stop_request_refuses_full_position_fallback(self):
+        """止损侧同口径：0 张请求绝不静默升级为整仓兜底挂单——那会按交易所
+        全仓（可能含人工仓）挂单且记账尺寸失真，巡检必然 mismatch 死循环。"""
+        api = _bare_api()
+        api._contract_size_cache['BTC/USDT:USDT'] = 0.01
+        api._amount_precision_cache['BTC/USDT:USDT'] = 0
+        api.exchange.amount_to_precision.side_effect = (
+            lambda _symbol, value: str(int(float(value))))
+        with patch.object(api, '_position_contracts', return_value=10.0):
+            result = api.create_stop_loss_order(
+                'BTC/USDT:USDT', 'long', 0.001, 50000)
+        self.assertIsNone(result)
+        api.exchange.create_order.assert_not_called()
+        api.exchange.privatePostTradeOrderAlgo.assert_not_called()
 
 
 class OrderTriStateAdjudicationTest(unittest.TestCase):

@@ -5,7 +5,6 @@
 
 let equityKlineDays = 120;
 let mainRefreshTimer = null;
-let _positionSymbols = [];
 
 // lightweight-charts
 const _charts = {};   // containerId -> { chart, series, container, tooltipId, klineByTime }
@@ -358,7 +357,6 @@ async function loadPositions() {
         const res = await authFetch('/api/positions');
         const positions = await res.json();
         const entries = Object.entries(positions || {});
-        _positionSymbols = entries.map(([s]) => s);
         if (!entries.length) { box.innerHTML = '<div class="empty">当前无持仓</div>'; return; }
         let totalPnl = 0;
         let totalNotional = 0;

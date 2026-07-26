@@ -118,14 +118,16 @@ class SignalHandlersMixin:
                     logger.warning(f"{symbol} [双均线] 止损确认已执行，但本地状态落盘失败，本轮不记录 T+1")
                     return
                 # 出场价传原始数值（与盘中巡检同口径），不做 .4f 假精度格式化
+                # T+1 记录与否由 _handle_exchange_flat_close 按在池状态如实
+                # 分叉记录（退池品种刻意不记），通知与日志不重复宣称
                 self.notifier.notify_stop_loss_triggered(
                     symbol,
                     self._get_strategy_display_name('ma_cross'),
                     position.get('side', ''),
                     exit_price,
-                    source='日检确认（T+1 已记录）'
+                    source='日检确认'
                 )
-                logger.info(f"{symbol} [双均线] 止损已记录，T+1将检查重入")
+                logger.info(f"{symbol} [双均线] 止损已确认并记平")
                 return
 
         # 检查反向交叉信号

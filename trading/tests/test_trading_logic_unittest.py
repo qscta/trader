@@ -1493,6 +1493,18 @@ class ApiTokenAuthTests(unittest.TestCase):
         self.assertNotIn(resp.status_code, (401, 429))
         self.assertEqual(api_server._token_failures, {})
 
+    def test_unconfigured_token_deployment_shares_backoff_and_429(self):
+        # token 未配置的部署也必须走同一退避簿记与 429：仅配置时退避会让
+        # 429/401 差异重开「token 是否启用」的远程探测面
+        with patch.object(api_server, "API_TOKEN", None):
+            for _ in range(api_server.LOGIN_MAX_FAILURES):
+                resp = self.client.get(
+                    "/api/status", headers={"X-API-Token": "any-token"})
+                self.assertEqual(resp.status_code, 401)
+            resp = self.client.get(
+                "/api/status", headers={"X-API-Token": "any-token"})
+            self.assertEqual(resp.status_code, 429)
+
     def test_short_api_token_rejected_at_startup_validation(self):
         # 与 FLASK_SECRET_KEY 同口径：已配置但 <32 字节拒绝启动；未配置合法
         with self.assertRaises(RuntimeError):
@@ -1500,6 +1512,14 @@ class ApiTokenAuthTests(unittest.TestCase):
         self.assertIsNone(api_server._validate_api_token(None))
         long_token = "x" * 32
         self.assertEqual(long_token, api_server._validate_api_token(long_token))
+
+    def test_both_auth_channels_missing_refuses_startup(self):
+        # 双通道皆缺 = 零认证可用面：真钱 runner 照常交易而应急控制面永久
+        # 401/503——与「弱凭据拒启」同口径 fail-loud；单通道缺席合法
+        with self.assertRaises(RuntimeError):
+            api_server._require_auth_channel(None, None)
+        api_server._require_auth_channel('a-strong-password', None)
+        api_server._require_auth_channel(None, 'x' * 32)
 
     def test_short_login_password_rejected_at_startup_validation(self):
         # 登录会话与 Token 等权；人工输入通道下限 12 字节，未配置合法

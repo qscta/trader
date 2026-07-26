@@ -164,7 +164,8 @@ class StopGuardianMixin:
             logger.warning(f"{symbol} [{strategy_name}] 盘中止损巡检已发通知，但本地状态落盘失败，跳过后续状态修正")
             return
 
-        logger.info(f"{symbol} [双均线] 盘中止损巡检已与平仓同事务记录 T+1 限制")
+        # T+1 记录与否由 _handle_exchange_flat_close 按在池状态如实分叉记录
+        logger.info(f"{symbol} [双均线] 盘中止损巡检记平已同事务落盘")
 
     def _ensure_stop_order_alive(self, symbol, ccxt_symbol, position, strategy_name):
         """止损自愈：本地与交易所都有仓时，确认止损单仍挂在交易所；丢失则按本地止损价补挂。
@@ -513,6 +514,9 @@ class StopGuardianMixin:
             in_memory_dates = getattr(self, 'stop_loss_dates', None)
             if isinstance(in_memory_dates, dict):
                 in_memory_dates[symbol] = stop_loss_date
+            logger.info(f'{symbol} T+1 限制已与平仓同事务记录，次日按 EMA 方向检查重入')
+        elif effective_strategy == 'ma_cross':
+            logger.info(f'{symbol} 退池/禁用品种按「只平不开」收口，刻意不记 T+1')
         stop_cleared = self._cancel_stop_order_confirmed(
             symbol, ccxt_symbol, position.get('stop_order_id'),
             position.get('extra_stop_order_ids'),

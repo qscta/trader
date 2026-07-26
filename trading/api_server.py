@@ -122,6 +122,17 @@ app.permanent_session_lifetime = timedelta(hours=24)
 
 LOGIN_PASSWORD = _validate_login_password(os.environ.get('TRADING_LOGIN_PASSWORD'))
 
+
+@app.after_request
+def _security_headers(response):
+    # 真钱面板最小加固头（纵深防御，零破坏面：无 iframe 嵌套需求、静态资源
+    # MIME 均正确、无外链 Referer 需求）。完整 CSP 需先重构 index.html 的
+    # 内联脚本与 onclick，另行裁决，不在此一行式清单内。
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    return response
+
 # 全局单交易所系统（由 wsgi / __main__ 注入）
 trading_system = None
 
@@ -143,6 +154,20 @@ _token_failures = {}   # ip -> (连续失败次数, 锁定截止时间戳)
 _login_guard = threading.Lock()
 
 API_TOKEN = _validate_api_token(os.environ.get('TRADING_API_TOKEN'))
+
+
+def _require_auth_channel(password, token):
+    """管理面仅有密码会话与 API Token 两条认证通道：双双未配置=零认证
+    可用面——真钱 runner 照常交易而应急控制面（手动平仓/隔离核查）永久
+    401/503，属带病上线。与「弱密码/弱 token 拒启」同一 fail-loud 口径。
+    """
+    if password is None and token is None:
+        raise RuntimeError(
+            '未配置任何管理面认证通道：TRADING_LOGIN_PASSWORD 与 '
+            'TRADING_API_TOKEN 至少须配置其一，拒绝启动')
+
+
+_require_auth_channel(LOGIN_PASSWORD, API_TOKEN)
 
 # 由 wsgi / __main__ 保存真实 runner 线程状态。不能仅凭 trading_system 非空就宣称
 # “运行中”：调度线程若在 register_jobs/start 中异常退出，Web 仍可能完全正常。

@@ -61,8 +61,9 @@ class OkxApi(ExchangeApi):
                 'defaultType': 'swap',
             },
         })
-        # 只认文档化的 sandbox 键（verify_okx/迁移说明同口径）：未文档化的
-        # 别名键会绕过三入口校验且让 verify 的实盘/模拟盘判定与主程序分叉
+        # 只认文档化的 sandbox 键（verify_okx/迁移说明同口径）；类型已在
+        # __init__ 强校验为真布尔，未文档化别名键会让 verify 的实盘/模拟盘
+        # 判定与主程序分叉，已移除
         if config.get('sandbox'):
             ex.set_sandbox_mode(True)   # OKX 模拟盘（demo trading）
             logger.info("OKX 已切换到模拟盘模式")
@@ -77,6 +78,13 @@ class OkxApi(ExchangeApi):
             raise ValueError(
                 f"okx.margin_mode 非法: {config.get('margin_mode')!r}"
                 "（只支持 cross / isolated）")
+        # 实盘/模拟盘开关只接受真布尔（与 enabled 的 strict_bool 同威胁模型）：
+        # 字符串 "false" 裸 truthiness 会被当真切入模拟盘——实盘持仓/止损
+        # 无人托管，且 verify 的实盘确认提示被跳过。
+        raw_sandbox = config.get('sandbox')
+        if raw_sandbox is not None and not isinstance(raw_sandbox, bool):
+            raise ValueError(
+                f"okx.sandbox 非法: {raw_sandbox!r}（只支持布尔 true/false）")
         super().__init__(config)
         self.margin_mode = raw_margin_mode.strip().lower()
         # 杠杆：默认值 + 可按内部符号覆盖，如 {"BTCUSDT": 10}
@@ -1532,13 +1540,13 @@ class OkxApi(ExchangeApi):
 
         contracts = self._coin_to_contracts(ccxt_symbol, amount)
         if contracts <= 0:
-            # 用实际持仓张数兜底，避免因换算误差漏挂止损
-            try:
-                contracts = self._position_contracts(ccxt_symbol)
-            except Exception:
-                contracts = 0.0
-        if contracts <= 0:
-            logger.error(f"{ccxt_symbol} 止损单张数为0，放弃创建止损单")
+            # 请求币数换算为 0 张只在「账本币数与面值漂移」的失配态出现
+            # （合法账本量恒整张对齐）。绝不静默升级为整仓兜底：那会按交易所
+            # 全仓（可能含人工仓）挂单且记账尺寸失真——巡检按请求量换算 0 张
+            # 与整仓单必然 mismatch 死循环。交上层隔离对账（与平仓侧同口径）。
+            logger.critical(
+                f"{ccxt_symbol} 止损请求量 {amount} 币换算为 0 张，"
+                f"拒绝按整仓兜底挂单，请先对账（可能含人工仓）")
             return None
 
         try:

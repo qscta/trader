@@ -107,16 +107,7 @@ def _parse_startup_equity(balance):
         # total 为字符串/数字等真值垃圾时，(x or {}).get 会 AttributeError；
         # 本函数调用点在启动重试 try 之外，裸抛=进程裸 traceback 死亡。
         return None
-    value = total.get('USDT')
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(value) or value < 0:
-        return None
-    return value
+    return finite_nonnegative_or_none(total.get('USDT'))
 
 
 class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, TradeExecutorMixin):
@@ -308,7 +299,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             config = json.load(f)
         # 兼容旧多所格式：从 exchanges.okx 展平到顶层
         if 'okx' not in config and isinstance(config.get('exchanges'), dict):
-            okx_block = dict(config['exchanges'].get('okx') or {})
+            legacy_okx = config['exchanges'].get('okx')
+            # 与顶层拒绝族同口径校验展平源头：非对象真值经 dict() 只会得到
+            # 无法定位配置键的裸 TypeError/序列错误
+            if legacy_okx is not None and not isinstance(legacy_okx, dict):
+                raise ValueError(
+                    '配置项 exchanges.okx 必须是对象（旧多所格式），'
+                    '不允许其它类型')
+            okx_block = dict(legacy_okx or {})
             config['okx'] = okx_block
             config.setdefault('strategy', okx_block.get('strategy', {}))
             config.setdefault('trading', okx_block.get('trading', {'symbols': []}))
@@ -966,8 +964,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                         # 持久化故障处理器已用同一条告警建立运行时隔离；这里不再
                         # 对同一磁盘故障重复通知。
                         continue
-                    # 启动发现仓位已被止损/人工平掉，与盘中守护、日检
-                    # 用同一原子状态迁移：平仓与 T+1 已经同事务落盘。
+                    # 启动发现仓位已被止损/人工平掉，与盘中守护、日检用同一
+                    # 原子状态迁移：平仓（及在池品种的 T+1）已同事务落盘。
                     self._clear_position_quarantine_after_reconcile(symbol)
                 else:
                     local_position = open_positions[symbol]
@@ -1646,8 +1644,10 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                             # 运行时隔离，不重复轰炸。
                             failed_symbols.append(symbol)
                             continue
+                        # T+1 记录与否由 _handle_exchange_flat_close 按在池
+                        # 状态如实分叉记录，此处不重复宣称
                         logger.info(
-                            f'{symbol} [双均线] 日检记平与 T+1 已同事务落盘')
+                            f'{symbol} [双均线] 日检记平已同事务落盘')
                         self._clear_position_quarantine_after_reconcile(symbol)
                         local_position = None
                     elif not local_position and exchange_position:

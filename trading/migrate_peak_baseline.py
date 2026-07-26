@@ -108,9 +108,7 @@ def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
         candidates.append((eq, close_time, f'daily:{day_str}'))
         observed_days.append(_trading_day(close_time))
 
-    if not candidates:
-        return None
-
+    # candidates 恒非空：baseline 缺失已在上方早退，且必然被 append
     best_eq, best_time, best_source = max(candidates, key=lambda item: item[0])
     # baseline_time 在上方缺失即返回 None，此处必然非空
     observed_day = (
