@@ -52,6 +52,27 @@ class CoercePositiveFloatTest(unittest.TestCase):
         self.assertEqual(eqt._coerce_positive_float("123.45"), 123.45)
 
 
+class EquitySyncPeakDayClaimTest(unittest.TestCase):
+    """资金同步整代重置峰值后，同交易日的日检快照重跑不得覆盖新基准。
+
+    日检重跑（+1 分钟重试/30 分钟兜底）属设计内行为；若同步不认领当日
+    （peak_observed_day），重跑会用同步前的 08:00 收盘快照绕过日锁存，把
+    刚重置的峰值覆盖回旧世代并 ratchet 出虚假 max_drawdown。"""
+
+    def test_same_day_snapshot_rerun_keeps_synced_peak(self):
+        tmp, t = _make(equity=1000, peak=1000, peak_days_ago=0, longest=0)
+        t.record_daily_equity_snapshot()          # 当日首写快照（close=1000）
+        t.system.exchange_api.get_balance = (     # 出金 500 后同步
+            lambda: {'total': {'USDT': 500}, 'free': {'USDT': 500}})
+        t.equity_sync(flow_amount=-500)
+        self.assertEqual(
+            500, _jload(os.path.join(tmp, 'peak_equity.json'))['peak_equity'])
+
+        t.record_daily_equity_snapshot()          # 同交易日日检重跑
+        peak = _jload(os.path.join(tmp, 'peak_equity.json'))
+        self.assertEqual(500, peak['peak_equity'])   # 不得被同步前收盘 1000 覆盖
+
+
 class DrawdownStatsTest(unittest.TestCase):
     def test_not_new_high_includes_current_streak(self):
         """当前未创新高：历史最长 = max(历史已记录, 当前未创新高天数)。"""

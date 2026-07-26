@@ -128,6 +128,29 @@ class LedgerTransactionAtomicityTest(unittest.TestCase):
             self.assertNotIn('extra_stop_order_ids', position)
 
 
+class ForceRuntimeUntrackedRollbackTest(unittest.TestCase):
+    """force_runtime_add_untracked_open_position 必须与其余四个 force 通道
+    同走事务原语：磁盘已失效时内存是唯一账本，改到一半异常（如隔离详情
+    不可 deepcopy）必须整体回滚，不能留下「持仓已建、隔离标记缺失」的半截账本。"""
+
+    class _Boom:
+        def __deepcopy__(self, memo):
+            raise RuntimeError('quarantine details 不可拷贝')
+
+    def test_mid_mutation_failure_rolls_back_position(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = TradeState(str(Path(temp_dir) / 'trade_state.json'))
+            with self.assertRaises(RuntimeError):
+                state.force_runtime_add_untracked_open_position(
+                    'BTCUSDT', 'long', 100.0, 1.0, 90.0,
+                    stop_order_id='stop-1', strategy='ma_cross',
+                    quarantine_details={'raw': self._Boom()})
+            # 回滚后不得残留半截持仓/隔离/残留标记
+            self.assertIsNone(state.get_open_position('BTCUSDT'))
+            self.assertFalse(state.is_position_quarantined('BTCUSDT'))
+            self.assertFalse(state.has_stop_residue('BTCUSDT'))
+
+
 class AddOpenPositionGuardTest(unittest.TestCase):
     def test_rejects_silent_overwrite_of_same_symbol(self):
         with tempfile.TemporaryDirectory() as temp_dir:

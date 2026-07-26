@@ -1088,7 +1088,13 @@ class EquityTracker:
                 qiusuo_anchor = _coerce_positive_float(qiusuo_anchor) or (qiusuo_state.get('base_index') or self.QIUSUO_INDEX_BASE)
             new_divisor = current_equity / qiusuo_anchor
 
-            peak_data = {'peak_equity': current_equity, 'peak_time': now.isoformat()}
+            # 同步即整代重置基准：必须同时认领当日（peak_observed_day）——
+            # 否则同交易日的日检重跑（+1 分钟/30 分钟兜底均属设计内行为）会用
+            # 同步前的 08:00 收盘快照绕过日锁存，把刚重置的峰值/回撤基准
+            # 静默覆盖回旧世代，并被随后的统计刷新 ratchet 进 max_drawdown。
+            peak_data = {'peak_equity': current_equity,
+                         'peak_time': now.isoformat(),
+                         'peak_observed_day': self._qiusuo_trading_day(now)}
 
             eq_hist = copy.deepcopy(old_history)
             # or 0：全新系统 initial_equity 为 None（从未跑过统计刷新），

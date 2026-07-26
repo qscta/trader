@@ -111,10 +111,11 @@ def recompute_daily_close_peak(peak_data, eq_hist, daily_snapshots):
         return None
 
     best_eq, best_time, best_source = max(candidates, key=lambda item: item[0])
+    # baseline_time 在上方缺失即返回 None，此处必然非空
     observed_day = (
         max(observed_days)
         if observed_days
-        else _trading_day(baseline_time or best_time)
+        else _trading_day(baseline_time)
     )
     return {
         'stored_peak_equity': stored_eq,

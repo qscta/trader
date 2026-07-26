@@ -45,6 +45,9 @@ function pnlClass(n) { return n >= 0 ? 'price-up' : 'price-down'; }
 
 function onUnauthorized() {
     if (mainRefreshTimer) { clearInterval(mainRefreshTimer); mainRefreshTimer = null; }
+    // 登出/会话过期时清空密码框：否则离席机器上遮罩虽在，
+    // 预填的明文密码让任何人一键恢复对真钱写接口的控制
+    const pw = el('loginPassword'); if (pw) pw.value = '';
     const o = el('loginOverlay'); if (o) o.style.display = 'flex';
 }
 
@@ -98,6 +101,7 @@ async function doLogin() {
         const res = await authFetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) });
         const data = await res.json();
         if (data.success) {
+            el('loginPassword').value = '';   // 成功即清空，不把明文凭据留在 DOM
             el('loginOverlay').style.display = 'none';
             el('loginError').textContent = '';
             bootData();

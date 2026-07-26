@@ -1077,8 +1077,13 @@ class TradeState:
                 raise
 
     def force_runtime_add_untracked_open_position(self, *args, **kwargs):
+        """与其余四个 force_runtime 通道同走事务原语（save=False）：
+        磁盘已失效时内存是唯一账本，修改中途异常必须整体回滚，
+        不能留下「持仓已建、隔离/残留标记缺失、intent 未消费」的半截账本。"""
         with self.lock:
-            return self._add_untracked_open_position_locked(*args, **kwargs)
+            return self._transact_locked(
+                lambda: self._add_untracked_open_position_locked(*args, **kwargs),
+                save=False)
 
     def _close_position_locked(
             self, symbol, exit_price, exit_fee=None,
