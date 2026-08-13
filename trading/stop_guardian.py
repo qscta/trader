@@ -22,7 +22,7 @@ class StopGuardianMixin:
     def _persist_exchange_flat_policy(self, symbol, exit_only):
         """交易所已确认空仓后，先持久化后续开仓策略，再允许本地记平。
 
-        enabled 品种先落 T+1，删除/禁用品种先清掉旧标记。这样进程即使在
+        enabled 品种先落「下次日检重入」标记，删除/禁用品种先清掉旧标记。这样进程即使在
         “账本记平”附近崩溃，重启也不会把刚结束的仓位误当成可立即新开。
         """
         if exit_only:
@@ -173,9 +173,9 @@ class StopGuardianMixin:
             return
 
         if exit_only:
-            logger.info(f"{symbol} [退出模式] 当前仓已结束，不记录 T+1，后续不再开仓")
+            logger.info(f"{symbol} [退出模式] 当前仓已结束，不记录重入标记，后续不再开仓")
         else:
-            logger.info(f"{symbol} [双均线] 盘中止损巡检已记录 T+1 限制")
+            logger.info(f"{symbol} [双均线] 盘中止损巡检已记录下一次日检重入标记")
 
     def _managed_position_is_consistent(self, symbol, ccxt_symbol, position, exchange_position):
         """本地托管记录与交易所实仓方向、数量一致才允许自动管理。"""

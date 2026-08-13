@@ -61,7 +61,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         止损自愈巡检、「交易所已平」统一收尾、账本落盘失败的运行时补偿；
       - ReportingMixin（reporting.py）：通知缓冲/汇总、每日持仓汇总、周报、权益采样告警；
       - SignalHandlersMixin（signal_handlers.py）：双均线 EMA 的信号分派——无仓开仓判定、
-        有仓时的止损确认/翻转分派、双均线 T+1 重入；
+        有仓时的止损确认/翻转分派、双均线下一次日检重入；
       - TradeExecutorMixin（trade_executor.py）：下单执行——通用开仓（校验/回滚）、
         双均线翻转、开仓落盘失败的交易所侧回滚；
       - 本文件保留：装配与配置、状态归属护栏、启动同步、日检总指挥
@@ -89,13 +89,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
         webhook = os.environ.get('DINGTALK_WEBHOOK') or self.config.get('dingtalk', {}).get('webhook_url')
         self.notifier = DingTalkNotifier(webhook)
-        # 时区守卫：日检时点、T+1 记录、求索指数切日全用系统本地时间，部署要求
+        # 时区守卫：日检时点、重入标记日期、求索指数切日全用系统本地时间，部署要求
         # Asia/Shanghai（UTC+8）。不符只在启动时告警一次、不阻断——不给调度器单独
         # 钉时区（那会造出「调度上海时、业务本地时」的双时钟系统）。
         _tz_offset = datetime.now().astimezone().utcoffset()
         if _tz_offset != timedelta(hours=8):
             _tz_msg = (f'[{self.label}] 服务器时区异常：当前 UTC 偏移 {_tz_offset}，部署要求 UTC+8'
-                       f'（Asia/Shanghai）。日检时点/T+1 记录/求索指数切日均依赖本地时间，'
+                       f'（Asia/Shanghai）。日检时点/重入标记日期/求索指数切日均依赖本地时间，'
                        f'请尽快修正服务器时区！')
             logger.critical(_tz_msg)
             try:
@@ -401,7 +401,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return self.ma_cross_strategy, 'ma_cross'
 
     def _load_stop_loss_dates(self):
-        """加载 T+1 安全状态；文件存在但损坏时拒绝失忆运行。"""
+        """加载待下次日检重入标记；日期仅供审计，文件损坏时拒绝失忆运行。"""
         if os.path.exists(self.stop_loss_file):
             try:
                 with open(self.stop_loss_file, 'r', encoding='utf-8') as f:
@@ -420,8 +420,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                 logger.info(f"已加载止损日期记录: {data}")
                 return data
             except Exception as e:
-                msg = (f'T+1 止损日期文件损坏或无法读取: {self.stop_loss_file}: {e}。'
-                       f'拒绝以空状态启动，避免忘记当日止损后意外重新开仓。')
+                msg = (f'日检重入标记文件损坏或无法读取: {self.stop_loss_file}: {e}。'
+                       f'拒绝以空状态启动，避免忘记待重入品种。')
                 logger.critical(msg)
                 try:
                     self.notifier.notify_error(msg)
@@ -431,9 +431,9 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         return {}
 
     def _save_stop_loss_dates(self):
-        """保存止损日期记录（原子写入）；失败必须向上抛出。"""
+        """保存待下次日检重入标记（原子写入）；失败必须向上抛出。"""
         if not atomic_write_json(self.stop_loss_file, self.stop_loss_dates):
-            msg = (f'保存 T+1 止损日期失败: {self.stop_loss_file}。'
+            msg = (f'保存日检重入标记失败: {self.stop_loss_file}。'
                    f'当前进程仍保留内存阻断，但不得在修复磁盘前重启。')
             logger.critical(msg)
             try:
@@ -443,23 +443,13 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             raise TradeStatePersistenceError(msg)
         return True
 
-    def is_stop_loss_today(self, symbol):
-        """检查该交易对今天是否已经止损过（T+1限制）"""
-        if symbol in self.stop_loss_dates:
-            today_str = date.today().strftime('%Y-%m-%d')
-            # 未来日期只可能来自系统时钟回拨/外部篡改：按已止损处理（fail closed），
-            # 绝不因「不等于今天」就放行新开仓。启动加载也会拒绝这种状态。
-            if self.stop_loss_dates[symbol] >= today_str:
-                return True
-        return False
-
     def record_stop_loss(self, symbol):
-        """记录止损日期（持久化到文件）"""
+        """记录待下次日检重入标记；值为审计日期，不作为等待自然日的门槛。"""
         self.stop_loss_dates[symbol] = date.today().strftime('%Y-%m-%d')
         self._save_stop_loss_dates()
 
     def clear_stop_loss(self, symbol):
-        """清除 T+1 标记；落盘失败时恢复内存标记，保持 fail-closed。"""
+        """清除日检重入标记；落盘失败时恢复内存标记，保持 fail-closed。"""
         previous = self.stop_loss_dates.pop(symbol, None)
         if previous is None:
             return False
@@ -635,7 +625,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         场景：服务器恰在 08:00 前后宕机/重启，错过当天全部调度点——不补跑则当天的
         新信号与止损推进整日缺席。信号基于已收盘日线，补跑与 08:00 正点执行等价；
         重启后 _last_check_date 必然为空，午后重启也会补跑一轮——幂等防护
-        （持仓检查/同价跳过/T+1/张数上限）保证重复执行无副作用，且顺带自校验一遍状态。
+        （持仓检查/同价跳过/重入标记/张数上限）保证重复执行无副作用，且顺带自校验一遍状态。
         缓冲 2 分钟：恰在调度窗口内启动时，让正常 cron（:05/:20/:40 与 +1 分钟重试）先走。
         """
         now = now or datetime.now()

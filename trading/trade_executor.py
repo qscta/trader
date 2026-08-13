@@ -65,7 +65,7 @@ class TradeExecutorMixin:
 
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, old_position.get('stop_order_id'))
 
-        # 先把“不可反手/T+1”意图落盘，再记平本地仓位；否则两步之间崩溃，
+        # 先把“不可反手/下次日检重入”意图落盘，再记平本地仓位；否则两步之间崩溃，
         # 重启补跑可能在旧止损仍不可确认时同日重新开仓。
         if exit_only:
             self._persist_exchange_flat_policy(symbol, True)
@@ -94,15 +94,15 @@ class TradeExecutorMixin:
 
         if exit_only:
             if not stop_cleared:
-                logger.error(f"{symbol} [退出模式] 平仓后旧止损撤销不可确认，已标记残留；不反手、不记 T+1")
+                logger.error(f"{symbol} [退出模式] 平仓后旧止损撤销不可确认，已标记残留；不反手、不记重入标记")
             else:
-                logger.info(f"{symbol} [退出模式] 当前仓已平，不反手、不记 T+1")
+                logger.info(f"{symbol} [退出模式] 当前仓已平，不反手、不记重入标记")
             return
 
         if not stop_cleared:
-            # 记入 T+1：次日日检开头会自动重试清理残留，清理确认后由 T+1 重入按当时
+            # 记录下次日检重入：下一次日检开头会自动重试清理残留，清理确认后按当时
             # EMA 方向重新入场，恢复「永远在市」；清理仍失败则维持开仓阻断（已有告警）。
-            logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已记录 T+1，残留清理确认后次日按 EMA 方向重入")
+            logger.error(f"{symbol} [双均线] 旧止损撤销不可确认，本轮不反手开仓；已记录重入标记，残留清理确认后在下一次日检按 EMA 方向重入")
             return
 
         # 开仓价由 _execute_open 内部获取实时价格，这里传信号价作为参考
@@ -115,13 +115,13 @@ class TradeExecutorMixin:
         logger.info(f"{symbol} [双均线] 翻转开仓: 方向={new_side}, 信号价={entry_price}, 止损={stop_loss_price}")
         self._execute_open(symbol, new_side, entry_price, stop_loss_price, symbol_config)
         if not self.trade_state.get_open_position(symbol):
-            # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：记 T+1，
-            # 次日 handle_no_position_ma_cross 按当时 EMA 方向自动重入，恢复「永远在市」——
+            # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：记重入标记，
+            # 下一次日检按当时 EMA 方向自动重入，恢复「永远在市」——
             # 与 stop_cleared=False 分支同一恢复机制（_execute_open 内部已发失败告警）
             self._mark_ma_cross_reentry_pending(
                 symbol, new_side, signal,
-                '双均线翻转反手开仓未成功，已记 T+1 次日按 EMA 方向重入，请复核交易所与日志')
-            logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，已记 T+1 次日按 EMA 方向重入恢复在市")
+                '双均线翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入，请复核交易所与日志')
+            logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入恢复在市")
 
     def _persist_open_position_or_rollback(self, symbol, ccxt_symbol, side, actual_price, position_size, stop_loss_price, stop_order_id, strategy=None):
         try:
@@ -152,7 +152,7 @@ class TradeExecutorMixin:
         buffer_notification=False 供即时开仓路由使用：该路由自己发专属钉钉，
         不走日检的汇总缓冲——否则消息滞留缓冲区，直到下次日检开头被静默清空。
         """
-        # 所有自动/即时/T+1/翻转开仓最终都经过本方法；部署总闸必须放在
+        # 所有自动/即时/日检重入/翻转开仓最终都经过本方法；部署总闸必须放在
         # 这个最内层边界，避免只拦调度入口却漏掉 Web 即时开仓或反手腿。
         if getattr(self, 'new_entries_disabled', False):
             logger.warning(f"{symbol} 新开仓被 TRADING_DISABLE_NEW_OPENS 总闸阻断")
@@ -388,11 +388,11 @@ class TradeExecutorMixin:
             strategy=symbol_config.get('strategy', 'ma_cross')
         ):
             return
-        # 开仓成功即已重新入市：统一清除该品种的 T+1 重入待定标记（若有）。标记的唯一使命
-        # 是「空仓时次日补回持仓」，入市即寿终——否则「止损→次日全新交叉直接开仓」等不经
+        # 开仓成功即已重新入市：统一清除该品种的日检重入待定标记（若有）。标记的唯一使命
+        # 是「下一次日检补回持仓」，入市即寿终——否则「止损→后续全新交叉直接开仓」等不经
         # 重入路径的成功入市会留下过期标记，几周后人工平仓的下一个日检会因这枚陈旧标记
         # 触发意外自动重入，把用户明确退出的仓位悄悄补回来。此处是所有开仓成功路径的
-        # 单一收口（fresh-cross/T+1 重入/翻转反手/即时开仓），重入路径的显式清除改为 pop 兜底。
+        # 单一收口（fresh-cross/日检重入/翻转反手/即时开仓），重入路径的显式清除改为 pop 兜底。
         self.clear_stop_loss(symbol)
         if buffer_notification:
             self._buffer_trade_open_notification(symbol, side, actual_price, position_size, stop_loss_price)

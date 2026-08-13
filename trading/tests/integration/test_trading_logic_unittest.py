@@ -137,7 +137,7 @@ class LiveDailyHistoryValidationTests(unittest.TestCase):
         self.assertIn('NaN', reason)
 
 
-class MaCrossTPlusOneTests(unittest.TestCase):
+class MaCrossNextDailyCheckReentryTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
@@ -150,17 +150,45 @@ class MaCrossTPlusOneTests(unittest.TestCase):
         system.ma_cross_strategy = SimpleNamespace(check_reentry_condition=Mock())
         return system
 
-    def test_same_day_stop_loss_blocks_reentry(self):
+    def test_same_day_marker_reenters_at_next_daily_check(self):
+        """复现 LINK：05:40/07:59 的止损标记必须在当天 08:00 日检消费，不能等自然次日。"""
         system = self.make_system()
         today = main.date.today().strftime("%Y-%m-%d")
         system.stop_loss_dates["ETHUSDT"] = today
+        system.ma_cross_strategy.check_reentry_condition.return_value = (
+            True,
+            "long",
+            {"current_close": 100, "lower_stop": 90, "upper_stop": 110},
+        )
 
         signal = {"action": None}
         system.handle_no_position_ma_cross("ETHUSDT", signal, {"name": "ETHUSDT"}, df=object())
 
-        system._execute_open.assert_not_called()
+        system._execute_open.assert_called_once_with(
+            "ETHUSDT", "long", 100, 90, {"name": "ETHUSDT"}
+        )
+        self.assertNotIn("ETHUSDT", system.stop_loss_dates)
 
-    def test_next_day_reentry_opens_and_clears_stop_loss_marker(self):
+    def test_pending_marker_uses_reentry_direction_before_fresh_cross(self):
+        """待重入标记优先：下一次日检必须按当前 EMA 方向裁决，而非依赖新交叉。"""
+        system = self.make_system()
+        system.stop_loss_dates["ETHUSDT"] = main.date.today().strftime("%Y-%m-%d")
+        system.ma_cross_strategy.check_reentry_condition.return_value = (
+            True,
+            "short",
+            {"current_close": 100, "lower_stop": 90, "upper_stop": 110},
+        )
+
+        signal = {"action": "long", "current_close": 100, "lower_stop": 90}
+        system.handle_no_position_ma_cross("ETHUSDT", signal, {"name": "ETHUSDT"}, df=object())
+
+        system.ma_cross_strategy.check_reentry_condition.assert_called_once()
+        system._execute_open.assert_called_once_with(
+            "ETHUSDT", "short", 100, 110, {"name": "ETHUSDT"}
+        )
+        self.assertNotIn("ETHUSDT", system.stop_loss_dates)
+
+    def test_legacy_older_marker_reenters_and_clears_marker(self):
         system = self.make_system()
         system.stop_loss_dates["ETHUSDT"] = "2000-01-01"
         system.ma_cross_strategy.check_reentry_condition.return_value = (
@@ -178,8 +206,8 @@ class MaCrossTPlusOneTests(unittest.TestCase):
         self.assertNotIn("ETHUSDT", system.stop_loss_dates)
         system._save_stop_loss_dates.assert_called()
 
-    def test_next_day_reentry_keeps_marker_when_open_fails(self):
-        """T+1 重入开仓腿失败（成交后仍无持仓）：保留 T+1 标记，次日再重试重入，
+    def test_daily_check_reentry_keeps_marker_when_open_fails(self):
+        """日检重入开仓腿失败（成交后仍无持仓）：保留标记，下一次日检再重试，
         不放弃「永远在市」（此前无条件删除标记会永久放弃）。"""
         system = self.make_system()
         system.trade_state.get_open_position = Mock(return_value=None)  # 开仓腿失败
@@ -194,8 +222,8 @@ class MaCrossTPlusOneTests(unittest.TestCase):
         self.assertIn("ETHUSDT", system.stop_loss_dates)          # 标记保留
         system.notifier.notify_signal_missed.assert_called_once()
 
-    def test_initial_open_failure_records_tplus1_for_reentry(self):
-        """初始金叉/死叉开仓腿失败：记 T+1，次日按 EMA 方向自动重入恢复「永远在市」。"""
+    def test_initial_open_failure_records_next_check_reentry(self):
+        """初始金叉/死叉开仓腿失败：记标记，下次日检按 EMA 方向自动重入。"""
         system = self.make_system()
         system.trade_state.get_open_position = Mock(return_value=None)  # 开仓腿失败
         signal = {"action": "long", "current_close": 100, "lower_stop": 90, "upper_stop": 110}
@@ -203,7 +231,7 @@ class MaCrossTPlusOneTests(unittest.TestCase):
 
         system._execute_open.assert_called_once()
         today = main.date.today().strftime("%Y-%m-%d")
-        self.assertEqual(system.stop_loss_dates.get("ETHUSDT"), today)  # 记了 T+1
+        self.assertEqual(system.stop_loss_dates.get("ETHUSDT"), today)
         system.notifier.notify_signal_missed.assert_called_once()
 
 
@@ -812,10 +840,10 @@ class ManualCloseConsistencyApiTests(unittest.TestCase):
         system.clear_stop_loss.assert_called_once_with("BTCUSDT")
         system.exchange_api.close_position.assert_called_once_with("BTC/USDT", "long", 1.0)
 
-    def test_stale_t1_clear_failure_refuses_before_exchange_close(self):
+    def test_stale_reentry_marker_clear_failure_refuses_before_exchange_close(self):
         actual = {"contracts": 10, "side": "long"}
         system = self.make_system(actual)
-        system.clear_stop_loss.side_effect = RuntimeError("T+1 落盘失败")
+        system.clear_stop_loss.side_effect = RuntimeError("重入标记落盘失败")
 
         resp = self._close(system)
 
@@ -961,8 +989,8 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system.trade_state.add_open_position.assert_not_called()
         system.notifier.notify_error.assert_called_once()
 
-    def test_successful_open_clears_stale_tplus1_marker(self):
-        """开仓成功即入市：过期 T+1 标记必须随之清除——否则「止损→次日全新交叉直接开仓」
+    def test_successful_open_clears_stale_reentry_marker(self):
+        """开仓成功即入市：陈旧重入标记必须随之清除——否则「止损→后续全新交叉直接开仓」
         留下的陈旧标记，会在几周后人工平仓的下一个日检触发意外自动重入（把用户明确
         退出的仓位悄悄补回来）。"""
         system = self.make_system()
@@ -976,8 +1004,8 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         self.assertNotIn("BTCUSDT", system.stop_loss_dates)  # 标记已随入市消亡
         system._save_stop_loss_dates.assert_called_once()
 
-    def test_open_failure_keeps_tplus1_marker(self):
-        """开仓失败（止损单创建失败回滚）：标记保留，次日重入机制不受影响。"""
+    def test_open_failure_keeps_reentry_marker(self):
+        """开仓失败（止损单创建失败回滚）：标记保留，下次日检重入机制不受影响。"""
         system = self.make_system()
         system.stop_loss_dates = {"BTCUSDT": "2000-01-01"}
         system.exchange_api.create_stop_loss_order.return_value = None   # 止损创建失败 → 回滚
@@ -1371,11 +1399,11 @@ class MaCrossFlipTests(unittest.TestCase):
         system._execute_open.assert_called_once_with(
             "BTCUSDT", "long", 110, 95, {"name": "BTCUSDT"}
         )
-        system.record_stop_loss.assert_not_called()  # 正常反手不记 T+1
+        system.record_stop_loss.assert_not_called()  # 正常反手不记重入标记
 
     def test_flip_aborts_reopen_when_stop_cancel_unconfirmed(self):
         """翻转时撤旧止损不可确认：平仓记账完成、不反手开新仓，
-        但记录 T+1 交由次日重入（残留清理确认后恢复永远在市）。"""
+        但记录标记交由下一次日检重入（残留清理确认后恢复永远在市）。"""
         system = self.make_system()
         system.exchange_api.cancel_order.return_value = False
         system.exchange_api.cancel_all_orders.return_value = None
@@ -1387,14 +1415,14 @@ class MaCrossFlipTests(unittest.TestCase):
         system.trade_state.close_position.assert_called_once_with("BTCUSDT", 112)
         system.trade_state.mark_stop_residue.assert_called_once_with("BTCUSDT")
         system._execute_open.assert_not_called()
-        system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记 T+1，次日按 EMA 方向重入
+        system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 下次日检按 EMA 方向重入
 
-    def test_flip_persists_t1_before_local_close_when_cancel_is_unconfirmed(self):
+    def test_flip_persists_reentry_marker_before_local_close_when_cancel_is_unconfirmed(self):
         system = self.make_system()
         system.exchange_api.cancel_order.return_value = False
         system.exchange_api.cancel_all_orders.return_value = None
         events = []
-        system.record_stop_loss.side_effect = lambda symbol: events.append(("t1", symbol))
+        system.record_stop_loss.side_effect = lambda symbol: events.append(("marker", symbol))
         system.trade_state.close_position.side_effect = (
             lambda symbol, price: events.append(("close", symbol))
             or {"pnl": 12.0, "pnl_percent": 6.0}
@@ -1404,11 +1432,11 @@ class MaCrossFlipTests(unittest.TestCase):
 
         system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
 
-        self.assertEqual(events[:2], [("t1", "BTCUSDT"), ("close", "BTCUSDT")])
+        self.assertEqual(events[:2], [("marker", "BTCUSDT"), ("close", "BTCUSDT")])
         system._execute_open.assert_not_called()
 
-    def test_flip_records_tplus1_when_reopen_leg_fails(self):
-        """翻转平旧成功、反手开新腿失败（成交后仍无持仓）：记 T+1，次日按 EMA 方向重入，
+    def test_flip_records_reentry_marker_when_reopen_leg_fails(self):
+        """翻转平旧成功、反手开新腿失败（成交后仍无持仓）：下一次日检按 EMA 方向重入，
         恢复「永远在市」（此前失败后不留恢复线索，会空到下一次全新交叉）。"""
         system = self.make_system()
         system.notifier.notify_signal_missed = Mock()
@@ -1419,7 +1447,7 @@ class MaCrossFlipTests(unittest.TestCase):
         system._flip_position("BTCUSDT", signal, old_position, "long", {"name": "BTCUSDT"})
 
         system._execute_open.assert_called_once()                 # 尝试了反手
-        system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记 T+1 次日重入
+        system.record_stop_loss.assert_called_once_with("BTCUSDT")  # 记下次日检重入标记
         system.notifier.notify_signal_missed.assert_called_once()
 
     def test_removed_symbol_reverse_signal_passes_exit_only_and_never_reopens(self):
@@ -1438,7 +1466,7 @@ class MaCrossFlipTests(unittest.TestCase):
             {"name": "BTCUSDT", "strategy": "ma_cross", "exit_only": True},
             exit_only=True)
 
-    def test_removed_symbol_external_flat_does_not_record_t1(self):
+    def test_removed_symbol_external_flat_does_not_record_reentry_marker(self):
         system = self.make_system()
         system.exchange_api.get_position = Mock(return_value=None)
         system.stop_loss_dates = {"BTCUSDT": "2000-01-01"}
@@ -1454,9 +1482,21 @@ class MaCrossFlipTests(unittest.TestCase):
         self.assertNotIn("BTCUSDT", system.stop_loss_dates)
         system._save_stop_loss_dates.assert_called_once()
 
-    def test_handle_open_position_ma_cross_records_stop_loss_and_returns_when_exchange_position_missing(self):
+    def test_daily_check_reenters_when_exchange_flat_was_first_seen_at_check(self):
+        """复现 07:59 边界：巡检未及记录时，08:00 日检确认空仓后也须当场重入。"""
         system = self.make_system()
         system.exchange_api.get_position = Mock(return_value=None)
+        system.stop_loss_dates = {}
+        system._save_stop_loss_dates = Mock()
+        system.record_stop_loss.side_effect = (
+            lambda symbol: system.stop_loss_dates.__setitem__(
+                symbol, main.date.today().strftime("%Y-%m-%d")))
+        system.ma_cross_strategy = SimpleNamespace(
+            check_reentry_condition=Mock(return_value=(
+                True,
+                "long",
+                {"current_close": 101, "lower_stop": 90, "upper_stop": 110},
+            )))
 
         signal = {"current_close": 101}
         position = {"side": "long", "position_size": 2.0, "stop_loss_price": 99}
@@ -1467,6 +1507,28 @@ class MaCrossFlipTests(unittest.TestCase):
 
         system.trade_state.close_position.assert_called_once_with("BTCUSDT", 99)
         system.record_stop_loss.assert_called_once_with("BTCUSDT")
+        system.ma_cross_strategy.check_reentry_condition.assert_called_once()
+        system._execute_open.assert_called_once_with(
+            "BTCUSDT", "long", 101, 90, {"name": "BTCUSDT"})
+
+    def test_daily_check_does_not_reenter_if_exchange_flat_state_save_fails(self):
+        """交易所虽空仓，但本地记平未可靠落盘时不得新开仓。"""
+        system = self.make_system()
+        system.exchange_api.get_position = Mock(return_value=None)
+        system.stop_loss_dates = {"BTCUSDT": main.date.today().strftime("%Y-%m-%d")}
+        system._handle_exchange_flat_close = Mock(
+            return_value=({"symbol": "BTCUSDT"}, False, True))
+        system.ma_cross_strategy = SimpleNamespace(check_reentry_condition=Mock())
+
+        system.handle_open_position_ma_cross(
+            "BTCUSDT",
+            {"current_close": 101},
+            {"side": "long", "position_size": 2.0, "stop_loss_price": 99},
+            {"name": "BTCUSDT"},
+            df=object(),
+        )
+
+        system.ma_cross_strategy.check_reentry_condition.assert_not_called()
         system._execute_open.assert_not_called()
 
 class TradeStatePersistenceFailureTests(unittest.TestCase):
@@ -1609,14 +1671,14 @@ class StartupSyncCompensationTests(unittest.TestCase):
     def test_startup_persists_reentry_policy_before_local_close(self):
         system = self.make_system()
         events = []
-        system.record_stop_loss.side_effect = lambda symbol: events.append(("t1", symbol))
+        system.record_stop_loss.side_effect = lambda symbol: events.append(("marker", symbol))
         system.trade_state.close_position.side_effect = (
             lambda symbol, price: events.append(("close", symbol)) or {"pnl": 0, "pnl_percent": 0}
         )
 
         system.sync_positions_on_startup()
 
-        self.assertEqual(events[:2], [("t1", "BTCUSDT"), ("close", "BTCUSDT")])
+        self.assertEqual(events[:2], [("marker", "BTCUSDT"), ("close", "BTCUSDT")])
 
 
 class LoginBackoffTests(unittest.TestCase):

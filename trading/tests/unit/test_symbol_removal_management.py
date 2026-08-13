@@ -286,7 +286,7 @@ class DailyCheckFallbackJobTest(unittest.TestCase):
 
 
 class MaCrossFlipResidueTest(unittest.TestCase):
-    """翻转平仓后旧止损撤销不可确认：不反手，但记录 T+1 交由次日重入（恢复永远在市）。"""
+    """翻转平仓后旧止损撤销不可确认：不反手，下一次日检再重入。"""
 
     def _build(self, tmp, cancel_ok):
         system = TradingSystem.__new__(TradingSystem)
@@ -310,14 +310,14 @@ class MaCrossFlipResidueTest(unittest.TestCase):
 
         def _fake_open(*a, **k):
             # 桩须模拟真实 _execute_open 成功建仓（add_open_position），否则 get_open_position
-            # 仍返回 None，会被翻转的「开仓腿失败」检测误判为失败并错记 T+1
+            # 仍返回 None，会被翻转的「开仓腿失败」检测误判为失败并错记重入标记
             opened.append(a)
             system.trade_state.add_open_position(a[0], a[1], 2900.0, 1.0, 2800.0,
                                                  'stop-new', strategy='ma_cross')
         system._execute_open = _fake_open
         return system, opened
 
-    def test_unconfirmed_cancel_records_t1_and_blocks_reopen(self):
+    def test_unconfirmed_cancel_records_reentry_marker_and_blocks_reopen(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, opened = self._build(tmp, cancel_ok=False)
             position = system.trade_state.get_open_position('ETHUSDT')
@@ -327,10 +327,10 @@ class MaCrossFlipResidueTest(unittest.TestCase):
 
             self.assertEqual(opened, [])  # 不反手开新仓
             self.assertEqual(system.stop_loss_dates.get('ETHUSDT'),
-                             date.today().strftime('%Y-%m-%d'))  # 已记 T+1，次日按 EMA 方向重入
+                             date.today().strftime('%Y-%m-%d'))  # 下一次日检按 EMA 方向重入
             self.assertTrue(system.trade_state.has_stop_residue('ETHUSDT'))  # 残留标记阻断开仓
 
-    def test_confirmed_cancel_flips_without_t1(self):
+    def test_confirmed_cancel_flips_without_reentry_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, opened = self._build(tmp, cancel_ok=True)
             position = system.trade_state.get_open_position('ETHUSDT')
@@ -339,10 +339,10 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             system._flip_position('ETHUSDT', signal, position, 'long', {'name': 'ETHUSDT'})
 
             self.assertEqual(len(opened), 1)  # 正常反手
-            self.assertEqual(system.stop_loss_dates, {})  # 不记 T+1
+            self.assertEqual(system.stop_loss_dates, {})  # 不记重入标记
             self.assertFalse(system.trade_state.has_stop_residue('ETHUSDT'))
 
-    def test_exit_only_closes_without_reopening_or_t1(self):
+    def test_exit_only_closes_without_reopening_or_reentry_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, opened = self._build(tmp, cancel_ok=True)
             system.stop_loss_dates['ETHUSDT'] = '2000-01-01'
@@ -356,7 +356,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
             self.assertIsNone(system.trade_state.get_open_position('ETHUSDT'))
             self.assertNotIn('ETHUSDT', system.stop_loss_dates)
 
-    def test_exit_only_cancel_residue_still_never_reopens_or_records_t1(self):
+    def test_exit_only_cancel_residue_never_reopens_or_records_reentry_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             system, opened = self._build(tmp, cancel_ok=False)
             position = system.trade_state.get_open_position('ETHUSDT')
@@ -489,7 +489,7 @@ class IntradayReconcileResidueTest(unittest.TestCase):
             system.reconcile_intraday_stop_losses()
             self.assertIsNone(system.trade_state.get_open_position('BTCUSDT'))  # 已记平
             self.assertFalse(system.trade_state.has_stop_residue('BTCUSDT'))
-            self.assertEqual(system.stop_loss_dates, {})  # 已删除品种：不记 T+1
+            self.assertEqual(system.stop_loss_dates, {})  # 已删除品种：不记重入标记
 
     def test_residue_marked_when_cancel_unconfirmed(self):
         """撤销不可确认：记平照常完成，但标记残留（持久化）阻断该品种后续开仓。"""
@@ -509,6 +509,31 @@ class IntradayReconcileResidueTest(unittest.TestCase):
 
             self.assertIsNotNone(system.trade_state.get_open_position('BTCUSDT'))
             self.assertEqual(system._stop_anomalies['BTCUSDT'], 'flat_unconfirmed')
+
+    def test_enabled_symbol_intraday_stop_records_marker_but_never_reopens(self):
+        """盘中只记账：即使品种仍启用，也不得从巡检路径直接新开仓。"""
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(
+                tmp,
+                config_symbols=[{
+                    'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
+            system.trade_state.add_open_position(
+                'BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
+                stop_order_id='stop-1', strategy='ma_cross')
+            system.exchange_api.get_position = lambda s: None
+            system.exchange_api.confirm_position_flat = lambda s: True
+            system.exchange_api.cancel_order = lambda *a: True
+            system.exchange_api.cancel_all_orders = lambda *a: True
+            system.notifier.notify_stop_loss_triggered = lambda *a, **k: True
+            system._execute_open = Mock()
+
+            system.reconcile_intraday_stop_losses()
+
+            self.assertIsNone(system.trade_state.get_open_position('BTCUSDT'))
+            self.assertIn('BTCUSDT', system.stop_loss_dates)
+            system._execute_open.assert_not_called()
 
 
 class IntradayPerSymbolIsolationTest(unittest.TestCase):
@@ -859,11 +884,11 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
         system.record_stop_loss.assert_called_once_with('ETHUSDT')
         self.assertEqual(cancel_calls, ['stop-9'])
 
-    def test_t1_save_failure_keeps_local_position_and_stop(self):
+    def test_reentry_marker_save_failure_keeps_local_position_and_stop(self):
         from unittest.mock import Mock
         system, cancel_calls = self._system()
         system.trade_state.close_position = Mock(return_value={'symbol': 'ETHUSDT'})
-        system.record_stop_loss.side_effect = TradeStatePersistenceError('T+1 磁盘故障')
+        system.record_stop_loss.side_effect = TradeStatePersistenceError('重入标记磁盘故障')
         signal = {'current_close': 101}
         position = {'side': 'long', 'stop_loss_price': 99, 'position_size': 2, 'stop_order_id': 'stop-9'}
 
@@ -907,7 +932,7 @@ class StopLossDatePersistenceSafetyTest(unittest.TestCase):
             with patch.object(main_module, 'atomic_write_json', Mock(return_value=False)):
                 with self.assertRaises(TradeStatePersistenceError):
                     system.record_stop_loss('BTCUSDT')
-            self.assertTrue(system.is_stop_loss_today('BTCUSDT'))
+            self.assertIn('BTCUSDT', system.stop_loss_dates)
 
     def test_clear_failure_restores_runtime_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -918,14 +943,6 @@ class StopLossDatePersistenceSafetyTest(unittest.TestCase):
                 with self.assertRaises(TradeStatePersistenceError):
                     system.clear_stop_loss('BTCUSDT')
             self.assertEqual(system.stop_loss_dates['BTCUSDT'], '2000-01-01')
-
-    def test_future_runtime_marker_blocks_open(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            system = self._system(tmp)
-            system.stop_loss_dates['BTCUSDT'] = (
-                date.today() + timedelta(days=1)).strftime('%Y-%m-%d')
-            self.assertTrue(system.is_stop_loss_today('BTCUSDT'))
-
 
 class TradeStateTransactionTest(unittest.TestCase):
     """核心状态方法事务化：落盘失败时内存必须回滚，不得留下与磁盘/交易所不一致的假状态。"""

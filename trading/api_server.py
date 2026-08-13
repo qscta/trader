@@ -893,7 +893,7 @@ def close_position():
                     symbol_name, ccxt_symbol, position, exchange_position):
                 return jsonify({'error': f'{symbol_name} 交易所持仓与本地记录不一致，'
                                          '已拒绝系统平仓，请直接在 OKX 人工处理'}), 409
-            # 手动平仓表示明确退出当前仓，不应被一次开仓后遗留的旧 T+1 标记在
+            # 手动平仓表示明确退出当前仓，不应被一次开仓后遗留的旧日检重入标记在
             # 后续日检中自动补回。先事务式清标记；失败时尚未发平仓单，可安全拒绝。
             system.clear_stop_loss(symbol_name)
             close_order = system.exchange_api.close_position(ccxt_symbol, position['side'], position['position_size'])

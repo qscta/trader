@@ -20,7 +20,7 @@ python3 -m unittest discover -s tests/unit -p "test_*.py"
 
 - 收盘 K 线时间戳过滤（`filter_closed_candles`）
 - 双均线止损确认与翻转分支（含撤销不可确认时不反手）
-- 双均线 T+1 重入
+- 双均线止损后的下一次日检重入（不以自然日零点为门槛）
 - `instant_open` / `delete_symbol` / 输入校验 / 策略参数校验等 API 路由行为
 - 开仓风险护栏、止损核验与自愈、持久化失败补偿等
 
