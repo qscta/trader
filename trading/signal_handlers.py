@@ -47,7 +47,7 @@ class SignalHandlersMixin:
                 else reentry_signal['upper_stop'])
             logger.info(
                 f"{symbol} [双均线] 日检重入: 方向={side}, "
-                f"EMA仍然{'看多' if side == 'long' else '看空'}")
+                f"当前EMA方向={'看多' if side == 'long' else '看空'}")
             self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
             if self.trade_state.get_open_position(symbol):
                 # _execute_open 成功路径已统一清除；此处幂等兜底，兼容测试桩。
