@@ -132,6 +132,40 @@ class DingTalkNotifier:
                 content += f"EMA短/长: {ema_short} / {ema_long}\n\n"
         return self.send_message(f"[交易系统] 信号未成交 - {symbol}", content)
 
+    def notify_open_safely_deferred(
+            self, symbol, strategy_name, side, reason,
+            reference_price, stop_loss_price, signal=None):
+        """止损结构无效且明确尚未发单时，发送无需人工介入的安全暂缓通知。"""
+        side_cn = "做多" if side == 'long' else "做空"
+        content = (
+            f"### ⏸️ 开仓安全暂缓 - {symbol}\n\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"交易对: {symbol}\n\n"
+            f"策略: {strategy_name}\n\n"
+            f"当前方向: {side_cn}\n\n"
+        )
+        signal_close = signal.get('current_close') if signal else None
+        if signal:
+            ema_short = signal.get('ema_short')
+            ema_long = signal.get('ema_long')
+            if ema_short is not None and ema_long is not None:
+                content += f"EMA短/长: {ema_short} / {ema_long}\n\n"
+        if signal_close is not None:
+            content += f"信号参考价: {signal_close}\n\n"
+            if reference_price != signal_close:
+                content += f"实时计算价: {reference_price}\n\n"
+        else:
+            content += f"安全检查参考价: {reference_price}\n\n"
+        content += (
+            f"固定止损价: {stop_loss_price}\n\n"
+            f"暂缓原因: {reason}\n\n"
+            "订单状态: 未向 OKX 发送开仓订单\n\n"
+            "当前状态: 无新增仓位、无新增挂单\n\n"
+            "后续处理: 重入标记已保留，下次日检将重新核定 EMA 方向和止损\n\n"
+            "处理建议: 正常风控拦截，无需人工操作"
+        )
+        return self.send_message(f"[交易系统] 开仓安全暂缓 - {symbol}", content)
+
     def notify_position_summary(self, positions, symbols_config, total_equity):
         """发送每日持仓汇总"""
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

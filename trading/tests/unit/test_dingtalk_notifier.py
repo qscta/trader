@@ -52,6 +52,32 @@ class DingTalkDeliveryEvidenceTest(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(2, calls)
 
+    def test_safe_defer_message_says_no_order_and_no_manual_action(self):
+        notifier = DingTalkNotifier('https://example.invalid/robot/send?access_token=secret')
+        signal = {
+            'current_close': 205.5,
+            'ema_short': 198.31500934090957,
+            'ema_long': 198.44727891198724,
+        }
+        with patch.object(notifier, 'send_message', return_value=True) as send:
+            result = notifier.notify_open_safely_deferred(
+                'TAOUSDT', '双均线 EMA', 'short',
+                '空单止损价(203.7)必须高于入场参考价(205.5)，当前风险结构不成立',
+                205.5, 203.7, signal=signal,
+            )
+
+        self.assertTrue(result)
+        title, content = send.call_args.args
+        self.assertEqual('[交易系统] 开仓安全暂缓 - TAOUSDT', title)
+        self.assertIn('### ⏸️ 开仓安全暂缓 - TAOUSDT', content)
+        self.assertIn('当前方向: 做空', content)
+        self.assertIn('EMA短/长: 198.31500934090957 / 198.44727891198724', content)
+        self.assertIn('信号参考价: 205.5', content)
+        self.assertIn('固定止损价: 203.7', content)
+        self.assertIn('未向 OKX 发送开仓订单', content)
+        self.assertIn('无新增仓位、无新增挂单', content)
+        self.assertIn('无需人工操作', content)
+
 
 if __name__ == '__main__':
     unittest.main()

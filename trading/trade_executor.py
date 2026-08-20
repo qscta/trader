@@ -21,6 +21,19 @@ from trade_state import TradeStatePersistenceError
 logger = logging.getLogger(__name__)
 
 
+def _safe_deferred_open_result(symbol, side, stop_loss_price, reference_price, price_label):
+    """构造“风险结构不成立且明确零下单”的非异常结果。"""
+    side_cn = '多单' if side == 'long' else '空单'
+    relation = '低于' if side == 'long' else '高于'
+    reason = (f"{side_cn}止损价({stop_loss_price})必须{relation}{price_label}({reference_price})，"
+              "当前风险结构不成立")
+    logger.info(f"{symbol} 开仓安全暂缓: {reason}；未发送订单")
+    return {
+        'status': 'safe_deferred', 'reason': reason,
+        'reference_price': reference_price, 'stop_loss_price': stop_loss_price,
+    }
+
+
 class TradeExecutorMixin:
 
     def _retain_position_after_failed_rollback(
@@ -113,15 +126,22 @@ class TradeExecutorMixin:
             stop_loss_price = signal['upper_stop']
 
         logger.info(f"{symbol} [双均线] 翻转开仓: 方向={new_side}, 信号价={entry_price}, 止损={stop_loss_price}")
-        self._execute_open(symbol, new_side, entry_price, stop_loss_price, symbol_config)
+        open_result = self._execute_open(
+            symbol, new_side, entry_price, stop_loss_price, symbol_config)
         if not self.trade_state.get_open_position(symbol):
             # 平旧仓成功但反手开新腿失败（价格已穿止损/超时未确认/保证金不足等）：记重入标记，
             # 下一次日检按当时 EMA 方向自动重入，恢复「永远在市」——
-            # 与 stop_cleared=False 分支同一恢复机制（_execute_open 内部已发失败告警）
+            # 与 stop_cleared=False 分支同一恢复机制；真实失败维持告警，明确零下单的
+            # 风险结构无效则由统一收口发送“安全暂缓”。
             self._mark_ma_cross_reentry_pending(
                 symbol, new_side, signal,
-                '双均线翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入，请复核交易所与日志')
-            logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入恢复在市")
+                '双均线翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入，请复核交易所与日志',
+                open_result=open_result)
+            if (isinstance(open_result, dict)
+                    and open_result.get('status') == 'safe_deferred'):
+                logger.info(f"{symbol} [双均线] 翻转反手安全暂缓，已记标记等待下一次日检")
+            else:
+                logger.error(f"{symbol} [双均线] 翻转反手开仓未成功，已记标记等待下一次日检按 EMA 方向重入恢复在市")
 
     def _persist_open_position_or_rollback(self, symbol, ccxt_symbol, side, actual_price, position_size, stop_loss_price, stop_order_id, strategy=None):
         try:
@@ -151,6 +171,7 @@ class TradeExecutorMixin:
 
         buffer_notification=False 供即时开仓路由使用：该路由自己发专属钉钉，
         不走日检的汇总缓冲——否则消息滞留缓冲区，直到下次日检开头被静默清空。
+        仅在止损方向无效且尚未发单时返回 ``safe_deferred`` 结果；其余返回语义不变。
         """
         # 所有自动/即时/日检重入/翻转开仓最终都经过本方法；部署总闸必须放在
         # 这个最内层边界，避免只拦调度入口却漏掉 Web 即时开仓或反手腿。
@@ -191,11 +212,11 @@ class TradeExecutorMixin:
             return
         # 基本方向校验：防止数据异常时开出危险仓位
         if side == 'long' and stop_loss_price >= entry_price:
-            logger.error(f"{symbol} 开仓中止: 多单止损价({stop_loss_price})必须低于入场价({entry_price})")
-            return
+            return _safe_deferred_open_result(
+                symbol, side, stop_loss_price, entry_price, '入场参考价')
         if side == 'short' and stop_loss_price <= entry_price:
-            logger.error(f"{symbol} 开仓中止: 空单止损价({stop_loss_price})必须高于入场价({entry_price})")
-            return
+            return _safe_deferred_open_result(
+                symbol, side, stop_loss_price, entry_price, '入场参考价')
 
         # ====== 核心修复：用实时市场价替代信号收盘价计算仓位 ======
         try:
@@ -209,11 +230,11 @@ class TradeExecutorMixin:
 
         # 使用实际计算价再次校验止损方向，避免信号价过时导致危险开仓
         if side == 'long' and stop_loss_price >= calc_price:
-            logger.error(f"{symbol} 开仓中止: 多单止损价({stop_loss_price})必须低于实时计算价({calc_price})")
-            return
+            return _safe_deferred_open_result(
+                symbol, side, stop_loss_price, calc_price, '实时计算价')
         if side == 'short' and stop_loss_price <= calc_price:
-            logger.error(f"{symbol} 开仓中止: 空单止损价({stop_loss_price})必须高于实时计算价({calc_price})")
-            return
+            return _safe_deferred_open_result(
+                symbol, side, stop_loss_price, calc_price, '实时计算价')
 
         balance = self.exchange_api.get_balance()
         account_equity = balance.get('total', {}).get('USDT') if balance else None

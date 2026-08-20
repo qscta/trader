@@ -146,7 +146,11 @@ class MaCrossNextDailyCheckReentryTests(unittest.TestCase):
         system._execute_open = Mock()
         # _execute_open 后主流程会确认持仓已形成，返回非 None 避免触发 missing-position 告警
         system.trade_state = SimpleNamespace(get_open_position=Mock(return_value={"symbol": "ETHUSDT"}))
-        system.notifier = SimpleNamespace(notify_signal_missed=Mock(), notify_error=Mock())
+        system.notifier = SimpleNamespace(
+            notify_signal_missed=Mock(),
+            notify_open_safely_deferred=Mock(),
+            notify_error=Mock(),
+        )
         system.ma_cross_strategy = SimpleNamespace(check_reentry_condition=Mock())
         return system
 
@@ -221,6 +225,39 @@ class MaCrossNextDailyCheckReentryTests(unittest.TestCase):
         system._execute_open.assert_called_once()
         self.assertIn("ETHUSDT", system.stop_loss_dates)          # 标记保留
         system.notifier.notify_signal_missed.assert_called_once()
+
+    def test_daily_check_invalid_stop_is_safe_defer_not_failure_alert(self):
+        """TAO 复现：方向成立但固定止损越过入场价时，应明确告知零下单的安全暂缓。"""
+        system = self.make_system()
+        system.trade_state.get_open_position = Mock(return_value=None)
+        system.stop_loss_dates["TAOUSDT"] = "2026-08-20"
+        signal = {
+            "current_close": 205.5,
+            "ema_short": 198.31500934090957,
+            "ema_long": 198.44727891198724,
+            "lower_stop": 187.3,
+            "upper_stop": 203.7,
+        }
+        system.ma_cross_strategy.check_reentry_condition.return_value = (
+            True, "short", signal,
+        )
+        system._execute_open.return_value = {
+            "status": "safe_deferred",
+            "reason": "空单止损价(203.7)必须高于入场参考价(205.5)，当前风险结构不成立",
+            "reference_price": 205.5,
+            "stop_loss_price": 203.7,
+        }
+
+        system.handle_no_position_ma_cross(
+            "TAOUSDT", {"action": None}, {"name": "TAOUSDT"}, df=object())
+
+        self.assertIn("TAOUSDT", system.stop_loss_dates)
+        system.notifier.notify_signal_missed.assert_not_called()
+        system.notifier.notify_open_safely_deferred.assert_called_once_with(
+            "TAOUSDT", "双均线 EMA", "short",
+            "空单止损价(203.7)必须高于入场参考价(205.5)，当前风险结构不成立",
+            205.5, 203.7, signal=signal,
+        )
 
     def test_initial_open_failure_records_next_check_reentry(self):
         """初始金叉/死叉开仓腿失败：记标记，下次日检按 EMA 方向自动重入。"""
@@ -918,6 +955,28 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
                 system.exchange_api.get_position.assert_not_called()
                 system.exchange_api.open_position.assert_not_called()
 
+    def test_invalid_short_stop_returns_safe_defer_without_sending_order(self):
+        """方向信号成立但止损结构无效：必须在任何写订单前返回可辨识的安全暂缓。"""
+        system = self.make_system()
+
+        result = system._execute_open(
+            "TAOUSDT", "short", 205.5, 203.7,
+            {"name": "TAOUSDT", "risk_per_trade": 0.01},
+        )
+
+        self.assertEqual(result, {
+            "status": "safe_deferred",
+            "reason": "空单止损价(203.7)必须高于入场参考价(205.5)，当前风险结构不成立",
+            "reference_price": 205.5,
+            "stop_loss_price": 203.7,
+        })
+        system.exchange_api.exchange.fetch_ticker.assert_not_called()
+        system.exchange_api.get_balance.assert_not_called()
+        system.exchange_api.cancel_all_orders.assert_not_called()
+        system.exchange_api.open_position.assert_not_called()
+        system.exchange_api.create_stop_loss_order.assert_not_called()
+        system.trade_state.add_open_position.assert_not_called()
+
     def test_live_price_failure_blocks_open(self):
         system = self.make_system()
         system.exchange_api.exchange.fetch_ticker.side_effect = RuntimeError('行情失败')
@@ -1072,7 +1131,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
         system = self.make_system()
         system.exchange_api.exchange.fetch_ticker.return_value = {"last": 78}
 
-        system._execute_open(
+        result = system._execute_open(
             "BTCUSDT",
             "long",
             100,
@@ -1080,6 +1139,12 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             {"name": "BTCUSDT", "risk_per_trade": 0.01},
         )
 
+        self.assertEqual(result, {
+            "status": "safe_deferred",
+            "reason": "多单止损价(80)必须低于实时计算价(78.0)，当前风险结构不成立",
+            "reference_price": 78.0,
+            "stop_loss_price": 80,
+        })
         system.exchange_api.open_position.assert_not_called()
         system.trade_state.add_open_position.assert_not_called()
 

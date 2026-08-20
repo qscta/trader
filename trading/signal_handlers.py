@@ -18,7 +18,27 @@ logger = logging.getLogger(__name__)
 
 class SignalHandlersMixin:
 
-    def _mark_ma_cross_reentry_pending(self, symbol, side, signal, reason):
+    def _notify_ma_cross_open_not_formed(
+            self, symbol, side, signal, open_result, failure_reason):
+        """按开仓结果分级通知；只有明确零下单的止损结构无效可降为安全暂缓。"""
+        if (isinstance(open_result, dict)
+                and open_result.get('status') == 'safe_deferred'):
+            self.notifier.notify_open_safely_deferred(
+                symbol,
+                self._get_strategy_display_name('ma_cross'),
+                side,
+                open_result['reason'],
+                open_result['reference_price'],
+                open_result['stop_loss_price'],
+                signal=signal,
+            )
+            logger.info(f"{symbol} [双均线] 风险结构不成立，已发送安全暂缓通知")
+            return
+        self._notify_missing_position_after_signal(
+            symbol, 'ma_cross', side, signal, failure_reason)
+
+    def _mark_ma_cross_reentry_pending(
+            self, symbol, side, signal, reason, open_result=None):
         """双均线开仓腿失败后统一收口：记「下次日检重入待定」标记 + 告警。
 
         双均线「永远在市」：任一开仓腿失败（初始金叉/死叉开仓、翻转反手、日检重入）若不留
@@ -26,7 +46,8 @@ class SignalHandlersMixin:
         消费，按当时 EMA 方向自动补回持仓——与止损后重入共用同一套机制。
         """
         self.record_stop_loss(symbol)
-        self._notify_missing_position_after_signal(symbol, 'ma_cross', side, signal, reason)
+        self._notify_ma_cross_open_not_formed(
+            symbol, side, signal, open_result, reason)
 
     # ========== 双均线策略处理 ==========
 
@@ -48,20 +69,22 @@ class SignalHandlersMixin:
             logger.info(
                 f"{symbol} [双均线] 日检重入: 方向={side}, "
                 f"当前EMA方向={'看多' if side == 'long' else '看空'}")
-            self._execute_open(symbol, side, entry_price, stop_loss_price, symbol_config)
+            open_result = self._execute_open(
+                symbol, side, entry_price, stop_loss_price, symbol_config)
             if self.trade_state.get_open_position(symbol):
                 # _execute_open 成功路径已统一清除；此处幂等兜底，兼容测试桩。
                 self.clear_stop_loss(symbol)
             else:
                 # 开仓未成功：保留标记，下一次日检继续按届时 EMA 方向重试。
-                self._notify_missing_position_after_signal(
-                    symbol,
-                    'ma_cross',
-                    side,
-                    reentry_signal,
+                self._notify_ma_cross_open_not_formed(
+                    symbol, side, reentry_signal, open_result,
                     '双均线日检重入开仓未成功，已保留标记等待下一次日检重试，请复核交易所与日志'
                 )
-                logger.warning(f"{symbol} [双均线] 日检重入开仓未成功，保留标记等待下一次日检")
+                if (isinstance(open_result, dict)
+                        and open_result.get('status') == 'safe_deferred'):
+                    logger.info(f"{symbol} [双均线] 日检重入安全暂缓，保留标记等待下一次日检")
+                else:
+                    logger.warning(f"{symbol} [双均线] 日检重入开仓未成功，保留标记等待下一次日检")
         else:
             logger.info(f"{symbol} [双均线] 重入条件不满足（EMA方向无法界定），不重入")
             self.clear_stop_loss(symbol)
@@ -82,25 +105,29 @@ class SignalHandlersMixin:
             logger.info(f"{symbol} [双均线] 金叉信号，准备做多...")
             entry_price = signal['current_close']
             stop_loss_price = signal['lower_stop']
-            self._execute_open(symbol, 'long', entry_price, stop_loss_price, symbol_config)
+            open_result = self._execute_open(
+                symbol, 'long', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
                 self._mark_ma_cross_reentry_pending(
                     symbol,
                     'long',
                     signal,
-                    '双均线做多信号已出现，但本轮检查结束后仍无持仓，已记标记等待下一次日检按 EMA 方向重入'
+                    '双均线做多信号已出现，但本轮检查结束后仍无持仓，已记标记等待下一次日检按 EMA 方向重入',
+                    open_result=open_result,
                 )
         elif signal['action'] == 'short':
             logger.info(f"{symbol} [双均线] 死叉信号，准备做空...")
             entry_price = signal['current_close']
             stop_loss_price = signal['upper_stop']
-            self._execute_open(symbol, 'short', entry_price, stop_loss_price, symbol_config)
+            open_result = self._execute_open(
+                symbol, 'short', entry_price, stop_loss_price, symbol_config)
             if not self.trade_state.get_open_position(symbol):
                 self._mark_ma_cross_reentry_pending(
                     symbol,
                     'short',
                     signal,
-                    '双均线做空信号已出现，但本轮检查结束后仍无持仓，已记标记等待下一次日检按 EMA 方向重入'
+                    '双均线做空信号已出现，但本轮检查结束后仍无持仓，已记标记等待下一次日检按 EMA 方向重入',
+                    open_result=open_result,
                 )
 
     def handle_open_position_ma_cross(self, symbol, signal, position, symbol_config, df):
