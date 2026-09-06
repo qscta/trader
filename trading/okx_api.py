@@ -473,6 +473,131 @@ class OkxApi(ExchangeApi):
             logger.error(f"平仓异常: {e}")
             return None
 
+    def partial_stop_is_intact(self, symbol, side, amount, price, stop_id):
+        """人工减仓只接受本系统原来的唯一 conditional 止损，不认领其他算法单。"""
+        ccxt_symbol = self._resolve_symbol(symbol)
+        orders = self._fetch_algo_orders(ccxt_symbol)
+        return (len(orders) == 1 and str(orders[0]['id']) == str(stop_id)
+                and orders[0].get('info', {}).get('ordType') == 'conditional'
+                and self._algo_order_matches(
+                    orders[0], 'sell' if side == 'long' else 'buy',
+                    self._align_stop_price(ccxt_symbol, price), self._coin_to_contracts(ccxt_symbol, amount)))
+
+    def preview_partial_close(self, symbol, position, percent):
+        """部分平仓专用数量检查；绝不使用“数量为零则全平”的兜底。"""
+        ccxt_symbol = self._resolve_symbol(symbol)
+        market = self.exchange.market(ccxt_symbol)
+        total = Decimal(str(position['contracts']))
+        raw = total * Decimal(str(percent)) / 100
+        size = Decimal(self.exchange.amount_to_precision(ccxt_symbol, str(raw)))
+        minimum = Decimal(str(market['limits']['amount']['min']))
+        if (not all(v.is_finite() for v in (total, raw, size, minimum))
+                or minimum <= 0 or not minimum <= size <= raw < total
+                or total - size < minimum):
+            raise ValueError('减仓量或剩余量不足交易所最小数量，拒绝自动扩大或全平')
+        contract_size = self._get_contract_size(ccxt_symbol)
+        return {'contracts': str(size), 'original_contracts': str(total),
+                'contract_size': contract_size, 'reduce_size': float(size * Decimal(str(contract_size))),
+                'remaining_size': float((total - size) * Decimal(str(contract_size)))}
+
+    def _partial_order_terminal(self, symbol, quote):
+        """按唯一 clOrdId 查终态；只允许撤本次普通单，不重发减仓，不撤算法止损。"""
+        inst_id = self._to_inst_id(self._resolve_symbol(symbol))
+        identity = {'instId': inst_id, 'clOrdId': quote['client_order_id']}
+        for attempt in range(6):
+            try:
+                response = self.exchange.privateGetTradeOrder(identity)
+                rows = response.get('data') if isinstance(response, dict) else None
+                if response.get('code') == '0' and isinstance(rows, list) and len(rows) == 1:
+                    order = rows[0]
+                    if order.get('state') in ('filled', 'canceled'):
+                        expected_side = 'sell' if quote['side'] == 'long' else 'buy'
+                        if (order.get('instId') != inst_id
+                                or order.get('clOrdId') != quote['client_order_id']
+                                or not order.get('ordId') or order.get('side') != expected_side
+                                or order.get('posSide') != 'net' or order.get('ordType') != 'market'
+                                or order.get('reduceOnly') not in (True, 'true')
+                                or Decimal(order['sz']) != Decimal(quote['contracts'])):
+                            raise ValueError('减仓订单身份或数量不匹配')
+                        filled = Decimal(order['accFillSz'])
+                        average = float(order['avgPx']) if filled else 0.
+                        if (not filled.is_finite() or not 0 <= filled <= Decimal(quote['contracts'])
+                                or (filled and (not math.isfinite(average) or average <= 0))):
+                            raise ValueError('减仓成交证据不完整')
+                        return filled, average
+            except Exception as e:
+                logger.warning('减仓订单第 %s 次查询尚未确认: %s', attempt + 1, e)
+            if attempt == 2:
+                try:
+                    self.exchange.privatePostTradeCancelOrder(identity)
+                except Exception as e:
+                    logger.warning('撤销本次未确认普通单失败，继续只读核对: %s', e)
+            if attempt < 5:
+                time.sleep(self.CANCEL_VERIFY_RECHECK_DELAY)
+        raise RuntimeError('减仓订单终态无法确认')
+
+    def _resize_partial_stop(self, symbol, quote, remaining):
+        """原位改数量；失败不撤旧保护，不创建另一张止损。"""
+        ccxt_symbol = self._resolve_symbol(symbol)
+        side = 'sell' if quote['side'] == 'long' else 'buy'
+        price = self._align_stop_price(ccxt_symbol, quote['stop_price'])
+        orders = self._fetch_algo_orders(ccxt_symbol)
+        if (len(orders) != 1 or str(orders[0]['id']) != str(quote['stop_order_id'])
+                or not any(self._algo_order_matches(orders[0], side, price, float(size))
+                           for size in (remaining, quote['original_contracts']))):
+            raise RuntimeError('原止损已变化，拒绝猜测或另挂止损')
+        if self._algo_order_matches(orders[0], side, price, float(remaining)):
+            return  # 交易所已自动调整，直接采用可核实结果
+        try:
+            self.exchange.privatePostTradeAmendAlgos({
+                'instId': self._to_inst_id(ccxt_symbol), 'algoId': str(quote['stop_order_id']),
+                'newSz': str(remaining), 'cxlOnFail': False})
+        except Exception as e:
+            logger.warning('止损改量请求异常，保留旧单并只读核对: %s', e)
+        for attempt in range(3):
+            orders = self._fetch_algo_orders(ccxt_symbol)
+            if (len(orders) == 1 and str(orders[0]['id']) == str(quote['stop_order_id'])
+                    and self._algo_order_matches(orders[0], side, price, float(remaining))):
+                return
+            if attempt < 2:
+                time.sleep(self.CANCEL_VERIFY_RECHECK_DELAY)
+        raise RuntimeError('剩余仓位止损数量未确认，保留原单并转人工核对')
+
+    def execute_partial_close(self, symbol, quote):
+        """调用前必须已持久化意图；发单仅一次，任何疑点由上层保留隔离记录。"""
+        ccxt_symbol = self._resolve_symbol(symbol)
+        before = self.get_position(ccxt_symbol)
+        if not before or not self.managed_position_matches(
+                ccxt_symbol, before, quote['side'], quote['original_size']):
+            raise RuntimeError('临下单实仓变化，未发单')
+        if not self.partial_stop_is_intact(symbol, quote['side'], quote['original_size'],
+                                          quote['stop_price'], quote['stop_order_id']):
+            raise RuntimeError('临下单止损状态变化，未发单')
+        params = self._order_params(reduce_only=True, extra={
+            'instId': self._to_inst_id(ccxt_symbol), 'posSide': 'net', 'ordType': 'market',
+            'side': 'sell' if quote['side'] == 'long' else 'buy',
+            'sz': quote['contracts'], 'clOrdId': quote['client_order_id']})
+        try:
+            self.exchange.privatePostTradeOrder(params)
+        except Exception as e:
+            logger.warning('减仓发单回执异常（绝不重发）: %s', e)
+        filled, average = self._partial_order_terminal(symbol, quote)
+        remaining = Decimal(quote['original_contracts']) - filled
+        remaining_coin = float(remaining * Decimal(str(quote['contract_size'])))
+        # 同时触发止损/人工交易时不能把数量差全部归因于本次减仓。
+        for _ in range(2):
+            actual = self.get_position(ccxt_symbol)
+            if not actual or not self.managed_position_matches(
+                    ccxt_symbol, actual, quote['side'], remaining_coin):
+                raise RuntimeError('减仓成交与实仓变化不能对应，转人工核对')
+        self._resize_partial_stop(symbol, quote, remaining)
+        actual = self.get_position(ccxt_symbol)
+        if not actual or not self.managed_position_matches(
+                ccxt_symbol, actual, quote['side'], remaining_coin):
+            raise RuntimeError('核对止损期间实仓再次变化，转人工核对')
+        return {'filled_size': float(filled * Decimal(str(quote['contract_size']))),
+                'remaining_size': remaining_coin, 'average': average}
+
     @staticmethod
     def _algo_order_matches(order, stop_side, stop_price, contracts):
         """判断一张算法单是否就是「我们刚下的那张止损单」：方向 + 触发价 + 张数全部吻合。
@@ -484,6 +609,9 @@ class OkxApi(ExchangeApi):
                 or order.get('reduceOnly') is not True):
             return False
         info = order.get('info') or {}
+        # 限价止损可能在跳价后挂而不成交，不能当作本系统的市价保护。
+        if str(info.get('slOrdPx')) != '-1':
+            return False
         trigger = (order.get('stopLossPrice') or order.get('triggerPrice') or order.get('stopPrice')
                    or info.get('slTriggerPx') or info.get('triggerPx'))
         try:

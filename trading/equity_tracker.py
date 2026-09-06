@@ -694,22 +694,23 @@ class EquityTracker:
         try:
             now = now or datetime.now()
             current_day = self._qiusuo_trading_day(now)
-            ticks = self.load_equity_ticks()
-            if not ticks:
-                return
-
-            by_day = {}
-            for item in ticks:
-                ts = _parse_equity_tick_timestamp(item.get('timestamp'))
-                if ts is None:
-                    continue
-                by_day.setdefault(self._qiusuo_trading_day(ts), []).append(item)
-
-            closed_days = [d for d in by_day if d < current_day]
-            if not closed_days:
-                return
-
+            # 与采样共用整段读改写锁，防止旧快照覆盖刚落盘的新采样。
             with self._lock:
+                ticks = self.load_equity_ticks()
+                if not ticks:
+                    return
+
+                by_day = {}
+                for item in ticks:
+                    ts = _parse_equity_tick_timestamp(item.get('timestamp'))
+                    if ts is None:
+                        continue
+                    by_day.setdefault(self._qiusuo_trading_day(ts), []).append(item)
+
+                closed_days = [d for d in by_day if d < current_day]
+                if not closed_days:
+                    return
+
                 daily = self.load_daily_equity()
                 daily_by_date = {s['date']: s for s in daily if s.get('date')}
                 for d in sorted(closed_days):

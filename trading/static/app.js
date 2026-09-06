@@ -6,6 +6,7 @@
 let equityKlineDays = 120;
 let mainRefreshTimer = null;
 let _positionSymbols = [];
+const _reducingSymbols = new Set();
 
 // lightweight-charts
 const _charts = {};   // containerId -> { chart, series, container, tooltipId, klineByTime }
@@ -359,7 +360,10 @@ async function loadPositions() {
                 <td class="number-cell">${cur}</td>
                 <td class="number-cell">${pnl}</td>
                 <td>${days}</td>
-                <td class="center-cell"><button class="btn-close-pos" data-action="close" data-symbol="${symbol}" data-side="${p.side}" data-size="${p.position_size}">平仓</button></td>
+                <td class="center-cell"><div class="position-actions">
+                    <button class="btn-close-pos btn-reduce-pos" data-action="reduce" data-symbol="${symbol}" ${p.pending_reduction || _reducingSymbols.has(symbol) ? 'disabled' : ''}>${p.pending_reduction ? '待核对' : '减仓'}</button>
+                    <button class="btn-close-pos" data-action="close" data-symbol="${symbol}" data-side="${p.side}" data-size="${p.position_size}" ${p.pending_reduction || _reducingSymbols.has(symbol) ? 'disabled' : ''}>全平</button>
+                </div></td>
             </tr>`;
         }).join('');
         const pnlSign = totalPnl >= 0 ? '+' : '';
@@ -468,7 +472,36 @@ async function instantOpen() {
     } catch (e) { out.className = 'result-line err'; out.textContent = '网络错误'; }
 }
 
+async function reducePosition(symbol) {
+    if (_reducingSymbols.has(symbol)) return;
+    _reducingSymbols.add(symbol);
+    try {
+        const input = prompt(`${symbol} · 一次性减仓\n请输入本次平仓比例，例如 20、30、50（单位 %，不含 100）：`, '50');
+        if (input == null) return;
+        const percent = Number(input.trim());
+        if (!Number.isFinite(percent) || percent <= 0 || percent >= 100) {
+            showAlert('请输入大于 0、小于 100 的比例；全部退出请使用全平', 'error'); return;
+        }
+        const preview = await postJSON('/api/reduce_position/preview', {name: symbol, percent});
+        const data = await preview.json();
+        if (!preview.ok) { showAlert(data.error || '无法安全预览减仓', 'error'); return; }
+        const q = data.quote;
+        const confirmName = prompt(`⚠️ 确认一次性减仓（市价下单，有滑点）\n${symbol} · ${q.side === 'long' ? '多仓' : '空仓'}\n当前：${q.original_size} 币\n本次减仓：${q.reduce_size} 币（已按交易规则取整）\n剩余：${q.remaining_size} 币\n止损价保持：${q.stop_price}\n\n不会自动补回，不修改下次开仓风险度。\n若原止损同时触发，仍可能整仓退出。\n确认请输入 ${symbol}（预览 2 分钟内有效）：`);
+        if (confirmName == null) return;
+        if (confirmName.trim().toUpperCase() !== symbol) { showAlert('名称不匹配，未下单', 'error'); return; }
+        const response = await postJSON('/api/reduce_position', {token: data.token});
+        const result = await response.json();
+        showAlert(response.ok ? `${symbol} 实际减仓 ${result.filled_size}，剩余 ${result.remaining_size}；不自动补单` : result.error, response.ok ? 'success' : 'error');
+    } catch (e) {
+        showAlert('网络异常，结果可能尚未确认。请查看实仓与系统提示，勿重复提交。', 'error');
+    } finally {
+        _reducingSymbols.delete(symbol);
+        loadPositions(); refreshStatus(); loadAccountStats(); loadTrades();
+    }
+}
+
 async function closePosition(symbol, side, size) {
+    if (_reducingSymbols.has(symbol)) return;
     const dir = side === 'long' ? '做多' : (side === 'short' ? '做空' : (side || '-'));
     const input = prompt(`⚠️ 平仓确认（真实下单，不可撤销）\n交易所：欧易\n交易对：${symbol}\n方向：${dir}\n数量：${size != null ? size : '-'}\n\n确认无误请输入交易对名 “${symbol}” 以继续：`);
     if (input == null) return;
@@ -546,8 +579,8 @@ async function loadTrades() {
         const trades = await tr.json();
         const summary = await sr.json();
         if (summary && summary.total) {
-            setText('tradesSummary', `共 ${summary.total} 笔 · 胜率 ${summary.win_rate}% · 净盈亏 ${fmt(summary.total_pnl)}U · 盈亏比 ${summary.profit_factor ?? '-'}`);
-        } else setText('tradesSummary', '暂无成交');
+            setText('tradesSummary', `完成 ${summary.total} 笔整仓交易 · 胜率 ${summary.win_rate}% · 已实现净盈亏 ${fmt(summary.total_pnl)}U（含减仓）· 盈亏比 ${summary.profit_factor ?? '-'}`);
+        } else setText('tradesSummary', summary.exit_count ? `尚无整仓结束 · 已实现减仓净盈亏 ${fmt(summary.total_pnl)}U` : '暂无成交');
         if (!trades || !trades.length) { box.innerHTML = '<div class="empty">暂无历史交易</div>'; return; }
         const rows = trades.slice().reverse().map(t => {
             const side = t.side === 'long' ? '<span class="badge badge-long">多</span>' : '<span class="badge badge-short">空</span>';
@@ -555,7 +588,7 @@ async function loadTrades() {
             const pnl = `<span class="${pnlClass(t.pnl)}">${t.pnl>=0?'+':''}${fmt(t.pnl)}</span>`;
             return `<tr>
                 <td>${closeTime}</td>
-                <td><span class="symbol-name">${t.symbol}</span></td>
+                <td><span class="symbol-name">${t.symbol}</span>${t.partial_close ? ' · 减仓' : ''}</td>
                 <td>${side}</td>
                 <td class="number-cell">${fmt(t.entry_price, 4)}</td>
                 <td class="number-cell">${fmt(t.exit_price, 4)}</td>
@@ -604,6 +637,7 @@ function bindEvents() {
         const action = t.getAttribute('data-action');
         const symbol = t.getAttribute('data-symbol');
         if (action === 'close') closePosition(symbol, t.getAttribute('data-side'), t.getAttribute('data-size'));
+        else if (action === 'reduce') reducePosition(symbol);
         else if (action === 'del') deleteSymbol(symbol);
         else if (action === 'toggle') toggleSymbol(symbol, t.getAttribute('data-enabled') === '1');
         else if (action === 'risk') updateSymbolRisk(symbol, parseFloat(t.getAttribute('data-risk')));

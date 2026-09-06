@@ -171,8 +171,12 @@ body {
 .btn-danger { background: var(--red-soft); color: var(--red-strong); }
 .btn-danger:hover { background: #fbdedf; }
 .btn-close-pos { background: var(--red-soft); color: var(--red-strong); border: 1px solid transparent; border-radius: var(--r-ctrl);
-    padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all .16s; }
+    padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer; transition: background-color .16s, transform .16s cubic-bezier(.23,1,.32,1); }
 .btn-close-pos:hover { background: #fbdedf; }
+.position-actions { display: flex; gap: 6px; justify-content: center; white-space: nowrap; }
+.btn-reduce-pos { background: var(--bg-card); color: var(--text-secondary); border-color: var(--border-strong); }
+.btn-close-pos:disabled { opacity: .5; cursor: not-allowed; }
+@media (prefers-reduced-motion: no-preference) { .btn-close-pos:not(:disabled):not(:focus-visible):active { transform: scale(.97); } }
 .result-line { font-size: 12.5px; margin-top: 10px; min-height: 18px; }
 .result-line.ok { color: var(--green-strong); }
 .result-line.err { color: var(--red-strong); }
@@ -416,6 +420,6 @@ table.data tbody tr:last-child td { border-bottom: none; }
 </div>
 
 <script src="/static/lwc.js"></script>
-<script src="/static/app.js?v=20260709-1"></script>
+<script src="/static/app.js?v=20260906-1"></script>
 </body>
 </html>

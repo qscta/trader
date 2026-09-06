@@ -173,20 +173,15 @@ class SignalHandlersMixin:
                 symbol, ccxt_symbol, position, exchange_position):
             return
 
-        # 检查反向交叉信号
-        if signal['action'] == 'long' and position['side'] == 'short':
-            action_text = '退出模式只平空仓、不反手' if exit_only else '空翻多'
-            logger.info(f"{symbol} [双均线] 金叉信号，{action_text}...")
-            self._flip_position(
-                symbol, signal, position, 'long', symbol_config,
+        # 日检按当前 EMA 方向管理旧仓；平仓失败或错过交叉当天后仍可继续处理。
+        # 相等时不界定方向；无仓首次入场仍由独立分支要求新交叉或重入标记。
+        ema_short, ema_long = signal['ema_short'], signal['ema_long']
+        new_side = 'long' if ema_short > ema_long else 'short' if ema_short < ema_long else None
+        if new_side and new_side != position['side']:
+            action_text = '只平旧仓、不反手' if exit_only else f"翻转为{new_side}"
+            logger.info(f"{symbol} [双均线] 当前 EMA 方向与持仓相反，{action_text}...")
+            return self._flip_position(
+                symbol, signal, position, new_side, symbol_config,
                 exit_only=exit_only)
-            return
-        elif signal['action'] == 'short' and position['side'] == 'long':
-            action_text = '退出模式只平多仓、不反手' if exit_only else '多翻空'
-            logger.info(f"{symbol} [双均线] 死叉信号，{action_text}...")
-            self._flip_position(
-                symbol, signal, position, 'short', symbol_config,
-                exit_only=exit_only)
-            return
 
-        logger.info(f"{symbol} [双均线] 无反向交叉信号，止损保持不变: {position['stop_loss_price']}")
+        logger.info(f"{symbol} [双均线] 当前 EMA 无反向指向，止损保持不变: {position['stop_loss_price']}")

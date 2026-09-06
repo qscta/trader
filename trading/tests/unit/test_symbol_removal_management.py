@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from tests.unit import _test_stubs
 
@@ -29,6 +30,7 @@ def _build_system(tmpdir, config_symbols):
                      'strategy': {'default_risk_per_trade': 0.01}}
     system._trade_lock = threading.Lock()
     system._stop_anomalies = {}
+    system._stop_anomaly_alerts = {}
     system._known_orphans = set()
     system._last_check_date = None
     system._last_failure_notify_ts = 0
@@ -135,11 +137,14 @@ class PerSymbolIsolationTest(unittest.TestCase):
             self.assertEqual(sorted(fetched), ['BTCUSDT', 'ETHUSDT'])
             self.assertIsNone(system._last_check_date)
 
-    def test_all_success_marks_day_done(self):
-        """全部品种正常：标记当日已完成，防止重复执行。"""
+    def test_warmup_marks_day_done_without_trading(self):
+        """有真实历史但尚未满足预热根数：正常跳过，不当成行情故障重试。"""
         with tempfile.TemporaryDirectory() as tmp:
             system, _checked = _build_system(
                 tmp, config_symbols=[{'name': 'BTCUSDT', 'enabled': True, 'strategy': 'ma_cross'}])
+            system.exchange_api.fetch_ohlcv = lambda *a, **k: [[1, 100, 100, 100, 100, 1]]
+            system.exchange_api.ohlcv_to_dataframe = lambda rows: rows
+            system.exchange_api.filter_closed_candles = lambda rows, **k: rows
 
             system.check_and_execute_trades()
 
@@ -294,6 +299,7 @@ class MaCrossFlipResidueTest(unittest.TestCase):
         system.trade_state.add_open_position(
             'ETHUSDT', 'short', 3000.0, 1.0, 3200.0, 'stop-1', strategy='ma_cross')
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         system._pending_trade_close_notifications = []
         system.stop_loss_file = os.path.join(tmp, 'stop_loss_dates.json')
         system.stop_loss_dates = {}
@@ -736,6 +742,57 @@ class ResidueAutoClearGuardTest(unittest.TestCase):
             self.assertTrue(system.trade_state.has_stop_residue('BTCUSDT'))
 
 
+class StopAnomalyDeliveryTest(unittest.TestCase):
+    def test_each_anomaly_retries_failed_delivery_then_deduplicates(self):
+        for reason in ('flat_unconfirmed', 'position_mismatch', 'mismatch', 'replant_failed'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                system, _ = _build_system(tmp, [])
+                system.notifier.notify_error = Mock(side_effect=[False, True])
+                position = {'side': 'long', 'position_size': 1., 'stop_loss_price': 90.}
+                system.exchange_api.confirm_position_flat = lambda *a: False
+                system.exchange_api.managed_position_matches = lambda *a: False
+                system.exchange_api.find_stop_order_state = lambda *a: (
+                    'mismatch' if reason == 'mismatch' else 'missing')
+                system.exchange_api.create_stop_loss_order = lambda *a: None
+                if reason == 'flat_unconfirmed':
+                    check = lambda: system._confirm_exchange_flat('BTCUSDT', 'BTCUSDT')
+                elif reason == 'position_mismatch':
+                    check = lambda: system._managed_position_is_consistent(
+                        'BTCUSDT', 'BTCUSDT', position, {})
+                else:
+                    check = lambda: system._ensure_stop_order_alive(
+                        'BTCUSDT', 'BTCUSDT', position, '双均线')
+                check()
+                self.assertEqual(system._stop_anomalies, {'BTCUSDT': reason})
+                self.assertEqual(system._stop_anomaly_alerts, {})
+                check()
+                check()
+                self.assertEqual(system.notifier.notify_error.call_count, 2)
+                self.assertEqual(system._stop_anomaly_alerts, {'BTCUSDT': reason})
+
+    def test_changed_or_recurring_anomaly_alerts_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, [])
+            system.notifier.notify_error = Mock(return_value=True)
+            for reason in ('position_mismatch', 'position_mismatch', 'position_unverifiable'):
+                system._report_stop_anomaly('BTCUSDT', reason, 'offline')
+            self.assertEqual(system.notifier.notify_error.call_count, 2)
+            system.exchange_api.managed_position_matches = lambda *a: True
+            system._managed_position_is_consistent('BTCUSDT', 'BTCUSDT', {}, {})
+            self.assertEqual(system._stop_anomaly_alerts, {})
+            system._report_stop_anomaly('BTCUSDT', 'position_unverifiable', 'offline')
+            self.assertEqual(system.notifier.notify_error.call_count, 3)
+
+    def test_sender_exception_does_not_hide_anomaly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system, _ = _build_system(tmp, [])
+            system.notifier.notify_error = Mock(side_effect=RuntimeError('offline'))
+            with self.assertRaises(RuntimeError):
+                system._report_stop_anomaly('BTCUSDT', 'mismatch', 'offline')
+            self.assertEqual(system._stop_anomalies, {'BTCUSDT': 'mismatch'})
+            self.assertEqual(system._stop_anomaly_alerts, {})
+
+
 class StopSelfHealTest(unittest.TestCase):
     """止损自愈：三态判定（intact 不动 / mismatch 告警人工 / missing 补挂）；不确定时一律不动。"""
 
@@ -743,6 +800,7 @@ class StopSelfHealTest(unittest.TestCase):
         system = TradingSystem.__new__(TradingSystem)
         system.label = '欧易'
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         system.trade_state = TradeState(os.path.join(tmp, 'trade_state.json'))
         system.trade_state.add_open_position('BTCUSDT', 'long', 60000.0, 0.1, 55000.0,
                                              stop_order_id='stop-1', strategy='ma_cross')
@@ -849,6 +907,7 @@ class StopConfirmOnPersistFailureTest(unittest.TestCase):
     def _system(self):
         system = TradingSystem.__new__(TradingSystem)
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         cancel_calls = []
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=lambda s: s,

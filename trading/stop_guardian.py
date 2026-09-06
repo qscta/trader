@@ -6,7 +6,7 @@
 以 mixin 形式承载：方法仍绑定在 TradingSystem 实例上——self 语义、
 测试对实例方法的桩打法、调用链与日志行为全部不变，只做物理分层。
 宿主须提供：exchange_api / trade_state / notifier / config / _trade_lock /
-_stop_anomalies / _known_orphans / record_stop_loss / get_strategy_for_symbol /
+_stop_anomalies / _stop_anomaly_alerts / _known_orphans / record_stop_loss / get_strategy_for_symbol /
 _get_strategy_display_name。
 """
 
@@ -18,6 +18,31 @@ logger = logging.getLogger(__name__)
 
 
 class StopGuardianMixin:
+
+    def _pending_reduction_blocks_management(self, symbol):
+        position = self.trade_state.get_open_position(symbol)
+        if not isinstance(position, dict) or 'pending_reduction' not in position:
+            return False
+        msg = (f'{symbol} 有未完成核对的人工减仓，已隔离该品种。'
+               '不再自动下单或改撤止损；请核对减仓订单、实际剩余仓位与止损，勿重复操作。')
+        logger.critical(msg)
+        try:
+            self._report_stop_anomaly(symbol, 'manual_reduction_pending', msg)
+        except Exception as e:
+            logger.error('减仓隔离告警发送失败（隔离仍有效）: %s', e)
+        return True
+
+    def _report_stop_anomaly(self, symbol, reason, message):
+        """异常始终对前端可见；同一异常仅在送达后去重，未送达下轮重试。"""
+        if self._stop_anomalies.get(symbol) != reason:
+            self._stop_anomaly_alerts.pop(symbol, None)
+        self._stop_anomalies[symbol] = reason
+        if self._stop_anomaly_alerts.get(symbol) != reason and self.notifier.notify_error(message):
+            self._stop_anomaly_alerts[symbol] = reason
+
+    def _clear_stop_anomaly(self, symbol):
+        self._stop_anomalies.pop(symbol, None)
+        self._stop_anomaly_alerts.pop(symbol, None)
 
     def _persist_exchange_flat_policy(self, symbol, exit_only):
         """交易所已确认空仓后，先持久化后续开仓策略，再允许本地记平。
@@ -45,9 +70,7 @@ class StopGuardianMixin:
         msg = (f"{symbol} 交易所首次返回空仓，但{detail}。为防瞬时空响应导致本地误记平、"
                f"撤掉真实仓位止损，已保留本地持仓并隔离，请等待下轮巡检或人工核对。")
         logger.critical(msg)
-        if self._stop_anomalies.get(symbol) != reason:
-            self.notifier.notify_error(msg)
-        self._stop_anomalies[symbol] = reason
+        self._report_stop_anomaly(symbol, reason, msg)
         return False
 
     def reconcile_intraday_stop_losses(self):
@@ -118,6 +141,8 @@ class StopGuardianMixin:
 
     def _reconcile_symbol_intraday(self, symbol, position, symbol_configs):
         """单品种盘中巡检：持仓核对 + 止损自愈 + 交易所端已平的记账。异常由调用方按品种隔离。"""
+        if self._pending_reduction_blocks_management(symbol):
+            return
         pool_config = symbol_configs.get(symbol)
         exit_only = pool_config is None or not pool_config.get('enabled', True)
         symbol_config = pool_config or {
@@ -190,7 +215,7 @@ class StopGuardianMixin:
             if matches:
                 if self._stop_anomalies.get(symbol) in (
                         'position_mismatch', 'position_unverifiable', 'flat_unconfirmed'):
-                    self._stop_anomalies.pop(symbol, None)
+                    self._clear_stop_anomaly(symbol)
                     logger.info(f"{symbol} 交易所持仓已恢复与本地托管记录一致")
                 return True
             reason = 'position_mismatch'
@@ -199,9 +224,7 @@ class StopGuardianMixin:
                    f"不自动平仓、翻转或补挂止损，请人工核对。")
 
         logger.critical(msg)
-        if self._stop_anomalies.get(symbol) != reason:
-            self.notifier.notify_error(msg)
-        self._stop_anomalies[symbol] = reason
+        self._report_stop_anomaly(symbol, reason, msg)
         return False
 
     def _ensure_stop_order_alive(self, symbol, ccxt_symbol, position, strategy_name):
@@ -211,7 +234,7 @@ class StopGuardianMixin:
         自动恢复保护，不再只靠告警等人工。fail-safe：查询失败、残留阻断、状态不明时一律不动。
         三态判定由适配层 find_stop_order_state 完成（方向+触发价+张数严格匹配才算 intact，
         张数换算不外泄）：intact 不动 / mismatch 告警人工不补挂（防双止损）/ missing 补挂。
-        异常状态记入 self._stop_anomalies（前端展示 + 告警只在状态首次进入时发，防止巡检轰炸）。
+        异常状态记入 self._stop_anomalies；告警送达后去重，未送达下轮重试。
         """
         if self.trade_state.has_stop_residue(symbol):
             return  # 残留阻断品种状态不明，交由无仓后的清理流程处理
@@ -228,7 +251,7 @@ class StopGuardianMixin:
             logger.warning(f"{symbol} [{strategy_name}] 止损存在性检查失败，跳过本轮: {e}")
             return
         if state == 'intact':
-            self._stop_anomalies.pop(symbol, None)  # 状态恢复正常，解除前端警示
+            self._clear_stop_anomaly(symbol)  # 状态恢复正常，解除前端警示
             return
         if state == 'mismatch':
             # 内容不符或存在额外/重复单：自动补挂会扩大冲突，必须人工裁决
@@ -236,9 +259,7 @@ class StopGuardianMixin:
                    f"reduce-only 止损（可能内容不符、人工额外挂单或重复单）。"
                    f"已暂停该品种自动补挂，请立即人工核对欧易委托！")
             logger.critical(msg)
-            if self._stop_anomalies.get(symbol) != 'mismatch':
-                self.notifier.notify_error(msg)  # 只在状态首次进入时发钉钉，巡检每轮重复判定不轰炸
-            self._stop_anomalies[symbol] = 'mismatch'
+            self._report_stop_anomaly(symbol, 'mismatch', msg)
             return
 
         logger.warning(f"{symbol} [{strategy_name}] 持仓缺少止损单（记录ID={stop_order_id}），按本地止损价 {stop_price} 补挂")
@@ -247,11 +268,9 @@ class StopGuardianMixin:
         if not stop_order:
             msg = f"{symbol} 持仓缺少止损单且自动补挂失败，仓位暂无止损保护，请立即人工处理！"
             logger.critical(msg)
-            if self._stop_anomalies.get(symbol) != 'replant_failed':
-                self.notifier.notify_error(msg)
-            self._stop_anomalies[symbol] = 'replant_failed'
+            self._report_stop_anomaly(symbol, 'replant_failed', msg)
             return
-        self._stop_anomalies.pop(symbol, None)
+        self._clear_stop_anomaly(symbol)
         self._update_trade_state_stop_with_runtime_fallback(
             symbol, stop_price, stop_order.get('id'), "巡检补挂止损")
         self.notifier.send_message(
@@ -345,7 +364,7 @@ class StopGuardianMixin:
             state_saved = False
         if closed_position:
             # 仓位已结束：止损异常警示随仓位生命周期终结（异常单实体由调用方的撤单确认链路负责清理）
-            self._stop_anomalies.pop(symbol, None)
+            self._clear_stop_anomaly(symbol)
         return closed_position, state_saved
 
     def _update_trade_state_stop_with_runtime_fallback(self, symbol, new_stop_loss_price, stop_order_id, context):

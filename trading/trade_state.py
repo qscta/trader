@@ -106,6 +106,26 @@ def enrich_closed_trade_with_fees(trade, fee_rate=TRADING_FEE_RATE):
     return enriched
 
 
+def completed_trade_groups(exits):
+    """胜率按完整仓位统计；分批退出不能凭空增加交易次数。输入已按现有费率口径补齐。"""
+    groups = {}
+    for index, trade in enumerate(exits):
+        key = ((trade.get('symbol'), trade['open_time']) if trade.get('open_time')
+               else ('legacy', index))
+        groups.setdefault(key, []).append(trade)
+    completed = []
+    for parts in groups.values():
+        finals = [part for part in parts if not part.get('partial_close')]
+        if not finals:
+            continue
+        result = dict(finals[-1])
+        pnl = sum(part.get('pnl', 0) for part in parts)
+        notional = sum(part.get('entry_notional', 0) for part in parts)
+        result.update(pnl=pnl, pnl_percent=pnl / notional * 100 if notional else 0)
+        completed.append(result)
+    return completed
+
+
 class TradeState:
     # 账本内保留的最近平仓记录条数：超出部分由 compact_closed_trades 搬进只追加的
     # 史书文件。命脉账本（持仓/止损/信号状态）从此恒定大小，每次落盘不再全量重写
@@ -188,6 +208,16 @@ class TradeState:
                 raise ValueError(f'{source} {symbol} 空仓止损价必须高于入场价')
             if position.get('strategy') not in (None, 'ma_cross'):
                 raise ValueError(f"{source} {symbol} strategy 非法: {position.get('strategy')!r}")
+            revision = position.get('reduction_revision', 0)
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                raise ValueError(f'{source} {symbol} 减仓版本非法')
+            if 'pending_reduction' in position:
+                pending = position['pending_reduction']
+                if (not isinstance(pending, dict) or not pending.get('client_order_id')
+                        or pending.get('open_time') != position.get('open_time')
+                        or pending.get('revision') != revision
+                        or pending.get('original_size') != position['position_size']):
+                    raise ValueError(f'{source} {symbol} 待确认减仓记录损坏，拒绝恢复交易')
         return state
 
     def get_default_state(self):
@@ -263,6 +293,54 @@ class TradeState:
         with self.lock:
             position = self.state['open_positions'].get(symbol)
             return copy.deepcopy(position) if position is not None else None
+
+    def begin_reduction(self, symbol, quote):
+        """先落盘意图再下单；老页面、重复提交和重启均不能绕过未确认操作。"""
+        with self.lock:
+            position = self.state['open_positions'].get(symbol)
+            if (not position or 'pending_reduction' in position
+                    or position.get('open_time') != quote['open_time']
+                    or position['position_size'] != quote['original_size']
+                    or position.get('reduction_revision', 0) != quote['revision']):
+                raise ValueError('持仓已变化或有待确认减仓，请刷新；不会重复下单')
+            snapshot = self._snapshot_locked()
+            position['pending_reduction'] = copy.deepcopy(quote)
+            self._save_or_rollback_locked(snapshot)
+
+    def finish_reduction(self, symbol, client_order_id, filled_size, remaining_size, exit_price):
+        """仅确认本单终态、剩余仓及止损后调用；账本和操作完成标记同次原子提交。"""
+        with self.lock:
+            position = self.state['open_positions'][symbol]
+            pending = position['pending_reduction']
+            if pending['client_order_id'] != client_order_id:
+                raise ValueError('减仓操作标识不一致')
+            if (not math.isfinite(filled_size) or filled_size < 0
+                    or filled_size > pending['reduce_size']
+                    or filled_size >= position['position_size']):
+                raise ValueError('减仓成交数量越界')
+            if filled_size and (not math.isfinite(exit_price) or exit_price <= 0):
+                raise ValueError('减仓成交价格无效，拒绝猜测记账')
+            if (not math.isfinite(remaining_size) or remaining_size <= 0
+                    or remaining_size > position['position_size']
+                    or not math.isclose(filled_size + remaining_size,
+                                        position['position_size'], rel_tol=1e-12)):
+                raise ValueError('剩余持仓数量与成交不相符')
+            snapshot = self._snapshot_locked()
+            trade = None
+            if filled_size:
+                trade = {key: position.get(key) for key in
+                         ('symbol', 'side', 'entry_price', 'open_time', 'strategy')}
+                trade.update(position_size=filled_size, exit_price=exit_price,
+                             close_time=datetime.now().isoformat(), partial_close=True,
+                             client_order_id=client_order_id)
+                trade.update(calculate_closed_trade_metrics(
+                    position['side'], position['entry_price'], exit_price, filled_size))
+                self.state['closed_trades'].append(trade)
+                position['position_size'] = remaining_size
+            del position['pending_reduction']
+            position['reduction_revision'] = position.get('reduction_revision', 0) + 1
+            self._save_or_rollback_locked(snapshot)
+            return copy.deepcopy(trade)
 
     def update_stop_loss(self, symbol, new_stop_price, new_stop_order_id):
         with self.lock:

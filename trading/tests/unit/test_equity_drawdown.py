@@ -3,9 +3,11 @@ import os
 import sys
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 # 生产代码在仓库根（tests/unit 的上两级）；从任意 cwd 独立运行也能 import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -81,6 +83,62 @@ class DrawdownStatsTest(unittest.TestCase):
         d = t.build_account_stats(persist=True)             # 统计刷新时峰值已是新高
         self.assertEqual(d['days_since_peak'], 0)
         self.assertEqual(d['longest_drawdown_days'], 5)
+
+
+class EquityCompactionTest(unittest.TestCase):
+    def test_compaction_preserves_concurrent_new_sample_and_closed_ohlc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = eqt.EquityTracker(tmp, Mock())
+            now = datetime.now().replace(hour=10, minute=0, second=0, microsecond=0)
+            yesterday = now - timedelta(days=1)
+            tracker.save_equity_ticks([
+                {'timestamp': yesterday.isoformat(), 'equity': 100., 'qiusuo_index': 1853.},
+                {'timestamp': (yesterday + timedelta(minutes=5)).isoformat(),
+                 'equity': 105., 'qiusuo_index': 1945.65},
+                {'timestamp': (now - timedelta(hours=1)).isoformat(),
+                 'equity': 105., 'qiusuo_index': 1945.65}])
+            load = tracker.load_equity_ticks
+            attempted, finished = threading.Event(), threading.Event()
+            results = []
+
+            def sample():
+                attempted.set()
+                results.append(tracker.record_equity_tick(equity=110., now=now))
+                finished.set()
+
+            writer = threading.Thread(target=sample, daemon=True)
+
+            def read_then_sample():
+                snapshot = load()
+                tracker.load_equity_ticks = load
+                writer.start()
+                self.assertTrue(attempted.wait(2))
+                # 旧实现会让另一线程写完后才压缩；正确实现使写者等到压缩释放锁。
+                finished.wait(.5)
+                return snapshot
+
+            tracker.load_equity_ticks = read_then_sample
+            tracker._compact_closed_ticks(now)
+            writer.join(2)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(results, [True])
+            self.assertEqual([t['equity'] for t in load()], [105., 110.])
+            daily = tracker.load_daily_equity()
+            self.assertEqual(len(daily), 1)
+            self.assertEqual((daily[0]['open'], daily[0]['low']), (1853., 1853.))
+            self.assertEqual((daily[0]['close'], daily[0]['high']), (1945.65, 1945.65))
+            self.assertEqual(daily[0]['samples'], 2)
+
+    def test_failed_daily_save_keeps_original_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = eqt.EquityTracker(tmp, Mock())
+            now = datetime.now()
+            original = [{'timestamp': (now - timedelta(days=1)).isoformat(),
+                         'equity': 100., 'qiusuo_index': 1853.}]
+            tracker.save_equity_ticks(original)
+            with patch.object(tracker, 'save_daily_equity', return_value=False):
+                tracker._compact_closed_ticks(now)
+            self.assertEqual(tracker.load_equity_ticks(), original)
 
 
 class EquitySyncFlowTest(unittest.TestCase):

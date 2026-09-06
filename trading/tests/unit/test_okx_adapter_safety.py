@@ -52,7 +52,7 @@ def _bare_api():
 def _native_stop(algo_id='stop-1', side='sell', sz='10', px='55000'):
     """OKX orders-algo-pending 原生响应里的一条 conditional 止损单。"""
     return {'algoId': algo_id, 'side': side, 'sz': sz, 'slTriggerPx': px,
-            'ordType': 'conditional', 'reduceOnly': 'true'}
+            'ordType': 'conditional', 'reduceOnly': 'true', 'slOrdPx': '-1'}
 
 
 def _algo_stub(items_by_type):
@@ -358,7 +358,7 @@ class StopOrderTimeoutSafetyTest(unittest.TestCase):
         api = self._api()
         confirmed = {
             'id': 'stop-1', 'side': 'sell', 'amount': 10,
-            'stopLossPrice': 55000, 'reduceOnly': True, 'info': {},
+            'stopLossPrice': 55000, 'reduceOnly': True, 'info': {'slOrdPx': '-1'},
         }
         with patch.object(api, '_fetch_algo_orders', side_effect=[[], [confirmed]]), \
                 patch.object(okx_api, 'time', Mock(sleep=lambda _s: None)):
@@ -596,7 +596,7 @@ class TickAlignmentTest(unittest.TestCase):
         api.exchange.create_order.return_value = {'id': 'stop-1'}
         with patch.object(api, '_fetch_algo_orders', return_value=[{
                 'id': 'stop-1', 'side': 'sell', 'reduceOnly': True,
-                'info': {'slTriggerPx': '55000.38', 'sz': '10'}}]):
+                'info': {'slTriggerPx': '55000.38', 'sz': '10', 'slOrdPx': '-1'}}]):
             api.create_stop_loss_order('BTC/USDT:USDT', 'long', 0.1, 55000.384)
         _args, _kwargs = api.exchange.create_order.call_args
         params = _args[5]
@@ -671,10 +671,16 @@ class FindStopOrderStateTest(unittest.TestCase):
 
 class StopOrderMatchTest(unittest.TestCase):
     GOOD = {'side': 'sell', 'amount': 25.0, 'stopLossPrice': 98.5,
-            'reduceOnly': True, 'info': {}}
+            'reduceOnly': True, 'info': {'slOrdPx': '-1'}}
 
     def test_full_match(self):
         self.assertTrue(OkxApi._algo_order_matches(self.GOOD, 'sell', 98.5, 25.0))
+
+    def test_limit_or_missing_execution_price_is_not_market_protection(self):
+        for value in ('98', '0', '', None):
+            with self.subTest(value=value):
+                order = dict(self.GOOD, info={'slOrdPx': value})
+                self.assertFalse(OkxApi._algo_order_matches(order, 'sell', 98.5, 25.0))
 
     def test_wrong_trigger_price_is_old_order(self):
         """触发价不同（残留旧止损）→ 不匹配，防止误认。"""
@@ -705,7 +711,7 @@ class StopOrderMatchTest(unittest.TestCase):
 
     def test_trigger_from_okx_info_field(self):
         o = {'side': 'sell', 'reduceOnly': True,
-             'info': {'slTriggerPx': '98.5', 'sz': '25'}}
+             'info': {'slTriggerPx': '98.5', 'sz': '25', 'slOrdPx': '-1'}}
         self.assertTrue(OkxApi._algo_order_matches(o, 'sell', 98.5, 25.0))
 
 

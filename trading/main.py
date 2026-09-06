@@ -123,7 +123,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         self._pending_trade_close_notifications = []
         self._trade_lock = threading.Lock()  # 防并发执行锁
         self._summary_lock = threading.Lock()  # 每日汇总「查重→推送→标记」的原子化（兜底调度与日检可能并发）
-        self._stop_anomalies = {}  # 止损异常状态（mismatch/补挂失败），供前端警示与告警节流
+        self._stop_anomalies = {}  # 当前异常，供前端警示；告警未送达也必须可见
+        self._stop_anomaly_alerts = {}  # 已送达的异常告警，仅内存去重，失败交由下轮重试
         self._known_orphans = set()  # 已告警的孤儿仓（新增才告警、消失即移除，与 _stop_anomalies 同一节流模式）
         self._last_failure_notify_ts = 0
         self._equity_tick_fail_streak = 0
@@ -356,6 +357,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
         open_positions = self.trade_state.get_all_open_positions()
 
         for symbol in list(open_positions.keys()):
+            if self._pending_reduction_blocks_management(symbol):
+                continue
             ccxt_symbol = self.exchange_api.to_ccxt_symbol(symbol)
             position = self.exchange_api.get_position(ccxt_symbol)
 
@@ -500,6 +503,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
             for symbol in sorted(symbols_to_check):
                 # 单品种异常只跳过该品种，不得中断其余品种的止损推进/平仓检查（真钱红线）
                 try:
+                    if self._pending_reduction_blocks_management(symbol):
+                        continue  # 明确人工隔离，不用整轮自动重试去猜测成交
                     symbol_config = symbol_config_map.get(symbol)
                     if symbol_config is None:
                         # 品种已从手动池删除但仍有持仓：优先用「持仓记录的策略」（当前仅 ma_cross）
@@ -531,12 +536,14 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     ohlcv = self.exchange_api.fetch_ohlcv(ccxt_symbol, '1d', limit=fetch_limit)
                     if not ohlcv:
                         logger.warning(f"{symbol} 获取K线数据失败")
+                        failed_symbols.append(symbol)
                         continue
 
                     df = self.exchange_api.ohlcv_to_dataframe(ohlcv)
                     df = self.exchange_api.filter_closed_candles(df, timeframe='1d')
                     if len(df) == 0:
                         logger.warning(f"{symbol} 无已收盘K线，跳过本轮检查")
+                        failed_symbols.append(symbol)
                         continue
                     if len(df) < required_closed_candles:
                         logger.warning(
@@ -557,6 +564,7 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
 
                     if not signal:
                         logger.warning(f"{symbol} 策略未返回信号，跳过本轮检查")
+                        failed_symbols.append(symbol)
                         continue
 
                     current_close = float(df['close'].iloc[-1])
@@ -572,7 +580,8 @@ class TradingSystem(StopGuardianMixin, ReportingMixin, SignalHandlersMixin, Trad
                     position = self.trade_state.get_open_position(symbol)
 
                     if position:
-                        self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df)
+                        if self.handle_open_position_ma_cross(symbol, signal, position, symbol_config, df) is False:
+                            failed_symbols.append(symbol)
                     else:
                         self.handle_no_position_ma_cross(symbol, signal, symbol_config, df)
 

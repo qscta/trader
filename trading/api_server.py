@@ -9,7 +9,9 @@ import os
 import signal
 import secrets
 from datetime import datetime
-from trade_state import enrich_closed_trade_with_fees
+from itsdangerous import URLSafeTimedSerializer, BadData
+from trade_state import enrich_closed_trade_with_fees, completed_trade_groups
+from partial_close import preview_reduction, execute_reduction
 
 # 品种写接口的输入校验（脏数据会进 config、前端渲染和真实下单路径，必须挡在门口）。
 # 校验口径全部取自 config_validation——与手写 config.json 的启动校验同一事实源，
@@ -529,16 +531,18 @@ def get_trades_summary():
     if err:
         return err
     try:
-        trades = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
+        exits = [enrich_closed_trade_with_fees(t) for t in system.trade_state.get_closed_trades()]
+        trades = completed_trade_groups(exits)
+        realized_pnl = sum(t.get('pnl', 0) for t in exits)
         if not trades:
-            return jsonify({'total': 0})
+            return jsonify({'total': 0, 'total_pnl': round(realized_pnl, 2), 'exit_count': len(exits)})
         total = len(trades)
         wins = [t for t in trades if t.get('pnl', 0) > 0]
         losses = [t for t in trades if t.get('pnl', 0) <= 0]
         win_count = len(wins)
         loss_count = len(losses)
         win_rate = win_count / total * 100 if total > 0 else 0
-        total_pnl = sum(t.get('pnl', 0) for t in trades)
+        total_pnl = realized_pnl  # 包含尚未整仓结束的已实现减仓盈亏
         avg_win = sum(t.get('pnl', 0) for t in wins) / win_count if win_count > 0 else 0
         avg_loss = sum(t.get('pnl', 0) for t in losses) / loss_count if loss_count > 0 else 0
         loss_sum = sum(t.get('pnl', 0) for t in losses)
@@ -860,6 +864,39 @@ def instant_open():
         return jsonify({'error': f'即时开仓异常: {str(e)}'}), 500
 
 
+@app.route('/api/reduce_position/preview', methods=['POST'])
+@app.route('/api/reduce_position', methods=['POST'])
+@require_auth
+def reduce_position():
+    """短时签名预览 + 明确确认；锁内重新核对，绝不把网络重试当新操作。"""
+    system, err = _require_system()
+    if err:
+        return err
+    # 与旧交易流程独立的上线闸：交易所止损改量验证通过前不得启用。
+    if os.environ.get('TRADING_ENABLE_PARTIAL_CLOSE') != '1':
+        return jsonify({'error': '按比例减仓尚未启用，须先完成交易所验证'}), 403
+    if not system._trade_lock.acquire(blocking=False):
+        return jsonify({'error': '交易检查/巡检或其他交易正在执行，请稍后重新预览'}), 409
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('请求必须是 JSON 对象')
+        signer = URLSafeTimedSerializer(app.secret_key, salt='manual-partial-close-v1')
+        if request.path.endswith('/preview'):
+            symbol = normalize_symbol_name(data.get('name'))
+            quote = preview_reduction(system, symbol, data.get('percent'))
+            return jsonify({'quote': quote, 'token': signer.dumps(quote), 'expires_in': 120})
+        quote = signer.loads(data.get('token', ''), max_age=120)
+        return jsonify(execute_reduction(system, quote))
+    except (ValueError, BadData) as e:
+        return jsonify({'error': f'减仓未执行或预览无效: {e}；请重新预览确认'}), 409
+    except Exception as e:
+        logger.exception('人工减仓失败或结果待核对')
+        return jsonify({'error': str(e)}), 503
+    finally:
+        system._trade_lock.release()
+
+
 @app.route('/api/close_position', methods=['POST'])
 @require_auth
 def close_position():
@@ -883,6 +920,8 @@ def close_position():
             position = system.trade_state.get_open_position(symbol_name)
             if not position:
                 return jsonify({'error': f'{symbol_name} 没有持仓记录'}), 400
+            if 'pending_reduction' in position:
+                return jsonify({'error': '该品种有待核对减仓，已拒绝继续下单；请人工核对'}), 409
 
             ccxt_symbol = system.exchange_api.to_ccxt_symbol(symbol_name)
             try:

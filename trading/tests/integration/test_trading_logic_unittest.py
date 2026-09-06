@@ -141,6 +141,7 @@ class MaCrossNextDailyCheckReentryTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         system.stop_loss_dates = {}
         system._save_stop_loss_dates = Mock()
         system._execute_open = Mock()
@@ -893,6 +894,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         system.stop_loss_dates = {}
         system._save_stop_loss_dates = Mock()
         system.config = {"strategy": {"default_risk_per_trade": 0.01}}
@@ -901,6 +903,7 @@ class ExecuteOpenRiskGuardTests(unittest.TestCase):
             notify_trade_opened=Mock(),
         )
         system.trade_state = SimpleNamespace(
+            get_open_position=Mock(return_value=None),
             add_open_position=Mock(),
             force_runtime_add_open_position=Mock(),
             has_stop_residue=Mock(return_value=False),
@@ -1424,6 +1427,7 @@ class MaCrossFlipTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         exchange_stub = SimpleNamespace(fetch_ticker=Mock(return_value={"last": 111}))
         system.exchange_api = SimpleNamespace(
             to_ccxt_symbol=_fake_to_ccxt,
@@ -1521,13 +1525,14 @@ class MaCrossFlipTests(unittest.TestCase):
         system.exchange_api.managed_position_matches = Mock(return_value=True)
         system._flip_position = Mock()
         position = {"side": "long", "position_size": 2.0, "stop_loss_price": 90.0}
+        signal = {"action": "short", "ema_short": 90, "ema_long": 100}
 
         system.handle_open_position_ma_cross(
-            "BTCUSDT", {"action": "short"}, position,
+            "BTCUSDT", signal, position,
             {"name": "BTCUSDT", "strategy": "ma_cross", "exit_only": True}, df=object())
 
         system._flip_position.assert_called_once_with(
-            "BTCUSDT", {"action": "short"}, position, "short",
+            "BTCUSDT", signal, position, "short",
             {"name": "BTCUSDT", "strategy": "ma_cross", "exit_only": True},
             exit_only=True)
 
@@ -1686,6 +1691,7 @@ class StartupSyncCompensationTests(unittest.TestCase):
     def make_system(self):
         system = object.__new__(main.TradingSystem)
         system._stop_anomalies = {}
+        system._stop_anomaly_alerts = {}
         system._known_orphans = set()
         system.config = {
             "strategy": {"default_risk_per_trade": 0.01},
@@ -1706,6 +1712,7 @@ class StartupSyncCompensationTests(unittest.TestCase):
             get_last_price=lambda s: float(exchange_stub.fetch_ticker(s)["last"]),
         )
         system.trade_state = SimpleNamespace(
+            get_open_position=Mock(return_value={"side": "long", "position_size": 2.0}),
             get_all_open_positions=Mock(
                 return_value={
                     "BTCUSDT": {

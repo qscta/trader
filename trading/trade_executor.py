@@ -74,7 +74,7 @@ class TradeExecutorMixin:
         if not close_order:
             logger.error(f"{symbol} [双均线] 翻转平仓失败")
             self.notifier.notify_error(f"{symbol} [双均线] 翻转平仓失败")
-            return
+            return False  # 日检不记完成；下轮先复核实仓，再决定是否仍需平仓
 
         stop_cleared = self._cancel_stop_order_confirmed(symbol, ccxt_symbol, old_position.get('stop_order_id'))
 
@@ -177,6 +177,8 @@ class TradeExecutorMixin:
         # 这个最内层边界，避免只拦调度入口却漏掉 Web 即时开仓或反手腿。
         if getattr(self, 'new_entries_disabled', False):
             logger.warning(f"{symbol} 新开仓被 TRADING_DISABLE_NEW_OPENS 总闸阻断")
+            return
+        if self._pending_reduction_blocks_management(symbol):
             return
         if symbol_config.get('enabled') is False or symbol_config.get('exit_only'):
             logger.warning(f"{symbol} 已禁用或处于退出模式，本次新开仓被阻断")
