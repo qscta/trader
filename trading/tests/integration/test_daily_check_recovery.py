@@ -16,6 +16,46 @@ from ma_cross_strategy import MaCrossStrategy
 from trade_state import TradeState
 
 
+class MaDirectionContractTests(unittest.TestCase):
+    def test_reentry_uses_current_direction_and_preserves_signal_shape(self):
+        for periods in ((7, 28, 28), (3, 9, 15), (5, 14, 40)):
+            strategy = MaCrossStrategy(*periods)
+            count = max(periods[1] * 2, periods[2] + 1) + 10
+            for step, side in ((1., 'long'), (-1., 'short'), (0., None)):
+                with self.subTest(periods=periods, side=side):
+                    frame = pd.DataFrame({'close': [100. + step * i for i in range(count)]})
+                    original = frame.copy(deep=True)
+                    current = strategy.check_current_state(frame)
+                    should_reenter, actual_side, signal = strategy.check_reentry_condition(frame)
+                    self.assertIs(should_reenter, side is not None)
+                    self.assertEqual(actual_side, side)
+                    self.assertEqual(current.pop('action'), side)
+                    self.assertEqual(signal, current)
+                    self.assertNotIn('action', signal)
+                    closes = frame['close'].iloc[-(periods[2] + 1):-1]
+                    self.assertEqual(signal['upper_stop'], closes.max())
+                    self.assertEqual(signal['lower_stop'], closes.min())
+                    self.assertIsNone(strategy.check_signal(frame)['action'])
+                    pd.testing.assert_frame_equal(frame, original)
+
+    def test_reentry_history_threshold_is_unchanged(self):
+        for periods in ((7, 28, 28), (3, 9, 40)):
+            strategy = MaCrossStrategy(*periods)
+            required = max(periods[1] * 2, periods[2] + 1)
+            for count in (0, 1, required - 1):
+                with self.subTest(periods=periods, count=count):
+                    self.assertEqual(strategy.check_reentry_condition(
+                        pd.DataFrame({'close': [100.] * count})), (False, None, None))
+            self.assertIsNotNone(strategy.check_reentry_condition(
+                pd.DataFrame({'close': [100.] * required}))[2])
+
+    def test_missing_stop_levels_prevents_reentry(self):
+        strategy = MaCrossStrategy()
+        with patch.object(strategy, 'calculate_stop_levels', return_value=(None, None)):
+            self.assertEqual(strategy.check_reentry_condition(
+                pd.DataFrame({'close': list(range(1, 101))})), (False, None, None))
+
+
 class DailyCheckRecoveryTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

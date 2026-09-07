@@ -71,6 +71,14 @@ class EquityTracker:
         self.EQUITY_TICKS_FILE = os.path.join(data_dir, 'equity_ticks.json')
         self.QIUSUO_INDEX_FILE = os.path.join(data_dir, 'qiusuo_index.json')
 
+    def _save_json(self, filepath, data, failure_message):
+        """五类权益文件共用原子写入与失败告警；不改变调用方的锁和保存顺序。"""
+        if not atomic_write_json(filepath, data):
+            logger.error(f"{failure_message}: {filepath}")
+            self.notify_failure(failure_message, filepath)
+            return False
+        return True
+
     # ====== 权益历史 / 峰值 ======
 
     def load_equity_history(self):
@@ -88,11 +96,7 @@ class EquityTracker:
         }
 
     def save_equity_history(self, data):
-        if not atomic_write_json(self.EQUITY_HISTORY_FILE, data):
-            logger.error(f"保存权益历史失败: {self.EQUITY_HISTORY_FILE}")
-            self.notify_failure("保存权益历史失败", self.EQUITY_HISTORY_FILE)
-            return False
-        return True
+        return self._save_json(self.EQUITY_HISTORY_FILE, data, "保存权益历史失败")
 
     def load_peak_equity(self):
         if os.path.exists(self.PEAK_EQUITY_FILE):
@@ -104,11 +108,7 @@ class EquityTracker:
         return {'peak_equity': 0, 'peak_time': None}
 
     def save_peak_equity(self, peak_data):
-        if not atomic_write_json(self.PEAK_EQUITY_FILE, peak_data):
-            logger.error(f"保存峰值权益失败: {self.PEAK_EQUITY_FILE}")
-            self.notify_failure("保存峰值权益失败", self.PEAK_EQUITY_FILE)
-            return False
-        return True
+        return self._save_json(self.PEAK_EQUITY_FILE, peak_data, "保存峰值权益失败")
 
     def reconcile_peak_equity(self, current_equity, persist=False, now=None):
         now = now or datetime.now()
@@ -299,11 +299,7 @@ class EquityTracker:
         return []
 
     def save_daily_equity(self, data):
-        if not atomic_write_json(self.DAILY_EQUITY_FILE, data):
-            logger.error(f"保存每日权益快照失败: {self.DAILY_EQUITY_FILE}")
-            self.notify_failure("保存每日权益快照失败", self.DAILY_EQUITY_FILE)
-            return False
-        return True
+        return self._save_json(self.DAILY_EQUITY_FILE, data, "保存每日权益快照失败")
 
     def load_equity_ticks(self):
         try:
@@ -315,11 +311,7 @@ class EquityTracker:
         return []
 
     def save_equity_ticks(self, data):
-        if not atomic_write_json(self.EQUITY_TICKS_FILE, data):
-            logger.error(f"保存权益采样失败: {self.EQUITY_TICKS_FILE}")
-            self.notify_failure("保存权益采样失败", self.EQUITY_TICKS_FILE)
-            return False
-        return True
+        return self._save_json(self.EQUITY_TICKS_FILE, data, "保存权益采样失败")
 
     def load_qiusuo_index_state(self):
         try:
@@ -338,11 +330,7 @@ class EquityTracker:
         }
 
     def save_qiusuo_index_state(self, data):
-        if not atomic_write_json(self.QIUSUO_INDEX_FILE, data):
-            logger.error(f"保存求索指数状态失败: {self.QIUSUO_INDEX_FILE}")
-            self.notify_failure("保存求索指数状态失败", self.QIUSUO_INDEX_FILE)
-            return False
-        return True
+        return self._save_json(self.QIUSUO_INDEX_FILE, data, "保存求索指数状态失败")
 
     def _equity_tick_bucket(self, now=None):
         now = now or datetime.now()

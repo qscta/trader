@@ -196,32 +196,9 @@ class MaCrossStrategy:
 
         返回: (should_reenter, side, signal)
         """
-        min_required = max(self.long_period * 2, self.stop_loss_period + 1)
-        if len(df) < min_required:
+        # 与即时开仓共用当前方向计算；保留重入接口的三元组及原信号字段。
+        signal = self.check_current_state(df)
+        if signal is None:
             return False, None, None
-
-        df = self.calculate_ema(df)
-
-        current_ema_short = df['ema_short'].iloc[-1]
-        current_ema_long = df['ema_long'].iloc[-1]
-        current_close = df['close'].iloc[-1]
-
-        upper_stop, lower_stop = self.calculate_stop_levels(df)
-        if upper_stop is None:
-            return False, None, None
-
-        signal = {
-            'ema_short': current_ema_short,
-            'ema_long': current_ema_long,
-            'upper_stop': upper_stop,
-            'lower_stop': lower_stop,
-            'current_close': current_close,
-            'ema_bullish': current_ema_short > current_ema_long
-        }
-
-        if current_ema_short > current_ema_long:
-            return True, 'long', signal
-        elif current_ema_short < current_ema_long:
-            return True, 'short', signal
-
-        return False, None, signal
+        side = signal.pop('action')
+        return side is not None, side, signal

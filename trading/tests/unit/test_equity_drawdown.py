@@ -40,6 +40,59 @@ def _jdump(data, path):
         json.dump(data, f)
 
 
+class EquitySaveContractTest(unittest.TestCase):
+    SAVES = (
+        ('save_equity_history', 'EQUITY_HISTORY_FILE', '保存权益历史失败'),
+        ('save_peak_equity', 'PEAK_EQUITY_FILE', '保存峰值权益失败'),
+        ('save_daily_equity', 'DAILY_EQUITY_FILE', '保存每日权益快照失败'),
+        ('save_equity_ticks', 'EQUITY_TICKS_FILE', '保存权益采样失败'),
+        ('save_qiusuo_index_state', 'QIUSUO_INDEX_FILE', '保存求索指数状态失败'),
+    )
+
+    def test_all_save_paths_use_atomic_writer_and_preserve_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notify = Mock()
+            tracker = eqt.EquityTracker(tmp, Mock(), notify_failure=notify)
+            for method, attribute, _ in self.SAVES:
+                with self.subTest(method=method), patch.object(
+                        eqt, 'atomic_write_json', wraps=eqt.atomic_write_json) as write:
+                    data = {'name': method, 'values': [1., 2.5]}
+                    path = getattr(tracker, attribute)
+                    self.assertIs(getattr(tracker, method)(data), True)
+                    write.assert_called_once_with(path, data)
+                    self.assertEqual(_jload(path), data)
+            notify.assert_not_called()
+
+    def test_failed_save_keeps_previous_data_and_reports_exact_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notify = Mock()
+            tracker = eqt.EquityTracker(tmp, Mock(), notify_failure=notify)
+            for method, attribute, message in self.SAVES:
+                with self.subTest(method=method):
+                    path = getattr(tracker, attribute)
+                    getattr(tracker, method)({'old': 1})
+                    notify.reset_mock()
+                    with patch.object(eqt, 'atomic_write_json', return_value=False) as write, \
+                            self.assertLogs(eqt.logger, level='ERROR') as logs:
+                        self.assertIs(getattr(tracker, method)({'new': 2}), False)
+                    write.assert_called_once_with(path, {'new': 2})
+                    notify.assert_called_once_with(message, path)
+                    self.assertEqual([r.getMessage() for r in logs.records], [f'{message}: {path}'])
+                    self.assertEqual(_jload(path), {'old': 1})
+
+    def test_unexpected_writer_or_notification_exception_is_not_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = eqt.EquityTracker(tmp, Mock(), notify_failure=Mock())
+            for method, _, _ in self.SAVES:
+                for writer_fails in (True, False):
+                    with self.subTest(method=method, writer_fails=writer_fails), \
+                            patch.object(eqt, 'atomic_write_json', return_value=False,
+                                         side_effect=OSError('test failure') if writer_fails else None), \
+                            patch.object(tracker, 'notify_failure', side_effect=OSError('test failure')):
+                        with self.assertRaisesRegex(OSError, 'test failure'):
+                            getattr(tracker, method)({})
+
+
 class CoercePositiveFloatTest(unittest.TestCase):
     def test_rejects_nonfinite_values(self):
         for bad in ("inf", "-inf", "nan", float('inf'), float('nan')):
